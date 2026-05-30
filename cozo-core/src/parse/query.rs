@@ -491,18 +491,14 @@ pub(crate) fn parse_query(
     struct RelationHasNoKeys(String, #[label] SourceSpan);
 
     let empty_mutation_head = match &prog.out_opts.store_relation {
-        None => false,
-        Some((handle, _, _)) => {
-            if handle.key_bindings.is_empty() {
-                if handle.dep_bindings.is_empty() {
-                    true
-                } else {
-                    bail!(RelationHasNoKeys(handle.name.to_string(), handle.span));
-                }
+        Some((handle, _, _)) if handle.key_bindings.is_empty() => {
+            if handle.dep_bindings.is_empty() {
+                true
             } else {
-                false
+                bail!(RelationHasNoKeys(handle.name.to_string(), handle.span));
             }
         }
+        _ => false,
     };
 
     if empty_mutation_head {
