@@ -189,9 +189,12 @@ raw_string_inner = {
     )*
 }
 string = _{(raw_string | s_quoted_string | quoted_string)}
-// Boolean and null
-boolean = { "true" | "false" }
-null = { "null" }
+// Boolean and null. The trailing `!("_" | XID_CONTINUE)` is a word boundary so
+// these keyword literals do not greedily match a prefix of a longer identifier
+// (e.g. `nullable_column`, `trueValue`) where `term` tries `literal` before
+// `var` — upstream cozo #281.
+boolean = { ("true" | "false") ~ !("_" | XID_CONTINUE) }
+null = { "null" ~ !("_" | XID_CONTINUE) }
 // Numbers
 pos_int = @{ASCII_DIGIT ~ ("_" | ASCII_DIGIT)*}
 hex_pos_int = @{"0x" ~ ASCII_HEX_DIGIT ~ ("_" | ASCII_HEX_DIGIT)*}

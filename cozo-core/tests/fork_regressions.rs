@@ -8,7 +8,7 @@
 
 //! Regression tests for mnestic fork divergences from upstream CozoDB.
 
-use cozo::{DbInstance, ScriptMutability};
+use cozo::{DataValue, DbInstance, ScriptMutability};
 use std::collections::BTreeMap;
 
 /// Fork #2 (DESIGN CALL, NOT YET FIXED): a top-level `:create _foo` returns Ok
@@ -105,4 +105,47 @@ fn equality_post_filter_uses_prefix_lookup() {
     assert_eq!(rows.rows.len(), 1, "exactly one row matches uid == 'b'");
     assert_eq!(rows.rows[0][0].get_str(), Some("b"));
     assert_eq!(rows.rows[0][1].get_str(), Some("2"));
+}
+
+/// Upstream cozo #281 (FIXED): identifiers that start with a keyword literal
+/// (`null`, `true`, `false`) mis-parsed in value positions because `term` tries
+/// `literal` before `var` and the keyword literals had no word boundary. So
+/// `*rel{col: nullable_column}` failed while `*rel{col: x}` worked. Fix: word-
+/// boundary lookahead on `null`/`boolean` in `cozoscript.pest`.
+#[test]
+fn keyword_prefixed_identifiers_parse() {
+    let db = DbInstance::default();
+    let q = |s: &str| db.run_script(s, BTreeMap::new(), ScriptMutability::Mutable);
+
+    q(":create rel { id: Int => nullable_column: Int? }").unwrap();
+    q(r#"?[id, nullable_column] <- [[1, 10],[2, 20]] :put rel { id => nullable_column }"#)
+        .unwrap();
+
+    // The #281 case: `field: binding` where the binding name starts with `null`.
+    let r = q("?[id, nullable_column] := *rel{id, nullable_column: nullable_column}")
+        .expect("nullable_column binding must parse");
+    assert_eq!(r.rows.len(), 2);
+
+    // Other keyword-prefixed identifiers as bindings/vars.
+    for ident in ["nullable2", "trueValue", "falsey", "null_x", "true_thing"] {
+        let r = db
+            .run_script(
+                &format!("?[{ident}] := {ident} = 1"),
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap_or_else(|e| panic!("`{ident}` should parse as a var: {e:?}"));
+        assert_eq!(r.rows.len(), 1);
+    }
+
+    // Regression guard: the actual literals must still parse and evaluate.
+    let lit = |s: &str| {
+        db.run_script(s, BTreeMap::new(), ScriptMutability::Immutable)
+            .unwrap()
+            .rows
+    };
+    assert_eq!(lit("?[x] := x = true")[0][0], DataValue::Bool(true));
+    assert_eq!(lit("?[x] := x = false")[0][0], DataValue::Bool(false));
+    assert_eq!(lit("?[x] := x = null")[0][0], DataValue::Null);
+    assert_eq!(lit("?[x] := x = [null, true, false]")[0][0].get_slice().unwrap().len(), 3);
 }

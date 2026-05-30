@@ -50,6 +50,15 @@ fixes) for free.
     (~48–51 µs). The speedup scales with row count (O(N) scan → O(log N) lookup).
   - Tests: `tests/fork_regressions.rs::equality_post_filter_uses_prefix_lookup`
     (now active, was `#[ignore]`); baseline bench `benches/point_lookup.rs`.
+- **#281 keyword-prefixed identifiers now parse** (`cozo-core/src/cozoscript.pest`).
+  An identifier starting with a keyword literal — `nullable_column`, `trueValue`,
+  `falsey` — failed to parse in value positions (`*rel{col: nullable_column}`)
+  because `term` tries `literal` before `var` and `null`/`boolean` had no word
+  boundary, so `null` greedily matched the `null`-prefix and the parse aborted.
+  Added an identifier-boundary lookahead (`~ !("_" | XID_CONTINUE)`) to the `null`
+  and `boolean` rules. Closes upstream cozo #281. Tests:
+  `tests/fork_regressions.rs::keyword_prefixed_identifiers_parse` (includes a guard
+  that real `null`/`true`/`false` literals still parse).
 - **#287 `env_logger` moved to a dev-dependency** (`cozo-core/Cargo.toml`). It was
   a hard dependency but is only used by `runtime/tests.rs` (cfg(test)). Closes
   upstream cozo #287; trims downstream build graphs.
@@ -61,5 +70,11 @@ fixes) for free.
 ### Next (ordered by value/confidence)
 - **#4** batch secondary-index writes into a single `WriteBatch` — perf, needs the cozorocks bridge to expose batch put.
 - **#7** `multi_get` for HNSW neighbor fetches — perf, needs bridge support.
-- **bit-rot**: #307 (benches don't compile on the 3-arg `run_script`), #298 (rayon cargo-update break), #281 (`nullable…` column binding parser bug).
+- **bit-rot (deferred, low value)**: #307 — the upstream pokec/wiki/time_travel
+  benches need nightly `#![feature(test)]` + external datasets, so they can't run
+  in CI and can't be compile-verified on a stable toolchain; superseded by the
+  criterion harness (`benches/point_lookup.rs`). #298 — newer rayon raises MSRV;
+  builds fine on our toolchain (rustc 1.93.1, rayon 1.10/core 1.12.1), only bites
+  users below rayon's MSRV, not reproducible for us. Revisit if either becomes
+  load-bearing.
 - **#2** decide + implement the top-level temp-create behavior (warn vs error vs surface scope).
