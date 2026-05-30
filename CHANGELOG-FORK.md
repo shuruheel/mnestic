@@ -46,8 +46,21 @@ fixes) for free.
   Rationale: Datalog can already *sum* reciprocal contributions but cannot assign
   a *rank position within a group* — that intra-list ranking is the missing
   primitive. Tests: `cozo-core/tests/rrf.rs` (fusion math, `k` smoothing,
-  ascending direction, alias, default-k). Next on Bet 1: MMR (diversity rerank)
-  and an end-to-end HNSW+FTS+RRF example.
+  ascending direction, alias, default-k).
+- **`MaximalMarginalRelevance` fixed rule (diversity rerank, Bet 1)** —
+  `cozo-core/src/fixed_rule/utilities/mmr.rs`, aliased `MMR`. Re-ranks a candidate
+  set to balance relevance against diversity (avoids recalling near-duplicate
+  memories). Input `[item, relevance, vector]`; greedily selects
+  `argmax(λ·relevance − (1−λ)·max cosine_sim to already-selected)`. Options:
+  `lambda` (default 0.5, clamped to [0,1]), `k` (default 0 = all). Output
+  `[item, rank]` (selection order). Tests: `cozo-core/tests/mmr.rs`.
+- **End-to-end hybrid retrieval test** — `cozo-core/tests/hybrid_retrieval_e2e.rs`
+  runs a real HNSW (vector) search + a real FTS (keyword) search over one
+  relation, fuses with `ReciprocalRankFusion`, then reranks with
+  `MaximalMarginalRelevance` — proving the full hybrid path composes, not just
+  synthetic ranked lists.
+- Next on Bet 1: a higher-level one-call convenience + a LangChain/LlamaIndex
+  adapter once the surface stabilises.
 
 #### Phase 0 — fixes
 - **#1 equality-pushdown for stored relations** (`query/reorder.rs`). Equality

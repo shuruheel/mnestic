@@ -828,6 +828,14 @@ lazy_static! {
                 Arc::<Box<dyn FixedRule>>::new(Box::new(ReciprocalRankFusion)),
             ),
             (
+                "MaximalMarginalRelevance".to_string(),
+                Arc::<Box<dyn FixedRule>>::new(Box::new(MaximalMarginalRelevance)),
+            ),
+            (
+                "MMR".to_string(),
+                Arc::<Box<dyn FixedRule>>::new(Box::new(MaximalMarginalRelevance)),
+            ),
+            (
                 "JsonReader".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(JsonReader)),
             ),
