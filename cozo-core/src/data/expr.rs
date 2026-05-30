@@ -418,8 +418,8 @@ impl Expr {
                 all_evaluated = all_evaluated && matches!(arg, Expr::Const { .. });
             }
             if all_evaluated {
-                let result = self.eval(&vec![])?;
-                mem::swap(self, &mut Expr::Const { val: result, span });
+                let result = self.eval(vec![])?;
+                *self = Expr::Const { val: result, span };
             }
             // nested not's can accumulate during conversion to normal form
             if let Expr::Apply {

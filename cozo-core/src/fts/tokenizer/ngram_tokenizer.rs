@@ -274,7 +274,7 @@ impl<'a> Iterator for CodepointFrontiers<'a> {
     type Item = usize;
 
     fn next(&mut self) -> Option<usize> {
-        self.next_el.map(|offset| {
+        self.next_el.inspect(|&offset| {
             if self.s.is_empty() {
                 self.next_el = None;
             } else {
@@ -282,7 +282,6 @@ impl<'a> Iterator for CodepointFrontiers<'a> {
                 self.s = &self.s[first_codepoint_width..];
                 self.next_el = Some(offset + first_codepoint_width);
             }
-            offset
         })
     }
 }

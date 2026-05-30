@@ -40,7 +40,7 @@
 use std::collections::BTreeMap;
 use std::fmt::Write;
 
-use miette::{bail, ensure, Result};
+use miette::{ensure, Result};
 
 use crate::data::value::DataValue;
 

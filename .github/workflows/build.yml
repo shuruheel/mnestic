@@ -36,8 +36,20 @@ jobs:
       - name: Build with RocksDB backend
         run: cargo build -p mnestic --features storage-rocksdb --verbose
 
-  # NOTE: a `lint` job (cargo fmt --check + clippy) is intentionally omitted for
-  # now. The inherited upstream tree is not rustfmt-clean and carries ~168 clippy
-  # warnings, so the job could only ever be informational/red. Rather than ship a
-  # perpetually-failing (even if non-blocking) check, we defer it to a dedicated
-  # formatting + clippy cleanup pass, after which it returns as a BLOCKING gate.
+  clippy:
+    name: clippy (blocking, -D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # Blocking lint gate on default (SQLite) features — fast, no C++ build.
+      # Inherited upstream lints (missing_docs, dead_code, mutable_key_type, ...)
+      # are allow-listed with rationale in cozo-core/src/lib.rs, so this gate
+      # catches NEW clippy issues. `cargo fmt --check` is intentionally NOT part
+      # of the gate yet: the inherited tree isn't rustfmt-clean and reformatting
+      # ~178 mostly-upstream files is deferred to a dedicated pass.
+      - name: Clippy
+        run: cargo clippy -p mnestic -- -D warnings

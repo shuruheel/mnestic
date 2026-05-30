@@ -372,7 +372,7 @@ pub(crate) struct TupleInIterIterator<'a> {
 
 impl PartialEq for TupleInIter<'_> {
     fn eq(&self, other: &Self) -> bool {
-        self.into_iter().eq(other.into_iter())
+        self.into_iter().eq(*other)
     }
 }
 
@@ -380,7 +380,7 @@ impl Eq for TupleInIter<'_> {}
 
 impl Ord for TupleInIter<'_> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.into_iter().cmp(other.into_iter())
+        self.into_iter().cmp(*other)
     }
 }
 
@@ -408,10 +408,7 @@ impl<'a> Iterator for TupleInIterIterator<'a> {
     fn next(&mut self) -> Option<Self::Item> {
         let ret = match self.inner.0.get(self.idx) {
             Some(d) => d,
-            None => match self.inner.1.get(self.idx - self.inner.0.len()) {
-                None => return None,
-                Some(d) => d,
-            },
+            None => self.inner.1.get(self.idx - self.inner.0.len())?,
         };
         self.idx += 1;
         Some(ret)

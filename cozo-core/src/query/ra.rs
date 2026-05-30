@@ -12,7 +12,7 @@ use std::iter;
 
 use either::{Left, Right};
 use itertools::Itertools;
-use log::{debug, error};
+use log::debug;
 use miette::{bail, Diagnostic, Result};
 use smartstring::SmartString;
 use thiserror::Error;
@@ -263,7 +263,7 @@ impl Debug for RelAlgebra {
                 } else if r.data.len() == 1 {
                     f.debug_tuple("Singlet")
                         .field(&bindings)
-                        .field(r.data.get(0).unwrap())
+                        .field(r.data.first().unwrap())
                         .finish()
                 } else {
                     f.debug_tuple("Fixed")
@@ -1179,10 +1179,7 @@ impl StoredWithValidityRA {
 
                 if !skip_range_check && !self.filters.is_empty() {
                     let other_bindings = &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
-                    let (l_bound, u_bound) = match compute_bounds(&self.filters, other_bindings) {
-                        Ok(b) => b,
-                        _ => (vec![], vec![]),
-                    };
+                    let (l_bound, u_bound) = compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
@@ -1342,10 +1339,7 @@ impl StoredRA {
 
                 if !skip_range_check && !self.filters.is_empty() {
                     let other_bindings = &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
-                    let (l_bound, u_bound) = match compute_bounds(&self.filters, other_bindings) {
-                        Ok(b) => b,
-                        _ => (vec![], vec![]),
-                    };
+                    let (l_bound, u_bound) = compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
@@ -1692,10 +1686,7 @@ impl TempStoreRA {
 
                 if !skip_range_check && !self.filters.is_empty() {
                     let other_bindings = &self.bindings[right_join_indices.len()..];
-                    let (l_bound, u_bound) = match compute_bounds(&self.filters, other_bindings) {
-                        Ok(b) => b,
-                        _ => (vec![], vec![]),
-                    };
+                    let (l_bound, u_bound) = compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {

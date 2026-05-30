@@ -152,7 +152,7 @@ fn convert_normal_form_program_to_graph(
 
 fn reduce_to_graph<'a>(g: &StratifiedGraph<&'a Symbol>) -> Graph<&'a Symbol> {
     g.iter()
-        .map(|(k, s)| (*k, s.iter().map(|(sk, _)| *sk).collect_vec()))
+        .map(|(k, s)| (*k, s.keys().copied().collect_vec()))
         .collect()
 }
 
