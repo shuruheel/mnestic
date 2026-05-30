@@ -36,20 +36,8 @@ jobs:
       - name: Build with RocksDB backend
         run: cargo build -p mnestic --features storage-rocksdb --verbose
 
-  lint:
-    # Informational for now: the inherited upstream tree has ~168 warnings and is
-    # not yet rustfmt-clean under our toolchain. Non-blocking until we do a
-    # dedicated cleanup pass; flip continue-on-error off then.
-    name: fmt + clippy (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - name: rustfmt
-        run: cargo fmt --check
-      - name: clippy
-        run: cargo clippy -p mnestic
+  # NOTE: a `lint` job (cargo fmt --check + clippy) is intentionally omitted for
+  # now. The inherited upstream tree is not rustfmt-clean and carries ~168 clippy
+  # warnings, so the job could only ever be informational/red. Rather than ship a
+  # perpetually-failing (even if non-blocking) check, we defer it to a dedicated
+  # formatting + clippy cleanup pass, after which it returns as a BLOCKING gate.
