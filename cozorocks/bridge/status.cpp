@@ -5,7 +5,8 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "status.h"
-#include "cozorocks/src/bridge/mod.rs.h"
+// cxx generates this header under the package name (mnestic-rocks).
+#include "mnestic-rocks/src/bridge/mod.rs.h"
 
 void write_status(const Status &rstatus, RocksDbStatus &status) {
     status.code = rstatus.code();

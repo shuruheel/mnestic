@@ -7,7 +7,8 @@
 #include <iostream>
 #include <memory>
 #include "db.h"
-#include "cozorocks/src/bridge/mod.rs.h"
+// cxx generates this header under the package name (mnestic-rocks).
+#include "mnestic-rocks/src/bridge/mod.rs.h"
 #include "rocksdb/utilities/options_util.h"
 
 Options default_db_options() {

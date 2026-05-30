@@ -5,7 +5,9 @@
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
 #include "tx.h"
-#include "cozorocks/src/bridge/mod.rs.h"
+// cxx generates this header under the package name (mnestic-rocks), even
+// though the importable crate name stays `cozorocks`.
+#include "mnestic-rocks/src/bridge/mod.rs.h"
 
 void TxBridge::start() {
     if (odb != nullptr) {

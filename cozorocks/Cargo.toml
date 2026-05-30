@@ -1,14 +1,20 @@
 [package]
-name = "cozorocks"
-version = "0.1.7"
+name = "mnestic-rocks"
+version = "0.1.8"
 edition = "2021"
 license = "MPL-2.0"
-authors = ["Ziyang Hu"]
-description = "Bindings to RocksDB used by the cozo crate"
-homepage = "https://www.cozodb.org"
-repository = "https://github.com/cozodb/cozo"
+authors = ["Ziyang Hu", "Shan Rizvi (mnestic fork)"]
+description = "RocksDB bindings for mnestic — a maintained fork of cozo's cozorocks bridge"
+homepage = "https://github.com/shuruheel/mnestic"
+repository = "https://github.com/shuruheel/mnestic"
 documentation = "https://docs.cozodb.org"
 exclude = ["rocksdb/docs", "rocksdb/java"]
+
+# The published package is `mnestic-rocks`, but the importable crate name stays
+# `cozorocks` so `cozo-core`'s `use cozorocks::` and `cozorocks?/feature` refs
+# keep working unchanged (mirrors the mnestic/cozo rename idiom).
+[lib]
+name = "cozorocks"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 

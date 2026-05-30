@@ -22,5 +22,5 @@ exclude = [
 lto = true
 debug = true
 
-[profile.dev.package."cozorocks"]
+[profile.dev.package."mnestic-rocks"]
 opt-level = 3
