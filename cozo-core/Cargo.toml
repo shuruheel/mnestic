@@ -6,6 +6,9 @@ description = "A transactional relational-graph-vector database using Datalog â€
 authors = ["Shan Rizvi", "Ziyang Hu (original CozoDB author)"]
 license = "MPL-2.0"
 repository = "https://github.com/shuruheel/mnestic"
+readme = "README-mnestic.md"
+keywords = ["database", "datalog", "graph", "vector", "embedded"]
+categories = ["database", "database-implementations"]
 exclude = [
     "tests/*",
 ]
