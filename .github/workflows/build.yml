@@ -1,4 +1,4 @@
-name: Build
+name: CI
 
 on:
   push:
@@ -10,15 +10,46 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  build:
-
+  test:
+    name: test (mnestic, default/sqlite features)
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v3
-      with:
-        submodules: recursive
-    - name: Build
-      run: cargo build -p cozo --release --verbose
-    - name: Run tests
-      run: cargo test -p cozo --release --verbose
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Default features are SQLite-only, so no RocksDB submodule / C++ build is
+      # needed here — keeps the correctness gate fast. RocksDB is covered below.
+      - name: Build
+        run: cargo build -p mnestic --verbose
+      - name: Test (lib + integration, incl. fork regressions)
+        run: cargo test -p mnestic --verbose
+
+  rocksdb:
+    name: build (storage-rocksdb, C++ bridge)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with RocksDB backend
+        run: cargo build -p mnestic --features storage-rocksdb --verbose
+
+  lint:
+    # Informational for now: the inherited upstream tree has ~168 warnings and is
+    # not yet rustfmt-clean under our toolchain. Non-blocking until we do a
+    # dedicated cleanup pass; flip continue-on-error off then.
+    name: fmt + clippy (informational)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: rustfmt
+        run: cargo fmt --check
+      - name: clippy
+        run: cargo clippy -p mnestic

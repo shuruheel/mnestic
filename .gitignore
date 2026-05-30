@@ -41,3 +41,7 @@ Cross.toml
 flamegraph*.svg
 # CodeGraph local index (large, machine-local)
 .codegraph/
+
+# Local-only working docs (not for the public repo)
+CLAUDE.md
+DEVELOPMENT.md
