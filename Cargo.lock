@@ -751,21 +751,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cozorocks"
-version = "0.1.7"
-dependencies = [
- "cc",
- "cxx",
- "cxx-build",
- "libc",
- "lz4-sys",
- "miette",
- "pkg-config",
- "tikv-jemalloc-sys",
- "zstd-sys",
-]
-
-[[package]]
 name = "cpufeatures"
 version = "0.2.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2166,7 +2151,6 @@ dependencies = [
  "casey",
  "chrono",
  "chrono-tz",
- "cozorocks",
  "criterion",
  "crossbeam",
  "csv",
@@ -2182,6 +2166,7 @@ dependencies = [
  "log",
  "miette",
  "minreq",
+ "mnestic-rocks",
  "ndarray",
  "num-traits",
  "ordered-float",
@@ -2217,6 +2202,21 @@ dependencies = [
  "twox-hash",
  "unicode-normalization",
  "uuid",
+]
+
+[[package]]
+name = "mnestic-rocks"
+version = "0.1.8"
+dependencies = [
+ "cc",
+ "cxx",
+ "cxx-build",
+ "libc",
+ "lz4-sys",
+ "miette",
+ "pkg-config",
+ "tikv-jemalloc-sys",
+ "zstd-sys",
 ]
 
 [[package]]
