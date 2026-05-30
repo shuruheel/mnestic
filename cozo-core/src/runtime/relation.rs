@@ -1179,17 +1179,8 @@ impl<'a> SessionTx<'a> {
         // made the build superlinear. We then bulk-migrate the finished graph
         // to the real store in one pass. The graph is byte-identical either way.
         idx_handle.is_temp = true;
-        let mut stack = vec![];
-        for tuple in all_tuples.into_iter() {
-            self.hnsw_put(
-                &manifest,
-                &rel_handle,
-                &idx_handle,
-                filter,
-                &mut stack,
-                &tuple,
-            )?;
-        }
+        let tuples: Vec<_> = all_tuples.into_iter().collect();
+        self.hnsw_build_index(&manifest, &rel_handle, &idx_handle, filter, tuples)?;
         self.flush_temp_index_to_store(&idx_handle)?;
         idx_handle.is_temp = false;
 

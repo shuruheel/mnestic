@@ -724,6 +724,59 @@ impl<'a> SessionTx<'a> {
         stack: &mut Vec<DataValue>,
         tuple: &[DataValue],
     ) -> Result<bool> {
+        // Steady-state path (single upsert): a fresh per-call cache, because a
+        // batch can update a vector that is also some other row's neighbour, and
+        // a cache shared across the batch could then serve a stale vector.
+        let mut vec_cache = VectorCache {
+            cache: FxHashMap::default(),
+            distance: manifest.distance,
+        };
+        self.hnsw_put_inner(manifest, orig_table, idx_table, filter, stack, tuple, &mut vec_cache)
+    }
+
+    /// Bulk-build an HNSW index over `tuples` (mnestic fork). Unlike the
+    /// steady-state path this shares one `VectorCache` across every insertion:
+    /// during a fresh build no vector is mutated, so a neighbour's vector can be
+    /// fetched+decoded from the base relation once and reused, instead of being
+    /// re-read for every insertion that visits it.
+    pub(crate) fn hnsw_build_index(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        filter: Option<&Vec<Bytecode>>,
+        tuples: Vec<Tuple>,
+    ) -> Result<()> {
+        let mut vec_cache = VectorCache {
+            cache: FxHashMap::default(),
+            distance: manifest.distance,
+        };
+        let mut stack = vec![];
+        for tuple in tuples {
+            self.hnsw_put_inner(
+                manifest,
+                orig_table,
+                idx_table,
+                filter,
+                &mut stack,
+                &tuple,
+                &mut vec_cache,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hnsw_put_inner(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        filter: Option<&Vec<Bytecode>>,
+        stack: &mut Vec<DataValue>,
+        tuple: &[DataValue],
+        vec_cache: &mut VectorCache,
+    ) -> Result<bool> {
         if let Some(code) = filter {
             if !eval_bytecode_pred(code, tuple, stack, Default::default())? {
                 self.hnsw_remove(orig_table, idx_table, tuple)?;
@@ -746,10 +799,6 @@ impl<'a> SessionTx<'a> {
         if extracted_vectors.is_empty() {
             return Ok(false);
         }
-        let mut vec_cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
         for (vec, idx, sub) in extracted_vectors {
             self.hnsw_put_vector(
                 tuple,
@@ -759,7 +808,7 @@ impl<'a> SessionTx<'a> {
                 manifest,
                 orig_table,
                 idx_table,
-                &mut vec_cache,
+                vec_cache,
             )?;
         }
         Ok(true)
