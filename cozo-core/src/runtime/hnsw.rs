@@ -745,7 +745,7 @@ impl<'a> SessionTx<'a> {
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
         filter: Option<&Vec<Bytecode>>,
-        tuples: Vec<Tuple>,
+        tuples: &[Tuple],
     ) -> Result<()> {
         let mut vec_cache = VectorCache {
             cache: FxHashMap::default(),
@@ -759,7 +759,7 @@ impl<'a> SessionTx<'a> {
                 idx_table,
                 filter,
                 &mut stack,
-                &tuple,
+                tuple,
                 &mut vec_cache,
             )?;
         }

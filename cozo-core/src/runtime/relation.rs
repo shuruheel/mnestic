@@ -19,6 +19,7 @@ use serde::Serialize;
 use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
+use crate::data::expr::Bytecode;
 use crate::data::memcmp::MemCmpEncoder;
 use crate::data::relation::{ColType, ColumnDef, NullableColType, StoredRelationMetadata};
 use crate::data::symb::Symbol;
@@ -1007,9 +1008,16 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    pub(crate) fn create_hnsw_index(&mut self, config: &HnswIndexConfig) -> Result<()> {
+    /// Validate an HNSW index config, create its (empty) index relation, and
+    /// build the manifest + compiled filter (mnestic fork). Shared by the
+    /// in-transaction build (`create_hnsw_index`) and the non-blocking off-lock
+    /// build orchestrated at the `Db` level. Does NOT scan/build/publish.
+    pub(crate) fn prepare_hnsw_index(
+        &mut self,
+        config: &HnswIndexConfig,
+    ) -> Result<(RelationHandle, RelationHandle, HnswIndexManifest, Vec<Bytecode>)> {
         // Get relation handle
-        let mut rel_handle = self.get_relation(&config.base_relation, true)?;
+        let rel_handle = self.get_relation(&config.base_relation, true)?;
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1125,7 +1133,7 @@ impl<'a> SessionTx<'a> {
             },
         ];
         // create index relation
-        let mut idx_handle = self.write_idx_relation(
+        let idx_handle = self.write_idx_relation(
             &config.base_relation,
             &config.index_name,
             idx_keys,
@@ -1150,11 +1158,6 @@ impl<'a> SessionTx<'a> {
             keep_pruned_connections: config.keep_pruned_connections,
         };
 
-        // populate index
-        let mut all_tuples = TempCollector::default();
-        for tuple in rel_handle.scan_all(self) {
-            all_tuples.push(tuple?);
-        }
         let filter = if let Some(f_code) = &manifest.index_filter {
             let parsed = CozoScriptParser::parse(Rule::expr, f_code)
                 .into_diagnostic()?
@@ -1167,7 +1170,24 @@ impl<'a> SessionTx<'a> {
         } else {
             vec![]
         };
-        let filter = if filter.is_empty() {
+
+        Ok((rel_handle, idx_handle, manifest, filter))
+    }
+
+    /// Build an HNSW index entirely within this transaction (mnestic fork): the
+    /// graph is constructed in the in-RAM temp store, then the caller publishes
+    /// the data (SST ingest, or the per-key flush). Used by non-RocksDB backends
+    /// and the `skip_locking` import/restore path; RocksDB uses the non-blocking
+    /// off-lock build orchestrated at the `Db` level.
+    pub(crate) fn create_hnsw_index(&mut self, config: &HnswIndexConfig) -> Result<RelationId> {
+        let (rel_handle, mut idx_handle, manifest, filter) = self.prepare_hnsw_index(config)?;
+
+        // populate index
+        let mut all_tuples = TempCollector::default();
+        for tuple in rel_handle.scan_all(self) {
+            all_tuples.push(tuple?);
+        }
+        let filter_ref = if filter.is_empty() {
             None
         } else {
             Some(&filter)
@@ -1176,37 +1196,96 @@ impl<'a> SessionTx<'a> {
         // the index handle `is_temp` routes every neighbour read/write to the
         // temp BTreeMap instead of the pessimistic transaction's RocksDB
         // `WriteBatchWithIndex` overlay, whose cost grows with the index and
-        // made the build superlinear. We then bulk-migrate the finished graph
-        // to the real store in one pass. The graph is byte-identical either way.
+        // made the build superlinear.
         idx_handle.is_temp = true;
         let tuples: Vec<_> = all_tuples.into_iter().collect();
-        self.hnsw_build_index(&manifest, &rel_handle, &idx_handle, filter, tuples)?;
-        self.flush_temp_index_to_store(&idx_handle)?;
+        self.hnsw_build_index(&manifest, &rel_handle, &idx_handle, filter_ref, &tuples)?;
         idx_handle.is_temp = false;
+        let idx_id = idx_handle.id;
 
+        self.insert_hnsw_index_meta(rel_handle, idx_handle, manifest, &config.index_name)?;
+        Ok(idx_id)
+    }
+
+    /// Publish a built HNSW index by registering it in the base relation's
+    /// metadata, so reads and incremental maintenance pick it up (mnestic fork).
+    /// Transactional: becomes visible at `commit`.
+    pub(crate) fn insert_hnsw_index_meta(
+        &mut self,
+        mut rel_handle: RelationHandle,
+        idx_handle: RelationHandle,
+        manifest: HnswIndexManifest,
+        index_name: &str,
+    ) -> Result<()> {
         rel_handle
             .hnsw_indices
-            .insert(config.index_name.clone(), (idx_handle, manifest));
-
-        // update relation metadata
+            .insert(SmartString::from(index_name), (idx_handle, manifest));
         let new_encoded =
-            vec![DataValue::from(&config.base_relation as &str)].encode_as_key(RelationId::SYSTEM);
+            vec![DataValue::from(&rel_handle.name as &str)].encode_as_key(RelationId::SYSTEM);
         let mut meta_val = vec![];
         rel_handle
             .serialize(&mut Serializer::new(&mut meta_val))
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
+        Ok(())
+    }
 
+    /// Reconcile an off-lock-built HNSW index against base-relation mutations
+    /// that committed during the unlocked build window (mnestic fork). `idx_table`
+    /// must be the live (non-temp) handle; the bulk graph for `snapshot_tuples`
+    /// has already been ingested. Diffs the current base against the snapshot and
+    /// applies exactly the steady-state incremental maintenance for the delta:
+    /// inserts for new rows, remove+insert for changed rows, removes for deleted
+    /// rows. A no-op when nothing changed during the build.
+    pub(crate) fn reconcile_hnsw_index(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        filter: Option<&Vec<Bytecode>>,
+        snapshot_tuples: &[Tuple],
+    ) -> Result<()> {
+        let nkeys = orig_table.metadata.keys.len();
+        let mut snap: BTreeMap<Vec<u8>, &Tuple> = BTreeMap::new();
+        for t in snapshot_tuples {
+            let k = orig_table.encode_key_for_store(&t[0..nkeys], Default::default())?;
+            snap.insert(k, t);
+        }
+        let current: Vec<Tuple> = orig_table
+            .scan_all(self)
+            .collect::<Result<Vec<_>>>()?;
+        let mut stack = vec![];
+        for cur in &current {
+            let k = orig_table.encode_key_for_store(&cur[0..nkeys], Default::default())?;
+            match snap.remove(&k) {
+                None => {
+                    // new row inserted during the build
+                    self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
+                }
+                Some(old) => {
+                    if old != cur {
+                        // row changed in place during the build
+                        self.hnsw_remove(orig_table, idx_table, old)?;
+                        self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
+                    }
+                }
+            }
+        }
+        // rows present at snapshot but gone now: deleted during the build
+        let removed: Vec<&Tuple> = snap.into_values().collect();
+        for old in removed {
+            self.hnsw_remove(orig_table, idx_table, old)?;
+        }
         Ok(())
     }
 
     /// Bulk-copy a freshly-built index relation from the in-RAM temp store to
     /// the persistent store (mnestic fork). The entries arrive in key-sorted
-    /// order (the temp store is a `BTreeMap`), so this is also the natural input
-    /// for an `SstFileWriter`/`IngestExternalFile` atomic publish (Layer 2).
-    fn flush_temp_index_to_store(&mut self, idx_handle: &RelationHandle) -> Result<()> {
-        let lower = Tuple::default().encode_as_key(idx_handle.id);
-        let upper = Tuple::default().encode_as_key(idx_handle.id.next());
+    /// order (the temp store is a `BTreeMap`). Used by engines that do not
+    /// support SST ingest; the RocksDB path publishes via `ingest_sorted`.
+    pub(crate) fn flush_temp_index_to_store(&mut self, idx_id: RelationId) -> Result<()> {
+        let lower = Tuple::default().encode_as_key(idx_id);
+        let upper = Tuple::default().encode_as_key(idx_id.next());
         let entries: Vec<(Vec<u8>, Vec<u8>)> = self
             .temp_store_tx
             .range_scan(&lower, &upper)

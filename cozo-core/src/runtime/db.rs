@@ -40,7 +40,7 @@ use crate::data::tuple::{Tuple, TupleT};
 use crate::data::value::{DataValue, ValidityTs, LARGEST_UTF_CHAR};
 use crate::fixed_rule::DEFAULT_FIXED_RULES;
 use crate::fts::TokenizerCache;
-use crate::parse::sys::SysOp;
+use crate::parse::sys::{HnswIndexConfig, SysOp};
 use crate::parse::{parse_expressions, parse_script, CozoScript, SourceSpan};
 use crate::query::compile::{CompiledProgram, CompiledRule, CompiledRuleSet};
 use crate::query::ra::{
@@ -56,7 +56,7 @@ use crate::runtime::relation::{
 };
 use crate::runtime::transact::SessionTx;
 use crate::storage::temp::TempStorage;
-use crate::storage::Storage;
+use crate::storage::{Storage, StoreTx};
 use crate::{decode_tuple_from_kv, FixedRule, Symbol};
 
 pub(crate) struct RunningQueryHandle {
@@ -107,11 +107,31 @@ pub struct Db<S> {
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) event_callbacks: Arc<ShardedLock<EventCallbackRegistry>>,
     relation_locks: Arc<ShardedLock<BTreeMap<SmartString<LazyCompact>, Arc<ShardedLock<()>>>>>,
+    /// Index relations currently being built off-lock (mnestic fork). The
+    /// non-blocking HNSW build releases the relation write lock during the heavy
+    /// build phase, so this set serialises concurrent builds of the *same* index
+    /// (whose publication only becomes visible at the end) without re-blocking
+    /// readers. Keyed by the index relation's full `base:idx` name.
+    index_builds_in_progress: Arc<Mutex<BTreeSet<SmartString<LazyCompact>>>>,
 }
 
 impl<S> Debug for Db<S> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         write!(f, "Db")
+    }
+}
+
+/// RAII marker for an in-progress off-lock index build (mnestic fork): removes
+/// the index name from the in-progress set on drop, covering every exit path
+/// (success, error, or panic) so a failed build never wedges future ones.
+struct IndexBuildGuard {
+    set: Arc<Mutex<BTreeSet<SmartString<LazyCompact>>>>,
+    name: SmartString<LazyCompact>,
+}
+
+impl Drop for IndexBuildGuard {
+    fn drop(&mut self) {
+        self.set.lock().unwrap().remove(&self.name);
     }
 }
 
@@ -278,6 +298,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             #[cfg(not(target_arch = "wasm32"))]
             event_callbacks: Default::default(),
             relation_locks: Default::default(),
+            index_builds_in_progress: Default::default(),
         };
         Ok(ret)
     }
@@ -1207,6 +1228,139 @@ impl<'s, S: Storage<'s>> Db<S> {
 
         Ok(NamedRows::new(headers, rows))
     }
+    /// Build an HNSW index into the in-RAM temp store, then publish its data to
+    /// the live store (mnestic fork). On engines that support SST ingest the
+    /// finished, key-sorted graph is bulk-loaded via `ingest_sorted`, which
+    /// bypasses the transaction write-batch overlay entirely; other engines fall
+    /// back to the per-key temp->store flush.
+    ///
+    /// Ordering invariant: the index *data* is ingested here, while the index
+    /// *metadata* `put` (written transactionally by `create_hnsw_index`) only
+    /// becomes visible at the enclosing `commit_tx`. So the keys an index
+    /// references always exist on disk before any reader can observe the index —
+    /// never the reverse.
+    fn build_and_publish_hnsw(
+        &'s self,
+        tx: &mut SessionTx<'_>,
+        config: &HnswIndexConfig,
+    ) -> Result<()> {
+        let idx_id = tx.create_hnsw_index(config)?;
+        if self.db.supports_sst_ingest() {
+            let lower = Tuple::default().encode_as_key(idx_id);
+            let upper = Tuple::default().encode_as_key(idx_id.next());
+            self.db
+                .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
+        } else {
+            tx.flush_temp_index_to_store(idx_id)?;
+        }
+        Ok(())
+    }
+
+    /// Build an HNSW index WITHOUT holding the per-relation write lock during the
+    /// (multi-minute) graph construction, so concurrent reads are never blocked
+    /// (mnestic fork). The write lock is taken only briefly to set up the empty
+    /// index relation (Phase A) and to reconcile + publish (Phase D); the heavy
+    /// build and the SST bulk-load happen lock-free in between.
+    ///
+    /// Consistency: the build reads every vector from one read-transaction
+    /// snapshot, so the bulk graph is self-consistent. Base-relation rows that
+    /// change during the unlocked window are folded in by `reconcile_hnsw_index`
+    /// under the Phase-D lock. Ordering: the index data is ingested (live) before
+    /// its metadata is committed, so a reader can never observe the index before
+    /// its keys exist. RocksDB only (requires SST ingest).
+    fn create_hnsw_index_nonblocking(&'s self, config: &HnswIndexConfig) -> Result<()> {
+        let idx_full_name = SmartString::<LazyCompact>::from(format!(
+            "{}:{}",
+            config.base_relation, config.index_name
+        ));
+        // Serialise concurrent builds of the *same* index: publication is
+        // deferred past the unlocked window, so `has_index` alone can't catch a
+        // racing builder. The RAII guard clears the marker on every exit path.
+        let _build_guard = {
+            let mut set = self.index_builds_in_progress.lock().unwrap();
+            if !set.insert(idx_full_name.clone()) {
+                bail!("an index build for `{idx_full_name}` is already in progress");
+            }
+            IndexBuildGuard {
+                set: self.index_builds_in_progress.clone(),
+                name: idx_full_name,
+            }
+        };
+
+        let rel_lock = self
+            .obtain_relation_locks(iter::once(&config.base_relation))
+            .pop()
+            .unwrap();
+
+        // PHASE A — brief write lock: create the empty index relation and commit,
+        // so its relation id is durably consumed (never reused, even on crash).
+        let (idx_handle, manifest, filter) = {
+            let _guard = rel_lock.write().unwrap();
+            let mut tx = self.transact_write()?;
+            let (_rel_handle, idx_handle, manifest, filter) = tx.prepare_hnsw_index(config)?;
+            tx.commit_tx()?;
+            (idx_handle, manifest, filter)
+        };
+        let idx_id = idx_handle.id;
+        let lower = Tuple::default().encode_as_key(idx_id);
+        let upper = Tuple::default().encode_as_key(idx_id.next());
+        let filter_ref = if filter.is_empty() {
+            None
+        } else {
+            Some(&filter)
+        };
+
+        // PHASE B/C — NO lock: scan + build the graph in the in-RAM temp store,
+        // then bulk-publish it into the live store via SST ingest. Every vector
+        // read uses this read transaction's single snapshot, so the graph is
+        // self-consistent; mutations after this snapshot are caught in Phase D.
+        let snapshot_tuples: Vec<Tuple> = {
+            let mut tx = self.transact()?;
+            let base_handle = tx.get_relation(&config.base_relation, false)?;
+            let snapshot_tuples: Vec<Tuple> =
+                base_handle.scan_all(&tx).collect::<Result<Vec<_>>>()?;
+            let mut idx_temp = idx_handle.clone();
+            idx_temp.is_temp = true;
+            // The build only *writes* the temp store (is_temp routing) and only
+            // *reads* the base relation via this snapshot — so a read transaction
+            // is sufficient and holds no relation lock.
+            tx.hnsw_build_index(&manifest, &base_handle, &idx_temp, filter_ref, &snapshot_tuples)?;
+            self.db
+                .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
+            snapshot_tuples
+        };
+
+        // PHASE D — brief write lock: reconcile mutations from the unlocked
+        // window, then publish the metadata. Data is already live (ingested);
+        // metadata becomes visible at commit, strictly after the data.
+        {
+            let _guard = rel_lock.write().unwrap();
+            let mut tx = self.transact_write()?;
+            let rel_handle = tx.get_relation(&config.base_relation, true)?;
+            if rel_handle.has_index(&config.index_name) {
+                // Lost a race (or the relation was rebuilt): our ingested data is
+                // orphaned at idx_id — drop it and report the conflict.
+                tx.store_tx.del_range_from_persisted(&lower, &upper)?;
+                tx.commit_tx()?;
+                bail!(
+                    "index `{}` already exists on relation `{}`",
+                    config.index_name,
+                    config.base_relation
+                );
+            }
+            tx.reconcile_hnsw_index(
+                &manifest,
+                &rel_handle,
+                &idx_handle,
+                filter_ref,
+                &snapshot_tuples,
+            )?;
+            tx.insert_hnsw_index_meta(rel_handle, idx_handle, manifest, &config.index_name)?;
+            tx.commit_tx()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn run_sys_op_with_tx(
         &'s self,
         tx: &mut SessionTx<'_>,
@@ -1300,14 +1454,14 @@ impl<'s, S: Storage<'s>> Db<S> {
                     bail!("Cannot create vector index in read-only mode");
                 }
                 if skip_locking {
-                    tx.create_hnsw_index(config)?;
+                    self.build_and_publish_hnsw(tx, config)?;
                 } else {
                     let lock = self
                         .obtain_relation_locks(iter::once(&config.base_relation))
                         .pop()
                         .unwrap();
                     let _guard = lock.write().unwrap();
-                    tx.create_hnsw_index(config)?;
+                    self.build_and_publish_hnsw(tx, config)?;
                 }
                 Ok(NamedRows::new(
                     vec![STATUS_STR.to_string()],
@@ -1460,6 +1614,18 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
     }
     fn run_sys_op(&'s self, op: SysOp, read_only: bool) -> Result<NamedRows> {
+        // RocksDB builds HNSW indexes off-lock so reads aren't blocked for
+        // minutes; that path manages its own transactions and locks, so it runs
+        // outside the single-tx wrapper below. (mnestic fork)
+        if let SysOp::CreateVectorIndex(config) = &op {
+            if !read_only && self.db.supports_sst_ingest() {
+                self.create_hnsw_index_nonblocking(config)?;
+                return Ok(NamedRows::new(
+                    vec![STATUS_STR.to_string()],
+                    vec![vec![DataValue::from(OK_STR)]],
+                ));
+            }
+        }
         let mut tx = if read_only {
             self.transact()?
         } else {

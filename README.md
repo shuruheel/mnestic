@@ -15,6 +15,16 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
+**0.8.2**
+
+- **Non-blocking HNSW index builds** — `::hnsw create` no longer holds the base
+  relation's write lock during graph construction, so concurrent reads no longer
+  stall for the whole build (previously 10–20+ min in production). The graph is
+  built off-lock under a snapshot and bulk-published via `SstFileWriter`/
+  `IngestExternalFile`; mutations during the build are reconciled under a brief
+  final lock. Measured: 90,507 reads completed (slowest 0.8 ms) during a ~5.6 s
+  40k-vector build that would previously have blocked them all. RocksDB only.
+
 **0.8.1**
 
 - **One-call hybrid retrieval** — `DbInstance::hybrid_search` runs HNSW + FTS

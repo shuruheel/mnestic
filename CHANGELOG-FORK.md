@@ -3,6 +3,42 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## 0.8.2 — 2026-05-30
+
+Third fork release. Makes HNSW index builds **non-blocking for readers**: an
+index build no longer freezes all reads on the base relation for the (often
+multi-minute) duration of the build. All 169 inherited lib tests + the
+integration/feature suites pass; `cargo clippy -p mnestic -- -D warnings` is clean.
+
+### Performance — non-blocking HNSW index builds (readers no longer stall)
+- Building/rebuilding an HNSW index (`::hnsw create`) used to hold the base
+  relation's **exclusive write lock** for the *entire* build, so every concurrent
+  read (which takes the same lock shared) blocked until the build finished — in
+  production, **10–20+ minutes** (76 min for a 151K × 1536 index). The stall was
+  cozo's per-relation `ShardedLock`, not RocksDB.
+- The build is now done **off-lock** on RocksDB: the heavy graph construction runs
+  under a read-only snapshot with **no relation lock held**, and the lock is taken
+  only briefly to set up the empty index relation and to publish the result.
+  Measured: building a **40,000**-vector index takes ~5.6 s, during which
+  **90,507** concurrent reads of the same relation completed, the slowest in
+  **0.8 ms** (release). Previously those reads would have queued behind the whole
+  ~5.6 s build.
+- **How it stays correct.** The finished, key-sorted graph is bulk-published into
+  the live store via `SstFileWriter` / `IngestExternalFile` (bypassing the
+  transaction write-batch), and the index *data* is always ingested before its
+  *metadata* is committed — so a reader can never observe an index before its keys
+  exist. Base-relation rows that change during the unlocked build are folded in by
+  a short reconcile pass (re-scan + diff against the build snapshot, applying the
+  same incremental `hnsw_put`/`hnsw_remove` maintenance) under a brief final lock.
+  Concurrent builds of the same index are serialised; a lost race cleans up its
+  ingested data. Index relation ids are always freshly allocated, so a crash
+  mid-publish leaves at worst unreferenced dead keys, never a torn index.
+- Non-RocksDB backends (sqlite/mem/…) keep the in-transaction build + per-key
+  flush unchanged. New `Storage::ingest_sorted` (default-errors; real impl only on
+  RocksDB) carries the SST bulk-load. Guarded by `tests/hnsw_nonblocking_build.rs`
+  (build correctness, persistence across reopen, reads-during-build, reconcile of
+  concurrent inserts, drop+recreate).
+
 ## 0.8.1 — 2026-05-30
 
 Second fork release. Adds the one-call hybrid-retrieval API, a substantial HNSW

@@ -20,6 +20,16 @@ of upstream `481af05` (the last upstream commit, 2024-12-04).
 Highlights (full detail in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)):
 
+**0.8.2**
+
+- **Non-blocking HNSW index builds** — `::hnsw create` no longer holds the base
+  relation's write lock during graph construction, so concurrent reads are no
+  longer stalled for the whole build (previously 10–20+ min in production). Built
+  off-lock under a snapshot and bulk-published via `SstFileWriter`/
+  `IngestExternalFile`; concurrent mutations reconciled under a brief final lock.
+  Measured: 90,507 reads completed (slowest 0.8 ms) during a ~5.6 s 40k-vector
+  build. RocksDB only.
+
 **0.8.1**
 
 - **One-call hybrid retrieval** — `DbInstance::hybrid_search` runs HNSW + FTS
@@ -60,7 +70,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.8.1"
+mnestic = "0.8.2"
 ```
 
 ```rust

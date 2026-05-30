@@ -7,7 +7,7 @@
  */
 
 use itertools::Itertools;
-use miette::Result;
+use miette::{bail, Result};
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
@@ -49,6 +49,32 @@ pub trait Storage<'s>: Send + Sync + Clone {
         &'a self,
         data: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
     ) -> Result<()>;
+
+    /// Whether this engine can bulk-publish a freshly-built index by ingesting a
+    /// sorted-string table (SST) file — see [`ingest_sorted`](Self::ingest_sorted).
+    /// Defaults to `false`; only the RocksDB backend overrides this. (mnestic fork)
+    fn supports_sst_ingest(&self) -> bool {
+        false
+    }
+
+    /// Bulk-publish strictly-ascending key-value `entries` into the *live*
+    /// database by building an SST file and atomically ingesting it, bypassing
+    /// the transaction write-batch overlay entirely. The engine manages the
+    /// temporary file. Keys MUST arrive in strictly ascending order. (mnestic fork)
+    ///
+    /// Unlike a transactional `put`, ingested keys become visible to new reads
+    /// as soon as this returns, independent of any open transaction's commit.
+    /// Callers relying on this for index publishing must therefore ingest the
+    /// index data *before* the metadata that references it becomes visible.
+    ///
+    /// The default implementation errors; engines without SST support should use
+    /// the per-key `put` path instead.
+    fn ingest_sorted<'a>(
+        &'a self,
+        _entries: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
+    ) -> Result<()> {
+        bail!("this storage engine does not support SST ingest")
+    }
 }
 
 /// Trait for the associated transaction type of a storage engine.

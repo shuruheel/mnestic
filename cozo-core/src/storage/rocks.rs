@@ -8,6 +8,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use log::info;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
@@ -147,6 +148,63 @@ impl Storage<'_> for RocksDbStorage {
             self.db.raw_put(&key, &val)?;
         }
         Ok(())
+    }
+
+    fn supports_sst_ingest(&self) -> bool {
+        true
+    }
+
+    fn ingest_sorted<'a>(
+        &'a self,
+        entries: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
+    ) -> Result<()> {
+        // Build the SST in a sibling of the RocksDB data directory (same
+        // filesystem → cheap ingest copy, and a cozo-managed dir RocksDB won't
+        // scan). A process-unique, monotonic name avoids collisions; index
+        // builds are also serialised by the per-relation write lock. (mnestic fork)
+        static SST_SEQ: AtomicU64 = AtomicU64::new(0);
+        let data_dir = self.db.db_path();
+        let staging_dir = Path::new(&data_dir)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from(&data_dir));
+        let seq = SST_SEQ.fetch_add(1, Ordering::Relaxed);
+        let sst_path = staging_dir.join(format!(
+            "idx_build_{}_{}.sst",
+            std::process::id(),
+            seq
+        ));
+        let sst_path_str = sst_path
+            .to_str()
+            .ok_or_else(|| miette!("bad SST staging path"))?;
+
+        let mut writer = self
+            .db
+            .get_sst_writer(sst_path_str)
+            .into_diagnostic()
+            .wrap_err("creating SST writer for index build")?;
+        let mut wrote_any = false;
+        for result in entries {
+            let (key, val) = result?;
+            writer.put(&key, &val).into_diagnostic()?;
+            wrote_any = true;
+        }
+        if !wrote_any {
+            // An empty SST cannot be finished/ingested; nothing to publish.
+            return Ok(());
+        }
+        writer
+            .finish()
+            .into_diagnostic()
+            .wrap_err("finalising SST for index build")?;
+        let ingest_res = self
+            .db
+            .ingest_sst_file(sst_path_str)
+            .into_diagnostic()
+            .wrap_err("ingesting SST for index build");
+        // Best-effort cleanup of the staging file (ingest copies it).
+        let _ = fs::remove_file(&sst_path);
+        ingest_res
     }
 }
 
