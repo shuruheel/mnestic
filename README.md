@@ -13,9 +13,21 @@
 
 ## What mnestic adds over CozoDB
 
-Highlights of **0.8.0** (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
+Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
-**Fixes**
+**0.8.1**
+
+- **One-call hybrid retrieval** — `DbInstance::hybrid_search` runs HNSW + FTS
+  (+ optional graph traversal), fuses with RRF, and optionally diversifies with
+  MMR in a single typed call (previously ~7 hand-written Datalog rules).
+- **HNSW index build ~3× faster** — the build no longer round-trips the whole
+  graph through the transaction's write-batch overlay (20k × 128: 135s → 43.6s,
+  measured release); built graph is byte-identical.
+- **`mnestic-rocks`** — the C++/RocksDB bridge is now a maintained fork (importable
+  name stays `cozorocks`), unblocking future bridge-level work.
+- Blocking clippy CI gate; `document-features` future-incompat warning cleared.
+
+**0.8.0 — fixes**
 
 - **Equality pushdown** — `*rel[k, ..], k == <value>` now compiles to a keyed
   `stored_prefix_join` instead of a full scan (**~28–29× faster** single-row
@@ -28,7 +40,7 @@ Highlights of **0.8.0** (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)
 - `env_logger` moved to a dev-dependency for a slimmer dependency graph
   (upstream #287).
 
-**New — hybrid retrieval for agentic memory** (Datalog-composable fixed rules)
+**0.8.0 — new: hybrid retrieval for agentic memory** (Datalog-composable fixed rules)
 
 - `ReciprocalRankFusion` (alias `RRF`) — fuse vector (HNSW) + full-text (FTS) +
   graph-traversal result lists into one ranking.

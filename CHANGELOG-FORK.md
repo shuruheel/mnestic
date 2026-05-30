@@ -3,6 +3,61 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## 0.8.1 — 2026-05-30
+
+Second fork release. Adds the one-call hybrid-retrieval API, a substantial HNSW
+index-build speedup, the maintained `mnestic-rocks` bridge fork, and a blocking
+clippy CI gate. All 169 inherited lib tests + integration/feature tests pass.
+
+### New — one-call hybrid retrieval (`HybridSearch`)
+- `DbInstance::hybrid_search` / `Db::hybrid_search` (and `*_script` to inspect the
+  generated CozoScript) run an HNSW + FTS (+ optional graph-traversal) recall,
+  fuse it with `ReciprocalRankFusion`, and optionally diversify with
+  `MaximalMarginalRelevance` — in one typed call. Previously this was ~7
+  hand-assembled Datalog rules. Read-only; the query vector/text are passed as
+  script params (never string-interpolated) and every interpolated identifier is
+  validated against injection. New module `runtime/hybrid.rs`; tested in
+  `tests/hybrid_helper.rs`.
+
+### Performance — HNSW index build ~3× faster
+- `::hnsw create` (and backfill) over a large relation was **superlinear**: the
+  whole graph was built inside the script's pessimistic transaction, so every
+  neighbour read/write round-tripped through RocksDB's `WriteBatchWithIndex`
+  overlay (whose cost grows with the index). Measured baseline: **135 s for
+  20k × 128** vectors (release).
+- The build now constructs the graph in the in-RAM temp store (`is_temp` routing
+  via new `idx_put`/`idx_get`/`idx_del`/`idx_exists` helpers) and bulk-migrates
+  the finished, key-sorted graph to the persistent store in one pass; and it
+  shares one `VectorCache` across the whole build instead of rebuilding it per
+  node. Combined **~3.1× faster** (20k × 128: 135 s → 43.6 s; 10k: 51.8 s →
+  16.5 s). The built graph is byte-identical; guarded by `tests/hnsw_build.rs`.
+- *Investigated and dropped:* batched secondary-index writes (drafted "#4",
+  claimed 2–3× ingest). Measured: index writes are ~7 % of ingest even with 4
+  indexes, and within a pessimistic txn each `put` only appends to an in-memory
+  batch — batching saves <1 %. The real ingest floor is the per-script
+  pessimistic transaction, which that change doesn't touch.
+
+### Bridge — `mnestic-rocks`
+- Forked the C++/RocksDB bridge crate `cozorocks` → **`mnestic-rocks`** (v0.1.8),
+  keeping the importable crate name `cozorocks` (`[lib] name`) so `use cozorocks::`
+  and `cozorocks?/feature` references are unchanged. Enables shipping future
+  bridge-level work (e.g. out-of-transaction index build + `IngestExternalFile`
+  atomic publish) on crates.io.
+
+### Maintenance
+- `document-features` 0.2.8 → 0.2.12 to clear a future-incompat warning.
+- **Blocking clippy CI gate** (`cargo clippy -- -D warnings`, default features).
+  Pervasive/intrinsic inherited lints are allow-listed with rationale in
+  `lib.rs` so the gate catches new issues. `cargo fmt --check` is deliberately
+  not gated yet (a ~178-file reformat is deferred to its own pass).
+
+### Deferred (designed, not in this release)
+- **Lock-free index build** (out-of-transaction build against a snapshot +
+  `SstFileWriter`/`IngestExternalFile` atomic publish) — directly fixes "rebuild
+  holds the write lock and blocks readers"; touches the transaction lifecycle.
+- **Native in-RAM graph** (adjacency as integer arrays, no per-edge
+  (de)serialization) for a further ~10–50× build speedup, like hnswlib.
+
 ## 0.8.0 — 2026-05-30
 
 First fork release. Lineage: cozo 0.7.6 + 30 unreleased upstream commits (our fork
