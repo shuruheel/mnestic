@@ -2604,8 +2604,19 @@ fn decode_ulid(s: &str) -> Result<u128> {
         "invalid ULID: expected 26 characters, got {}",
         s.len()
     );
-    let mut value: u128 = 0;
-    for c in s.bytes() {
+    let mut bytes = s.bytes();
+    // The first base32 char encodes the top of a 130-bit space; a canonical ULID
+    // (128 bits) leaves its high 2 bits zero, so the first char must be 0..=7.
+    // A larger value would silently overflow the u128 below and decode to a wrong
+    // timestamp — reject it instead.
+    let first = crockford_decode(bytes.next().unwrap())
+        .ok_or_else(|| miette!("invalid ULID: bad leading character"))?;
+    ensure!(
+        first <= 7,
+        "invalid ULID: leading character overflows 128 bits (non-canonical)"
+    );
+    let mut value: u128 = first;
+    for c in bytes {
         let d = crockford_decode(c)
             .ok_or_else(|| miette!("invalid ULID character {:?}", c as char))?;
         value = (value << 5) | d;

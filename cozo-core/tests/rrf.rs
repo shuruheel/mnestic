@@ -100,3 +100,50 @@ fn rrf_default_k_is_60() {
     let m = fused_map(&res);
     assert!((m["x"] - 1.0 / 61.0).abs() < 1e-9, "default k=60 => 1/61");
 }
+
+#[test]
+fn rrf_dedups_within_list_keeping_best() {
+    // An item appearing twice in one list keeps its best (descending => highest)
+    // score before ranking.
+    let db = DbInstance::default();
+    let res = run(
+        &db,
+        r#"combined[lid, item, score] <- [
+            ['a', 'x', 0.5], ['a', 'x', 0.9], ['a', 'y', 0.7]
+        ]
+        ?[item, fused] <~ ReciprocalRankFusion(combined[lid, item, score], k: 60)"#,
+    );
+    let m = fused_map(&res);
+    // x's best (0.9) ranks above y (0.7), so x=rank1 => 1/61, y=rank2 => 1/62.
+    assert!((m["x"] - 1.0 / 61.0).abs() < 1e-9, "x deduped to best score (rank1): {}", m["x"]);
+    assert!((m["y"] - 1.0 / 62.0).abs() < 1e-9, "y = {}", m["y"]);
+}
+
+#[test]
+fn rrf_rejects_nan_score() {
+    // Review fix: NaN sorts above +inf under the DataValue total order and would
+    // grab rank 1; reject non-finite scores instead.
+    use cozo::DataValue;
+    let db = DbInstance::default();
+    let mut p = BTreeMap::new();
+    p.insert("s".to_string(), DataValue::from(f64::NAN));
+    let res = db.run_script(
+        r#"combined[lid, item, score] <- [['a', 'x', $s]]
+           ?[item, fused] <~ RRF(combined[lid, item, score])"#,
+        p,
+        ScriptMutability::Mutable,
+    );
+    assert!(res.is_err(), "NaN score must be rejected");
+}
+
+#[test]
+fn rrf_empty_input() {
+    let db = DbInstance::default();
+    let res = run(
+        &db,
+        r#"src[lid, item, score] <- [['a', 'x', 0.5]]
+           combined[lid, item, score] := src[lid, item, score], score > 100.0
+           ?[item, fused] <~ RRF(combined[lid, item, score])"#,
+    );
+    assert_eq!(res.rows.len(), 0, "empty input yields empty output");
+}

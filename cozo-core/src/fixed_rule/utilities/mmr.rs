@@ -47,8 +47,11 @@ impl FixedRule for MaximalMarginalRelevance {
         let lambda = payload.float_option("lambda", Some(0.5))?.clamp(0.0, 1.0);
         let k_opt = payload.non_neg_integer_option("k", Some(0))?; // 0 => select all
 
-        // Collect candidates: (item, relevance, vector).
+        // Collect candidates: (item, relevance, vector). All vectors must share a
+        // dimension (cosine over differing dims is meaningless and ndarray's `dot`
+        // would panic), so we reject a mismatch with a clear error rather than crash.
         let mut cands: Vec<(DataValue, f64, Vector)> = vec![];
+        let mut dim: Option<usize> = None;
         for tuple in in_rel.iter()? {
             let tuple = tuple?;
             if tuple.len() != 3 {
@@ -61,7 +64,8 @@ impl FixedRule for MaximalMarginalRelevance {
             let mut it = tuple.into_iter();
             let item = it.next().unwrap();
             let relevance = match it.next().unwrap().get_float() {
-                Some(f) => f,
+                Some(f) if f.is_finite() => f,
+                Some(_) => bail!("MaximalMarginalRelevance: relevance (column 2) must be finite"),
                 None => bail!("MaximalMarginalRelevance: relevance (column 2) must be a number"),
             };
             let vector = match it.next().unwrap() {
@@ -71,6 +75,17 @@ impl FixedRule for MaximalMarginalRelevance {
                     other
                 ),
             };
+            let vlen = vector_len(&vector);
+            match dim {
+                None => dim = Some(vlen),
+                Some(d) if d != vlen => bail!(
+                    "MaximalMarginalRelevance: inconsistent vector dimensions ({} vs {}); \
+                     all embeddings must share one dimension",
+                    d,
+                    vlen
+                ),
+                Some(_) => {}
+            }
             cands.push((item, relevance, vector));
             poison.check()?;
         }
@@ -85,12 +100,19 @@ impl FixedRule for MaximalMarginalRelevance {
             let mut best_pos = 0usize; // position within `remaining`
             let mut best_score = f64::NEG_INFINITY;
             for (ri, &ci) in remaining.iter().enumerate() {
-                // Max similarity to anything already selected (0 when none yet,
-                // so the first pick is simply the most relevant).
-                let max_sim = selected
-                    .iter()
-                    .map(|&sj| cosine_sim(&cands[ci].2, &cands[sj].2))
-                    .fold(0.0_f64, f64::max);
+                // Max cosine similarity to anything already selected. With nothing
+                // selected yet the diversity term is 0, so the first pick is simply
+                // the most relevant. Once items are selected we take the true max
+                // (seeded at -inf) so anti-correlated (negative-cosine) candidates
+                // are correctly rewarded rather than clamped at a 0 floor.
+                let max_sim = if selected.is_empty() {
+                    0.0
+                } else {
+                    selected
+                        .iter()
+                        .map(|&sj| cosine_sim(&cands[ci].2, &cands[sj].2))
+                        .fold(f64::NEG_INFINITY, f64::max)
+                };
                 let mmr = lambda * cands[ci].1 - (1.0 - lambda) * max_sim;
                 if mmr > best_score {
                     best_score = mmr;
@@ -119,11 +141,24 @@ impl FixedRule for MaximalMarginalRelevance {
     }
 }
 
+fn vector_len(v: &Vector) -> usize {
+    match v {
+        Vector::F32(a) => a.len(),
+        Vector::F64(a) => a.len(),
+    }
+}
+
 /// Cosine similarity in `[-1, 1]` (1 = identical direction). Returns 0 for a
-/// zero vector or mismatched precision (treated as no diversity penalty).
+/// zero vector, mismatched precision, or mismatched length (treated as no
+/// diversity penalty). The length guard is defense-in-depth: `run` already rejects
+/// inconsistent dimensions up front, but it keeps `ndarray::dot` (which panics on
+/// a length mismatch) safe regardless of caller.
 fn cosine_sim(a: &Vector, b: &Vector) -> f64 {
     match (a, b) {
         (Vector::F32(x), Vector::F32(y)) => {
+            if x.len() != y.len() {
+                return 0.0;
+            }
             let dot = x.dot(y) as f64;
             let nx = (x.dot(x) as f64).sqrt();
             let ny = (y.dot(y) as f64).sqrt();
@@ -134,6 +169,9 @@ fn cosine_sim(a: &Vector, b: &Vector) -> f64 {
             }
         }
         (Vector::F64(x), Vector::F64(y)) => {
+            if x.len() != y.len() {
+                return 0.0;
+            }
             let dot = x.dot(y);
             let nx = x.dot(x).sqrt();
             let ny = y.dot(y).sqrt();

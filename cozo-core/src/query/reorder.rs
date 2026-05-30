@@ -15,6 +15,7 @@ use thiserror::Error;
 use crate::data::expr::Expr;
 use crate::data::program::{NormalFormAtom, NormalFormInlineRule, Unification};
 use crate::data::symb::Symbol;
+use crate::data::value::DataValue;
 use crate::parse::SourceSpan;
 
 #[derive(Diagnostic, Debug, Error)]
@@ -39,16 +40,26 @@ pub(crate) struct UnboundVariable(#[label] pub(crate) SourceSpan);
 /// scan with an `eq(..)` post-filter, even when `k` is a key column — whereas the
 /// semantically identical binding-first form `k = <ground>, *rel{k, ..}` compiles
 /// to a keyed `stored_prefix_join`. This pass rewrites the former into the latter:
-/// it converts `Predicate(eq(var, ground))` (where `var` is produced by a stored
-/// relation atom and the other side has no free variables) into a `Unification`,
-/// then hoists ground equality unifications ahead of the atoms that would
-/// otherwise generate them, so the existing well-ordering logic below emits a
-/// prefix lookup. Purely an optimization: the result set is unchanged.
+/// it converts a qualifying `Predicate(eq(var, ground))` into a `Unification` and
+/// hoists *only those converted unifications* to the front, so the relation atom
+/// that produces `var` binds it as a join key and the existing well-ordering logic
+/// below emits a prefix lookup.
+///
+/// Deliberately conservative:
+/// - Only `Predicate` atoms are touched; user-written unifications and every other
+///   atom keep their exact original relative order, so no existing query's behavior
+///   changes — we only rewrite the `==`-post-filter shape.
+/// - Numeric ground values are NOT converted (see `eq_predicate_as_unification`):
+///   `op_eq` treats `Int(n) == Float(n)` as equal across types, but a keyed lookup
+///   uses the index's strict `Num` ordering where `Int(n) != Float(n)`, so
+///   converting a numeric equality could silently drop cross-type matches.
+///
+/// Result sets are therefore unchanged; this is purely an optimization.
 fn push_equality_filters_to_bindings(body: Vec<NormalFormAtom>) -> Vec<NormalFormAtom> {
     // Variables produced by positive stored-relation atoms. Only equalities on
-    // these are safe to convert: converting an equality on a variable that no
-    // atom generates would turn a (possibly erroneous) filter into a generator
-    // and silence a genuine unbound-variable error.
+    // these are converted: converting an equality on a variable that no atom
+    // generates would turn a (possibly erroneous) filter into a generator and
+    // silence a genuine unbound-variable error.
     let mut generated: BTreeSet<Symbol> = BTreeSet::new();
     for atom in &body {
         if let NormalFormAtom::Relation(r) = atom {
@@ -56,29 +67,17 @@ fn push_equality_filters_to_bindings(body: Vec<NormalFormAtom>) -> Vec<NormalFor
         }
     }
 
-    // Convert qualifying eq-predicates into unifications.
-    let converted = body.into_iter().map(|atom| match atom {
-        NormalFormAtom::Predicate(expr) => match eq_predicate_as_unification(&expr, &generated) {
-            Some(unif) => NormalFormAtom::Unification(unif),
-            None => NormalFormAtom::Predicate(expr),
-        },
-        other => other,
-    });
-
-    // Hoist ground equality unifications to the front (stable order preserved
-    // among them and among the rest), so the relation atom that uses the variable
-    // can bind it as a join key.
+    // Converted equality bindings are hoisted to the front (preserving their
+    // relative order); everything else keeps its original relative order.
     let mut front = vec![];
     let mut rest = vec![];
-    for atom in converted {
-        let is_ground_eq = matches!(&atom,
-            NormalFormAtom::Unification(u)
-                if !u.one_many_unif
-                    && u.bindings_in_expr().map(|b| b.is_empty()).unwrap_or(false));
-        if is_ground_eq {
-            front.push(atom);
-        } else {
-            rest.push(atom);
+    for atom in body {
+        match atom {
+            NormalFormAtom::Predicate(expr) => match eq_predicate_as_unification(&expr, &generated) {
+                Some(unif) => front.push(NormalFormAtom::Unification(unif)),
+                None => rest.push(NormalFormAtom::Predicate(expr)),
+            },
+            other => rest.push(other),
         }
     }
     front.extend(rest);
@@ -86,8 +85,8 @@ fn push_equality_filters_to_bindings(body: Vec<NormalFormAtom>) -> Vec<NormalFor
 }
 
 /// If `expr` is `eq(v, g)` or `eq(g, v)` where `v` is a bare variable in
-/// `generated` and `g` has no free variables, returns the equivalent `v = g`
-/// unification. Otherwise `None`.
+/// `generated` and `g` is a NON-numeric ground value, returns the equivalent
+/// `v = g` unification. Otherwise `None`.
 fn eq_predicate_as_unification(expr: &Expr, generated: &BTreeSet<Symbol>) -> Option<Unification> {
     let (op, args, span) = match expr {
         Expr::Apply { op, args, span } => (op, args, *span),
@@ -98,11 +97,21 @@ fn eq_predicate_as_unification(expr: &Expr, generated: &BTreeSet<Symbol>) -> Opt
     }
     for (maybe_var, maybe_ground) in [(&args[0], &args[1]), (&args[1], &args[0])] {
         if let Expr::Binding { var, .. } = maybe_var {
+            // The other side must have no free variables.
             let ground = maybe_ground
                 .bindings()
                 .map(|b| b.is_empty())
                 .unwrap_or(false);
-            if ground && generated.contains(var) {
+            // Refuse NUMERIC grounds: `op_eq` treats `Int(n) == Float(n)` as equal
+            // (cross-type), but a keyed prefix lookup uses the key index's strict
+            // `Num` ordering where `Int(n) != Float(n)`. Converting a numeric
+            // equality would therefore silently drop cross-type matches. Non-numeric
+            // values (str/uuid/bytes/bool/null) compare identically under `op_eq` and
+            // the index. Parameters are already substituted to `Expr::Const` by this
+            // stage, so this also covers `k == $numeric_param`.
+            let numeric_const =
+                matches!(maybe_ground, Expr::Const { val: DataValue::Num(_), .. });
+            if ground && !numeric_const && generated.contains(var) {
                 return Some(Unification {
                     binding: var.clone(),
                     expr: maybe_ground.clone(),

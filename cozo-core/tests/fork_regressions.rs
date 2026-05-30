@@ -149,3 +149,36 @@ fn keyword_prefixed_identifiers_parse() {
     assert_eq!(lit("?[x] := x = null")[0][0], DataValue::Null);
     assert_eq!(lit("?[x] := x = [null, true, false]")[0][0].get_slice().unwrap().len(), 3);
 }
+
+/// Fork #1 boundary (review fix): numeric equality post-filters must NOT be pushed
+/// to a keyed lookup. `op_eq` treats `Int(n) == Float(n)` as equal (cross-type),
+/// but the key index uses strict `Num` ordering where `Int(n) != Float(n)`, so a
+/// pushdown would silently drop cross-type matches. This guards that numeric `==`
+/// keeps full `op_eq` semantics (the conversion is gated to non-numeric grounds).
+#[test]
+fn numeric_equality_keeps_cross_type_semantics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new(
+        "sqlite",
+        dir.path().join("xnum.db").to_str().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    let q = |s: &str| {
+        db.run_script(s, BTreeMap::new(), ScriptMutability::Mutable)
+            .unwrap()
+    };
+    q(":create rel { id: Int => k }");
+    q(r#"?[id, k] <- [[1, 3], [2, 3.0]] :put rel { id => k }"#);
+    // op_eq matches both Int(3) and Float(3.0); the pushdown must not change this.
+    assert_eq!(
+        q("?[id, k] := *rel{id, k}, k == 3").rows.len(),
+        2,
+        "numeric `== 3` must keep cross-type op_eq semantics (match Int and Float)"
+    );
+    assert_eq!(
+        q("?[id, k] := *rel{id, k}, k == 3.0").rows.len(),
+        2,
+        "numeric `== 3.0` must also match both"
+    );
+}

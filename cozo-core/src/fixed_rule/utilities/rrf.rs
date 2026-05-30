@@ -78,6 +78,13 @@ impl FixedRule for ReciprocalRankFusion {
             let list_id = it.next().unwrap();
             let item = it.next().unwrap();
             let score = it.next().unwrap();
+            // Reject non-finite scores: a NaN sorts above +inf under the DataValue
+            // total order, so it would silently grab rank 1 and poison the fusion.
+            if let Some(f) = score.get_float() {
+                if !f.is_finite() {
+                    bail!("ReciprocalRankFusion: score (column 3) must be finite, got {f}");
+                }
+            }
             lists.entry(list_id).or_default().push((item, score));
             poison.check()?;
         }

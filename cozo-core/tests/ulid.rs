@@ -86,3 +86,31 @@ fn rand_ulid_is_sortable_and_distinct() {
     );
     assert_eq!(distinct, DataValue::Bool(true));
 }
+
+#[test]
+fn ulid_timestamp_rejects_malformed() {
+    let db = DbInstance::default();
+    let err = |s: &str| {
+        db.run_script(s, BTreeMap::new(), ScriptMutability::Immutable)
+            .is_err()
+    };
+    // Wrong length.
+    assert!(err("?[t] := t = ulid_timestamp('TOOSHORT')"), "short string");
+    // Invalid Crockford char ('U' is excluded).
+    assert!(
+        err("?[t] := t = ulid_timestamp('U0000000000000000000000000')"),
+        "invalid char U"
+    );
+    // Review fix: non-canonical leading char (> 7) would overflow u128 and decode
+    // to a wrong timestamp; must be rejected.
+    assert!(
+        err("?[t] := t = ulid_timestamp('80000000000000000000000000')"),
+        "non-canonical leading char 8"
+    );
+    assert!(
+        err("?[t] := t = ulid_timestamp('Z0000000000000000000000000')"),
+        "non-canonical leading char Z"
+    );
+    // Non-string argument.
+    assert!(err("?[t] := t = ulid_timestamp(123)"), "non-string arg");
+}

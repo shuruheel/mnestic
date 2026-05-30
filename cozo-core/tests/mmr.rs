@@ -79,3 +79,52 @@ fn mmr_k_limits_selection() {
     assert_eq!(m["C"], 2);
     assert!(!m.contains_key("B"));
 }
+
+#[test]
+fn mmr_mismatched_dimensions_error_not_panic() {
+    // Review fix: cosine over differing dims used to panic via ndarray::dot.
+    let db = DbInstance::default();
+    let res = db.run_script(
+        r#"cand[item, rel, v] <- [['A', 1.0, vec([1.0, 0.0])], ['B', 0.9, vec([1.0, 0.0, 0.0])]]
+           ?[item, rank] <~ MaximalMarginalRelevance(cand[item, rel, v], lambda: 0.5)"#,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    );
+    assert!(res.is_err(), "mismatched vector dimensions must error, not panic");
+}
+
+#[test]
+fn mmr_rewards_anticorrelated_over_orthogonal() {
+    // Review fix: the diversity term used to floor cosine at 0.0, so an
+    // anti-correlated (cosine -1) candidate looked identical to an orthogonal
+    // (cosine 0) one. Now the true max is used, so the anti-correlated B is picked
+    // before the orthogonal C even though C has higher relevance.
+    let db = DbInstance::default();
+    let res = run(
+        &db,
+        r#"cand[item, rel, v] <- [
+            ['A', 1.0, vec([1.0, 0.0])],
+            ['B', 0.5, vec([-1.0, 0.0])],
+            ['C', 0.6, vec([0.0, 1.0])]
+        ]
+        ?[item, rank] <~ MMR(cand[item, rel, v], lambda: 0.5)"#,
+    );
+    let m = rank_map(&res);
+    assert_eq!(m["A"], 1, "A most relevant, picked first");
+    assert!(
+        m["B"] < m["C"],
+        "anti-correlated B should be picked before orthogonal C: {m:?}"
+    );
+}
+
+#[test]
+fn mmr_empty_input() {
+    let db = DbInstance::default();
+    let res = run(
+        &db,
+        r#"src[item, rel, v] <- [['A', 1.0, vec([1.0, 2.0])]]
+           cand[item, rel, v] := src[item, rel, v], rel > 100.0
+           ?[item, rank] <~ MMR(cand[item, rel, v])"#,
+    );
+    assert_eq!(res.rows.len(), 0, "empty input yields empty output");
+}
