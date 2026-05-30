@@ -2568,6 +2568,79 @@ pub(crate) fn op_uuid_timestamp(args: &[DataValue]) -> Result<DataValue> {
     })
 }
 
+// --- ULID (mnestic fork, upstream cozo #296) ---------------------------------
+// Lexicographically-sortable 128-bit identifiers (48-bit ms timestamp + 80-bit
+// randomness), Crockford base32, 26 chars. Sortable string IDs are ideal as keys
+// for time-ordered agentic-memory scans (unlike random UUIDv4).
+
+const CROCKFORD: &[u8; 32] = b"0123456789ABCDEFGHJKMNPQRSTVWXYZ";
+
+fn encode_ulid(value: u128) -> String {
+    // 26 base32 chars, most-significant first. A 128-bit value uses 26*5 = 130
+    // bits of space with the top 2 bits zero, so lexicographic order of the
+    // output matches the numeric order of `value` — hence time-sortable.
+    let mut buf = [0u8; 26];
+    let mut v = value;
+    for slot in buf.iter_mut().rev() {
+        *slot = CROCKFORD[(v & 0x1f) as usize];
+        v >>= 5;
+    }
+    // SAFETY: every byte is from the ASCII CROCKFORD table.
+    String::from_utf8(buf.to_vec()).unwrap()
+}
+
+fn crockford_decode(c: u8) -> Option<u128> {
+    // Canonical-tolerant: accept lowercase and Crockford's confusable aliases.
+    match c.to_ascii_uppercase() {
+        b'O' => Some(0),
+        b'I' | b'L' => Some(1),
+        up => CROCKFORD.iter().position(|&x| x == up).map(|p| p as u128),
+    }
+}
+
+fn decode_ulid(s: &str) -> Result<u128> {
+    ensure!(
+        s.len() == 26,
+        "invalid ULID: expected 26 characters, got {}",
+        s.len()
+    );
+    let mut value: u128 = 0;
+    for c in s.bytes() {
+        let d = crockford_decode(c)
+            .ok_or_else(|| miette!("invalid ULID character {:?}", c as char))?;
+        value = (value << 5) | d;
+    }
+    Ok(value)
+}
+
+define_op!(OP_RAND_ULID, 0, false);
+pub(crate) fn op_rand_ulid(_args: &[DataValue]) -> Result<DataValue> {
+    let mut rng = rand::thread_rng();
+    #[cfg(target_arch = "wasm32")]
+    let ms: u128 = Date::now() as u128;
+    #[cfg(not(target_arch = "wasm32"))]
+    let ms: u128 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let ms = ms & ((1u128 << 48) - 1);
+    let rand80: u128 = rng.gen::<u128>() & ((1u128 << 80) - 1);
+    let value = (ms << 80) | rand80;
+    Ok(DataValue::Str(SmartString::from(encode_ulid(value))))
+}
+
+define_op!(OP_ULID_TIMESTAMP, 1, false);
+pub(crate) fn op_ulid_timestamp(args: &[DataValue]) -> Result<DataValue> {
+    let s = match &args[0] {
+        DataValue::Str(s) => s,
+        _ => bail!("'ulid_timestamp' expects a string ULID"),
+    };
+    let value = decode_ulid(s)?;
+    // Milliseconds since the Unix epoch (the ULID's high 48 bits).
+    let ms = (value >> 80) as i64;
+    Ok(DataValue::from(ms))
+}
+
 define_op!(OP_VALIDITY, 1, true);
 pub(crate) fn op_validity(args: &[DataValue]) -> Result<DataValue> {
     let ts = args[0]

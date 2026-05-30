@@ -69,6 +69,13 @@ fixes) for free.
   synthetic ranked lists.
 - Next on Bet 1: a higher-level one-call convenience + a LangChain/LlamaIndex
   adapter once the surface stabilises.
+- **ULID functions (`rand_ulid`, `ulid_timestamp`)** — `data/functions.rs`,
+  upstream cozo #296. `rand_ulid()` returns a lexicographically-sortable 26-char
+  Crockford-base32 ULID (48-bit ms timestamp + 80-bit randomness); sortable string
+  IDs are ideal keys for time-ordered agentic-memory scans (unlike random UUIDv4).
+  `ulid_timestamp(s)` extracts the embedded Unix-ms timestamp. Tests:
+  `cozo-core/tests/ulid.rs` (format, two hand-derivable decode vectors, recency,
+  sortability, distinctness).
 
 #### Phase 0 — fixes
 - **#1 equality-pushdown for stored relations** (`query/reorder.rs`). Equality
