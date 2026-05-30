@@ -1125,7 +1125,7 @@ impl<'a> SessionTx<'a> {
             },
         ];
         // create index relation
-        let idx_handle = self.write_idx_relation(
+        let mut idx_handle = self.write_idx_relation(
             &config.base_relation,
             &config.index_name,
             idx_keys,
@@ -1172,6 +1172,13 @@ impl<'a> SessionTx<'a> {
         } else {
             Some(&filter)
         };
+        // Build the whole graph in the in-RAM temp store (mnestic fork): marking
+        // the index handle `is_temp` routes every neighbour read/write to the
+        // temp BTreeMap instead of the pessimistic transaction's RocksDB
+        // `WriteBatchWithIndex` overlay, whose cost grows with the index and
+        // made the build superlinear. We then bulk-migrate the finished graph
+        // to the real store in one pass. The graph is byte-identical either way.
+        idx_handle.is_temp = true;
         let mut stack = vec![];
         for tuple in all_tuples.into_iter() {
             self.hnsw_put(
@@ -1183,6 +1190,8 @@ impl<'a> SessionTx<'a> {
                 &tuple,
             )?;
         }
+        self.flush_temp_index_to_store(&idx_handle)?;
+        idx_handle.is_temp = false;
 
         rel_handle
             .hnsw_indices
@@ -1197,6 +1206,23 @@ impl<'a> SessionTx<'a> {
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
+        Ok(())
+    }
+
+    /// Bulk-copy a freshly-built index relation from the in-RAM temp store to
+    /// the persistent store (mnestic fork). The entries arrive in key-sorted
+    /// order (the temp store is a `BTreeMap`), so this is also the natural input
+    /// for an `SstFileWriter`/`IngestExternalFile` atomic publish (Layer 2).
+    fn flush_temp_index_to_store(&mut self, idx_handle: &RelationHandle) -> Result<()> {
+        let lower = Tuple::default().encode_as_key(idx_handle.id);
+        let upper = Tuple::default().encode_as_key(idx_handle.id.next());
+        let entries: Vec<(Vec<u8>, Vec<u8>)> = self
+            .temp_store_tx
+            .range_scan(&lower, &upper)
+            .collect::<Result<Vec<_>>>()?;
+        for (k, v) in entries {
+            self.store_tx.put(&k, &v)?;
+        }
         Ok(())
     }
 

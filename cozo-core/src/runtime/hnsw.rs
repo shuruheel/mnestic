@@ -14,6 +14,7 @@ use crate::data::value::Vector;
 use crate::parse::sys::HnswDistance;
 use crate::runtime::relation::RelationHandle;
 use crate::runtime::transact::SessionTx;
+use crate::storage::StoreTx;
 use crate::{DataValue, SourceSpan};
 use itertools::Itertools;
 use miette::{bail, miette, Result};
@@ -152,6 +153,47 @@ impl VectorCache {
 }
 
 impl<'a> SessionTx<'a> {
+    // --- index-store routing (mnestic fork) -------------------------------
+    // During `create_hnsw_index` the index handle is marked `is_temp` so the
+    // whole graph is built in the in-RAM temp store (a plain BTreeMap), instead
+    // of round-tripping every neighbour read/write through the pessimistic
+    // transaction's RocksDB `WriteBatchWithIndex` overlay (which grows with the
+    // index and makes the build superlinear). These helpers route raw index
+    // KV ops to the same store the `RelationHandle` read methods already pick
+    // via `is_temp`, so build and steady-state writes stay byte-identical.
+    #[inline]
+    fn idx_put(&mut self, idx_table: &RelationHandle, key: &[u8], val: &[u8]) -> Result<()> {
+        if idx_table.is_temp {
+            self.temp_store_tx.put(key, val)
+        } else {
+            self.store_tx.put(key, val)
+        }
+    }
+    #[inline]
+    fn idx_get(&self, idx_table: &RelationHandle, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if idx_table.is_temp {
+            self.temp_store_tx.get(key, false)
+        } else {
+            self.store_tx.get(key, false)
+        }
+    }
+    #[inline]
+    fn idx_del(&mut self, idx_table: &RelationHandle, key: &[u8]) -> Result<()> {
+        if idx_table.is_temp {
+            self.temp_store_tx.del(key)
+        } else {
+            self.store_tx.del(key)
+        }
+    }
+    #[inline]
+    fn idx_exists(&self, idx_table: &RelationHandle, key: &[u8]) -> Result<bool> {
+        if idx_table.is_temp {
+            self.temp_store_tx.exists(key, false)
+        } else {
+            self.store_tx.exists(key, false)
+        }
+    }
+
     fn hnsw_put_vector(
         &mut self,
         tuple: &[DataValue],
@@ -273,8 +315,7 @@ impl<'a> SessionTx<'a> {
                     idx_table.encode_key_for_store(&self_tuple_key, Default::default())?;
                 let self_tuple_val_bytes =
                     idx_table.encode_val_only_for_store(&self_tuple_val, Default::default())?;
-                self.store_tx
-                    .put(&self_tuple_key_bytes, &self_tuple_val_bytes)?;
+                self.idx_put(idx_table, &self_tuple_key_bytes, &self_tuple_val_bytes)?;
 
                 // add bidirectional links
                 for (neighbour, Reverse(OrderedFloat(dist))) in neighbours.iter() {
@@ -295,7 +336,7 @@ impl<'a> SessionTx<'a> {
                         idx_table.encode_key_for_store(&out_key, Default::default())?;
                     let out_val_bytes =
                         idx_table.encode_val_only_for_store(&out_val, Default::default())?;
-                    self.store_tx.put(&out_key_bytes, &out_val_bytes)?;
+                    self.idx_put(idx_table, &out_key_bytes, &out_val_bytes)?;
 
                     let mut in_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
                     let in_val = vec![
@@ -315,7 +356,7 @@ impl<'a> SessionTx<'a> {
                         idx_table.encode_key_for_store(&in_key, Default::default())?;
                     let in_val_bytes =
                         idx_table.encode_val_only_for_store(&in_val, Default::default())?;
-                    self.store_tx.put(&in_key_bytes, &in_val_bytes)?;
+                    self.idx_put(idx_table, &in_key_bytes, &in_val_bytes)?;
 
                     // shrink links if necessary
                     let mut target_self_key =
@@ -328,7 +369,7 @@ impl<'a> SessionTx<'a> {
                     }
                     let target_self_key_bytes =
                         idx_table.encode_key_for_store(&target_self_key, Default::default())?;
-                    let target_self_val_bytes = match self.store_tx.get(&target_self_key_bytes, false)? {
+                    let target_self_val_bytes = match self.idx_get(idx_table, &target_self_key_bytes)? {
                         Some(bytes) => bytes,
                         None => bail!("Indexed vector not found, this signifies a bug in the index implementation"),
                     };
@@ -350,11 +391,9 @@ impl<'a> SessionTx<'a> {
                     }
                     // update degree
                     target_self_val[0] = DataValue::from(target_degree as f64);
-                    self.store_tx.put(
-                        &target_self_key_bytes,
-                        &idx_table
-                            .encode_val_only_for_store(&target_self_val, Default::default())?,
-                    )?;
+                    let target_self_val_bytes_new =
+                        idx_table.encode_val_only_for_store(&target_self_val, Default::default())?;
+                    self.idx_put(idx_table, &target_self_key_bytes, &target_self_val_bytes_new)?;
                 }
             }
         } else {
@@ -428,7 +467,7 @@ impl<'a> SessionTx<'a> {
                 let new_key_bytes = idx_table.encode_key_for_store(&new_key, Default::default())?;
                 let new_val_bytes =
                     idx_table.encode_val_only_for_store(&new_val, Default::default())?;
-                self.store_tx.put(&new_key_bytes, &new_val_bytes)?;
+                self.idx_put(idx_table, &new_key_bytes, &new_val_bytes)?;
             }
         }
         for (old, OrderedFloat(old_dist)) in candidates {
@@ -442,7 +481,7 @@ impl<'a> SessionTx<'a> {
                 old_key.push(DataValue::from(old.1 as i64));
                 old_key.push(DataValue::from(old.2 as i64));
                 let old_key_bytes = idx_table.encode_key_for_store(&old_key, Default::default())?;
-                let old_existing_val = match self.store_tx.get(&old_key_bytes, false)? {
+                let old_existing_val = match self.idx_get(idx_table, &old_key_bytes)? {
                     Some(bytes) => bytes,
                     None => {
                         bail!("Indexed vector not found, this signifies a bug in the index implementation")
@@ -451,7 +490,7 @@ impl<'a> SessionTx<'a> {
                 let old_existing_val: Vec<DataValue> =
                     rmp_serde::from_slice(&old_existing_val[ENCODED_KEY_MIN_LEN..]).unwrap();
                 if old_existing_val[2].get_bool().unwrap() {
-                    self.store_tx.del(&old_key_bytes)?;
+                    self.idx_del(idx_table, &old_key_bytes)?;
                 } else {
                     let old_val = vec![
                         DataValue::from(old_dist),
@@ -460,7 +499,7 @@ impl<'a> SessionTx<'a> {
                     ];
                     let old_val_bytes =
                         idx_table.encode_val_only_for_store(&old_val, Default::default())?;
-                    self.store_tx.put(&old_key_bytes, &old_val_bytes)?;
+                    self.idx_put(idx_table, &old_key_bytes, &old_val_bytes)?;
                 }
             }
         }
@@ -666,13 +705,13 @@ impl<'a> SessionTx<'a> {
         let canary_key_bytes = idx_table.encode_key_for_store(&canary_key, Default::default())?;
         let canary_value_bytes =
             idx_table.encode_val_only_for_store(&canary_value, Default::default())?;
-        self.store_tx.put(&canary_key_bytes, &canary_value_bytes)?;
+        self.idx_put(idx_table, &canary_key_bytes, &canary_value_bytes)?;
 
         for cur_level in bottom_level..=top_level {
             target_key[0] = DataValue::from(cur_level);
             let key = idx_table.encode_key_for_store(&target_key, Default::default())?;
             let val = idx_table.encode_val_only_for_store(&target_value, Default::default())?;
-            self.store_tx.put(&key, &val)?;
+            self.idx_put(idx_table, &key, &val)?;
         }
         Ok(())
     }
@@ -771,8 +810,8 @@ impl<'a> SessionTx<'a> {
                 self_key.push(DataValue::from(subidx as i64));
             }
             let self_key_bytes = idx_table.encode_key_for_store(&self_key, Default::default())?;
-            if self.store_tx.exists(&self_key_bytes, false)? {
-                self.store_tx.del(&self_key_bytes)?;
+            if self.idx_exists(idx_table, &self_key_bytes)? {
+                self.idx_del(idx_table, &self_key_bytes)?;
             } else {
                 break;
             }
@@ -792,7 +831,7 @@ impl<'a> SessionTx<'a> {
                 out_key.push(DataValue::from(neighbour_key.1 as i64));
                 out_key.push(DataValue::from(neighbour_key.2 as i64));
                 let out_key_bytes = idx_table.encode_key_for_store(&out_key, Default::default())?;
-                self.store_tx.del(&out_key_bytes)?;
+                self.idx_del(idx_table, &out_key_bytes)?;
                 let mut in_key = vec![DataValue::from(layer)];
                 in_key.extend_from_slice(&neighbour_key.0);
                 in_key.push(DataValue::from(neighbour_key.1 as i64));
@@ -801,27 +840,23 @@ impl<'a> SessionTx<'a> {
                 in_key.push(DataValue::from(idx as i64));
                 in_key.push(DataValue::from(subidx as i64));
                 let in_key_bytes = idx_table.encode_key_for_store(&in_key, Default::default())?;
-                self.store_tx.del(&in_key_bytes)?;
+                self.idx_del(idx_table, &in_key_bytes)?;
                 let mut neighbour_self_key = vec![DataValue::from(layer)];
                 for _ in 0..2 {
                     neighbour_self_key.extend_from_slice(&neighbour_key.0);
                     neighbour_self_key.push(DataValue::from(neighbour_key.1 as i64));
                     neighbour_self_key.push(DataValue::from(neighbour_key.2 as i64));
                 }
-                let neighbour_val_bytes = self
-                    .store_tx
-                    .get(
-                        &idx_table.encode_key_for_store(&neighbour_self_key, Default::default())?,
-                        false,
-                    )?
-                    .unwrap();
+                let neighbour_self_key_bytes =
+                    idx_table.encode_key_for_store(&neighbour_self_key, Default::default())?;
+                let neighbour_val_bytes =
+                    self.idx_get(idx_table, &neighbour_self_key_bytes)?.unwrap();
                 let mut neighbour_val: Vec<DataValue> =
                     rmp_serde::from_slice(&neighbour_val_bytes[ENCODED_KEY_MIN_LEN..]).unwrap();
                 neighbour_val[0] = DataValue::from(neighbour_val[0].get_float().unwrap() - 1.);
-                self.store_tx.put(
-                    &idx_table.encode_key_for_store(&neighbour_self_key, Default::default())?,
-                    &idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?,
-                )?;
+                let neighbour_val_bytes_new =
+                    idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?;
+                self.idx_put(idx_table, &neighbour_self_key_bytes, &neighbour_val_bytes_new)?;
             }
         }
 
@@ -857,10 +892,10 @@ impl<'a> SessionTx<'a> {
                 ];
                 let canary_value_bytes =
                     idx_table.encode_val_only_for_store(&canary_value, Default::default())?;
-                self.store_tx.put(&canary_key_bytes, &canary_value_bytes)?;
+                self.idx_put(idx_table, &canary_key_bytes, &canary_value_bytes)?;
             } else {
                 // HA! we have removed the last item in the index
-                self.store_tx.del(&canary_key_bytes)?;
+                self.idx_del(idx_table, &canary_key_bytes)?;
             }
         }
 
