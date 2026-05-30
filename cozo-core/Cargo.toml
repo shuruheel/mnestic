@@ -1,16 +1,20 @@
 [package]
-name = "cozo"
+name = "mnestic"
 version = "0.7.6"
 edition = "2021"
-description = "A general-purpose, transactional, relational database that uses Datalog and focuses on graph data and algorithms"
-authors = ["Ziyang Hu"]
+description = "A transactional relational-graph-vector database using Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory"
+authors = ["Shan Rizvi", "Ziyang Hu (original CozoDB author)"]
 license = "MPL-2.0"
-homepage = "https://www.cozodb.org"
-repository = "https://github.com/cozodb/cozo"
-documentation = "https://docs.cozodb.org"
+repository = "https://github.com/shuruheel/mnestic"
 exclude = [
     "tests/*",
 ]
+
+# The published package is `mnestic`, but the importable Rust crate name stays
+# `cozo` so that downstream `use cozo::...` (including this crate's own tests,
+# benches, and doctests) continues to work unchanged. See FORK.md.
+[lib]
+name = "cozo"
 
 [features]
 #! # Features

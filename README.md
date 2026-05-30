@@ -1,21 +1,19 @@
-<img src="static/logo_c.png" width="200" height="175" alt="Logo">
+# `mnestic`
 
-[![docs](https://img.shields.io/readthedocs/cozo/latest)](https://docs.cozodb.org/)
-[![cozo-node](https://img.shields.io/npm/v/cozo-node)](https://www.npmjs.com/package/cozo-node)
-[![npm (web)](https://img.shields.io/npm/v/cozo-lib-wasm?label=browser)](https://www.npmjs.com/package/cozo-lib-wasm)
-[![Crates.io](https://img.shields.io/crates/v/cozo)](https://crates.io/crates/cozo)
-[![docs.rs](https://img.shields.io/docsrs/cozo?label=docs.rs)](https://docs.rs/cozo)
-[![pypi](https://img.shields.io/pypi/v/pycozo)](https://pypi.org/project/pycozo/)
-[![java](https://img.shields.io/maven-central/v/io.github.cozodb/cozo_java?label=java)](https://mvnrepository.com/artifact/io.github.cozodb/cozo_java)
-[![clj](https://img.shields.io/maven-central/v/io.github.cozodb/cozo-clj?label=clj)](https://mvnrepository.com/artifact/io.github.cozodb/cozo-clj)
-[![android](https://img.shields.io/maven-central/v/io.github.cozodb/cozo_android?label=android)](https://mvnrepository.com/artifact/io.github.cozodb/cozo_android)
-[![pod](https://img.shields.io/cocoapods/v/CozoSwiftBridge)](https://github.com/cozodb/cozo/tree/main/cozo-lib-swift)
-[![Go](https://img.shields.io/github/v/release/cozodb/cozo-lib-go?label=go)](https://github.com/cozodb/cozo-lib-go)
-[![C](https://img.shields.io/github/v/release/cozodb/cozo?label=C)](https://github.com/cozodb/cozo/releases)
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/cozodb/cozo/build.yml?branch=main)](https://github.com/cozodb/cozo/actions/workflows/build.yml)
-[![GitHub](https://img.shields.io/github/license/cozodb/cozo)](https://github.com/cozodb/cozo/blob/main/LICENSE.txt)
+> **mnestic** is an independently maintained fork of [CozoDB](https://github.com/cozodb/cozo),
+> a transactional relational-graph-vector database that uses Datalog for queries —
+> "the hippocampus for AI." This fork continues the project as a substrate for
+> **agentic memory**, with performance, correctness, and operational fixes on top
+> of upstream `481af05` (the last upstream commit, 2024-12-04).
+>
+> mnestic is **not** the official CozoDB and is not affiliated with or endorsed by
+> its original authors. All credit for the original design belongs to Ziyang Hu and
+> the Cozo Project Authors. See [`FORK.md`](FORK.md) for provenance and licensing,
+> and [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) for what diverges from upstream.
 
-# `CozoDB`
+The remainder of this README is upstream CozoDB's documentation. The query
+language (CozoScript / Datalog) and engine semantics are unchanged unless noted
+in `CHANGELOG-FORK.md`.
 
 ### Table of contents
 

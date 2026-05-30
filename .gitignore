@@ -39,3 +39,5 @@ Cross.toml
 .cozo_repl_history
 /venv/
 flamegraph*.svg
+# CodeGraph local index (large, machine-local)
+.codegraph/

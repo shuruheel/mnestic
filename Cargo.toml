@@ -4,13 +4,18 @@ members = [
     "cozo-core",
     "cozorocks",
     "cozo-bin",
+    "cozo-core-examples",
+]
+# Language bindings are deferred in the mnestic fork — the fork targets a Rust
+# agentic-memory substrate (consumed by mindgraph-rs). The binding crates are
+# kept in-tree but excluded from the workspace build/maintenance for now.
+exclude = [
     "cozo-lib-c",
     "cozo-lib-java",
     "cozo-lib-wasm",
     "cozo-lib-swift",
     "cozo-lib-python",
     "cozo-lib-nodejs",
-    "cozo-core-examples",
 ]
 
 [profile.bench]
