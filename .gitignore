@@ -42,6 +42,9 @@ flamegraph*.svg
 # CodeGraph local index (large, machine-local)
 .codegraph/
 
+# Claude Code session data (machine-local)
+.claude/
+
 # Local-only working docs (not for the public repo)
 CLAUDE.md
 DEVELOPMENT.md

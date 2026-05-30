@@ -15,6 +15,33 @@ of upstream `481af05` (the last upstream commit, 2024-12-04).
 > [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
 > for what diverges from upstream.
 
+## What mnestic adds over CozoDB
+
+Highlights of **0.8.0** (full detail in
+[`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)):
+
+**Fixes**
+
+- **Equality pushdown** — `*rel[k, ..], k == <value>` now compiles to a keyed
+  `stored_prefix_join` instead of a full scan (**~28–29× faster** single-row
+  primary-key lookups, measured at 5k rows). Numeric equalities keep cross-type
+  `op_eq` semantics.
+- **Parser fix** — identifiers that start with a keyword literal
+  (`nullable_column`, `trueValue`, `falsey`) now parse correctly (upstream #281).
+- **Unreleased upstream fixes for free** — the fork point is 30 commits ahead of
+  the published 0.7.6, including the `stored_prefix_join` correctness fix.
+- `env_logger` moved to a dev-dependency for a slimmer dependency graph
+  (upstream #287).
+
+**New — hybrid retrieval for agentic memory** (Datalog-composable fixed rules)
+
+- `ReciprocalRankFusion` (alias `RRF`) — fuse vector (HNSW) + full-text (FTS) +
+  graph-traversal result lists into one ranking.
+- `MaximalMarginalRelevance` (alias `MMR`) — diversity-aware reranking that avoids
+  near-duplicate recalls.
+- `rand_ulid()` / `ulid_timestamp()` — lexicographically-sortable identifiers for
+  time-ordered scans (upstream #296).
+
 ## Importable name
 
 The published crate is `mnestic`, but the importable Rust crate name is `cozo`,
@@ -22,7 +49,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.7.6"
+mnestic = "0.8.0"
 ```
 
 ```rust
