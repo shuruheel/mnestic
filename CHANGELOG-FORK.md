@@ -3,7 +3,15 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased
+## 0.8.0 — 2026-05-30
+
+First fork release. Lineage: cozo 0.7.6 + 30 unreleased upstream commits (our fork
+point). Bumped to **0.8.0** (not 0.7.7) to mark the fork's identity as a maintained,
+agentic-memory-focused engine: it ships real planner/parser fixes *and* the first
+hybrid-retrieval primitives (RRF, MMR). All changes are pure `cozo-core` (Rust) —
+no `cozorocks` bridge changes — so the rocksdb feature still resolves to upstream
+`cozorocks 0.1.7`. 169 inherited lib tests + 68 air_routes + all fork/feature tests
+pass.
 
 ### Fork bootstrap
 - Forked from `cozodb/cozo` at `481af05`; full history preserved, upstream
