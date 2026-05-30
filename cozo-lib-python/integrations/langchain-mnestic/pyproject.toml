@@ -1,0 +1,24 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "langchain-mnestic"
+version = "0.1.0"
+description = "LangChain VectorStore for mnestic — embedded graph + vector + full-text store with one-call hybrid retrieval."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MPL-2.0" }
+authors = [{ name = "Shan Rizvi" }]
+keywords = ["langchain", "mnestic", "vectorstore", "hybrid-search", "rag", "cozodb"]
+dependencies = [
+    "mnestic>=0.8.2",
+    "langchain-core>=0.3,<2.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/shuruheel/mnestic"
+Repository = "https://github.com/shuruheel/mnestic"
+
+[tool.hatch.build.targets.wheel]
+packages = ["langchain_mnestic"]

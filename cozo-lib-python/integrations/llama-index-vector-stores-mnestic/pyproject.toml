@@ -1,0 +1,26 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "llama-index-vector-stores-mnestic"
+version = "0.1.0"
+description = "LlamaIndex vector store for mnestic — embedded graph + vector + full-text store with one-call hybrid retrieval."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MPL-2.0" }
+authors = [{ name = "Shan Rizvi" }]
+keywords = ["llamaindex", "llama-index", "mnestic", "vector-store", "hybrid-search", "rag", "cozodb"]
+dependencies = [
+    "mnestic>=0.8.2",
+    "llama-index-core>=0.12,<0.15",
+]
+
+[project.urls]
+Homepage = "https://github.com/shuruheel/mnestic"
+Repository = "https://github.com/shuruheel/mnestic"
+
+[tool.hatch.build.targets.wheel]
+# PEP 420 namespace package: no __init__.py at llama_index/ or
+# llama_index/vector_stores/; only the mnestic leaf is a regular package.
+packages = ["llama_index"]

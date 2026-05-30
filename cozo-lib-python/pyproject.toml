@@ -1,15 +1,33 @@
 [build-system]
-requires = ["maturin>=0.13,<0.14"]
+requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "cozo_embedded"
-requires-python = ">=3.7"
+name = "mnestic"
+version = "0.8.2"
+description = "Embedded graph + vector + full-text database with Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MPL-2.0" }
+authors = [{ name = "Shan Rizvi" }]
+keywords = ["database", "graph", "vector", "datalog", "embeddings", "rag", "agentic-memory", "cozodb"]
 classifiers = [
     "Topic :: Database",
+    "Topic :: Database :: Database Engines/Servers",
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: Implementation :: PyPy",
+    "License :: OSI Approved :: Mozilla Public License 2.0 (MPL 2.0)",
 ]
 
+[project.urls]
+Homepage = "https://github.com/shuruheel/mnestic"
+Repository = "https://github.com/shuruheel/mnestic"
 
+[tool.maturin]
+# The importable module is the cdylib `[lib] name` ("mnestic"). Build the sqlite +
+# in-memory engines (no rocksdb → clean cross-platform abi3 wheels). `compact`
+# pulls storage-sqlite + graph-algo (the latter brings rayon, which the engine
+# requires) + requests.
+no-default-features = true
+features = ["compact"]

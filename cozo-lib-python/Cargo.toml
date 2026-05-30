@@ -1,18 +1,18 @@
 [package]
-name = "cozo_py"
-version = "0.7.6"
+name = "mnestic-py"
+version = "0.8.2"
 edition = "2021"
-description = "Cozo database for python"
-authors = ["Ziyang Hu"]
+description = "mnestic database for Python — a maintained fork of CozoDB (embedded graph + vector + full-text store for agentic memory)"
+authors = ["Shan Rizvi (mnestic fork)", "Ziyang Hu"]
 license = "MPL-2.0"
-homepage = "https://www.cozodb.org"
-repository = "https://github.com/cozodb/cozo"
+homepage = "https://github.com/shuruheel/mnestic"
+repository = "https://github.com/shuruheel/mnestic"
 documentation = "https://docs.cozodb.org"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [lib]
-name = "cozo_embedded"
+name = "mnestic"
 crate-type = ["cdylib"]
 
 [features]
@@ -41,7 +41,7 @@ io-uring = ["cozo/io-uring"]
 
 
 [dependencies]
-cozo = { version = "0.7.6", path = "../cozo-core", default-features = false }
+cozo = { package = "mnestic", version = "0.8.2", path = "../cozo-core", default-features = false }
 pyo3 = { version = "0.21.2", features = ["extension-module", "abi3", "abi3-py37"] }
 miette = "5.10.0"
 serde_json = "1.0.116"

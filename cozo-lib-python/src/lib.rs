@@ -100,6 +100,82 @@ fn convert_params(ob: &PyDict) -> PyResult<BTreeMap<String, DataValue>> {
     Ok(ret)
 }
 
+/// Build a [`HybridSearch`] from a Python dict, applying the Rust `Default` for
+/// any omitted field (mnestic fork). Mirrors the field names of the Rust struct.
+fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
+    let mut q = HybridSearch::default();
+    if let Some(v) = d.get_item("relation")? {
+        q.relation = v.extract()?;
+    }
+    if let Some(v) = d.get_item("id_col")? {
+        q.id_col = v.extract()?;
+    }
+    if let Some(v) = d.get_item("vector_index")? {
+        q.vector_index = v.extract()?;
+    }
+    if let Some(v) = d.get_item("query_vector")? {
+        q.query_vector = v.extract()?;
+    }
+    if let Some(v) = d.get_item("vector_f64")? {
+        q.vector_f64 = v.extract()?;
+    }
+    if let Some(v) = d.get_item("vector_k")? {
+        q.vector_k = v.extract()?;
+    }
+    if let Some(v) = d.get_item("ef")? {
+        q.ef = v.extract()?;
+    }
+    if let Some(v) = d.get_item("fts_index")? {
+        q.fts_index = v.extract()?;
+    }
+    if let Some(v) = d.get_item("query_text")? {
+        q.query_text = v.extract()?;
+    }
+    if let Some(v) = d.get_item("fts_k")? {
+        q.fts_k = v.extract()?;
+    }
+    if let Some(v) = d.get_item("rrf_k")? {
+        q.rrf_k = v.extract()?;
+    }
+    if let Some(v) = d.get_item("limit")? {
+        q.limit = v.extract()?;
+    }
+    if let Some(v) = d.get_item("extra_lists")? {
+        let items = v.downcast::<PyList>()?;
+        let mut lists = Vec::with_capacity(items.len());
+        for it in items {
+            let ld = it.downcast::<PyDict>()?;
+            let label = ld
+                .get_item("label")?
+                .ok_or_else(|| PyException::new_err("extra_lists entry needs 'label'"))?
+                .extract()?;
+            let rule_body = ld
+                .get_item("rule_body")?
+                .ok_or_else(|| PyException::new_err("extra_lists entry needs 'rule_body'"))?
+                .extract()?;
+            lists.push(HybridList { label, rule_body });
+        }
+        q.extra_lists = lists;
+    }
+    if let Some(v) = d.get_item("mmr")? {
+        if !v.is_none() {
+            let md = v.downcast::<PyDict>()?;
+            let mut m = MmrParams::default();
+            if let Some(x) = md.get_item("lambda")? {
+                m.lambda = x.extract()?;
+            }
+            if let Some(x) = md.get_item("k")? {
+                m.k = x.extract()?;
+            }
+            if let Some(x) = md.get_item("embedding_col")? {
+                m.embedding_col = x.extract()?;
+            }
+            q.mmr = Some(m);
+        }
+    }
+    Ok(q)
+}
+
 fn options_to_py(opts: BTreeMap<String, DataValue>, py: Python<'_>) -> PyResult<PyObject> {
     let ret = PyDict::new(py);
 
@@ -242,6 +318,29 @@ impl CozoDbPy {
                 Ok(rows) => Ok(named_rows_to_py(rows, py)),
                 Err(err) => {
                     let reports = format_error_as_json(err, Some(query)).to_string();
+                    let json_mod = py.import("json")?;
+                    let loads_fn = json_mod.getattr("loads")?;
+                    let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+                    let msg = loads_fn.call1(args)?;
+                    Err(PyException::new_err(PyObject::from(msg)))
+                }
+            }
+        } else {
+            Err(PyException::new_err(DB_CLOSED_MSG))
+        }
+    }
+    /// One-call hybrid retrieval (mnestic fork): HNSW + FTS (+ optional extra
+    /// ranked lists) fused with RRF and optionally diversified with MMR. Takes a
+    /// dict mirroring the Rust `HybridSearch` fields; returns the same shape as
+    /// `run_script` (`{rows, headers, next}`) with headers `["id","score"]`
+    /// (or `["id","rank"]` when MMR is set).
+    pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
+        if let Some(db) = &self.db {
+            let q = py_to_hybrid_search(query)?;
+            match py.allow_threads(|| db.hybrid_search(&q)) {
+                Ok(rows) => Ok(named_rows_to_py(rows, py)),
+                Err(err) => {
+                    let reports = format_error_as_json(err, None).to_string();
                     let json_mod = py.import("json")?;
                     let loads_fn = json_mod.getattr("loads")?;
                     let args = PyTuple::new(py, [PyString::new(py, &reports)]);
@@ -456,7 +555,7 @@ fn variables(py: Python<'_>, query: &str, params: &PyDict) -> PyResult<BTreeSet<
 }
 
 #[pymodule]
-fn cozo_embedded(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+fn mnestic(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<CozoDbPy>()?;
     m.add_class::<CozoDbMulTx>()?;
     m.add_function(wrap_pyfunction!(eval_expressions, m)?)?;

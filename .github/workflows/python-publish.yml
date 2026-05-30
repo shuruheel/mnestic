@@ -1,0 +1,133 @@
+# Build + publish the Python packages to PyPI:
+#   - mnestic                              (pyo3 binding, cross-platform abi3 wheels)
+#   - langchain-mnestic                    (pure Python)
+#   - llama-index-vector-stores-mnestic    (pure Python)
+#
+# Publishing uses PyPI **trusted publishing** (OIDC) — no API tokens. Each of the
+# three PyPI projects must have a trusted publisher configured pointing at this
+# repo, workflow file `python-publish.yml`, environment `pypi`.
+#
+# Triggered by `py-v*` tags (and manually). Build-only on workflow_dispatch unless
+# `publish=true` is passed.
+
+name: python-publish
+
+on:
+  push:
+    tags: ["py-v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to PyPI (else build artifacts only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # --- mnestic binding: cross-platform abi3 wheels via maturin ---
+  build-mnestic:
+    name: build mnestic (${{ matrix.platform.target }} / ${{ matrix.platform.os }})
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2014" }
+          - { os: ubuntu-latest,  target: aarch64, manylinux: "2014" }
+          - { os: macos-13,       target: x86_64 }
+          - { os: macos-14,       target: aarch64 }
+          - { os: windows-latest, target: x64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: cozo-lib-python
+          target: ${{ matrix.platform.target }}
+          manylinux: ${{ matrix.platform.manylinux }}
+          # pyproject [tool.maturin] already pins no-default-features + features=compact.
+          args: --release --out dist --compatibility pypi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mnestic-wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
+          path: cozo-lib-python/dist
+
+  build-mnestic-sdist:
+    name: build mnestic sdist
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: PyO3/maturin-action@v1
+        with:
+          working-directory: cozo-lib-python
+          command: sdist
+          args: --out dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mnestic-sdist
+          path: cozo-lib-python/dist
+
+  # --- pure-Python adapter packages ---
+  build-adapters:
+    name: build ${{ matrix.pkg }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        pkg: [langchain-mnestic, llama-index-vector-stores-mnestic]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11" }
+      - run: pipx run build --outdir dist
+        working-directory: cozo-lib-python/integrations/${{ matrix.pkg }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.pkg }}
+          path: cozo-lib-python/integrations/${{ matrix.pkg }}/dist
+
+  # --- publish (OIDC trusted publishing); one job per PyPI project ---
+  publish-mnestic:
+    needs: [build-mnestic, build-mnestic-sdist]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "mnestic-*"
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-langchain-mnestic:
+    needs: [build-adapters]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist-langchain-mnestic, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+
+  publish-llama-index-vector-stores-mnestic:
+    needs: [build-adapters]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist-llama-index-vector-stores-mnestic, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
