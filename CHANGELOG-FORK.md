@@ -33,6 +33,23 @@ adopting mnestic already gives MindGraph bug #3's fix (and the other unreleased
 fixes) for free.
 
 ### Shipped in the fork
+
+#### Phase 1 — agentic-memory features
+- **`ReciprocalRankFusion` fixed rule (hybrid retrieval, Bet 1)** —
+  `cozo-core/src/fixed_rule/utilities/rrf.rs`, aliased `RRF`. Fuses several ranked
+  result lists (vector/HNSW + full-text/FTS + graph traversal) into one ranking
+  via `Σ_lists 1/(k + rank_in_list)`. Input is a single relation
+  `[list_id, item, score]`; rows are grouped by `list_id`, ranked within each list
+  by `score` (`descending` option, default true), and the reciprocal-rank
+  contributions are summed per item. Options: `k` (default 60), `descending`.
+  Output `[item, fused_score]`, composable in further Datalog. Not feature-gated.
+  Rationale: Datalog can already *sum* reciprocal contributions but cannot assign
+  a *rank position within a group* — that intra-list ranking is the missing
+  primitive. Tests: `cozo-core/tests/rrf.rs` (fusion math, `k` smoothing,
+  ascending direction, alias, default-k). Next on Bet 1: MMR (diversity rerank)
+  and an end-to-end HNSW+FTS+RRF example.
+
+#### Phase 0 — fixes
 - **#1 equality-pushdown for stored relations** (`query/reorder.rs`). Equality
   post-filters on a stored relation — `*rel[k, ..], k == <ground>` and
   `*rel{k, ..}, k == <ground>` — now compile to a keyed `stored_prefix_join`,

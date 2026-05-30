@@ -820,6 +820,14 @@ lazy_static! {
                 Arc::<Box<dyn FixedRule>>::new(Box::new(ReorderSort)),
             ),
             (
+                "ReciprocalRankFusion".to_string(),
+                Arc::<Box<dyn FixedRule>>::new(Box::new(ReciprocalRankFusion)),
+            ),
+            (
+                "RRF".to_string(),
+                Arc::<Box<dyn FixedRule>>::new(Box::new(ReciprocalRankFusion)),
+            ),
+            (
                 "JsonReader".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(JsonReader)),
             ),
