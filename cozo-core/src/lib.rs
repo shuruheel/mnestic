@@ -55,6 +55,7 @@ pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, Valid
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 pub use runtime::db::Db;
 pub use runtime::db::NamedRows;
+pub use runtime::hybrid::{build_hybrid_query, HybridList, HybridSearch, MmrParams};
 pub use runtime::relation::decode_tuple_from_kv;
 pub use runtime::temp_store::RegularTempStore;
 pub use storage::mem::{new_cozo_mem, MemStorage};
@@ -216,6 +217,19 @@ impl DbInstance {
     /// `run_script` with mutable script and no parameters
     pub fn run_default(&self, payload: &str) -> Result<NamedRows> {
         self.run_script(payload, BTreeMap::new(), ScriptMutability::Mutable)
+    }
+    /// One-call hybrid retrieval (mnestic fork addition): runs an HNSW + FTS
+    /// (+ optional traversal) recall, fuses with Reciprocal Rank Fusion, and
+    /// optionally diversifies with Maximal Marginal Relevance. Read-only. See
+    /// [`HybridSearch`].
+    pub fn hybrid_search(&self, q: &HybridSearch) -> Result<NamedRows> {
+        let (script, params) = build_hybrid_query(q)?;
+        self.run_script(&script, params, ScriptMutability::Immutable)
+    }
+    /// Build the CozoScript that [`DbInstance::hybrid_search`] would run, without
+    /// executing it — for inspection or hand-tuning. See [`HybridSearch`].
+    pub fn hybrid_search_script(&self, q: &HybridSearch) -> Result<String> {
+        Ok(build_hybrid_query(q)?.0)
     }
     /// Run a parsed (AST) program. If you have a string script, use `run_script` or `run_default`.
     pub fn run_script_ast(

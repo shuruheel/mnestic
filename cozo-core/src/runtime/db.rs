@@ -418,6 +418,24 @@ impl<'s, S: Storage<'s>> Db<S> {
         )
     }
 
+    /// One-call hybrid retrieval (mnestic fork addition): HNSW + FTS (+ optional
+    /// traversal) recall fused with Reciprocal Rank Fusion, optionally
+    /// diversified with Maximal Marginal Relevance. Read-only. See
+    /// [`crate::HybridSearch`].
+    pub fn hybrid_search(&'s self, q: &crate::runtime::hybrid::HybridSearch) -> Result<NamedRows> {
+        let (script, params) = crate::runtime::hybrid::build_hybrid_query(q)?;
+        self.run_script(&script, params, ScriptMutability::Immutable)
+    }
+
+    /// Build the CozoScript that [`Db::hybrid_search`] would run, without
+    /// executing it. See [`crate::HybridSearch`].
+    pub fn hybrid_search_script(
+        &'s self,
+        q: &crate::runtime::hybrid::HybridSearch,
+    ) -> Result<String> {
+        Ok(crate::runtime::hybrid::build_hybrid_query(q)?.0)
+    }
+
     /// Run the CozoScript passed in. The `params` argument is a map of parameters.
     pub fn run_script_read_only(
         &'s self,
