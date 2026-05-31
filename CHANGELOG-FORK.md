@@ -3,6 +3,54 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased — native 3-way fused recall (DEVELOPMENT.md Bet 1a)
+
+Extends the one-call `hybrid_search` so a **graph-proximity signal is fused
+in-engine** alongside the vector (HNSW) and keyword (FTS) legs — the capability
+no other embedded engine in the hybrid-recall bench offers (graphless engines
+crater at ~0.51 recall vs 0.75+ for graph-capable ones), and which previously
+required a *second* `run_script` the caller had to RRF by hand (~8× slower:
+325 ms vs 41 ms p50, because each script re-parses and opens its own
+transaction). All 169 inherited lib tests + feature suites pass;
+`cargo clippy -p mnestic -- -D warnings` is clean.
+
+### New — typed `GraphLeg` on `HybridSearch`
+- `HybridSearch::graph_legs: Vec<GraphLeg>` (new `GraphLeg` type, re-exported from
+  the crate root). Each leg expands from a set of `seeds` over a stored edge
+  relation up to `max_hops`, scores every reached node by its **minimum hop
+  distance** (closer ⇒ higher rank), and contributes that ranked list to the
+  *same* Reciprocal Rank Fusion as the vector/keyword legs — one call, one
+  transaction, no hand-written recursion.
+- Why a new type rather than the existing `extra_lists`: an `extra_lists` entry is
+  a *single* spliced rule body, which cannot express the recursive shortest-path
+  rule that bounded-hop proximity needs. `GraphLeg` generates that rule — a seed
+  relation, a hop-1 base rule, and a `min(dist)` recursive rule gated at
+  `max_hops` — for you. Supports `undirected` traversal (also follows edges in
+  reverse) and multiple seeds (unioned).
+- **Injection-safe.** Seed values are passed as query **params** (`$hg{i}_seed{j}`),
+  never string-interpolated; the label, edge relation, and column names are
+  validated as bare identifiers, and empty seeds / `max_hops == 0` are rejected.
+  The generated script remains inspectable via `hybrid_search_script`.
+- `runtime/hybrid.rs`; guarded by `tests/hybrid_graph_leg.rs` (recall a neighbour
+  the fixed legs miss, closer-outranks-farther via `min(dist)`, hop bound,
+  undirected reverse edges, multi-seed union, script-is-recursive-and-parametrised,
+  input validation). Backward compatible: an empty `graph_legs` generates the exact
+  prior script.
+
+### Added — read-path latency baseline (groundwork for Item 9)
+- `benches/read_path.rs` (criterion) times `parse_only` (parse + compile-to-AST)
+  vs `full_run` (end-to-end `run_script`) for a point read and a multi-rule
+  retrieval query on SQLite, to size the parse/compile fraction a compiled-plan
+  cache could eliminate before any cache is built (the fork's baseline-first
+  rule). **Finding:** parse/compile is a roughly *fixed* ~20–85 µs cost — ≈39% of
+  a 55.7 µs point read but only ≈1.1% of a 7.68 ms multi-rule retrieval query — so
+  a plan cache helps cheap point reads but is noise for the retrieval workload,
+  where execution (and, on RocksDB, the pessimistic txn) dominates. That makes
+  **Bet 1a (one fused call instead of three `run_script`s) the read-path latency
+  fix that matters**, not the plan cache. See the "Item 9" note in `DEVELOPMENT.md`
+  for the two structural blockers a real cache must also clear (parse-time param
+  inlining; no reusable-plan execute entry point).
+
 ## 0.8.2 — 2026-05-30
 
 Third fork release. Makes HNSW index builds **non-blocking for readers**: an

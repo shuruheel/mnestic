@@ -161,3 +161,7 @@ criterion = { version = "0.5", features = ["html_reports"] }
 [[bench]]
 name = "point_lookup"
 harness = false
+
+[[bench]]
+name = "read_path"
+harness = false
