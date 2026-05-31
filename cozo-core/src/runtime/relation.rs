@@ -992,6 +992,12 @@ impl<'a> SessionTx<'a> {
             )?;
         }
 
+        // Publish the authoritative corpus doc-stats counter for this freshly
+        // built index (mnestic fork, Bet 1b) so `avgdl` is an O(1) read rather
+        // than a per-query scan. Overwrites any incremental value accumulated by
+        // the del/put loop above.
+        self.rebuild_fts_doc_stats(&idx_handle)?;
+
         rel_handle
             .fts_indices
             .insert(manifest.index_name.clone(), (idx_handle, manifest));

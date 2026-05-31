@@ -77,12 +77,66 @@ impl Default for MmrParams {
 ///
 /// The body is your own Datalog and is spliced verbatim — it is *not* sanitized.
 /// Only `label` is validated (it becomes a fusion list tag).
+///
+/// For the common case of *bounded-hop graph proximity from a seed set*, prefer
+/// the typed [`GraphLeg`] (`HybridSearch::graph_legs`): a single inline body
+/// cannot express the recursive shortest-path rule that proximity needs, and
+/// [`GraphLeg`] generates it for you (with min-distance semantics, a hop bound,
+/// and params for the seeds) so it folds into the *same* fused call.
 #[derive(Clone, Debug)]
 pub struct HybridList {
     /// Fusion list tag (validated identifier).
     pub label: String,
     /// Rule body binding `id` and `score`.
     pub rule_body: String,
+}
+
+/// A typed **k-hop graph-proximity** leg folded into the fusion (the mnestic
+/// fork's native 3-way fused recall — DEVELOPMENT.md Bet 1a).
+///
+/// Unlike [`HybridList`], whose body is a single spliced rule, this generates a
+/// **recursive bounded shortest-path rule** over a stored edge relation: it
+/// expands from `seeds` up to `max_hops` hops, scores each reached node by its
+/// *minimum* hop distance (closer = higher rank), and contributes that ranked
+/// list to the Reciprocal Rank Fusion alongside the vector and keyword legs —
+/// all in the one optimized call (no second `run_script`, no hand-written
+/// recursion). The reached node id binds to the fused output id, so seeds and
+/// item ids must live in the same id space as the base relation's key.
+///
+/// The seed values are passed as query **params** (never string-interpolated);
+/// every identifier (`label`, relation, columns) is validated.
+#[derive(Clone, Debug)]
+pub struct GraphLeg {
+    /// Fusion list tag (validated identifier). Default `"graph"`.
+    pub label: String,
+    /// The stored edge relation to traverse, e.g. `"edges"`.
+    pub edge_relation: String,
+    /// Edge column holding the source node id. Default `"from"`.
+    pub from_col: String,
+    /// Edge column holding the destination node id. Default `"to"`.
+    pub to_col: String,
+    /// Seed node ids to expand from (the query anchors). The seeds themselves
+    /// are *not* scored — proximity starts at hop 1.
+    pub seeds: Vec<DataValue>,
+    /// Maximum number of hops to expand (`k`). Must be `>= 1`.
+    pub max_hops: usize,
+    /// Treat edges as undirected — also traverse `to_col -> from_col`. Default
+    /// `false` (follow edges in their stored direction only).
+    pub undirected: bool,
+}
+
+impl Default for GraphLeg {
+    fn default() -> Self {
+        GraphLeg {
+            label: "graph".into(),
+            edge_relation: String::new(),
+            from_col: "from".into(),
+            to_col: "to".into(),
+            seeds: Vec::new(),
+            max_hops: 2,
+            undirected: false,
+        }
+    }
 }
 
 /// Parameters for a one-call hybrid retrieval. See the module docs.
@@ -113,6 +167,9 @@ pub struct HybridSearch {
     pub fts_k: usize,
     /// Extra ranked lists folded into the fusion (e.g. graph traversal).
     pub extra_lists: Vec<HybridList>,
+    /// Typed k-hop graph-proximity legs folded into the fusion (native 3-way
+    /// fused recall). See [`GraphLeg`].
+    pub graph_legs: Vec<GraphLeg>,
     /// RRF `k` constant (rank-bias damping). Default `60.0`.
     pub rrf_k: f64,
     /// Optional MMR diversity rerank. `None` returns the fused ranking directly.
@@ -135,6 +192,7 @@ impl Default for HybridSearch {
             query_text: String::new(),
             fts_k: 10,
             extra_lists: Vec::new(),
+            graph_legs: Vec::new(),
             rrf_k: 60.0,
             mmr: None,
             limit: 10,
@@ -186,6 +244,14 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
     for l in &q.extra_lists {
         validate_ident(&l.label, "extra_lists.label")?;
     }
+    for g in &q.graph_legs {
+        validate_ident(&g.label, "graph_legs.label")?;
+        validate_ident(&g.edge_relation, "graph_legs.edge_relation")?;
+        validate_ident(&g.from_col, "graph_legs.from_col")?;
+        validate_ident(&g.to_col, "graph_legs.to_col")?;
+        ensure!(g.max_hops >= 1, "hybrid_search: graph_legs.max_hops must be >= 1");
+        ensure!(!g.seeds.is_empty(), "hybrid_search: graph_legs.seeds is empty");
+    }
     if let Some(m) = &q.mmr {
         validate_ident(&m.embedding_col, "mmr.embedding_col")?;
         ensure!(m.lambda.is_finite(), "hybrid_search: mmr.lambda must be finite");
@@ -218,6 +284,59 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         fk = q.fts_k,
     )
     .unwrap();
+
+    // Typed graph-proximity legs (Bet 1a). For each leg we emit a recursive
+    // bounded shortest-path rule: a seed relation (seeds as params, unioned),
+    // a base rule (hop 1) and a recursive rule (hop n+1, gated at `max_hops`)
+    // that uses `min(dist)` so a node reached by several paths scores by its
+    // *shortest* distance. Internal rule/var names are prefixed `hg{i}_` to
+    // avoid colliding with the fixed legs or a user's `extra_lists` bodies.
+    let mut params = BTreeMap::new();
+    params.insert(
+        "qv".to_string(),
+        DataValue::List(q.query_vector.iter().map(|f| DataValue::from(*f as f64)).collect()),
+    );
+    params.insert("qt".to_string(), DataValue::from(q.query_text.as_str()));
+    for (i, g) in q.graph_legs.iter().enumerate() {
+        let er = &g.edge_relation;
+        let fc = &g.from_col;
+        let tc = &g.to_col;
+        // Seed relation: one union rule per seed, value carried as a param.
+        for (j, seed) in g.seeds.iter().enumerate() {
+            let pname = format!("hg{i}_seed{j}");
+            writeln!(s, "hg{i}_seed[__s] := __s = ${pname}").unwrap();
+            params.insert(pname, seed.clone());
+        }
+        // Hop 1: direct neighbours of the seeds.
+        writeln!(
+            s,
+            "hg{i}_reach[__to, min(__d)] := hg{i}_seed[__s], *{er}{{ {fc}: __s, {tc}: __to }}, __d = 1.0"
+        )
+        .unwrap();
+        if g.undirected {
+            writeln!(
+                s,
+                "hg{i}_reach[__to, min(__d)] := hg{i}_seed[__s], *{er}{{ {fc}: __to, {tc}: __s }}, __d = 1.0"
+            )
+            .unwrap();
+        }
+        // Hop n+1: expand only from nodes whose shortest distance is below the
+        // hop bound, so the recursion is capped at `max_hops`.
+        let bound = fmt_f64(g.max_hops as f64);
+        writeln!(
+            s,
+            "hg{i}_reach[__to, min(__d)] := hg{i}_reach[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __mid, {tc}: __to }}, __d = __pd + 1.0"
+        )
+        .unwrap();
+        if g.undirected {
+            writeln!(
+                s,
+                "hg{i}_reach[__to, min(__d)] := hg{i}_reach[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __to, {tc}: __mid }}, __d = __pd + 1.0"
+            )
+            .unwrap();
+        }
+    }
+
     // Union all legs into one [list_id, item, score] relation.
     writeln!(s, "combined[__lid, id, score] := sem[id, score], __lid = 'semantic'").unwrap();
     writeln!(s, "combined[__lid, id, score] := txt[id, score], __lid = 'text'").unwrap();
@@ -227,6 +346,16 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
             "combined[__lid, id, score] := {body}, __lid = '{label}'",
             body = l.rule_body,
             label = l.label,
+        )
+        .unwrap();
+    }
+    for (i, g) in q.graph_legs.iter().enumerate() {
+        // Closer (smaller distance) ⇒ higher score, matching the other legs'
+        // higher-is-better orientation; RRF only uses the within-list rank.
+        writeln!(
+            s,
+            "combined[__lid, id, score] := hg{i}_reach[id, __gd], score = -__gd, __lid = '{label}'",
+            label = g.label,
         )
         .unwrap();
     }
@@ -264,13 +393,6 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
             writeln!(s, ":order rank").unwrap();
         }
     }
-
-    let mut params = BTreeMap::new();
-    params.insert(
-        "qv".to_string(),
-        DataValue::List(q.query_vector.iter().map(|f| DataValue::from(*f as f64)).collect()),
-    );
-    params.insert("qt".to_string(), DataValue::from(q.query_text.as_str()));
 
     Ok((s, params))
 }

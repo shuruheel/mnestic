@@ -6,10 +6,12 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use miette::{bail, Result};
+use smartstring::{LazyCompact, SmartString};
 use crate::data::program::ReturnMutation;
 
 use crate::data::tuple::TupleT;
@@ -27,6 +29,9 @@ pub struct SessionTx<'a> {
     pub(crate) relation_store_id: Arc<AtomicU64>,
     pub(crate) temp_store_id: AtomicU32,
     pub(crate) tokenizers: Arc<TokenizerCache>,
+    /// Cross-query cache of FTS corpus stats for legacy indexes (mnestic fork);
+    /// see `Db::fts_doc_stats_cache`. Shared `Arc` cloned per transaction.
+    pub(crate) fts_doc_stats_cache: Arc<Mutex<BTreeMap<SmartString<LazyCompact>, (u64, u64)>>>,
 }
 
 pub const CURRENT_STORAGE_VERSION: [u8; 1] = [0x00];

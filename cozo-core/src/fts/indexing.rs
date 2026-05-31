@@ -44,6 +44,35 @@ impl FtsCache {
             Entry::Occupied(o) => *o.get(),
         })
     }
+    /// Average document length (in tokens) over the indexed corpus — the BM25
+    /// length-normalization denominator (mnestic fork, DEVELOPMENT.md Bet 1b).
+    ///
+    /// **O(1)** when the index carries the durable doc-stats counter (every index
+    /// built or written under this code): a single keyed `get`. For a *legacy*
+    /// index that predates the counter and has not been written since (its corpus
+    /// is therefore immutable), it falls back to one deduplicated full scan,
+    /// cached on the `Db` so it is paid once per process rather than per query.
+    fn get_avgdl_for_index(&mut self, idx: &RelationHandle, tx: &SessionTx<'_>) -> Result<f64> {
+        let avgdl = |total: u64, n: u64| if n > 0 { total as f64 / n as f64 } else { 0.0 };
+        if let Some((total, n)) = tx.read_fts_doc_stats(idx)? {
+            return Ok(avgdl(total, n));
+        }
+        if let Some((total, n)) = tx
+            .fts_doc_stats_cache
+            .lock()
+            .unwrap()
+            .get(&idx.name)
+            .copied()
+        {
+            return Ok(avgdl(total, n));
+        }
+        let (total, n) = tx.scan_fts_doc_stats(idx)?;
+        tx.fts_doc_stats_cache
+            .lock()
+            .unwrap()
+            .insert(idx.name.clone(), (total, n));
+        Ok(avgdl(total, n))
+    }
 }
 
 struct PositionInfo {
@@ -55,10 +84,88 @@ struct PositionInfo {
 struct LiteralStats {
     key: Tuple,
     position_info: Vec<PositionInfo>,
-    // doc_len: u32,
+    /// Total token count of the document this posting belongs to (stored per posting
+    /// at index time as `vals[3]`); used for BM25 length normalization.
+    doc_len: u32,
 }
 
 impl<'a> SessionTx<'a> {
+    /// Reserved key under which an FTS index stores its durable corpus doc-stats
+    /// counter `[total_tokens, n_docs]` (mnestic fork, Bet 1b). `DataValue::Bot`
+    /// is the top key sentinel, so this sits *above* every `[term, …doc_key]`
+    /// posting — it is never returned by a term range scan nor by the full-index
+    /// doc scan (whose exclusive upper bound is exactly this key).
+    fn fts_stats_key(idx: &RelationHandle) -> Vec<u8> {
+        idx.encode_partial_key_for_store(&[DataValue::Bot])
+    }
+
+    /// Read the durable doc-stats counter, or `None` if the index predates it
+    /// (legacy / not yet migrated).
+    pub(crate) fn read_fts_doc_stats(&self, idx: &RelationHandle) -> Result<Option<(u64, u64)>> {
+        let key = Self::fts_stats_key(idx);
+        match self.store_tx.get(&key, false)? {
+            None => Ok(None),
+            Some(v) => {
+                let vals: Vec<DataValue> = rmp_serde::from_slice(&v[ENCODED_KEY_MIN_LEN..])
+                    .map_err(|e| miette!("corrupt FTS doc-stats counter: {e}"))?;
+                let total = vals.first().and_then(|d| d.get_int()).unwrap_or(0).max(0) as u64;
+                let n = vals.get(1).and_then(|d| d.get_int()).unwrap_or(0).max(0) as u64;
+                Ok(Some((total, n)))
+            }
+        }
+    }
+
+    pub(crate) fn write_fts_doc_stats(
+        &mut self,
+        idx: &RelationHandle,
+        total: u64,
+        n: u64,
+    ) -> Result<()> {
+        let key = Self::fts_stats_key(idx);
+        let val = vec![DataValue::from(total as i64), DataValue::from(n as i64)];
+        let val_bytes = idx.encode_val_only_for_store(&val, Default::default())?;
+        self.store_tx.put(&key, &val_bytes)
+    }
+
+    /// Deduplicated full scan of the FTS index → `(total_tokens, n_docs)` over
+    /// the documents that have at least one posting. Each document's length is
+    /// stored redundantly on every posting (`vals[3]`), so we count each document
+    /// key once. This is the legacy/seed path; the steady state reads the counter.
+    pub(crate) fn scan_fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        let start = idx.encode_partial_key_for_store(&[]);
+        let end = idx.encode_partial_key_for_store(&[DataValue::Bot]);
+        let mut seen: FxHashSet<Tuple> = FxHashSet::default();
+        let mut total: u64 = 0;
+        for item in self.store_tx.range_scan(&start, &end) {
+            let (kvec, vvec) = item?;
+            let key_tuple = decode_tuple_from_key(&kvec, idx.metadata.keys.len());
+            if seen.insert(key_tuple[1..].to_vec()) {
+                let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..])
+                    .map_err(|e| miette!("corrupt FTS posting value: {e}"))?;
+                total += vals[3].get_int().unwrap_or(0).max(0) as u64;
+            }
+        }
+        Ok((total, seen.len() as u64))
+    }
+
+    /// Read the counter, seeding it from a one-time scan if absent — so a legacy
+    /// index migrates itself to O(1) on its first write.
+    fn ensure_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        if let Some(s) = self.read_fts_doc_stats(idx)? {
+            return Ok(s);
+        }
+        let (total, n) = self.scan_fts_doc_stats(idx)?;
+        self.write_fts_doc_stats(idx, total, n)?;
+        Ok((total, n))
+    }
+
+    /// Recompute and overwrite the durable counter from a full scan. Called at the
+    /// end of an index (re)build to publish the authoritative corpus stats.
+    pub(crate) fn rebuild_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<()> {
+        let (total, n) = self.scan_fts_doc_stats(idx)?;
+        self.write_fts_doc_stats(idx, total, n)
+    }
+
     fn fts_search_literal(
         &self,
         literal: &FtsLiteral,
@@ -88,7 +195,7 @@ impl<'a> SessionTx<'a> {
             let froms = vals[0].get_slice().unwrap();
             let tos = vals[1].get_slice().unwrap();
             let positions = vals[2].get_slice().unwrap();
-            // let total_length = vals[3].get_int().unwrap();
+            let total_length = vals[3].get_int().unwrap();
             let position_info = froms
                 .iter()
                 .zip(tos.iter())
@@ -102,7 +209,7 @@ impl<'a> SessionTx<'a> {
             results.push(LiteralStats {
                 key: key_tuple[1..].to_vec(),
                 position_info,
-                // doc_len: total_length as u32,
+                doc_len: total_length as u32,
             });
         }
         Ok(results)
@@ -112,6 +219,7 @@ impl<'a> SessionTx<'a> {
         ast: &FtsExpr,
         config: &FtsSearch,
         n: usize,
+        avgdl: f64,
     ) -> Result<FxHashMap<Tuple, f64>> {
         Ok(match ast {
             FtsExpr::Literal(l) => {
@@ -123,6 +231,8 @@ impl<'a> SessionTx<'a> {
                         el.position_info.len(),
                         found_docs_len,
                         n,
+                        el.doc_len,
+                        avgdl,
                         l.booster.0,
                         config,
                     );
@@ -136,9 +246,10 @@ impl<'a> SessionTx<'a> {
                     l_iter.next().unwrap(),
                     config,
                     n,
+                    avgdl,
                 )?;
                 for nxt in l_iter {
-                    let nxt_res = self.fts_search_impl(nxt, config, n)?;
+                    let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     res = res
                         .into_iter()
                         .filter_map(|(k, v)| nxt_res.get(&k).map(|nxt_v| (k, v + nxt_v)))
@@ -147,12 +258,15 @@ impl<'a> SessionTx<'a> {
                 res
             }
             FtsExpr::Or(ls) => {
+                // BM25 sums each query term's contribution (a doc matching more terms
+                // ranks higher); tf/tf_idf keep upstream's max-combine for compatibility.
+                let sum_terms = config.score_kind == FtsScoreKind::Bm25;
                 let mut res: FxHashMap<Tuple, f64> = FxHashMap::default();
                 for nxt in ls {
-                    let nxt_res = self.fts_search_impl(nxt, config, n)?;
+                    let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     for (k, v) in nxt_res {
                         if let Some(old_v) = res.get_mut(&k) {
-                            *old_v = (*old_v).max(v);
+                            *old_v = if sum_terms { *old_v + v } else { (*old_v).max(v) };
                         } else {
                             res.insert(k, v);
                         }
@@ -163,7 +277,11 @@ impl<'a> SessionTx<'a> {
             FtsExpr::Near(FtsNear { literals, distance }) => {
                 let mut l_it = literals.iter();
                 let mut coll: FxHashMap<_, _> = FxHashMap::default();
+                // The document length is identical across a doc's postings, so capture
+                // it from the first literal's scan for BM25 length normalization.
+                let mut doc_lens: FxHashMap<Tuple, u32> = FxHashMap::default();
                 for first_el in self.fts_search_literal(l_it.next().unwrap(), &config.idx_handle)? {
+                    doc_lens.insert(first_el.key.clone(), first_el.doc_len);
                     coll.insert(
                         first_el.key,
                         first_el
@@ -209,17 +327,24 @@ impl<'a> SessionTx<'a> {
                 let coll_len = coll.len();
                 coll.into_iter()
                     .map(|(k, cands)| {
-                        (
-                            k,
-                            Self::fts_compute_score(cands.len(), coll_len, n, booster, config),
-                        )
+                        let doc_len = doc_lens.get(&k).copied().unwrap_or(0);
+                        let score = Self::fts_compute_score(
+                            cands.len(),
+                            coll_len,
+                            n,
+                            doc_len,
+                            avgdl,
+                            booster,
+                            config,
+                        );
+                        (k, score)
                     })
                     .collect()
             }
             FtsExpr::Not(fst, snd) => {
-                let mut res = self.fts_search_impl(fst, config, n)?;
+                let mut res = self.fts_search_impl(fst, config, n, avgdl)?;
                 for el in self
-                    .fts_search_impl(snd, config, n)?
+                    .fts_search_impl(snd, config, n, avgdl)?
                     .keys()
                 {
                     res.remove(el);
@@ -232,6 +357,8 @@ impl<'a> SessionTx<'a> {
         tf: usize,
         n_found_docs: usize,
         n_total: usize,
+        doc_len: u32,
+        avgdl: f64,
         booster: f64,
         config: &FtsSearch,
     ) -> f64 {
@@ -242,6 +369,20 @@ impl<'a> SessionTx<'a> {
                 let n_found_docs = n_found_docs as f64;
                 let idf = (1.0 + (n_total as f64 - n_found_docs + 0.5) / (n_found_docs + 0.5)).ln();
                 tf * idf * booster
+            }
+            FtsScoreKind::Bm25 => {
+                // Okapi BM25: idf · tf·(k1+1) / (tf + k1·(1 − b + b·|D|/avgdl)) · booster
+                let df = n_found_docs as f64;
+                let idf = (1.0 + (n_total as f64 - df + 0.5) / (df + 0.5)).ln();
+                let avgdl = if avgdl > 0.0 { avgdl } else { 1.0 };
+                let norm = 1.0 - config.b + config.b * (doc_len as f64) / avgdl;
+                let denom = tf + config.k1 * norm;
+                let saturated = if denom > 0.0 {
+                    tf * (config.k1 + 1.0) / denom
+                } else {
+                    0.0
+                };
+                idf * saturated * booster
             }
         }
     }
@@ -258,13 +399,19 @@ impl<'a> SessionTx<'a> {
         if ast.is_empty() {
             return Ok(vec![]);
         }
-        let n = if config.score_kind == FtsScoreKind::TfIdf {
-            cache.get_n_for_relation(&config.base_handle, self)?
+        let n = match config.score_kind {
+            FtsScoreKind::TfIdf | FtsScoreKind::Bm25 => {
+                cache.get_n_for_relation(&config.base_handle, self)?
+            }
+            FtsScoreKind::Tf => 0,
+        };
+        let avgdl = if config.score_kind == FtsScoreKind::Bm25 {
+            cache.get_avgdl_for_index(&config.idx_handle, self)?
         } else {
-            0
+            0.0
         };
         let mut result: Vec<_> = self
-            .fts_search_impl(&ast, config, n)?
+            .fts_search_impl(&ast, config, n, avgdl)?
             .into_iter()
             .collect();
         result.sort_by_key(|(_, score)| Reverse(OrderedFloat(*score)));
@@ -333,6 +480,18 @@ impl<'a> SessionTx<'a> {
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
         }
+        // Maintain the durable doc-stats counter (mnestic fork, Bet 1b) so `avgdl`
+        // is an O(1) read. Done *before* writing this document's postings so a
+        // seed-on-absent scan sees the pre-insert corpus and we add the new
+        // document exactly once. `count == 0` (no tokens ⇒ no postings) is skipped,
+        // matching the scan, which only counts documents that have postings.
+        // (The normal update path is del-then-put, so the old document is already
+        // subtracted; an FTS-only relation with no secondary index does not call
+        // `del` on update and can drift, mirroring upstream's posting leak there.)
+        if count > 0 {
+            let (total, n) = self.ensure_fts_doc_stats(idx_handle)?;
+            self.write_fts_doc_stats(idx_handle, total + count as u64, n + 1)?;
+        }
         let mut val = vec![
             DataValue::Bot,
             DataValue::Bot,
@@ -373,14 +532,36 @@ impl<'a> SessionTx<'a> {
         };
         let mut token_stream = tokenizer.token_stream(&to_index);
         let mut collector = FxHashSet::default();
+        let mut count = 0i64;
         while let Some(token) = token_stream.next() {
             let text = SmartString::<LazyCompact>::from(&token.text);
             collector.insert(text);
+            count += 1;
         }
         let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
         key.push(DataValue::Bot);
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
+        }
+        // Maintain the durable doc-stats counter (mnestic fork, Bet 1b) — but only
+        // if this document is actually indexed (probe one of its postings). That
+        // guards against a delete of an unindexed row and the del-then-put refresh
+        // in `create_fts_index`, where `del` runs over a not-yet-indexed row. Done
+        // before the postings are removed so a seed-on-absent scan still sees them.
+        if count > 0 {
+            if let Some(term) = collector.iter().next() {
+                let mut probe = key.clone();
+                probe[0] = DataValue::Str(term.clone());
+                let probe_bytes = idx_handle.encode_key_for_store(&probe, Default::default())?;
+                if self.store_tx.exists(&probe_bytes, false)? {
+                    let (total, n) = self.ensure_fts_doc_stats(idx_handle)?;
+                    self.write_fts_doc_stats(
+                        idx_handle,
+                        total.saturating_sub(count as u64),
+                        n.saturating_sub(1),
+                    )?;
+                }
+            }
         }
         for text in collector {
             key[0] = DataValue::Str(text);

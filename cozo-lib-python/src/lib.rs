@@ -157,6 +157,55 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
         }
         q.extra_lists = lists;
     }
+    if let Some(v) = d.get_item("graph_legs")? {
+        let items = v.downcast::<PyList>()?;
+        let mut legs = Vec::with_capacity(items.len());
+        for it in items {
+            let gd = it.downcast::<PyDict>()?;
+            let edge_relation = gd
+                .get_item("edge_relation")?
+                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'edge_relation'"))?
+                .extract()?;
+            let seeds_list = gd
+                .get_item("seeds")?
+                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'seeds'"))?
+                .downcast::<PyList>()?;
+            let mut seeds = Vec::with_capacity(seeds_list.len());
+            for s in seeds_list {
+                seeds.push(py_to_value(s)?);
+            }
+            let max_hops = gd
+                .get_item("max_hops")?
+                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'max_hops'"))?
+                .extract()?;
+            let label = match gd.get_item("label")? {
+                Some(x) => x.extract()?,
+                None => "graph".to_string(),
+            };
+            let from_col = match gd.get_item("from_col")? {
+                Some(x) => x.extract()?,
+                None => "from".to_string(),
+            };
+            let to_col = match gd.get_item("to_col")? {
+                Some(x) => x.extract()?,
+                None => "to".to_string(),
+            };
+            let undirected = match gd.get_item("undirected")? {
+                Some(x) => x.extract()?,
+                None => false,
+            };
+            legs.push(GraphLeg {
+                label,
+                edge_relation,
+                from_col,
+                to_col,
+                seeds,
+                max_hops,
+                undirected,
+            });
+        }
+        q.graph_legs = legs;
+    }
     if let Some(v) = d.get_item("mmr")? {
         if !v.is_none() {
             let md = v.downcast::<PyDict>()?;

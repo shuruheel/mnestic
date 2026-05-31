@@ -1,6 +1,6 @@
 [package]
 name = "mnestic"
-version = "0.8.2"
+version = "0.8.3"
 edition = "2021"
 description = "A transactional relational-graph-vector database using Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory"
 authors = ["Shan Rizvi", "Ziyang Hu (original CozoDB author)"]
@@ -160,4 +160,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # mnestic fork perf baselines (stable, self-contained synthetic data).
 [[bench]]
 name = "point_lookup"
+harness = false
+
+[[bench]]
+name = "read_path"
 harness = false

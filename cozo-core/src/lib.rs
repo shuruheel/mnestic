@@ -66,7 +66,7 @@ pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, Valid
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 pub use runtime::db::Db;
 pub use runtime::db::NamedRows;
-pub use runtime::hybrid::{build_hybrid_query, HybridList, HybridSearch, MmrParams};
+pub use runtime::hybrid::{build_hybrid_query, GraphLeg, HybridList, HybridSearch, MmrParams};
 pub use runtime::relation::decode_tuple_from_kv;
 pub use runtime::temp_store::RegularTempStore;
 pub use storage::mem::{new_cozo_mem, MemStorage};

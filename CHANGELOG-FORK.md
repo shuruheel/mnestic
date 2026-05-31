@@ -3,6 +3,119 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## 0.8.3 — 2026-05-31
+
+Fourth fork release. Two agentic-memory wedge features land together and are
+**validated end-to-end** on the `mnestic-benchmarks` hybrid suite (2026-05-31,
+SQLite-backed wheel, vs SQLite/DuckDB/LanceDB/Kuzu): **native 3-way fused recall**
+(Bet 1a) and **BM25-correct FTS with O(1) `avgdl`** (Bet 1b). All 169 inherited
+lib tests + feature suites pass; `cargo clippy -p mnestic -- -D warnings` is clean.
+
+> **Heads-up — the FTS default scorer changed.** The default `::fts` score kind
+> moves from `tf_idf` to Okapi `bm25` (a behaviour change). `tf` and `tf_idf`
+> stay selectable for byte-identical upstream scoring.
+
+**Measured (2026-05-31):**
+- **BM25 + O(1) `avgdl`:** fused recall **0.75 → 0.954** (parity with DuckDB
+  0.957 / SQLite 1.0); decomposed-path p50 **927 → 175 ms** and the cold p99 tail
+  **2,900 → 258 ms**. (The tail was the per-query `avgdl` scan, *not* cold HNSW as
+  first assumed — the vector leg even got faster cold→warm, 117 → 23 ms, unchanged.)
+- **Native 3-way:** the one fused call runs vector+FTS+graph at **41.55 ms p50**
+  (recall 0.873) — **~4× faster** than the 175 ms hand-decomposed path, fusing a
+  signal (graph) no other engine here has (LanceDB native is 2-way only: recall
+  0.456). The one-call advantage reappeared exactly as predicted once the `avgdl`
+  fix removed the FTS scan that had masked it.
+
+### New — native 3-way fused recall: typed `GraphLeg` on `HybridSearch`
+- `HybridSearch::graph_legs: Vec<GraphLeg>` (new `GraphLeg` type, re-exported from
+  the crate root). Each leg expands from a set of `seeds` over a stored edge
+  relation up to `max_hops`, scores every reached node by its **minimum hop
+  distance** (closer ⇒ higher rank), and contributes that ranked list to the
+  *same* Reciprocal Rank Fusion as the vector/keyword legs — one call, one
+  transaction, no hand-written recursion.
+- Why a new type rather than the existing `extra_lists`: an `extra_lists` entry is
+  a *single* spliced rule body, which cannot express the recursive shortest-path
+  rule that bounded-hop proximity needs. `GraphLeg` generates that rule — a seed
+  relation, a hop-1 base rule, and a `min(dist)` recursive rule gated at
+  `max_hops` — for you. Supports `undirected` traversal (also follows edges in
+  reverse) and multiple seeds (unioned).
+- **Injection-safe.** Seed values are passed as query **params** (`$hg{i}_seed{j}`),
+  never string-interpolated; the label, edge relation, and column names are
+  validated as bare identifiers, and empty seeds / `max_hops == 0` are rejected.
+  The generated script remains inspectable via `hybrid_search_script`.
+- `runtime/hybrid.rs`; guarded by `tests/hybrid_graph_leg.rs` (recall a neighbour
+  the fixed legs miss, closer-outranks-farther via `min(dist)`, hop bound,
+  undirected reverse edges, multi-seed union, script-is-recursive-and-parametrised,
+  input validation). Backward compatible: an empty `graph_legs` generates the exact
+  prior script.
+
+### Added — read-path latency baseline (groundwork for Item 9)
+- `benches/read_path.rs` (criterion) times `parse_only` (parse + compile-to-AST)
+  vs `full_run` (end-to-end `run_script`) for a point read and a multi-rule
+  retrieval query on SQLite, to size the parse/compile fraction a compiled-plan
+  cache could eliminate before any cache is built (the fork's baseline-first
+  rule). **Finding:** parse/compile is a roughly *fixed* ~20–85 µs cost — ≈39% of
+  a 55.7 µs point read but only ≈1.1% of a 7.68 ms multi-rule retrieval query — so
+  a plan cache helps cheap point reads but is noise for the retrieval workload,
+  where execution (and, on RocksDB, the pessimistic txn) dominates. That makes
+  **Bet 1a (one fused call instead of three `run_script`s) the read-path latency
+  fix that matters**, not the plan cache. See the "Item 9" note in `DEVELOPMENT.md`
+  for the two structural blockers a real cache must also clear (parse-time param
+  inlining; no reusable-plan execute entry point).
+
+### FTS — Okapi BM25 scoring + summed disjunction + O(1) `avgdl`
+
+The recall lever the hybrid-retrieval benchmark localized the entire fused-recall
+gap to (FTS recall-agreement 0.72 vs vector 0.99 / graph 1.00).
+
+- **New default score kind `bm25`** for `::fts`/`~rel:idx{… | score_kind: 'bm25'}`.
+  Implements `idf · tf·(k1+1) / (tf + k1·(1 − b + b·|D|/avgdl))`: term-frequency
+  **saturation** (`k1`, default 1.2) and **document-length normalization** (`b`,
+  default 0.75, range `[0,1]`), both tunable as query params. Replaces upstream's
+  raw `tf · idf`, which had neither — long documents and high raw term counts
+  dominated unfairly. Two upstream defects fixed:
+  - *No length normalization.* The per-document token length was **already stored**
+    on every posting (`vals[3]`) but **discarded** at search time; it is now read
+    (`LiteralStats::doc_len`) and used. Average document length (`avgdl`) is an
+    **O(1) read** of a durable per-index doc-stats counter (see below).
+  - *Disjunction did not sum.* An `a OR b` query took the **max** of per-term scores,
+    so a document matching both terms could tie one matching a single term — forcing
+    callers into app-side per-term aggregation with wide over-fetch. Under `bm25`,
+    `OR` now **sums** per-term contributions (a document matching more query terms
+    ranks higher). `tf`/`tf_idf` keep upstream's max-combine.
+- **Backward compatible:** `score_kind: 'tf_idf'` and `'tf'` are unchanged
+  (byte-identical scoring and the original `OR`=max semantics). Only the *default*
+  moved to `bm25`.
+- Guarded by `tests/bm25.rs` (sqlite backend, stored path): OR-sum beats
+  repeated-single-term, length normalization favors the shorter doc, and `b: 0.0`
+  provably disables length normalization (proving `b` is wired through).
+- **`avgdl` is now O(1) (durable doc-stats counter).** The bench validated BM25's
+  recall (0.75 → 0.96) but exposed a **~10× FTS latency regression** (71 → 755 ms
+  p50): the initial `avgdl` was a full deduplicated index scan (O(#docs),
+  ~680 ms/query at 40k chunks) recomputed on *every* query, because the cache lived
+  on the per-operator `FtsCache`. Fixed: each FTS index maintains a durable
+  `(total_tokens, n_docs)` counter at a reserved `[Bot]` key (sorts above all
+  `[term, …doc_key]` postings, so it is invisible to term scans). `put_fts_index_item`
+  adds a document's tokens, `del_fts_index_item` subtracts them (guarded by a posting
+  existence probe), and `create_fts_index` publishes the authoritative count via one
+  final scan — so `avgdl` is a single keyed `get`. A legacy index that predates the
+  counter migrates itself on its first write (seed-by-scan) and, until then, reads
+  fall back to a `Db`-scoped cross-query cache (one scan per process, not per query —
+  correct because an un-migrated index is immutable). Identical scores to the prior
+  scan (the counter value equals the scan); guarded by `tests/fts_avgdl.rs`
+  (delete-equals-fresh-build, survives reopen, `avgdl` feeds the BM25 denominator).
+  Well-behaved workloads (insert, delete, del-then-put update) are exact; an FTS-only
+  relation with no secondary index can drift on in-place update, mirroring upstream's
+  existing posting leak there (an index rebuild resets it). **Bench-confirmed:** the
+  FTS leg returned to ~71 ms and decomposed p99 fell 2,900 → 258 ms with recall held
+  at 0.954.
+
+### Python
+- `cozo-lib-python`'s `hybrid_search` now accepts a `graph_legs` list (mapped to
+  `Vec<GraphLeg>`), so the embedded `mnestic` wheel can drive the native 3-way
+  fused recall from Python. `cozo-lib-python` stays workspace-excluded (built only
+  when the wheel is built).
+
 ## 0.8.2 — 2026-05-30
 
 Third fork release. Makes HNSW index builds **non-blocking for readers**: an
