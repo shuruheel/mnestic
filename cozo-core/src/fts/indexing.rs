@@ -29,7 +29,6 @@ use thiserror::Error;
 #[derive(Default)]
 pub(crate) struct FtsCache {
     total_n_cache: FxHashMap<SmartString<LazyCompact>, usize>,
-    avgdl_cache: FxHashMap<SmartString<LazyCompact>, f64>,
 }
 
 impl FtsCache {
@@ -46,38 +45,33 @@ impl FtsCache {
         })
     }
     /// Average document length (in tokens) over the indexed corpus — the BM25
-    /// length-normalization denominator. Computed once per index by a deduplicated
-    /// scan of the FTS index relation (each document's length is stored redundantly
-    /// on every posting, so we count each document key once) and cached for the
-    /// lifetime of this cache, like `N`.
+    /// length-normalization denominator (mnestic fork, DEVELOPMENT.md Bet 1b).
     ///
-    /// NOTE (deferred, see DEVELOPMENT.md Bet 1b): this is a full index scan with an
-    /// O(#docs) dedup set. A future optimization maintains a running token total in
-    /// the index manifest incrementally (on `put`/`del`) to avoid the scan entirely.
+    /// **O(1)** when the index carries the durable doc-stats counter (every index
+    /// built or written under this code): a single keyed `get`. For a *legacy*
+    /// index that predates the counter and has not been written since (its corpus
+    /// is therefore immutable), it falls back to one deduplicated full scan,
+    /// cached on the `Db` so it is paid once per process rather than per query.
     fn get_avgdl_for_index(&mut self, idx: &RelationHandle, tx: &SessionTx<'_>) -> Result<f64> {
-        if let Some(v) = self.avgdl_cache.get(&idx.name) {
-            return Ok(*v);
+        let avgdl = |total: u64, n: u64| if n > 0 { total as f64 / n as f64 } else { 0.0 };
+        if let Some((total, n)) = tx.read_fts_doc_stats(idx)? {
+            return Ok(avgdl(total, n));
         }
-        let start = idx.encode_partial_key_for_store(&[]);
-        let end = idx.encode_partial_key_for_store(&[DataValue::Bot]);
-        let mut seen: FxHashSet<Tuple> = FxHashSet::default();
-        let mut total_len: u64 = 0;
-        for item in tx.store_tx.range_scan(&start, &end) {
-            let (kvec, vvec) = item?;
-            let key_tuple = decode_tuple_from_key(&kvec, idx.metadata.keys.len());
-            // key[0] is the term; key[1..] is the document key. Count each doc once.
-            if seen.insert(key_tuple[1..].to_vec()) {
-                let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..]).unwrap();
-                total_len += vals[3].get_int().unwrap() as u64;
-            }
+        if let Some((total, n)) = tx
+            .fts_doc_stats_cache
+            .lock()
+            .unwrap()
+            .get(&idx.name)
+            .copied()
+        {
+            return Ok(avgdl(total, n));
         }
-        let avgdl = if seen.is_empty() {
-            0.0
-        } else {
-            total_len as f64 / seen.len() as f64
-        };
-        self.avgdl_cache.insert(idx.name.clone(), avgdl);
-        Ok(avgdl)
+        let (total, n) = tx.scan_fts_doc_stats(idx)?;
+        tx.fts_doc_stats_cache
+            .lock()
+            .unwrap()
+            .insert(idx.name.clone(), (total, n));
+        Ok(avgdl(total, n))
     }
 }
 
@@ -96,6 +90,82 @@ struct LiteralStats {
 }
 
 impl<'a> SessionTx<'a> {
+    /// Reserved key under which an FTS index stores its durable corpus doc-stats
+    /// counter `[total_tokens, n_docs]` (mnestic fork, Bet 1b). `DataValue::Bot`
+    /// is the top key sentinel, so this sits *above* every `[term, …doc_key]`
+    /// posting — it is never returned by a term range scan nor by the full-index
+    /// doc scan (whose exclusive upper bound is exactly this key).
+    fn fts_stats_key(idx: &RelationHandle) -> Vec<u8> {
+        idx.encode_partial_key_for_store(&[DataValue::Bot])
+    }
+
+    /// Read the durable doc-stats counter, or `None` if the index predates it
+    /// (legacy / not yet migrated).
+    pub(crate) fn read_fts_doc_stats(&self, idx: &RelationHandle) -> Result<Option<(u64, u64)>> {
+        let key = Self::fts_stats_key(idx);
+        match self.store_tx.get(&key, false)? {
+            None => Ok(None),
+            Some(v) => {
+                let vals: Vec<DataValue> = rmp_serde::from_slice(&v[ENCODED_KEY_MIN_LEN..])
+                    .map_err(|e| miette!("corrupt FTS doc-stats counter: {e}"))?;
+                let total = vals.first().and_then(|d| d.get_int()).unwrap_or(0).max(0) as u64;
+                let n = vals.get(1).and_then(|d| d.get_int()).unwrap_or(0).max(0) as u64;
+                Ok(Some((total, n)))
+            }
+        }
+    }
+
+    pub(crate) fn write_fts_doc_stats(
+        &mut self,
+        idx: &RelationHandle,
+        total: u64,
+        n: u64,
+    ) -> Result<()> {
+        let key = Self::fts_stats_key(idx);
+        let val = vec![DataValue::from(total as i64), DataValue::from(n as i64)];
+        let val_bytes = idx.encode_val_only_for_store(&val, Default::default())?;
+        self.store_tx.put(&key, &val_bytes)
+    }
+
+    /// Deduplicated full scan of the FTS index → `(total_tokens, n_docs)` over
+    /// the documents that have at least one posting. Each document's length is
+    /// stored redundantly on every posting (`vals[3]`), so we count each document
+    /// key once. This is the legacy/seed path; the steady state reads the counter.
+    pub(crate) fn scan_fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        let start = idx.encode_partial_key_for_store(&[]);
+        let end = idx.encode_partial_key_for_store(&[DataValue::Bot]);
+        let mut seen: FxHashSet<Tuple> = FxHashSet::default();
+        let mut total: u64 = 0;
+        for item in self.store_tx.range_scan(&start, &end) {
+            let (kvec, vvec) = item?;
+            let key_tuple = decode_tuple_from_key(&kvec, idx.metadata.keys.len());
+            if seen.insert(key_tuple[1..].to_vec()) {
+                let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..])
+                    .map_err(|e| miette!("corrupt FTS posting value: {e}"))?;
+                total += vals[3].get_int().unwrap_or(0).max(0) as u64;
+            }
+        }
+        Ok((total, seen.len() as u64))
+    }
+
+    /// Read the counter, seeding it from a one-time scan if absent — so a legacy
+    /// index migrates itself to O(1) on its first write.
+    fn ensure_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        if let Some(s) = self.read_fts_doc_stats(idx)? {
+            return Ok(s);
+        }
+        let (total, n) = self.scan_fts_doc_stats(idx)?;
+        self.write_fts_doc_stats(idx, total, n)?;
+        Ok((total, n))
+    }
+
+    /// Recompute and overwrite the durable counter from a full scan. Called at the
+    /// end of an index (re)build to publish the authoritative corpus stats.
+    pub(crate) fn rebuild_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<()> {
+        let (total, n) = self.scan_fts_doc_stats(idx)?;
+        self.write_fts_doc_stats(idx, total, n)
+    }
+
     fn fts_search_literal(
         &self,
         literal: &FtsLiteral,
@@ -410,6 +480,18 @@ impl<'a> SessionTx<'a> {
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
         }
+        // Maintain the durable doc-stats counter (mnestic fork, Bet 1b) so `avgdl`
+        // is an O(1) read. Done *before* writing this document's postings so a
+        // seed-on-absent scan sees the pre-insert corpus and we add the new
+        // document exactly once. `count == 0` (no tokens ⇒ no postings) is skipped,
+        // matching the scan, which only counts documents that have postings.
+        // (The normal update path is del-then-put, so the old document is already
+        // subtracted; an FTS-only relation with no secondary index does not call
+        // `del` on update and can drift, mirroring upstream's posting leak there.)
+        if count > 0 {
+            let (total, n) = self.ensure_fts_doc_stats(idx_handle)?;
+            self.write_fts_doc_stats(idx_handle, total + count as u64, n + 1)?;
+        }
         let mut val = vec![
             DataValue::Bot,
             DataValue::Bot,
@@ -450,14 +532,36 @@ impl<'a> SessionTx<'a> {
         };
         let mut token_stream = tokenizer.token_stream(&to_index);
         let mut collector = FxHashSet::default();
+        let mut count = 0i64;
         while let Some(token) = token_stream.next() {
             let text = SmartString::<LazyCompact>::from(&token.text);
             collector.insert(text);
+            count += 1;
         }
         let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
         key.push(DataValue::Bot);
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
+        }
+        // Maintain the durable doc-stats counter (mnestic fork, Bet 1b) — but only
+        // if this document is actually indexed (probe one of its postings). That
+        // guards against a delete of an unindexed row and the del-then-put refresh
+        // in `create_fts_index`, where `del` runs over a not-yet-indexed row. Done
+        // before the postings are removed so a seed-on-absent scan still sees them.
+        if count > 0 {
+            if let Some(term) = collector.iter().next() {
+                let mut probe = key.clone();
+                probe[0] = DataValue::Str(term.clone());
+                let probe_bytes = idx_handle.encode_key_for_store(&probe, Default::default())?;
+                if self.store_tx.exists(&probe_bytes, false)? {
+                    let (total, n) = self.ensure_fts_doc_stats(idx_handle)?;
+                    self.write_fts_doc_stats(
+                        idx_handle,
+                        total.saturating_sub(count as u64),
+                        n.saturating_sub(1),
+                    )?;
+                }
+            }
         }
         for text in collector {
             key[0] = DataValue::Str(text);

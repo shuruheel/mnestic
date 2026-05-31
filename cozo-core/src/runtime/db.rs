@@ -113,6 +113,14 @@ pub struct Db<S> {
     /// (whose publication only becomes visible at the end) without re-blocking
     /// readers. Keyed by the index relation's full `base:idx` name.
     index_builds_in_progress: Arc<Mutex<BTreeSet<SmartString<LazyCompact>>>>,
+    /// Cross-query cache of FTS corpus stats `(total_tokens, n_docs)` keyed by
+    /// index relation name (mnestic fork, DEVELOPMENT.md Bet 1b avgdl). Only
+    /// consulted for *legacy* FTS indexes that predate the durable doc-stats
+    /// counter (no aggregate stored) and have not been written since — for those
+    /// the corpus is immutable, so a single deduplicated scan per process is
+    /// correct and needs no invalidation. Indexes built/migrated under the
+    /// counter read it directly (O(1)) and never touch this cache.
+    fts_doc_stats_cache: Arc<Mutex<BTreeMap<SmartString<LazyCompact>, (u64, u64)>>>,
 }
 
 impl<S> Debug for Db<S> {
@@ -299,6 +307,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             event_callbacks: Default::default(),
             relation_locks: Default::default(),
             index_builds_in_progress: Default::default(),
+            fts_doc_stats_cache: Default::default(),
         };
         Ok(ret)
     }
@@ -915,6 +924,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
+            fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
         };
         Ok(ret)
     }
@@ -925,6 +935,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
+            fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
         };
         Ok(ret)
     }

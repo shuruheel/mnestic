@@ -70,8 +70,8 @@ selectable for byte-identical upstream behavior.
   dominated unfairly. Two upstream defects fixed:
   - *No length normalization.* The per-document token length was **already stored**
     on every posting (`vals[3]`) but **discarded** at search time; it is now read
-    (`LiteralStats::doc_len`) and used. Average document length (`avgdl`) is computed
-    by a deduplicated scan of the FTS index, cached per index alongside `N`.
+    (`LiteralStats::doc_len`) and used. Average document length (`avgdl`) is an
+    **O(1) read** of a durable per-index doc-stats counter (see below).
   - *Disjunction did not sum.* An `a OR b` query took the **max** of per-term scores,
     so a document matching both terms could tie one matching a single term — forcing
     callers into app-side per-term aggregation with wide over-fetch. Under `bm25`,
@@ -83,11 +83,27 @@ selectable for byte-identical upstream behavior.
 - Guarded by `tests/bm25.rs` (sqlite backend, stored path): OR-sum beats
   repeated-single-term, length normalization favors the shorter doc, and `b: 0.0`
   provably disables length normalization (proving `b` is wired through).
-- **Deferred follow-up** (noted in DEVELOPMENT.md): `avgdl` is currently a full
-  index scan with an O(#docs) dedup set; a future optimization maintains a running
-  token total in the index manifest incrementally on `put`/`del`. Also pending:
-  re-running the `mnestic-benchmarks` hybrid suite to measure the FTS
-  recall-agreement gain (target: 0.72 → parity with the BM25-native SQL engines).
+- **`avgdl` is now O(1) (durable doc-stats counter).** The bench validated BM25's
+  recall (0.75 → 0.96) but exposed a **~10× FTS latency regression** (71 → 755 ms
+  p50): the initial `avgdl` was a full deduplicated index scan (O(#docs),
+  ~680 ms/query at 40k chunks) recomputed on *every* query, because the cache lived
+  on the per-operator `FtsCache`. Fixed: each FTS index maintains a durable
+  `(total_tokens, n_docs)` counter at a reserved `[Bot]` key (sorts above all
+  `[term, …doc_key]` postings, so it is invisible to term scans). `put_fts_index_item`
+  adds a document's tokens, `del_fts_index_item` subtracts them (guarded by a posting
+  existence probe), and `create_fts_index` publishes the authoritative count via one
+  final scan — so `avgdl` is a single keyed `get`. A legacy index that predates the
+  counter migrates itself on its first write (seed-by-scan) and, until then, reads
+  fall back to a `Db`-scoped cross-query cache (one scan per process, not per query —
+  correct because an un-migrated index is immutable). Identical scores to the prior
+  scan (the counter value equals the scan); guarded by `tests/fts_avgdl.rs`
+  (delete-equals-fresh-build, survives reopen, `avgdl` feeds the BM25 denominator).
+  Well-behaved workloads (insert, delete, del-then-put update) are exact; an FTS-only
+  relation with no secondary index can drift on in-place update, mirroring upstream's
+  existing posting leak there (an index rebuild resets it).
+- **Still pending:** re-running the `mnestic-benchmarks` hybrid suite to confirm the
+  FTS latency drops back to ~71 ms and the recall gain holds (target: 0.72 → parity
+  with the BM25-native SQL engines).
 
 ## 0.8.2 — 2026-05-30
 
