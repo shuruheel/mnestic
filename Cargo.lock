@@ -2142,7 +2142,7 @@ dependencies = [
 
 [[package]]
 name = "mnestic"
-version = "0.8.2"
+version = "0.8.3"
 dependencies = [
  "aho-corasick",
  "approx",
