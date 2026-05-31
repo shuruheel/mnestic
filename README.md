@@ -15,6 +15,23 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
+**0.8.3**
+
+- **Native 3-way fused recall** — `hybrid_search` now fuses a graph-proximity leg
+  *in-engine* alongside vector (HNSW) and full-text (FTS). A typed `GraphLeg`
+  generates a recursive bounded shortest-path rule (k-hop, `min(dist)` scoring) and
+  folds it into the same RRF, so one call returns the vector+FTS+graph ranking — a
+  capability no other embedded engine here offers. Measured **41.55 ms p50**, ~4×
+  faster than the hand-decomposed three-query path.
+- **BM25-correct FTS, with O(1) `avgdl`** — the default `::fts` scorer is now Okapi
+  **`bm25`** (term-frequency saturation `k1` + document-length normalization `b`,
+  both tunable; `OR` sums per-term contributions). Average document length is an O(1)
+  read of a durable per-index counter rather than a per-query index scan. Measured:
+  fused recall **0.75 → 0.954** (parity with DuckDB / SQLite) at no net latency cost
+  (decomposed p50 927 → 175 ms, cold p99 2,900 → 258 ms). **Heads-up:** this changes
+  the default FTS score kind (a behaviour change); `tf`/`tf_idf` stay selectable for
+  byte-identical upstream scoring.
+
 **0.8.2**
 
 - **Non-blocking HNSW index builds** — `::hnsw create` no longer holds the base
