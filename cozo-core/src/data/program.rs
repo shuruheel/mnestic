@@ -992,7 +992,12 @@ pub(crate) struct HnswSearch {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FtsScoreKind {
+    /// Okapi BM25 (mnestic fork default): `tf` saturation via `k1` + document-length
+    /// normalization via `b`, and `OR` sums per-term contributions. See `fts/indexing.rs`.
+    Bm25,
+    /// Upstream `tf * idf` (no length normalization; `OR` takes max). Kept for compatibility.
     TfIdf,
+    /// Raw term frequency (× booster).
     Tf,
 }
 
@@ -1003,8 +1008,10 @@ pub(crate) struct FtsSearch {
     pub(crate) manifest: FtsIndexManifest,
     pub(crate) bindings: Vec<Symbol>,
     pub(crate) k: usize,
-    // pub(crate) k1: f64,
-    // pub(crate) b: f64,
+    /// BM25 term-frequency saturation parameter (only used when `score_kind == Bm25`).
+    pub(crate) k1: f64,
+    /// BM25 document-length normalization parameter, 0..=1 (only used when `score_kind == Bm25`).
+    pub(crate) b: f64,
     pub(crate) query: Symbol,
     pub(crate) score_kind: FtsScoreKind,
     pub(crate) bind_score: Option<Symbol>,
@@ -1289,12 +1296,33 @@ impl SearchInput {
                     .ok_or_else(|| miette!("Score kind for FTS must be a string"))?;
 
                 match r {
+                    "bm25" => FtsScoreKind::Bm25,
                     "tf_idf" => FtsScoreKind::TfIdf,
                     "tf" => FtsScoreKind::Tf,
                     s => bail!("Unknown score kind for FTS: {}", s),
                 }
             }
-            None => FtsScoreKind::TfIdf,
+            None => FtsScoreKind::Bm25,
+        };
+
+        // BM25 parameters (standard defaults k1=1.2, b=0.75); ignored for tf/tf_idf.
+        let k1 = match self.parameters.remove("k1") {
+            None => 1.2,
+            Some(expr) => expr
+                .eval_to_const()?
+                .get_float()
+                .ok_or_else(|| miette!("`k1` for FTS must be a number"))?,
+        };
+        let b = match self.parameters.remove("b") {
+            None => 0.75,
+            Some(expr) => {
+                let b = expr
+                    .eval_to_const()?
+                    .get_float()
+                    .ok_or_else(|| miette!("`b` for FTS must be a number"))?;
+                ensure!((0.0..=1.0).contains(&b), "`b` for FTS must be in [0, 1], got {b}");
+                b
+            }
         };
 
         let filter = self.parameters.remove("filter");
@@ -1326,12 +1354,12 @@ impl SearchInput {
             manifest,
             bindings,
             k: k as usize,
+            k1,
+            b,
             query,
             score_kind,
             bind_score,
             // lax_mode,
-            // k1,
-            // b,
             filter,
             span: self.span,
         }));

@@ -3,6 +3,45 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased — BM25-correct FTS (DEVELOPMENT.md Bet 1b)
+
+Makes full-text scoring **Okapi BM25** — the recall lever the hybrid-retrieval
+benchmark localized the entire fused-recall gap to (FTS recall-agreement 0.72 vs
+vector 0.99 / graph 1.00). All 169 inherited lib tests + the
+integration/feature suites pass; `cargo clippy -p mnestic -- -D warnings` is clean.
+
+This is a **behavior change** (the default FTS score kind changes), so it warrants
+a **minor** version bump (→ `0.9.0`) when released; `tf` and `tf_idf` remain
+selectable for byte-identical upstream behavior.
+
+### FTS — Okapi BM25 scoring + summed disjunction
+- **New default score kind `bm25`** for `::fts`/`~rel:idx{… | score_kind: 'bm25'}`.
+  Implements `idf · tf·(k1+1) / (tf + k1·(1 − b + b·|D|/avgdl))`: term-frequency
+  **saturation** (`k1`, default 1.2) and **document-length normalization** (`b`,
+  default 0.75, range `[0,1]`), both tunable as query params. Replaces upstream's
+  raw `tf · idf`, which had neither — long documents and high raw term counts
+  dominated unfairly. Two upstream defects fixed:
+  - *No length normalization.* The per-document token length was **already stored**
+    on every posting (`vals[3]`) but **discarded** at search time; it is now read
+    (`LiteralStats::doc_len`) and used. Average document length (`avgdl`) is computed
+    by a deduplicated scan of the FTS index, cached per index alongside `N`.
+  - *Disjunction did not sum.* An `a OR b` query took the **max** of per-term scores,
+    so a document matching both terms could tie one matching a single term — forcing
+    callers into app-side per-term aggregation with wide over-fetch. Under `bm25`,
+    `OR` now **sums** per-term contributions (a document matching more query terms
+    ranks higher). `tf`/`tf_idf` keep upstream's max-combine.
+- **Backward compatible:** `score_kind: 'tf_idf'` and `'tf'` are unchanged
+  (byte-identical scoring and the original `OR`=max semantics). Only the *default*
+  moved to `bm25`.
+- Guarded by `tests/bm25.rs` (sqlite backend, stored path): OR-sum beats
+  repeated-single-term, length normalization favors the shorter doc, and `b: 0.0`
+  provably disables length normalization (proving `b` is wired through).
+- **Deferred follow-up** (noted in DEVELOPMENT.md): `avgdl` is currently a full
+  index scan with an O(#docs) dedup set; a future optimization maintains a running
+  token total in the index manifest incrementally on `put`/`del`. Also pending:
+  re-running the `mnestic-benchmarks` hybrid suite to measure the FTS
+  recall-agreement gain (target: 0.72 → parity with the BM25-native SQL engines).
+
 ## 0.8.2 — 2026-05-30
 
 Third fork release. Makes HNSW index builds **non-blocking for readers**: an

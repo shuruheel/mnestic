@@ -29,6 +29,7 @@ use thiserror::Error;
 #[derive(Default)]
 pub(crate) struct FtsCache {
     total_n_cache: FxHashMap<SmartString<LazyCompact>, usize>,
+    avgdl_cache: FxHashMap<SmartString<LazyCompact>, f64>,
 }
 
 impl FtsCache {
@@ -44,6 +45,40 @@ impl FtsCache {
             Entry::Occupied(o) => *o.get(),
         })
     }
+    /// Average document length (in tokens) over the indexed corpus — the BM25
+    /// length-normalization denominator. Computed once per index by a deduplicated
+    /// scan of the FTS index relation (each document's length is stored redundantly
+    /// on every posting, so we count each document key once) and cached for the
+    /// lifetime of this cache, like `N`.
+    ///
+    /// NOTE (deferred, see DEVELOPMENT.md Bet 1b): this is a full index scan with an
+    /// O(#docs) dedup set. A future optimization maintains a running token total in
+    /// the index manifest incrementally (on `put`/`del`) to avoid the scan entirely.
+    fn get_avgdl_for_index(&mut self, idx: &RelationHandle, tx: &SessionTx<'_>) -> Result<f64> {
+        if let Some(v) = self.avgdl_cache.get(&idx.name) {
+            return Ok(*v);
+        }
+        let start = idx.encode_partial_key_for_store(&[]);
+        let end = idx.encode_partial_key_for_store(&[DataValue::Bot]);
+        let mut seen: FxHashSet<Tuple> = FxHashSet::default();
+        let mut total_len: u64 = 0;
+        for item in tx.store_tx.range_scan(&start, &end) {
+            let (kvec, vvec) = item?;
+            let key_tuple = decode_tuple_from_key(&kvec, idx.metadata.keys.len());
+            // key[0] is the term; key[1..] is the document key. Count each doc once.
+            if seen.insert(key_tuple[1..].to_vec()) {
+                let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..]).unwrap();
+                total_len += vals[3].get_int().unwrap() as u64;
+            }
+        }
+        let avgdl = if seen.is_empty() {
+            0.0
+        } else {
+            total_len as f64 / seen.len() as f64
+        };
+        self.avgdl_cache.insert(idx.name.clone(), avgdl);
+        Ok(avgdl)
+    }
 }
 
 struct PositionInfo {
@@ -55,7 +90,9 @@ struct PositionInfo {
 struct LiteralStats {
     key: Tuple,
     position_info: Vec<PositionInfo>,
-    // doc_len: u32,
+    /// Total token count of the document this posting belongs to (stored per posting
+    /// at index time as `vals[3]`); used for BM25 length normalization.
+    doc_len: u32,
 }
 
 impl<'a> SessionTx<'a> {
@@ -88,7 +125,7 @@ impl<'a> SessionTx<'a> {
             let froms = vals[0].get_slice().unwrap();
             let tos = vals[1].get_slice().unwrap();
             let positions = vals[2].get_slice().unwrap();
-            // let total_length = vals[3].get_int().unwrap();
+            let total_length = vals[3].get_int().unwrap();
             let position_info = froms
                 .iter()
                 .zip(tos.iter())
@@ -102,7 +139,7 @@ impl<'a> SessionTx<'a> {
             results.push(LiteralStats {
                 key: key_tuple[1..].to_vec(),
                 position_info,
-                // doc_len: total_length as u32,
+                doc_len: total_length as u32,
             });
         }
         Ok(results)
@@ -112,6 +149,7 @@ impl<'a> SessionTx<'a> {
         ast: &FtsExpr,
         config: &FtsSearch,
         n: usize,
+        avgdl: f64,
     ) -> Result<FxHashMap<Tuple, f64>> {
         Ok(match ast {
             FtsExpr::Literal(l) => {
@@ -123,6 +161,8 @@ impl<'a> SessionTx<'a> {
                         el.position_info.len(),
                         found_docs_len,
                         n,
+                        el.doc_len,
+                        avgdl,
                         l.booster.0,
                         config,
                     );
@@ -136,9 +176,10 @@ impl<'a> SessionTx<'a> {
                     l_iter.next().unwrap(),
                     config,
                     n,
+                    avgdl,
                 )?;
                 for nxt in l_iter {
-                    let nxt_res = self.fts_search_impl(nxt, config, n)?;
+                    let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     res = res
                         .into_iter()
                         .filter_map(|(k, v)| nxt_res.get(&k).map(|nxt_v| (k, v + nxt_v)))
@@ -147,12 +188,15 @@ impl<'a> SessionTx<'a> {
                 res
             }
             FtsExpr::Or(ls) => {
+                // BM25 sums each query term's contribution (a doc matching more terms
+                // ranks higher); tf/tf_idf keep upstream's max-combine for compatibility.
+                let sum_terms = config.score_kind == FtsScoreKind::Bm25;
                 let mut res: FxHashMap<Tuple, f64> = FxHashMap::default();
                 for nxt in ls {
-                    let nxt_res = self.fts_search_impl(nxt, config, n)?;
+                    let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     for (k, v) in nxt_res {
                         if let Some(old_v) = res.get_mut(&k) {
-                            *old_v = (*old_v).max(v);
+                            *old_v = if sum_terms { *old_v + v } else { (*old_v).max(v) };
                         } else {
                             res.insert(k, v);
                         }
@@ -163,7 +207,11 @@ impl<'a> SessionTx<'a> {
             FtsExpr::Near(FtsNear { literals, distance }) => {
                 let mut l_it = literals.iter();
                 let mut coll: FxHashMap<_, _> = FxHashMap::default();
+                // The document length is identical across a doc's postings, so capture
+                // it from the first literal's scan for BM25 length normalization.
+                let mut doc_lens: FxHashMap<Tuple, u32> = FxHashMap::default();
                 for first_el in self.fts_search_literal(l_it.next().unwrap(), &config.idx_handle)? {
+                    doc_lens.insert(first_el.key.clone(), first_el.doc_len);
                     coll.insert(
                         first_el.key,
                         first_el
@@ -209,17 +257,24 @@ impl<'a> SessionTx<'a> {
                 let coll_len = coll.len();
                 coll.into_iter()
                     .map(|(k, cands)| {
-                        (
-                            k,
-                            Self::fts_compute_score(cands.len(), coll_len, n, booster, config),
-                        )
+                        let doc_len = doc_lens.get(&k).copied().unwrap_or(0);
+                        let score = Self::fts_compute_score(
+                            cands.len(),
+                            coll_len,
+                            n,
+                            doc_len,
+                            avgdl,
+                            booster,
+                            config,
+                        );
+                        (k, score)
                     })
                     .collect()
             }
             FtsExpr::Not(fst, snd) => {
-                let mut res = self.fts_search_impl(fst, config, n)?;
+                let mut res = self.fts_search_impl(fst, config, n, avgdl)?;
                 for el in self
-                    .fts_search_impl(snd, config, n)?
+                    .fts_search_impl(snd, config, n, avgdl)?
                     .keys()
                 {
                     res.remove(el);
@@ -232,6 +287,8 @@ impl<'a> SessionTx<'a> {
         tf: usize,
         n_found_docs: usize,
         n_total: usize,
+        doc_len: u32,
+        avgdl: f64,
         booster: f64,
         config: &FtsSearch,
     ) -> f64 {
@@ -242,6 +299,20 @@ impl<'a> SessionTx<'a> {
                 let n_found_docs = n_found_docs as f64;
                 let idf = (1.0 + (n_total as f64 - n_found_docs + 0.5) / (n_found_docs + 0.5)).ln();
                 tf * idf * booster
+            }
+            FtsScoreKind::Bm25 => {
+                // Okapi BM25: idf · tf·(k1+1) / (tf + k1·(1 − b + b·|D|/avgdl)) · booster
+                let df = n_found_docs as f64;
+                let idf = (1.0 + (n_total as f64 - df + 0.5) / (df + 0.5)).ln();
+                let avgdl = if avgdl > 0.0 { avgdl } else { 1.0 };
+                let norm = 1.0 - config.b + config.b * (doc_len as f64) / avgdl;
+                let denom = tf + config.k1 * norm;
+                let saturated = if denom > 0.0 {
+                    tf * (config.k1 + 1.0) / denom
+                } else {
+                    0.0
+                };
+                idf * saturated * booster
             }
         }
     }
@@ -258,13 +329,19 @@ impl<'a> SessionTx<'a> {
         if ast.is_empty() {
             return Ok(vec![]);
         }
-        let n = if config.score_kind == FtsScoreKind::TfIdf {
-            cache.get_n_for_relation(&config.base_handle, self)?
+        let n = match config.score_kind {
+            FtsScoreKind::TfIdf | FtsScoreKind::Bm25 => {
+                cache.get_n_for_relation(&config.base_handle, self)?
+            }
+            FtsScoreKind::Tf => 0,
+        };
+        let avgdl = if config.score_kind == FtsScoreKind::Bm25 {
+            cache.get_avgdl_for_index(&config.idx_handle, self)?
         } else {
-            0
+            0.0
         };
         let mut result: Vec<_> = self
-            .fts_search_impl(&ast, config, n)?
+            .fts_search_impl(&ast, config, n, avgdl)?
             .into_iter()
             .collect();
         result.sort_by_key(|(_, score)| Reverse(OrderedFloat(*score)));
