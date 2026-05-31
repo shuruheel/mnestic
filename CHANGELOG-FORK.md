@@ -3,18 +3,30 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased — native 3-way fused recall (DEVELOPMENT.md Bet 1a)
+## 0.8.3 — 2026-05-31
 
-Extends the one-call `hybrid_search` so a **graph-proximity signal is fused
-in-engine** alongside the vector (HNSW) and keyword (FTS) legs — the capability
-no other embedded engine in the hybrid-recall bench offers (graphless engines
-crater at ~0.51 recall vs 0.75+ for graph-capable ones), and which previously
-required a *second* `run_script` the caller had to RRF by hand (~8× slower:
-325 ms vs 41 ms p50, because each script re-parses and opens its own
-transaction). All 169 inherited lib tests + feature suites pass;
-`cargo clippy -p mnestic -- -D warnings` is clean.
+Fourth fork release. Two agentic-memory wedge features land together and are
+**validated end-to-end** on the `mnestic-benchmarks` hybrid suite (2026-05-31,
+SQLite-backed wheel, vs SQLite/DuckDB/LanceDB/Kuzu): **native 3-way fused recall**
+(Bet 1a) and **BM25-correct FTS with O(1) `avgdl`** (Bet 1b). All 169 inherited
+lib tests + feature suites pass; `cargo clippy -p mnestic -- -D warnings` is clean.
 
-### New — typed `GraphLeg` on `HybridSearch`
+> **Heads-up — the FTS default scorer changed.** The default `::fts` score kind
+> moves from `tf_idf` to Okapi `bm25` (a behaviour change). `tf` and `tf_idf`
+> stay selectable for byte-identical upstream scoring.
+
+**Measured (2026-05-31):**
+- **BM25 + O(1) `avgdl`:** fused recall **0.75 → 0.954** (parity with DuckDB
+  0.957 / SQLite 1.0); decomposed-path p50 **927 → 175 ms** and the cold p99 tail
+  **2,900 → 258 ms**. (The tail was the per-query `avgdl` scan, *not* cold HNSW as
+  first assumed — the vector leg even got faster cold→warm, 117 → 23 ms, unchanged.)
+- **Native 3-way:** the one fused call runs vector+FTS+graph at **41.55 ms p50**
+  (recall 0.873) — **~4× faster** than the 175 ms hand-decomposed path, fusing a
+  signal (graph) no other engine here has (LanceDB native is 2-way only: recall
+  0.456). The one-call advantage reappeared exactly as predicted once the `avgdl`
+  fix removed the FTS scan that had masked it.
+
+### New — native 3-way fused recall: typed `GraphLeg` on `HybridSearch`
 - `HybridSearch::graph_legs: Vec<GraphLeg>` (new `GraphLeg` type, re-exported from
   the crate root). Each leg expands from a set of `seeds` over a stored edge
   relation up to `max_hops`, scores every reached node by its **minimum hop
@@ -50,18 +62,12 @@ transaction). All 169 inherited lib tests + feature suites pass;
   fix that matters**, not the plan cache. See the "Item 9" note in `DEVELOPMENT.md`
   for the two structural blockers a real cache must also clear (parse-time param
   inlining; no reusable-plan execute entry point).
-## Unreleased — BM25-correct FTS (DEVELOPMENT.md Bet 1b)
 
-Makes full-text scoring **Okapi BM25** — the recall lever the hybrid-retrieval
-benchmark localized the entire fused-recall gap to (FTS recall-agreement 0.72 vs
-vector 0.99 / graph 1.00). All 169 inherited lib tests + the
-integration/feature suites pass; `cargo clippy -p mnestic -- -D warnings` is clean.
+### FTS — Okapi BM25 scoring + summed disjunction + O(1) `avgdl`
 
-This is a **behavior change** (the default FTS score kind changes), so it warrants
-a **minor** version bump (→ `0.9.0`) when released; `tf` and `tf_idf` remain
-selectable for byte-identical upstream behavior.
+The recall lever the hybrid-retrieval benchmark localized the entire fused-recall
+gap to (FTS recall-agreement 0.72 vs vector 0.99 / graph 1.00).
 
-### FTS — Okapi BM25 scoring + summed disjunction
 - **New default score kind `bm25`** for `::fts`/`~rel:idx{… | score_kind: 'bm25'}`.
   Implements `idf · tf·(k1+1) / (tf + k1·(1 − b + b·|D|/avgdl))`: term-frequency
   **saturation** (`k1`, default 1.2) and **document-length normalization** (`b`,
@@ -100,10 +106,15 @@ selectable for byte-identical upstream behavior.
   (delete-equals-fresh-build, survives reopen, `avgdl` feeds the BM25 denominator).
   Well-behaved workloads (insert, delete, del-then-put update) are exact; an FTS-only
   relation with no secondary index can drift on in-place update, mirroring upstream's
-  existing posting leak there (an index rebuild resets it).
-- **Still pending:** re-running the `mnestic-benchmarks` hybrid suite to confirm the
-  FTS latency drops back to ~71 ms and the recall gain holds (target: 0.72 → parity
-  with the BM25-native SQL engines).
+  existing posting leak there (an index rebuild resets it). **Bench-confirmed:** the
+  FTS leg returned to ~71 ms and decomposed p99 fell 2,900 → 258 ms with recall held
+  at 0.954.
+
+### Python
+- `cozo-lib-python`'s `hybrid_search` now accepts a `graph_legs` list (mapped to
+  `Vec<GraphLeg>`), so the embedded `mnestic` wheel can drive the native 3-way
+  fused recall from Python. `cozo-lib-python` stays workspace-excluded (built only
+  when the wheel is built).
 
 ## 0.8.2 — 2026-05-30
 
