@@ -3,9 +3,10 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## 0.8.4 — unreleased
+## 0.8.4 — 2026-06-10
 
-Banked for the next cadence release.
+Fifth fork release: a defect fix for 0.8.3's concurrent-write regression plus
+the per-leg fusion detail that powers MindGraph's "why retrieved" surface.
 
 ### New — per-leg retrieval detail: `detailed` on RRF and `HybridSearch`
 - `ReciprocalRankFusion(..., detailed: true)` switches the output from
