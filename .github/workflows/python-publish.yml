@@ -38,7 +38,10 @@ jobs:
           # aarch64 needs the 2_28 image: the manylinux2014 cross-GCC is too old
           # to assemble ring's ARM asm (#error "ARM assembler must define __ARM_ARCH").
           - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28" }
-          - { os: macos-13,       target: x86_64 }
+          # Intel-mac runners (macos-13) are retired — jobs queue forever.
+          # Cross-compile x86_64 on the arm64 runner instead (the binding's
+          # compact feature is pure Rust + cc, so the cross-build is safe).
+          - { os: macos-14,       target: x86_64 }
           - { os: macos-14,       target: aarch64 }
           - { os: windows-latest, target: x64 }
     steps:
