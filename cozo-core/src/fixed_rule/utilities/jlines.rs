@@ -12,6 +12,7 @@ use std::io::BufRead;
 use std::{fs, io};
 
 use itertools::Itertools;
+#[cfg(feature = "requests")]
 use log::error;
 #[allow(unused_imports)]
 use miette::{bail, miette, Diagnostic, IntoDiagnostic, Result, WrapErr};

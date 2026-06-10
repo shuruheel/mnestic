@@ -140,6 +140,9 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
     if let Some(v) = d.get_item("limit")? {
         q.limit = v.extract()?;
     }
+    if let Some(v) = d.get_item("detailed")? {
+        q.detailed = v.extract()?;
+    }
     if let Some(v) = d.get_item("extra_lists")? {
         let items = v.downcast::<PyList>()?;
         let mut lists = Vec::with_capacity(items.len());
@@ -382,7 +385,10 @@ impl CozoDbPy {
     /// ranked lists) fused with RRF and optionally diversified with MMR. Takes a
     /// dict mirroring the Rust `HybridSearch` fields; returns the same shape as
     /// `run_script` (`{rows, headers, next}`) with headers `["id","score"]`
-    /// (or `["id","rank"]` when MMR is set).
+    /// (or `["id","rank"]` when MMR is set). With `detailed: True` the output
+    /// is long-format per-leg contributions: headers
+    /// `["id","score","list_id","leg_rank","leg_score"]` (no MMR) or
+    /// `["id","rank","score","list_id","leg_rank","leg_score"]` (MMR).
     pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
         if let Some(db) = &self.db {
             let q = py_to_hybrid_search(query)?;

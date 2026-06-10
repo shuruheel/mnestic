@@ -264,3 +264,114 @@ fn script_builder_is_inspectable() {
     // No MMR requested → no rerank stage.
     assert!(!script.contains("MaximalMarginalRelevance"));
 }
+
+#[test]
+fn helper_detailed_returns_per_leg_contributions() {
+    let (db, _dir) = make_db();
+    let q = HybridSearch {
+        relation: "docs".into(),
+        vector_index: "vec".into(),
+        query_vector: vec![1.0, 0.0],
+        vector_k: 3,
+        fts_index: "fts".into(),
+        query_text: "cat".into(),
+        fts_k: 3,
+        detailed: true,
+        ..HybridSearch::default()
+    };
+    let res = db
+        .hybrid_search(&q)
+        .unwrap_or_else(|e| panic!("hybrid_search failed: {e:?}"));
+    assert_eq!(
+        res.headers,
+        vec!["id", "score", "list_id", "leg_rank", "leg_score"],
+        "long-format head"
+    );
+    assert!(!res.rows.is_empty(), "fusion produced no rows");
+
+    // d1 matches both legs ('cat' text + nearest embedding) => two rows, one
+    // per leg, same fused score, leg_rank 1 in each.
+    let d1_rows: Vec<_> = res
+        .rows
+        .iter()
+        .filter(|r| r[0].get_str() == Some("d1"))
+        .collect();
+    assert_eq!(d1_rows.len(), 2, "d1 contributes from both legs: {:?}", res.rows);
+    let lists: Vec<&str> = d1_rows.iter().map(|r| r[2].get_str().unwrap()).collect();
+    assert!(lists.contains(&"semantic") && lists.contains(&"text"), "lists = {lists:?}");
+    assert_eq!(
+        d1_rows[0][1], d1_rows[1][1],
+        "fused score repeats across an item's rows"
+    );
+    for r in &d1_rows {
+        assert_eq!(r[3].get_float(), Some(1.0), "d1 is rank 1 in both legs");
+    }
+
+    // Single-leg items get exactly one row: d2 ('a dog ran in the park') is in
+    // the semantic top-3 but never matches 'cat'; d3 ('cats and dogs are pets')
+    // matches the text leg but is the farthest embedding (outside vector_k=3).
+    let leg_of = |id: &str| -> Vec<&str> {
+        res.rows
+            .iter()
+            .filter(|r| r[0].get_str() == Some(id))
+            .map(|r| r[2].get_str().unwrap())
+            .collect()
+    };
+    assert_eq!(leg_of("d2"), vec!["semantic"], "rows = {:?}", res.rows);
+    assert_eq!(leg_of("d3"), vec!["text"], "rows = {:?}", res.rows);
+}
+
+#[test]
+fn helper_detailed_with_mmr_joins_detail_onto_selection() {
+    let (db, _dir) = make_db();
+    let q = HybridSearch {
+        relation: "docs".into(),
+        vector_index: "vec".into(),
+        query_vector: vec![1.0, 0.0],
+        vector_k: 4,
+        fts_index: "fts".into(),
+        query_text: "cat".into(),
+        fts_k: 4,
+        detailed: true,
+        mmr: Some(MmrParams {
+            lambda: 0.5,
+            k: 2,
+            embedding_col: "emb".into(),
+        }),
+        ..HybridSearch::default()
+    };
+    let res = db
+        .hybrid_search(&q)
+        .unwrap_or_else(|e| panic!("hybrid_search failed: {e:?}"));
+    assert_eq!(
+        res.headers,
+        vec!["id", "rank", "score", "list_id", "leg_rank", "leg_score"],
+        "MMR detailed head"
+    );
+    // MMR selected 2 items; rows expand per contributing leg, so distinct ids
+    // must be exactly 2.
+    let mut ids: Vec<&str> = res.rows.iter().map(|r| r[0].get_str().unwrap()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), 2, "MMR k=2 bounds the items; rows = {:?}", res.rows);
+}
+
+#[test]
+fn detailed_script_widens_limit_by_leg_count() {
+    let q = HybridSearch {
+        relation: "docs".into(),
+        vector_index: "vec".into(),
+        query_vector: vec![1.0, 0.0],
+        fts_index: "fts".into(),
+        query_text: "cat".into(),
+        detailed: true,
+        limit: 10,
+        ..HybridSearch::default()
+    };
+    let (script, _params) = build_hybrid_query(&q).unwrap();
+    assert!(script.contains("detailed: true"), "script: {script}");
+    assert!(
+        script.contains(":limit 20"),
+        "limit 10 × 2 legs = 20; script: {script}"
+    );
+}

@@ -176,6 +176,17 @@ pub struct HybridSearch {
     pub mmr: Option<MmrParams>,
     /// Max rows when no MMR rerank is applied (MMR uses its own `k`).
     pub limit: usize,
+    /// Also return per-leg contribution columns (long format). Each output row
+    /// is one *(item, contributing leg)* pair: without MMR the head is
+    /// `[id, score, list_id, leg_rank, leg_score]`, with MMR it is
+    /// `[id, rank, score, list_id, leg_rank, leg_score]`. `leg_rank` is the
+    /// 1-based within-list rank the fusion actually used; `leg_score` is the
+    /// leg's raw (deduplicated best) score; legs an item did not appear in
+    /// contribute no row. Without MMR the row limit is widened to
+    /// `limit × number-of-legs` so the top `limit` items are always fully
+    /// covered (the tail may include partially-covered extra items). Default
+    /// `false`.
+    pub detailed: bool,
 }
 
 impl Default for HybridSearch {
@@ -196,6 +207,7 @@ impl Default for HybridSearch {
             rrf_k: 60.0,
             mmr: None,
             limit: 10,
+            detailed: false,
         }
     }
 }
@@ -361,8 +373,9 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
     }
 
     let rrf_k = fmt_f64(q.rrf_k);
-    match &q.mmr {
-        None => {
+    let num_legs = 2 + q.extra_lists.len() + q.graph_legs.len();
+    match (&q.mmr, q.detailed) {
+        (None, false) => {
             writeln!(
                 s,
                 "?[id, score] <~ ReciprocalRankFusion(combined[__lid, id, score], k: {rrf_k})"
@@ -371,7 +384,19 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
             writeln!(s, ":order -score").unwrap();
             writeln!(s, ":limit {}", q.limit).unwrap();
         }
-        Some(m) => {
+        (None, true) => {
+            // Long format: one row per (item, contributing leg). Widen the row
+            // limit by the leg count so the top `limit` items are always fully
+            // covered; order keeps an item's rows adjacent.
+            writeln!(
+                s,
+                "?[id, score, list_id, leg_rank, leg_score] <~ ReciprocalRankFusion(combined[__lid, id, score], k: {rrf_k}, detailed: true)"
+            )
+            .unwrap();
+            writeln!(s, ":order -score, id, list_id").unwrap();
+            writeln!(s, ":limit {}", q.limit.saturating_mul(num_legs)).unwrap();
+        }
+        (Some(m), detailed) => {
             writeln!(
                 s,
                 "fused[id, score] <~ ReciprocalRankFusion(combined[__lid, id, score], k: {rrf_k})"
@@ -383,14 +408,36 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
                 emb = m.embedding_col,
             )
             .unwrap();
-            writeln!(
-                s,
-                "?[id, rank] <~ MaximalMarginalRelevance(cand[id, score, __emb], lambda: {lambda}, k: {k})",
-                lambda = fmt_f64(m.lambda.clamp(0.0, 1.0)),
-                k = m.k,
-            )
-            .unwrap();
-            writeln!(s, ":order rank").unwrap();
+            let lambda = fmt_f64(m.lambda.clamp(0.0, 1.0));
+            if detailed {
+                // MMR bounds the items; join the per-leg detail onto its
+                // selection (rows only expand per contributing leg).
+                writeln!(
+                    s,
+                    "mmrsel[id, rank] <~ MaximalMarginalRelevance(cand[id, score, __emb], lambda: {lambda}, k: {k})",
+                    k = m.k,
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "detail[id, score, list_id, leg_rank, leg_score] <~ ReciprocalRankFusion(combined[__lid, id, score], k: {rrf_k}, detailed: true)"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "?[id, rank, score, list_id, leg_rank, leg_score] := mmrsel[id, rank], detail[id, score, list_id, leg_rank, leg_score]"
+                )
+                .unwrap();
+                writeln!(s, ":order rank, list_id").unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "?[id, rank] <~ MaximalMarginalRelevance(cand[id, score, __emb], lambda: {lambda}, k: {k})",
+                    k = m.k,
+                )
+                .unwrap();
+                writeln!(s, ":order rank").unwrap();
+            }
         }
     }
 

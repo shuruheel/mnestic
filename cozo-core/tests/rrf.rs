@@ -147,3 +147,96 @@ fn rrf_empty_input() {
     );
     assert_eq!(res.rows.len(), 0, "empty input yields empty output");
 }
+
+#[test]
+fn rrf_detailed_long_format() {
+    // `detailed: true` emits one row per (item, contributing list):
+    // [item, fused_score, list_id, leg_rank, leg_score].
+    let db = DbInstance::default();
+    let res = run(
+        &db,
+        r#"
+        combined[lid, item, score] <- [
+            ['a', 'x', 0.9], ['a', 'y', 0.8], ['a', 'z', 0.7],
+            ['b', 'y', 0.95], ['b', 'z', 0.85], ['b', 'w', 0.5]
+        ]
+        ?[item, fused, lid, leg_rank, leg_score] <~
+            ReciprocalRankFusion(combined[lid, item, score], k: 60, detailed: true)
+    "#,
+    );
+    // 6 input rows, no within-list dups => 6 contribution rows.
+    assert_eq!(res.rows.len(), 6, "one row per (item, list) pair");
+
+    // (item, lid) -> (fused, leg_rank, leg_score)
+    let m: HashMap<(String, String), (f64, f64, f64)> = res
+        .rows
+        .iter()
+        .map(|r| {
+            (
+                (
+                    r[0].get_str().unwrap().to_string(),
+                    r[2].get_str().unwrap().to_string(),
+                ),
+                (
+                    r[1].get_float().unwrap(),
+                    r[3].get_float().unwrap(),
+                    r[4].get_float().unwrap(),
+                ),
+            )
+        })
+        .collect();
+    let approx = |a: f64, b: f64| (a - b).abs() < 1e-9;
+
+    // y: rank2 in a (0.8), rank1 in b (0.95); fused = 1/62 + 1/61 on both rows.
+    let y_fused = 1.0 / 62.0 + 1.0 / 61.0;
+    let (f, r, s) = m[&("y".into(), "a".into())];
+    assert!(approx(f, y_fused) && approx(r, 2.0) && approx(s, 0.8));
+    let (f, r, s) = m[&("y".into(), "b".into())];
+    assert!(approx(f, y_fused) && approx(r, 1.0) && approx(s, 0.95));
+
+    // x: only in a at rank1 => single row, fused = 1/61.
+    let (f, r, s) = m[&("x".into(), "a".into())];
+    assert!(approx(f, 1.0 / 61.0) && approx(r, 1.0) && approx(s, 0.9));
+    assert!(!m.contains_key(&("x".into(), "b".into())), "no row for a non-contributing list");
+}
+
+#[test]
+fn rrf_detailed_dedups_and_reports_best_leg_score() {
+    // Within-list dup keeps the best score; the detailed row reports that
+    // deduplicated score and the rank actually used.
+    let db = DbInstance::default();
+    let res = run(
+        &db,
+        r#"combined[lid, item, score] <- [
+            ['a', 'x', 0.5], ['a', 'x', 0.9], ['a', 'y', 0.7]
+        ]
+        ?[item, fused, lid, leg_rank, leg_score] <~
+            ReciprocalRankFusion(combined[lid, item, score], k: 60, detailed: true)"#,
+    );
+    assert_eq!(res.rows.len(), 2, "dup collapsed to one contribution row");
+    for r in &res.rows {
+        let item = r[0].get_str().unwrap();
+        let leg_rank = r[3].get_float().unwrap();
+        let leg_score = r[4].get_float().unwrap();
+        if item == "x" {
+            assert_eq!(leg_rank, 1.0);
+            assert!((leg_score - 0.9).abs() < 1e-9, "reports the kept best score");
+        } else {
+            assert_eq!(leg_rank, 2.0);
+        }
+    }
+}
+
+#[test]
+fn rrf_detailed_rejects_non_constant_option() {
+    // Arity depends on `detailed`, so it must be a constant boolean.
+    let db = DbInstance::default();
+    let res = db.run_script(
+        r#"combined[lid, item, score] <- [['a', 'x', 0.5]]
+           ?[item, fused, lid, lr, ls] <~
+               RRF(combined[lid, item, score], detailed: 123)"#,
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    );
+    assert!(res.is_err(), "non-boolean `detailed` must be rejected");
+}

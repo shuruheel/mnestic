@@ -19,6 +19,14 @@
 //! item across lists. Output: `[item, fused_score]` (the caller sorts/limits, or
 //! pipes it into further Datalog).
 //!
+//! With `detailed: true` the output is instead the long-format
+//! `[item, fused_score, list_id, leg_rank, leg_score]` — one row per
+//! *(item, contributing list)*, where `leg_rank` is the 1-based within-list rank
+//! the fusion actually used and `leg_score` is the (deduplicated best) raw score
+//! in that list. `fused_score` repeats on every row for an item. This exposes
+//! exactly *why* an item ranked where it did; lists an item did not appear in
+//! contribute no row.
+//!
 //! Why a fixed rule and not plain Datalog: Cozo can already *sum* reciprocal
 //! contributions, but it has no way to assign a *rank position within a group*.
 //! That intra-list ranking is exactly what this rule provides. Mixed-direction
@@ -43,7 +51,7 @@ use smartstring::{LazyCompact, SmartString};
 use crate::data::expr::Expr;
 use crate::data::symb::Symbol;
 use crate::data::value::DataValue;
-use crate::fixed_rule::{FixedRule, FixedRulePayload};
+use crate::fixed_rule::{CannotDetermineArity, FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
 use crate::runtime::temp_store::RegularTempStore;
@@ -62,6 +70,7 @@ impl FixedRule for ReciprocalRankFusion {
         // by zero or go negative.
         let k = payload.float_option("k", Some(60.0))?.max(0.0);
         let descending = payload.bool_option("descending", Some(true))?;
+        let detailed = payload.bool_option("detailed", Some(false))?;
 
         // Group (item, score) by list_id.
         let mut lists: BTreeMap<DataValue, Vec<(DataValue, DataValue)>> = BTreeMap::new();
@@ -91,7 +100,10 @@ impl FixedRule for ReciprocalRankFusion {
 
         // Fuse: rank within each list, accumulate 1 / (k + rank) per item.
         let mut fused: BTreeMap<DataValue, f64> = BTreeMap::new();
-        for (_list_id, entries) in lists {
+        // item -> (list_id, leg_rank, leg_score) contributions, kept only when
+        // `detailed` so the plain path stays allocation-free.
+        let mut contribs: BTreeMap<DataValue, Vec<(DataValue, f64, DataValue)>> = BTreeMap::new();
+        for (list_id, entries) in lists {
             // An item may appear more than once in a list; keep its best score.
             let mut best: BTreeMap<DataValue, DataValue> = BTreeMap::new();
             for (item, score) in entries {
@@ -115,26 +127,63 @@ impl FixedRule for ReciprocalRankFusion {
             } else {
                 ranked.sort_by(|a, b| a.1.cmp(&b.1));
             }
-            for (idx, (item, _score)) in ranked.into_iter().enumerate() {
+            for (idx, (item, score)) in ranked.into_iter().enumerate() {
                 let rank = (idx + 1) as f64;
-                *fused.entry(item).or_insert(0.0) += 1.0 / (k + rank);
+                *fused.entry(item.clone()).or_insert(0.0) += 1.0 / (k + rank);
+                if detailed {
+                    contribs
+                        .entry(item)
+                        .or_default()
+                        .push((list_id.clone(), rank, score));
+                }
             }
             poison.check()?;
         }
 
-        for (item, score) in fused {
-            out.put(vec![item, DataValue::from(score)]);
+        if detailed {
+            for (item, fused_score) in fused {
+                let item_contribs = contribs.remove(&item).unwrap_or_default();
+                for (list_id, leg_rank, leg_score) in item_contribs {
+                    out.put(vec![
+                        item.clone(),
+                        DataValue::from(fused_score),
+                        list_id,
+                        DataValue::from(leg_rank),
+                        leg_score,
+                    ]);
+                }
+            }
+        } else {
+            for (item, score) in fused {
+                out.put(vec![item, DataValue::from(score)]);
+            }
         }
         Ok(())
     }
 
     fn arity(
         &self,
-        _options: &BTreeMap<SmartString<LazyCompact>, Expr>,
+        options: &BTreeMap<SmartString<LazyCompact>, Expr>,
         _rule_head: &[Symbol],
-        _span: SourceSpan,
+        span: SourceSpan,
     ) -> Result<usize> {
-        // Output is always [item, fused_score].
-        Ok(2)
+        // [item, fused_score], or with `detailed: true` the long-format
+        // [item, fused_score, list_id, leg_rank, leg_score].
+        match options.get("detailed") {
+            None
+            | Some(Expr::Const {
+                val: DataValue::Bool(false),
+                ..
+            }) => Ok(2),
+            Some(Expr::Const {
+                val: DataValue::Bool(true),
+                ..
+            }) => Ok(5),
+            _ => bail!(CannotDetermineArity(
+                "ReciprocalRankFusion".to_string(),
+                "invalid option 'detailed' given, expect a constant boolean".to_string(),
+                span
+            )),
+        }
     }
 }

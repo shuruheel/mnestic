@@ -3,6 +3,31 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## 0.8.4 — unreleased
+
+Banked for the next cadence release.
+
+### New — per-leg retrieval detail: `detailed` on RRF and `HybridSearch`
+- `ReciprocalRankFusion(..., detailed: true)` switches the output from
+  `[item, fused_score]` to the long-format
+  `[item, fused_score, list_id, leg_rank, leg_score]` — one row per
+  *(item, contributing list)*. `leg_rank` is the 1-based within-list rank the
+  fusion actually used (after best-score dedup); `leg_score` is that
+  deduplicated raw score; lists an item did not appear in contribute no row.
+  `detailed` must be a constant boolean (output arity depends on it). This is
+  the mechanism behind a consumer's "why was this retrieved" surface: the rows
+  reconstruct the fused score exactly (`Σ 1/(k + leg_rank)`).
+- `HybridSearch::detailed: bool` plumbs it through the one-call helper. Without
+  MMR the head is `[id, score, list_id, leg_rank, leg_score]` and the row limit
+  widens to `limit × leg-count` so the top `limit` items are always fully
+  covered; with MMR the per-leg detail is joined onto MMR's selection and the
+  head is `[id, rank, score, list_id, leg_rank, leg_score]`.
+- Python binding: pass `detailed: True` in the `hybrid_search` dict.
+
+### Fixed
+- `log::error` import in `jlines.rs` is now gated behind the `requests`
+  feature (was an unused-import warning under minimal feature sets).
+
 ## 0.8.3 — 2026-05-31
 
 Fourth fork release. Two agentic-memory wedge features land together and are
