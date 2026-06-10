@@ -24,6 +24,23 @@ Banked for the next cadence release.
   head is `[id, rank, score, list_id, leg_rank, leg_score]`.
 - Python binding: pass `detailed: True` in the `hybrid_search` dict.
 
+### Fixed — concurrency regression in the 0.8.3 doc-stats counter
+- 0.8.3's durable `avgdl` counter was one shared storage key per FTS index,
+  read (without a lock) and rewritten inside **every** document transaction.
+  Under RocksDB pessimistic transactions this made all concurrent writers to
+  an FTS-indexed relation conflict on a single row lock (held until commit),
+  and the unlocked read-modify-write also lost updates, silently drifting the
+  counter. Concurrent ingest produced `Resource busy`-class storage errors.
+- The counter is now **process-cached and scan-seeded**: one deduplicated
+  full scan per index per process (the path 0.8.3 already used for legacy
+  indices), maintained incrementally in memory on every put/delete, with no
+  shared storage key in the hot path. Per-query `avgdl` stays O(1); the
+  pinned behaviours (deletes net correctly, scores identical across reopen,
+  BM25 denominator) are unchanged and covered by `tests/fts_avgdl.rs`.
+  Index rebuilds reseed the cache and delete any legacy 0.8.3 counter key.
+- Deltas from rolled-back transactions are not undone; the drift is
+  negligible for a smoothing denominator and clears on restart or rebuild.
+
 ### Fixed
 - `log::error` import in `jlines.rs` is now gated behind the `requests`
   feature (was an unused-import warning under minimal feature sets).

@@ -47,30 +47,22 @@ impl FtsCache {
     /// Average document length (in tokens) over the indexed corpus — the BM25
     /// length-normalization denominator (mnestic fork, DEVELOPMENT.md Bet 1b).
     ///
-    /// **O(1)** when the index carries the durable doc-stats counter (every index
-    /// built or written under this code): a single keyed `get`. For a *legacy*
-    /// index that predates the counter and has not been written since (its corpus
-    /// is therefore immutable), it falls back to one deduplicated full scan,
-    /// cached on the `Db` so it is paid once per process rather than per query.
+    /// **O(1)** per query: reads the process-level doc-stats cache on the `Db`,
+    /// seeding it with one deduplicated full scan of the index the first time it
+    /// is touched in this process. Writes maintain the cache incrementally (see
+    /// `SessionTx::bump_fts_doc_stats`), so the scan is paid once per process per
+    /// index, never per query — and, deliberately, nothing here writes a shared
+    /// storage key (a durable counter written from every document transaction
+    /// makes all concurrent writers conflict on one RocksDB lock; that was the
+    /// 0.8.3 design, reverted).
     fn get_avgdl_for_index(&mut self, idx: &RelationHandle, tx: &SessionTx<'_>) -> Result<f64> {
         let avgdl = |total: u64, n: u64| if n > 0 { total as f64 / n as f64 } else { 0.0 };
-        if let Some((total, n)) = tx.read_fts_doc_stats(idx)? {
-            return Ok(avgdl(total, n));
-        }
-        if let Some((total, n)) = tx
-            .fts_doc_stats_cache
-            .lock()
-            .unwrap()
-            .get(&idx.name)
-            .copied()
-        {
+        let mut cache = tx.fts_doc_stats_cache.lock().unwrap();
+        if let Some((total, n)) = cache.get(&idx.name).copied() {
             return Ok(avgdl(total, n));
         }
         let (total, n) = tx.scan_fts_doc_stats(idx)?;
-        tx.fts_doc_stats_cache
-            .lock()
-            .unwrap()
-            .insert(idx.name.clone(), (total, n));
+        cache.insert(idx.name.clone(), (total, n));
         Ok(avgdl(total, n))
     }
 }
@@ -90,41 +82,44 @@ struct LiteralStats {
 }
 
 impl<'a> SessionTx<'a> {
-    /// Reserved key under which an FTS index stores its durable corpus doc-stats
-    /// counter `[total_tokens, n_docs]` (mnestic fork, Bet 1b). `DataValue::Bot`
-    /// is the top key sentinel, so this sits *above* every `[term, …doc_key]`
-    /// posting — it is never returned by a term range scan nor by the full-index
-    /// doc scan (whose exclusive upper bound is exactly this key).
+    /// Reserved key under which the 0.8.3 design stored a durable corpus
+    /// doc-stats counter. `DataValue::Bot` is the top key sentinel, so it sits
+    /// *above* every `[term, …doc_key]` posting — never returned by a term range
+    /// scan nor by the full-index doc scan (whose exclusive upper bound is
+    /// exactly this key). Kept only so rebuilds can delete legacy counters;
+    /// nothing reads or writes it anymore (every document transaction writing
+    /// one shared key made all concurrent writers conflict on a single RocksDB
+    /// lock, and the unlocked read-modify-write also lost updates).
     fn fts_stats_key(idx: &RelationHandle) -> Vec<u8> {
         idx.encode_partial_key_for_store(&[DataValue::Bot])
     }
 
-    /// Read the durable doc-stats counter, or `None` if the index predates it
-    /// (legacy / not yet migrated).
-    pub(crate) fn read_fts_doc_stats(&self, idx: &RelationHandle) -> Result<Option<(u64, u64)>> {
-        let key = Self::fts_stats_key(idx);
-        match self.store_tx.get(&key, false)? {
-            None => Ok(None),
-            Some(v) => {
-                let vals: Vec<DataValue> = rmp_serde::from_slice(&v[ENCODED_KEY_MIN_LEN..])
-                    .map_err(|e| miette!("corrupt FTS doc-stats counter: {e}"))?;
-                let total = vals.first().and_then(|d| d.get_int()).unwrap_or(0).max(0) as u64;
-                let n = vals.get(1).and_then(|d| d.get_int()).unwrap_or(0).max(0) as u64;
-                Ok(Some((total, n)))
-            }
-        }
-    }
-
-    pub(crate) fn write_fts_doc_stats(
-        &mut self,
+    /// Apply a delta to the process-level doc-stats cache for `idx`, seeding it
+    /// with a one-time scan of the existing postings if absent.
+    ///
+    /// Call BEFORE mutating the document's postings: the seed scan must observe
+    /// the pre-mutation corpus so the delta is applied exactly once. The cache
+    /// mutex is a leaf lock; holding it across the (one-time) seed scan keeps
+    /// concurrent seeders from losing each other's deltas. Deltas from
+    /// transactions that later roll back are not undone — `avgdl` is a smoothing
+    /// denominator, the drift is negligible and clears on process restart or
+    /// index rebuild.
+    fn bump_fts_doc_stats(
+        &self,
         idx: &RelationHandle,
-        total: u64,
-        n: u64,
+        token_delta: i64,
+        doc_delta: i64,
     ) -> Result<()> {
-        let key = Self::fts_stats_key(idx);
-        let val = vec![DataValue::from(total as i64), DataValue::from(n as i64)];
-        let val_bytes = idx.encode_val_only_for_store(&val, Default::default())?;
-        self.store_tx.put(&key, &val_bytes)
+        let cache = self.fts_doc_stats_cache.clone();
+        let mut guard = cache.lock().unwrap();
+        let (total, n) = match guard.get(&idx.name).copied() {
+            Some(stats) => stats,
+            None => self.scan_fts_doc_stats(idx)?,
+        };
+        let total = (total as i64).saturating_add(token_delta).max(0) as u64;
+        let n = (n as i64).saturating_add(doc_delta).max(0) as u64;
+        guard.insert(idx.name.clone(), (total, n));
+        Ok(())
     }
 
     /// Deduplicated full scan of the FTS index → `(total_tokens, n_docs)` over
@@ -148,22 +143,21 @@ impl<'a> SessionTx<'a> {
         Ok((total, seen.len() as u64))
     }
 
-    /// Read the counter, seeding it from a one-time scan if absent — so a legacy
-    /// index migrates itself to O(1) on its first write.
-    fn ensure_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<(u64, u64)> {
-        if let Some(s) = self.read_fts_doc_stats(idx)? {
-            return Ok(s);
-        }
-        let (total, n) = self.scan_fts_doc_stats(idx)?;
-        self.write_fts_doc_stats(idx, total, n)?;
-        Ok((total, n))
-    }
-
-    /// Recompute and overwrite the durable counter from a full scan. Called at the
-    /// end of an index (re)build to publish the authoritative corpus stats.
+    /// Recompute the doc-stats cache entry from a full scan. Called at the end
+    /// of an index (re)build to publish authoritative corpus stats (and to clear
+    /// drift from any rolled-back deltas). Also deletes the legacy durable
+    /// counter a 0.8.3 build may have left behind.
     pub(crate) fn rebuild_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<()> {
-        let (total, n) = self.scan_fts_doc_stats(idx)?;
-        self.write_fts_doc_stats(idx, total, n)
+        let stats = self.scan_fts_doc_stats(idx)?;
+        self.fts_doc_stats_cache
+            .lock()
+            .unwrap()
+            .insert(idx.name.clone(), stats);
+        let legacy_key = Self::fts_stats_key(idx);
+        if self.store_tx.exists(&legacy_key, false)? {
+            self.store_tx.del(&legacy_key)?;
+        }
+        Ok(())
     }
 
     fn fts_search_literal(
@@ -480,17 +474,16 @@ impl<'a> SessionTx<'a> {
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
         }
-        // Maintain the durable doc-stats counter (mnestic fork, Bet 1b) so `avgdl`
-        // is an O(1) read. Done *before* writing this document's postings so a
-        // seed-on-absent scan sees the pre-insert corpus and we add the new
+        // Maintain the process-level doc-stats cache (mnestic fork, Bet 1b) so
+        // `avgdl` is an O(1) read. Done *before* writing this document's postings
+        // so a seed-on-absent scan sees the pre-insert corpus and we add the new
         // document exactly once. `count == 0` (no tokens ⇒ no postings) is skipped,
         // matching the scan, which only counts documents that have postings.
         // (The normal update path is del-then-put, so the old document is already
         // subtracted; an FTS-only relation with no secondary index does not call
         // `del` on update and can drift, mirroring upstream's posting leak there.)
         if count > 0 {
-            let (total, n) = self.ensure_fts_doc_stats(idx_handle)?;
-            self.write_fts_doc_stats(idx_handle, total + count as u64, n + 1)?;
+            self.bump_fts_doc_stats(idx_handle, count, 1)?;
         }
         let mut val = vec![
             DataValue::Bot,
@@ -543,23 +536,19 @@ impl<'a> SessionTx<'a> {
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
         }
-        // Maintain the durable doc-stats counter (mnestic fork, Bet 1b) — but only
-        // if this document is actually indexed (probe one of its postings). That
-        // guards against a delete of an unindexed row and the del-then-put refresh
-        // in `create_fts_index`, where `del` runs over a not-yet-indexed row. Done
-        // before the postings are removed so a seed-on-absent scan still sees them.
+        // Maintain the process-level doc-stats cache (mnestic fork, Bet 1b) — but
+        // only if this document is actually indexed (probe one of its postings).
+        // That guards against a delete of an unindexed row and the del-then-put
+        // refresh in `create_fts_index`, where `del` runs over a not-yet-indexed
+        // row. Done before the postings are removed so a seed-on-absent scan
+        // still sees them.
         if count > 0 {
             if let Some(term) = collector.iter().next() {
                 let mut probe = key.clone();
                 probe[0] = DataValue::Str(term.clone());
                 let probe_bytes = idx_handle.encode_key_for_store(&probe, Default::default())?;
                 if self.store_tx.exists(&probe_bytes, false)? {
-                    let (total, n) = self.ensure_fts_doc_stats(idx_handle)?;
-                    self.write_fts_doc_stats(
-                        idx_handle,
-                        total.saturating_sub(count as u64),
-                        n.saturating_sub(1),
-                    )?;
+                    self.bump_fts_doc_stats(idx_handle, -count, -1)?;
                 }
             }
         }
