@@ -29,6 +29,10 @@ hits = db.hybrid_search({
     "fts_index": "fts", "query_text": "vector search", "fts_k": 5,
 })
 # -> {"headers": ["id", "score"], "rows": [["d3", 0.033], ...], "next": None}
+
+# Pass "detailed": True for per-leg contributions — one row per (item, leg)
+# with the within-leg rank the fusion used and the leg's raw score:
+# headers ["id","score","list_id","leg_rank","leg_score"]
 ```
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages

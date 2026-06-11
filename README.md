@@ -15,6 +15,22 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
+**0.8.4**
+
+- **Per-leg fusion detail** — `ReciprocalRankFusion(..., detailed: true)` /
+  `HybridSearch::detailed` return one row per *(item, contributing leg)*:
+  `[item, fused_score, list_id, leg_rank, leg_score]`. The fused score
+  reconstructs exactly as `Σ 1/(k + leg_rank)` — the substrate for
+  "why was this retrieved" surfaces. Python binding: `detailed=True`.
+- **Concurrency fix** — 0.8.3's durable `avgdl` counter (one shared key written
+  in every document transaction) made concurrent writers to FTS-indexed
+  relations contend on a single RocksDB row lock and could lose counter
+  updates. Doc-stats are now process-cached and scan-seeded; per-query `avgdl`
+  stays O(1) and BM25 scores are unchanged.
+- **Python on PyPI** — `pip install mnestic` (abi3 wheels: Linux x86_64/aarch64,
+  macOS Intel/arm64, Windows), plus `langchain-mnestic` and
+  `llama-index-vector-stores-mnestic` adapters.
+
 **0.8.3**
 
 - **Native 3-way fused recall** — `hybrid_search` now fuses a graph-proximity leg
@@ -26,7 +42,8 @@ Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 - **BM25-correct FTS, with O(1) `avgdl`** — the default `::fts` scorer is now Okapi
   **`bm25`** (term-frequency saturation `k1` + document-length normalization `b`,
   both tunable; `OR` sums per-term contributions). Average document length is an O(1)
-  read of a durable per-index counter rather than a per-query index scan. Measured:
+  read rather than a per-query index scan (durable-counter design replaced by a
+  process-level cache in 0.8.4). Measured:
   fused recall **0.75 → 0.954** (parity with DuckDB / SQLite) at no net latency cost
   (decomposed p50 927 → 175 ms, cold p99 2,900 → 258 ms). **Heads-up:** this changes
   the default FTS score kind (a behaviour change); `tf`/`tf_idf` stay selectable for
