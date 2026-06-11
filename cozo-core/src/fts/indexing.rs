@@ -149,10 +149,22 @@ impl<'a> SessionTx<'a> {
     /// counter a 0.8.3 build may have left behind.
     pub(crate) fn rebuild_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<()> {
         let stats = self.scan_fts_doc_stats(idx)?;
+        self.seed_fts_doc_stats(idx, stats.0, stats.1)
+    }
+
+    /// Publish corpus stats already known exactly (e.g. counted during a bulk
+    /// build), skipping the full index scan `rebuild_fts_doc_stats` pays. Also
+    /// deletes the legacy durable counter a 0.8.3 build may have left behind.
+    pub(crate) fn seed_fts_doc_stats(
+        &mut self,
+        idx: &RelationHandle,
+        total_tokens: u64,
+        n_docs: u64,
+    ) -> Result<()> {
         self.fts_doc_stats_cache
             .lock()
             .unwrap()
-            .insert(idx.name.clone(), stats);
+            .insert(idx.name.clone(), (total_tokens, n_docs));
         let legacy_key = Self::fts_stats_key(idx);
         if self.store_tx.exists(&legacy_key, false)? {
             self.store_tx.del(&legacy_key)?;
@@ -446,34 +458,8 @@ impl<'a> SessionTx<'a> {
         rel_handle: &RelationHandle,
         idx_handle: &RelationHandle,
     ) -> Result<()> {
-        let to_index = match eval_bytecode(extractor, tuple, stack)? {
-            DataValue::Null => return Ok(()),
-            DataValue::Str(s) => s,
-            val => {
-                #[derive(Debug, Diagnostic, Error)]
-                #[error("FTS index extractor must return a string, got {0}")]
-                #[diagnostic(code(eval::fts::extractor::invalid_return_type))]
-                struct FtsExtractError(String);
-
-                bail!(FtsExtractError(format!("{}", val)))
-            }
-        };
-        let mut token_stream = tokenizer.token_stream(&to_index);
-        let mut collector: HashMap<_, (Vec<_>, Vec<_>, Vec<_>), _> = FxHashMap::default();
-        let mut count = 0i64;
-        while let Some(token) = token_stream.next() {
-            let text = SmartString::<LazyCompact>::from(&token.text);
-            let (fr, to, position) = collector.entry(text).or_default();
-            fr.push(DataValue::from(token.offset_from as i64));
-            to.push(DataValue::from(token.offset_to as i64));
-            position.push(DataValue::from(token.position as i64));
-            count += 1;
-        }
-        let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
-        key.push(DataValue::Bot);
-        for k in &tuple[..rel_handle.metadata.keys.len()] {
-            key.push(k.clone());
-        }
+        let (rows, count) =
+            encode_fts_rows_for_tuple(tuple, extractor, stack, tokenizer, rel_handle, idx_handle)?;
         // Maintain the process-level doc-stats cache (mnestic fork, Bet 1b) so
         // `avgdl` is an O(1) read. Done *before* writing this document's postings
         // so a seed-on-absent scan sees the pre-insert corpus and we add the new
@@ -485,19 +471,7 @@ impl<'a> SessionTx<'a> {
         if count > 0 {
             self.bump_fts_doc_stats(idx_handle, count, 1)?;
         }
-        let mut val = vec![
-            DataValue::Bot,
-            DataValue::Bot,
-            DataValue::Bot,
-            DataValue::from(count),
-        ];
-        for (text, (from, to, position)) in collector {
-            key[0] = DataValue::Str(text);
-            val[0] = DataValue::List(from);
-            val[1] = DataValue::List(to);
-            val[2] = DataValue::List(position);
-            let key_bytes = idx_handle.encode_key_for_store(&key, Default::default())?;
-            let val_bytes = idx_handle.encode_val_only_for_store(&val, Default::default())?;
+        for (key_bytes, val_bytes) in rows {
             self.store_tx.put(&key_bytes, &val_bytes)?;
         }
         Ok(())
@@ -559,4 +533,63 @@ impl<'a> SessionTx<'a> {
         }
         Ok(())
     }
+}
+
+/// Tokenise one document and encode its posting rows — the pure half of
+/// `put_fts_index_item` (mnestic fork). Needs no transaction access, so bulk
+/// index builds can run it on worker threads; the caller writes the returned
+/// rows and applies the token `count` to the doc-stats cache.
+pub(crate) fn encode_fts_rows_for_tuple(
+    tuple: &[DataValue],
+    extractor: &[Bytecode],
+    stack: &mut Vec<DataValue>,
+    tokenizer: &TextAnalyzer,
+    rel_handle: &RelationHandle,
+    idx_handle: &RelationHandle,
+) -> Result<(Vec<(Vec<u8>, Vec<u8>)>, i64)> {
+    let to_index = match eval_bytecode(extractor, tuple, stack)? {
+        DataValue::Null => return Ok((vec![], 0)),
+        DataValue::Str(s) => s,
+        val => {
+            #[derive(Debug, Diagnostic, Error)]
+            #[error("FTS index extractor must return a string, got {0}")]
+            #[diagnostic(code(eval::fts::extractor::invalid_return_type))]
+            struct FtsExtractError(String);
+
+            bail!(FtsExtractError(format!("{}", val)))
+        }
+    };
+    let mut token_stream = tokenizer.token_stream(&to_index);
+    let mut collector: HashMap<_, (Vec<_>, Vec<_>, Vec<_>), _> = FxHashMap::default();
+    let mut count = 0i64;
+    while let Some(token) = token_stream.next() {
+        let text = SmartString::<LazyCompact>::from(&token.text);
+        let (fr, to, position) = collector.entry(text).or_default();
+        fr.push(DataValue::from(token.offset_from as i64));
+        to.push(DataValue::from(token.offset_to as i64));
+        position.push(DataValue::from(token.position as i64));
+        count += 1;
+    }
+    let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
+    key.push(DataValue::Bot);
+    for k in &tuple[..rel_handle.metadata.keys.len()] {
+        key.push(k.clone());
+    }
+    let mut val = vec![
+        DataValue::Bot,
+        DataValue::Bot,
+        DataValue::Bot,
+        DataValue::from(count),
+    ];
+    let mut rows = Vec::with_capacity(collector.len());
+    for (text, (from, to, position)) in collector {
+        key[0] = DataValue::Str(text);
+        val[0] = DataValue::List(from);
+        val[1] = DataValue::List(to);
+        val[2] = DataValue::List(position);
+        let key_bytes = idx_handle.encode_key_for_store(&key, Default::default())?;
+        let val_bytes = idx_handle.encode_val_only_for_store(&val, Default::default())?;
+        rows.push((key_bytes, val_bytes));
+    }
+    Ok((rows, count))
 }

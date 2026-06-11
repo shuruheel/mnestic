@@ -44,7 +44,7 @@ pub(crate) struct HnswIndexManifest {
 }
 
 impl HnswIndexManifest {
-    fn get_random_level(&self) -> i64 {
+    pub(crate) fn get_random_level(&self) -> i64 {
         let mut rng = rand::thread_rng();
         let uniform_num: f64 = rng.gen_range(0.0..1.0);
         let r = -uniform_num.ln() * self.level_multiplier;
@@ -734,11 +734,13 @@ impl<'a> SessionTx<'a> {
         self.hnsw_put_inner(manifest, orig_table, idx_table, filter, stack, tuple, &mut vec_cache)
     }
 
-    /// Bulk-build an HNSW index over `tuples` (mnestic fork). Unlike the
-    /// steady-state path this shares one `VectorCache` across every insertion:
-    /// during a fresh build no vector is mutated, so a neighbour's vector can be
-    /// fetched+decoded from the base relation once and reused, instead of being
-    /// re-read for every insertion that visits it.
+    /// Bulk-build an HNSW index over `tuples` (mnestic fork). The graph is
+    /// constructed entirely in flat, integer-indexed memory (vector slab +
+    /// per-node adjacency — see `hnsw_build.rs`), optionally with parallel
+    /// insertion, then serialised into the index relation's tuple format in
+    /// one pass. Produces the same row layout as the incremental path
+    /// (`hnsw_put_vector`): per-level self rows carrying degree + vector hash,
+    /// directed edge rows carrying distances, and the entry-point canary.
     pub(crate) fn hnsw_build_index(
         &mut self,
         manifest: &HnswIndexManifest,
@@ -747,21 +749,131 @@ impl<'a> SessionTx<'a> {
         filter: Option<&Vec<Bytecode>>,
         tuples: &[Tuple],
     ) -> Result<()> {
-        let mut vec_cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
+        use crate::runtime::hnsw_build::{build_threads, FlatHnswBuilder, NodeMeta};
+
+        let key_len = orig_table.metadata.keys.len();
+        let mut builder = FlatHnswBuilder::new(manifest);
         let mut stack = vec![];
         for tuple in tuples {
-            self.hnsw_put_inner(
-                manifest,
-                orig_table,
-                idx_table,
-                filter,
-                &mut stack,
-                tuple,
-                &mut vec_cache,
-            )?;
+            if let Some(code) = filter {
+                if !eval_bytecode_pred(code, tuple, &mut stack, Default::default())? {
+                    continue;
+                }
+            }
+            for idx in &manifest.vec_fields {
+                let val = tuple.get(*idx).unwrap();
+                if let DataValue::Vec(v) = val {
+                    builder.add_node(
+                        NodeMeta {
+                            key: tuple[..key_len].to_vec(),
+                            field_idx: *idx,
+                            sub_idx: -1,
+                            hash: v.get_hash().as_ref().to_vec(),
+                        },
+                        v,
+                    )?;
+                } else if let DataValue::List(l) = val {
+                    for (sidx, v) in l.iter().enumerate() {
+                        if let DataValue::Vec(v) = v {
+                            builder.add_node(
+                                NodeMeta {
+                                    key: tuple[..key_len].to_vec(),
+                                    field_idx: *idx,
+                                    sub_idx: sidx as i32,
+                                    hash: v.get_hash().as_ref().to_vec(),
+                                },
+                                v,
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+        if builder.is_empty() {
+            return Ok(());
+        }
+        let build_start = std::time::Instant::now();
+        let graph = builder.build(manifest, build_threads());
+        let insert_elapsed = build_start.elapsed();
+
+        // Serialise: per node × level, one self row + one row per out-edge.
+        let mut key_buf: Vec<DataValue> = Vec::with_capacity(2 * key_len + 5);
+        for (i, meta) in graph.metas.iter().enumerate() {
+            for (d, list) in graph.towers[i].iter().enumerate() {
+                let level = -(d as i64);
+                key_buf.clear();
+                key_buf.push(DataValue::from(level));
+                for _ in 0..2 {
+                    key_buf.extend_from_slice(&meta.key);
+                    key_buf.push(DataValue::from(meta.field_idx as i64));
+                    key_buf.push(DataValue::from(meta.sub_idx as i64));
+                }
+                let self_val = [
+                    DataValue::from(list.len() as f64),
+                    DataValue::Bytes(meta.hash.clone()),
+                    DataValue::from(false),
+                ];
+                let k = idx_table.encode_key_for_store(&key_buf, Default::default())?;
+                let v = idx_table.encode_val_only_for_store(&self_val, Default::default())?;
+                self.idx_put(idx_table, &k, &v)?;
+
+                for &(nb, dist) in list {
+                    let nb_meta = &graph.metas[nb as usize];
+                    key_buf.clear();
+                    key_buf.push(DataValue::from(level));
+                    key_buf.extend_from_slice(&meta.key);
+                    key_buf.push(DataValue::from(meta.field_idx as i64));
+                    key_buf.push(DataValue::from(meta.sub_idx as i64));
+                    key_buf.extend_from_slice(&nb_meta.key);
+                    key_buf.push(DataValue::from(nb_meta.field_idx as i64));
+                    key_buf.push(DataValue::from(nb_meta.sub_idx as i64));
+                    let edge_val = [
+                        DataValue::from(dist),
+                        DataValue::Null,
+                        DataValue::from(false),
+                    ];
+                    let k = idx_table.encode_key_for_store(&key_buf, Default::default())?;
+                    let v = idx_table.encode_val_only_for_store(&edge_val, Default::default())?;
+                    self.idx_put(idx_table, &k, &v)?;
+                }
+            }
+        }
+
+        // Entry-point canary, as written by `hnsw_put_fresh_at_levels`.
+        if let Some((ep, ep_top)) = graph.entry {
+            let ep_meta = &graph.metas[ep as usize];
+            let mut target_key = vec![DataValue::Null];
+            let mut canary_key = vec![DataValue::from(1)];
+            for _ in 0..2 {
+                for k in ep_meta.key.iter() {
+                    target_key.push(k.clone());
+                    canary_key.push(DataValue::Null);
+                }
+                target_key.push(DataValue::from(ep_meta.field_idx as i64));
+                target_key.push(DataValue::from(ep_meta.sub_idx as i64));
+                canary_key.push(DataValue::Null);
+                canary_key.push(DataValue::Null);
+            }
+            let target_key_bytes =
+                idx_table.encode_key_for_store(&target_key, Default::default())?;
+            let canary_value = [
+                DataValue::from(ep_top),
+                DataValue::Bytes(target_key_bytes),
+                DataValue::from(false),
+            ];
+            let canary_key_bytes =
+                idx_table.encode_key_for_store(&canary_key, Default::default())?;
+            let canary_value_bytes =
+                idx_table.encode_val_only_for_store(&canary_value, Default::default())?;
+            self.idx_put(idx_table, &canary_key_bytes, &canary_value_bytes)?;
+        }
+        if std::env::var_os("MNESTIC_BUILD_PROFILE").is_some() {
+            eprintln!(
+                "hnsw bulk build: {} nodes, graph {:?}, serialise {:?}",
+                graph.metas.len(),
+                insert_elapsed,
+                build_start.elapsed() - insert_elapsed
+            );
         }
         Ok(())
     }

@@ -25,6 +25,7 @@ use crate::data::relation::{ColType, ColumnDef, NullableColType, StoredRelationM
 use crate::data::symb::Symbol;
 use crate::data::tuple::{decode_tuple_from_key, Tuple, TupleT, ENCODED_KEY_MIN_LEN};
 use crate::data::value::{DataValue, ValidityTs};
+use crate::fts::indexing::encode_fts_rows_for_tuple;
 use crate::fts::FtsIndexManifest;
 use crate::parse::expr::build_expr;
 use crate::parse::sys::{FtsIndexConfig, HnswIndexConfig, MinHashLshConfig};
@@ -964,39 +965,92 @@ impl<'a> SessionTx<'a> {
         code_expr.fill_binding_indices(&binding_map)?;
         let extractor = code_expr.compile()?;
 
-        let mut stack = vec![];
-
         let mut existing = TempCollector::default();
         for tuple in rel_handle.scan_all(self) {
             existing.push(tuple?);
         }
-        for tuple in existing.into_iter() {
-            let key_part = &tuple[..rel_handle.metadata.keys.len()];
-            if rel_handle.exists(self, key_part)? {
-                self.del_fts_index_item(
-                    &tuple,
+        let tuples: Vec<Tuple> = existing.into_iter().collect();
+
+        // Bulk-populate (mnestic fork). The index relation above is freshly
+        // created and empty, so no del pass is needed (the old code tokenised
+        // every document a second time to delete postings that could not
+        // exist). Tokenisation + row encoding are pure, so they fan out across
+        // worker threads; writes and doc-stats stay on this thread.
+        let threads = crate::runtime::hnsw_build::build_threads()
+            .max(1)
+            .min(tuples.len().max(1));
+        let mut total_tokens: u64 = 0;
+        let mut n_docs: u64 = 0;
+        if threads <= 1 || tuples.len() < 64 {
+            let mut stack = vec![];
+            for tuple in &tuples {
+                let (rows, count) = encode_fts_rows_for_tuple(
+                    tuple,
                     &extractor,
                     &mut stack,
                     &tokenizer,
                     &rel_handle,
                     &idx_handle,
                 )?;
+                if count > 0 {
+                    total_tokens += count as u64;
+                    n_docs += 1;
+                }
+                for (key_bytes, val_bytes) in rows {
+                    self.store_tx.put(&key_bytes, &val_bytes)?;
+                }
             }
-            self.put_fts_index_item(
-                &tuple,
-                &extractor,
-                &mut stack,
-                &tokenizer,
-                &rel_handle,
-                &idx_handle,
-            )?;
+        } else {
+            let chunk_size = tuples.len().div_ceil(threads);
+            type EncodedChunk = (Vec<(Vec<u8>, Vec<u8>)>, u64, u64);
+            let chunk_results: Vec<Result<EncodedChunk>> = std::thread::scope(|s| {
+                let handles: Vec<_> = tuples
+                    .chunks(chunk_size)
+                    .map(|chunk| {
+                        let extractor = &extractor;
+                        let tokenizer = &tokenizer;
+                        let rel_handle = &rel_handle;
+                        let idx_handle = &idx_handle;
+                        s.spawn(move || {
+                            let mut stack = vec![];
+                            let mut rows = vec![];
+                            let mut total_tokens: u64 = 0;
+                            let mut n_docs: u64 = 0;
+                            for tuple in chunk {
+                                let (tuple_rows, count) = encode_fts_rows_for_tuple(
+                                    tuple, extractor, &mut stack, tokenizer, rel_handle,
+                                    idx_handle,
+                                )?;
+                                if count > 0 {
+                                    total_tokens += count as u64;
+                                    n_docs += 1;
+                                }
+                                rows.extend(tuple_rows);
+                            }
+                            Ok((rows, total_tokens, n_docs))
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| h.join().expect("FTS index build worker panicked"))
+                    .collect()
+            });
+            for result in chunk_results {
+                let (rows, chunk_tokens, chunk_docs) = result?;
+                total_tokens += chunk_tokens;
+                n_docs += chunk_docs;
+                for (key_bytes, val_bytes) in rows {
+                    self.store_tx.put(&key_bytes, &val_bytes)?;
+                }
+            }
         }
 
         // Publish the authoritative corpus doc-stats counter for this freshly
         // built index (mnestic fork, Bet 1b) so `avgdl` is an O(1) read rather
-        // than a per-query scan. Overwrites any incremental value accumulated by
-        // the del/put loop above.
-        self.rebuild_fts_doc_stats(&idx_handle)?;
+        // than a per-query scan. Totals were counted exactly during the build,
+        // so no index scan is needed.
+        self.seed_fts_doc_stats(&idx_handle, total_tokens, n_docs)?;
 
         rel_handle
             .fts_indices

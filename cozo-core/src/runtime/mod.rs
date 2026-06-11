@@ -13,6 +13,7 @@ pub(crate) mod relation;
 pub(crate) mod temp_store;
 pub(crate) mod transact;
 pub(crate) mod hnsw;
+pub(crate) mod hnsw_build;
 pub(crate) mod hybrid;
 pub(crate) mod minhash_lsh;
 #[cfg(test)]

@@ -3,6 +3,38 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased
+
+### Changed — flat in-RAM parallel HNSW bulk build (`::hnsw create`)
+- `::hnsw create` now constructs the graph in flat, integer-indexed memory
+  (one contiguous vector slab + per-node adjacency arrays, the
+  hnswlib/pgvector/Lucene layout) instead of the temp-store BTreeMap of
+  encoded tuples, and inserts in parallel with per-node locks. A profile of
+  the old build showed >50% of CPU in tuple encode/decode, `CompoundKey`
+  hashing and allocator traffic — all gone. The finished graph is serialised
+  into the index relation's existing tuple format in one pass: the on-disk
+  layout, the search path, incremental maintenance (`hnsw_put`/`hnsw_remove`),
+  and the non-blocking Phase A–D build/reconcile orchestration are unchanged.
+- `MNESTIC_INDEX_BUILD_THREADS` controls worker count (unset/0 = all cores;
+  1 = serial insertion in scan order, the old behaviour). Parallel insertion
+  makes the built graph non-deterministic across runs (link sets vary with
+  interleaving, as in hnswlib/pgvector); recall agreement is guarded by
+  `tests/hnsw_build.rs::parallel_build_recall_agreement`.
+- Two parallel-only divergences from the serial insertion algorithm, both
+  required for lock-safety: neighbour-overflow shrinking never extends
+  candidates (would need two node locks at once), and a node's own link-list
+  write merges with concurrently-arrived backlinks instead of replacing them
+  (replacement severed edges and, on chain-shaped data, broke connectivity).
+
+### Changed — FTS bulk build (`::fts create`)
+- The populate loop no longer runs a del pass per row: the index relation is
+  freshly created and empty, so the old code tokenised every document a
+  second time to delete postings that could not exist.
+- Tokenisation + posting-row encoding now fan out across worker threads
+  (same `MNESTIC_INDEX_BUILD_THREADS` control); the row format is unchanged.
+- Corpus doc-stats (`avgdl`) are counted exactly during the build and seeded
+  directly, replacing the post-build full index scan.
+
 ## 0.8.4 — 2026-06-10
 
 Fifth fork release: a defect fix for 0.8.3's concurrent-write regression plus

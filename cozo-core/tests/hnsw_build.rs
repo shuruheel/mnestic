@@ -12,11 +12,16 @@
 //! with brute-force ordering — i.e. the migrated graph is queryable and correct.
 //! Uses the sqlite backend (real stored-relation path).
 
-use cozo::{DbInstance, NamedRows, ScriptMutability};
+use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
 use std::collections::BTreeMap;
 
 fn run(db: &DbInstance, s: &str) -> NamedRows {
     db.run_script(s, BTreeMap::new(), ScriptMutability::Mutable)
+        .unwrap_or_else(|e| panic!("script failed: {e:?}\n--- script ---\n{s}"))
+}
+
+fn run_params(db: &DbInstance, s: &str, params: BTreeMap<String, DataValue>) -> NamedRows {
+    db.run_script(s, params, ScriptMutability::Mutable)
         .unwrap_or_else(|e| panic!("script failed: {e:?}\n--- script ---\n{s}"))
 }
 
@@ -53,4 +58,99 @@ fn build_then_query_is_correct() {
             "neighbour {id} too far from 100; got {ids:?}"
         );
     }
+}
+
+/// Recall agreement of the parallel flat build against brute force on
+/// clustered data: 2000 vectors in 16 dims, 25 queries, top-10. Guards the
+/// per-node-lock insertion path (lost-backlink/duplicate-edge races showed up
+/// exactly here as broken graph connectivity).
+#[test]
+fn parallel_build_recall_agreement() {
+    // Deterministic LCG so the test needs no rand dev-dependency.
+    let mut state: u64 = 0x2545F4914F6CDD1D;
+    let mut next_f32 = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    };
+
+    const N: usize = 2000;
+    const DIM: usize = 16;
+    const CLUSTERS: usize = 20;
+    const K: usize = 10;
+
+    let centroids: Vec<Vec<f32>> = (0..CLUSTERS)
+        .map(|_| (0..DIM).map(|_| 4.0 * next_f32()).collect())
+        .collect();
+    let vectors: Vec<Vec<f32>> = (0..N)
+        .map(|i| {
+            let c = &centroids[i % CLUSTERS];
+            c.iter().map(|x| x + next_f32()).collect()
+        })
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new("sqlite", dir.path().join("r.db").to_str().unwrap(), "").unwrap();
+    run(&db, &format!(":create pts {{ id: Int => emb: <F32; {DIM}> }}"));
+    for chunk in vectors.chunks(500).enumerate().collect::<Vec<_>>() {
+        let (ci, rows) = chunk;
+        let body: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                let vs: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+                format!("[{},[{}]]", ci * 500 + j, vs.join(","))
+            })
+            .collect();
+        run(
+            &db,
+            &format!("?[id, emb] <- [{}] :put pts {{ id => emb }}", body.join(",")),
+        );
+    }
+    run(
+        &db,
+        &format!(
+            "::hnsw create pts:idx {{ dim: {DIM}, m: 16, dtype: F32, fields: [emb], \
+             distance: L2, ef_construction: 64 }}"
+        ),
+    );
+
+    let l2 = |a: &[f32], b: &[f32]| -> f64 {
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| ((x - y) as f64).powi(2))
+            .sum()
+    };
+
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for qi in 0..25 {
+        let q = &vectors[qi * 67 % N];
+        // brute-force top-K ids
+        let mut scored: Vec<(usize, f64)> = vectors.iter().map(|v| l2(q, v)).enumerate().collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let truth: std::collections::HashSet<usize> =
+            scored[..K].iter().map(|(i, _)| *i).collect();
+
+        let qs: Vec<String> = q.iter().map(|x| format!("{x:.6}")).collect();
+        let res = run_params(
+            &db,
+            &format!(
+                "?[id, dist] := ~pts:idx{{ id | query: vec([{}]), k: {K}, ef: 64, \
+                 bind_distance: dist }} :order dist :limit {K}",
+                qs.join(",")
+            ),
+            BTreeMap::new(),
+        );
+        for row in res.rows.iter() {
+            if truth.contains(&(row[0].get_int().unwrap() as usize)) {
+                hits += 1;
+            }
+        }
+        total += K;
+    }
+    let recall = hits as f64 / total as f64;
+    assert!(
+        recall >= 0.9,
+        "parallel flat build recall too low: {recall:.3} ({hits}/{total})"
+    );
 }
