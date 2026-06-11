@@ -182,3 +182,45 @@ fn numeric_equality_keeps_cross_type_semantics() {
         "numeric `== 3.0` must also match both"
     );
 }
+
+/// `::describe` writes relation metadata, but it was the only mutating sys op
+/// without a read-only guard. Before the snapshot read path it silently wrote
+/// under `ScriptMutability::Immutable`; after, it would surface the generic
+/// "write in read-only transaction" storage error. Pin the explicit guard
+/// (clear message, no storage-layer dependence), and that the mutable path
+/// still works.
+#[test]
+fn describe_relation_is_rejected_in_read_only_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new(
+        "sqlite",
+        dir.path().join("desc.db").to_str().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    db.run_script(
+        ":create rel { id: Int => v }",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )
+    .unwrap();
+
+    let err = db
+        .run_script(
+            "::describe rel 'a note'",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
+        .expect_err("::describe must be rejected in read-only mode");
+    assert!(
+        err.to_string().contains("read-only"),
+        "expected a read-only rejection, got: {err}"
+    );
+
+    db.run_script(
+        "::describe rel 'a note'",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )
+    .expect("::describe must still work in mutable mode");
+}

@@ -65,6 +65,28 @@ provenance and licensing.
 - Corpus doc-stats (`avgdl`) are counted exactly during the build and seeded
   directly, replacing the post-build full index scan.
 
+### Fixed — `::describe` was unreachable upstream; now parses and is read-only-guarded
+- Upstream defines `describe_relation_op` in the grammar and implements
+  `SysOp::DescribeRelation`, but never wired the rule into the `sys_script`
+  alternations — `::describe rel 'note'` always failed to parse. The op is
+  now reachable (top-level and inside imperative blocks).
+- `::describe` writes relation metadata; it was also the only mutating sys op
+  without a read-only guard. It now rejects `ScriptMutability::Immutable`
+  with a clear error, like its siblings, instead of falling through to the
+  storage layer. Pinned by `tests/fork_regressions.rs`.
+
+### Tests — bulk-build coverage from the post-ship bug-hunt audit
+- The audit (three independent reviews of the flat HNSW build, the snapshot
+  read path/FFI bridge, and the FTS bulk build) found no correctness bug; it
+  found untested live paths, now covered: HNSW flat build over a
+  **list-of-vectors column** (`[<F32; N>]`, the `sub_idx` branch), an
+  **F64 + Cosine** flat-build recall guard, and bulk-vs-incremental FTS
+  doc-stats score equality on a **multi-column-PK** relation.
+- Documented in the `hnsw_build.rs` module header: the flat build omits
+  pruned edges where the incremental path writes tombstoned rows —
+  indistinguishable to search (`include_deleted=false`); the degree counter
+  it feeds was already approximate upstream.
+
 ## 0.8.4 — 2026-06-10
 
 Fifth fork release: a defect fix for 0.8.3's concurrent-write regression plus

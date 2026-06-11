@@ -28,6 +28,14 @@
 //! - a node never links to itself even if a concurrent insertion has already
 //!   back-linked it into a neighbour list it then searches.
 //!
+//! One further on-disk divergence: when shrinking prunes an edge, the
+//! incremental path tombstones the row (keeps it with the deleted flag set,
+//! for `hnsw_remove`'s degree bookkeeping) while this builder simply omits it.
+//! Search reads with `include_deleted=false`, so the two are indistinguishable
+//! to queries; the degree counter was already approximate upstream (shrink
+//! never decrements the far endpoint's degree), and degree is only consulted
+//! by future incremental puts to decide whether to shrink a neighbour.
+//!
 //! Thread count: `MNESTIC_INDEX_BUILD_THREADS` (0 or unset = all available
 //! cores; 1 = serial insertion in scan order, matching the old build).
 

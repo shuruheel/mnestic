@@ -126,6 +126,85 @@ fn avgdl_counter_survives_reopen() {
     }
 }
 
+/// Bulk build vs incremental build on a relation with a **multi-column primary
+/// key**: `::fts create` over existing rows seeds the doc-stats counter from
+/// build counts (`seed_fts_doc_stats`), relying on "distinct base tuples ⇒
+/// distinct FTS doc keys". A composite PK is where that invariant would break
+/// if doc keys ever collapsed to a single column — scores would diverge from
+/// the incremental path, which bumps the counter once per put.
+#[test]
+fn bulk_build_doc_stats_match_incremental_on_multi_column_pk() {
+    let dir = tempfile::tempdir().unwrap();
+
+    let rows = format!(
+        r"['a', 1, 'gamma'], ['a', 2, 'delta {FILLER}'], ['b', 1, 'gamma delta'], ['b', 2, 'epsilon {FILLER}']"
+    );
+    let setup_rel = |db: &DbInstance| {
+        run(db, r":create note {ns: String, seq: Int => body: String}");
+    };
+    let create_idx = |db: &DbInstance| {
+        run(
+            db,
+            r"::fts create note:fts { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+        );
+    };
+    let put_rows = |db: &DbInstance| {
+        run(
+            db,
+            &format!(r"?[ns, seq, body] <- [{rows}] :put note {{ns, seq => body}}"),
+        );
+    };
+    let scores = |db: &DbInstance, query: &str| -> Vec<(String, i64, f64)> {
+        let res = run(
+            db,
+            &format!(
+                r"?[ns, seq, s] := ~note:fts{{ns, seq | query: '{query}', k: 50, bind_score: s}} :order ns, seq"
+            ),
+        );
+        res.rows
+            .iter()
+            .map(|r| {
+                (
+                    r[0].get_str().unwrap().to_string(),
+                    r[1].get_int().unwrap(),
+                    r[2].get_float().unwrap(),
+                )
+            })
+            .collect()
+    };
+
+    // A: bulk path — rows exist before the index is created (seeded stats).
+    let bulk = new_db(&dir.path().join("bulk.db"));
+    setup_rel(&bulk);
+    put_rows(&bulk);
+    create_idx(&bulk);
+
+    // B: incremental path — index created empty, rows put afterwards.
+    let incr = new_db(&dir.path().join("incr.db"));
+    setup_rel(&incr);
+    create_idx(&incr);
+    put_rows(&incr);
+
+    for q in ["gamma", "delta", "epsilon"] {
+        let sa = scores(&bulk, q);
+        let sb = scores(&incr, q);
+        assert!(!sa.is_empty(), "query '{q}' returned no hits on the bulk build");
+        assert_eq!(
+            sa.len(),
+            sb.len(),
+            "hit count differs for '{q}': bulk {sa:?} vs incremental {sb:?}"
+        );
+        for ((ns_a, seq_a, s_a), (ns_b, seq_b, s_b)) in sa.iter().zip(&sb) {
+            assert_eq!((ns_a, seq_a), (ns_b, seq_b), "doc keys differ for '{q}'");
+            assert!(
+                (s_a - s_b).abs() < 1e-9,
+                "score for ({ns_a}, {seq_a}) on '{q}' differs: bulk {s_a} vs incremental {s_b} \
+                 — seeded doc-stats diverge from incrementally maintained ones"
+            );
+        }
+    }
+}
+
 /// `avgdl` must actually feed the BM25 length normalization: a document of fixed
 /// length scores *higher* in a corpus with a larger average document length
 /// (its `|D|/avgdl` ratio shrinks, so the length penalty relaxes). `gamma` has

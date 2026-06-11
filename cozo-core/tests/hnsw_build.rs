@@ -60,6 +60,143 @@ fn build_then_query_is_correct() {
     }
 }
 
+/// The flat build must index every element of a **list-of-vectors** column
+/// (`sub_idx >= 0` branch), not just plain vector columns. Each doc holds two
+/// segments in disjoint regions; a query near a doc's *second* segment must
+/// return that doc — impossible if only `sub_idx == 0` (or none) were indexed.
+#[test]
+fn list_of_vectors_build_and_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new("sqlite", dir.path().join("l.db").to_str().unwrap(), "").unwrap();
+    run(&db, ":create docs { id: Int => segs: [<F32; 2>] }");
+
+    // doc i: segment 0 at [i, 0], segment 1 at [i, 100].
+    let rows: Vec<String> = (0..100)
+        .map(|i| format!("[{i},[[{i}.0,0.0],[{i}.0,100.0]]]"))
+        .collect();
+    run(
+        &db,
+        &format!("?[id, segs] <- [{}] :put docs {{ id => segs }}", rows.join(",")),
+    );
+    run(
+        &db,
+        "::hnsw create docs:idx { dim: 2, m: 16, dtype: F32, fields: [segs], distance: L2, ef_construction: 50 }",
+    );
+
+    for (q, label) in [("[50.0, 100.0]", "second segment"), ("[50.0, 0.0]", "first segment")] {
+        let res = run(
+            &db,
+            &format!(
+                "?[id, dist] := ~docs:idx{{ id | query: vec({q}), k: 3, ef: 60, bind_distance: dist }} :order dist :limit 1"
+            ),
+        );
+        assert!(!res.rows.is_empty(), "no neighbours returned for {label}");
+        let id = res.rows[0][0].get_int().unwrap();
+        let dist = res.rows[0][1].get_float().unwrap();
+        assert_eq!(id, 50, "nearest to {q} ({label}) must be doc 50, got {id}");
+        assert!(
+            dist < 1e-6,
+            "doc 50 has a segment exactly at {q}; distance must be ~0, got {dist}"
+        );
+    }
+}
+
+/// F64 dtype + Cosine distance through the flat build: recall agreement
+/// against brute-force cosine ordering. Guards the F64 slab variant and the
+/// cosine normalisation (`dist = 1 - dot/(|a||b|)`) end to end.
+#[test]
+fn f64_cosine_build_recall() {
+    let mut state: u64 = 0x9E3779B97F4A7C15;
+    let mut next = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        let raw = ((state >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
+        // Round to the 6 decimals we serialise, so brute force sees the exact
+        // stored values.
+        (raw * 1e6).round() / 1e6
+    };
+
+    const N: usize = 600;
+    const DIM: usize = 8;
+    const CLUSTERS: usize = 12;
+    const K: usize = 10;
+
+    // Centroids of magnitude ~4 with ±1 noise keep norms well away from zero
+    // (cosine is undefined at the origin).
+    let centroids: Vec<Vec<f64>> = (0..CLUSTERS)
+        .map(|_| (0..DIM).map(|_| 4.0 * next()).collect())
+        .collect();
+    let vectors: Vec<Vec<f64>> = (0..N)
+        .map(|i| {
+            let c = &centroids[i % CLUSTERS];
+            c.iter().map(|x| ((x + next()) * 1e6).round() / 1e6).collect()
+        })
+        .collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new("sqlite", dir.path().join("c.db").to_str().unwrap(), "").unwrap();
+    run(&db, &format!(":create pts {{ id: Int => emb: <F64; {DIM}> }}"));
+    for (ci, rows) in vectors.chunks(200).enumerate() {
+        let body: Vec<String> = rows
+            .iter()
+            .enumerate()
+            .map(|(j, v)| {
+                let vs: Vec<String> = v.iter().map(|x| format!("{x:.6}")).collect();
+                format!("[{},[{}]]", ci * 200 + j, vs.join(","))
+            })
+            .collect();
+        run(
+            &db,
+            &format!("?[id, emb] <- [{}] :put pts {{ id => emb }}", body.join(",")),
+        );
+    }
+    run(
+        &db,
+        &format!(
+            "::hnsw create pts:idx {{ dim: {DIM}, m: 16, dtype: F64, fields: [emb], \
+             distance: Cosine, ef_construction: 64 }}"
+        ),
+    );
+
+    let cosine = |a: &[f64], b: &[f64]| -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let na: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
+        let nb: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+        1.0 - dot / (na * nb)
+    };
+
+    let mut hits = 0usize;
+    let mut total = 0usize;
+    for qi in 0..25 {
+        let q = &vectors[qi * 43 % N];
+        let mut scored: Vec<(usize, f64)> =
+            vectors.iter().map(|v| cosine(q, v)).enumerate().collect();
+        scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+        let truth: std::collections::HashSet<usize> =
+            scored[..K].iter().map(|(i, _)| *i).collect();
+
+        let qs: Vec<String> = q.iter().map(|x| format!("{x:.6}")).collect();
+        let res = run(
+            &db,
+            &format!(
+                "?[id, dist] := ~pts:idx{{ id | query: vec([{}]), k: {K}, ef: 64, \
+                 bind_distance: dist }} :order dist :limit {K}",
+                qs.join(",")
+            ),
+        );
+        for row in res.rows.iter() {
+            if truth.contains(&(row[0].get_int().unwrap() as usize)) {
+                hits += 1;
+            }
+        }
+        total += K;
+    }
+    let recall = hits as f64 / total as f64;
+    assert!(
+        recall >= 0.9,
+        "F64/Cosine flat build recall too low: {recall:.3} ({hits}/{total})"
+    );
+}
+
 /// Recall agreement of the parallel flat build against brute force on
 /// clustered data: 2000 vectors in 16 dims, 25 queries, top-10. Guards the
 /// per-node-lock insertion path (lost-backlink/duplicate-edge races showed up

@@ -1435,6 +1435,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                 ))
             }
             SysOp::DescribeRelation(rel_name, description) => {
+                if read_only {
+                    bail!("Cannot describe relation in read-only mode");
+                }
                 tx.describe_relation(rel_name, description)?;
                 Ok(NamedRows::new(
                     vec![STATUS_STR.to_string()],
