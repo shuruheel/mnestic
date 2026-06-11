@@ -399,6 +399,28 @@ impl RelationHandle {
         }
     }
 
+    /// Batched point lookups (mnestic fork): encode all keys and serve them
+    /// through one `StoreTx::multi_get` — a true RocksDB `MultiGet` on the
+    /// snapshot read path (shared filter probes, batched block reads).
+    /// Returns one entry per key, in order.
+    pub(crate) fn get_batch(
+        &self,
+        tx: &SessionTx<'_>,
+        keys: &[&[DataValue]],
+    ) -> Result<Vec<Option<Tuple>>> {
+        let encoded: Vec<Vec<u8>> = keys.iter().map(|k| k.encode_as_key(self.id)).collect();
+        let raw = if self.is_temp {
+            tx.temp_store_tx.multi_get(&encoded, false)?
+        } else {
+            tx.store_tx.multi_get(&encoded, false)?
+        };
+        Ok(raw
+            .into_iter()
+            .zip(encoded.iter())
+            .map(|(v, k)| v.map(|val| decode_tuple_from_kv(k, &val, Some(self.arity()))))
+            .collect())
+    }
+
     pub(crate) fn get_val_only(
         &self,
         tx: &SessionTx<'_>,

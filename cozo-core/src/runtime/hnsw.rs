@@ -128,25 +128,59 @@ impl VectorCache {
     ) -> Result<()> {
         if !self.cache.contains_key(key) {
             match handle.get(tx, &key.0)? {
-                Some(tuple) => {
-                    let mut field = &tuple[key.1];
-                    if key.2 >= 0 {
-                        match field {
-                            DataValue::List(l) => {
-                                field = &l[key.2 as usize];
-                            }
-                            _ => bail!("Cannot interpret {} as list", field),
-                        }
-                    }
-                    match field {
-                        DataValue::Vec(v) => {
-                            self.cache.insert(key.clone(), v.clone());
-                        }
-                        _ => bail!("Cannot interpret {} as vector", field),
-                    }
-                }
+                Some(tuple) => self.insert_from_tuple(key, &tuple)?,
                 None => bail!("Cannot find compound key for HNSW: {:?}", key),
             }
+        }
+        Ok(())
+    }
+
+    /// Batch `ensure_key` (mnestic fork): one storage `multi_get` covers every
+    /// not-yet-cached key. Used on the search hot path, where serial
+    /// per-neighbour point gets were measured as a large share of
+    /// disk-resident HNSW query cost.
+    fn ensure_keys(
+        &mut self,
+        keys: &[CompoundKey],
+        handle: &RelationHandle,
+        tx: &SessionTx<'_>,
+    ) -> Result<()> {
+        let missing: Vec<&CompoundKey> = keys
+            .iter()
+            .filter(|k| !self.cache.contains_key(*k))
+            .collect();
+        if missing.is_empty() {
+            return Ok(());
+        }
+        if missing.len() == 1 {
+            return self.ensure_key(missing[0], handle, tx);
+        }
+        let key_slices: Vec<&[DataValue]> = missing.iter().map(|k| k.0.as_slice()).collect();
+        let tuples = handle.get_batch(tx, &key_slices)?;
+        for (key, tuple) in missing.iter().zip(tuples) {
+            match tuple {
+                Some(tuple) => self.insert_from_tuple(key, &tuple)?,
+                None => bail!("Cannot find compound key for HNSW: {:?}", key),
+            }
+        }
+        Ok(())
+    }
+
+    fn insert_from_tuple(&mut self, key: &CompoundKey, tuple: &[DataValue]) -> Result<()> {
+        let mut field = &tuple[key.1];
+        if key.2 >= 0 {
+            match field {
+                DataValue::List(l) => {
+                    field = &l[key.2 as usize];
+                }
+                _ => bail!("Cannot interpret {} as list", field),
+            }
+        }
+        match field {
+            DataValue::Vec(v) => {
+                self.cache.insert(key.clone(), v.clone());
+            }
+            _ => bail!("Cannot interpret {} as vector", field),
         }
         Ok(())
     }
@@ -601,14 +635,18 @@ impl<'a> SessionTx<'a> {
             if candidate_dist > furtherest_dist {
                 break;
             }
-            // loop over each of the candidate's neighbors
-            for (neighbour_key, _) in
-                self.hnsw_get_neighbours(&candidate, cur_level, idx_table, false)?
-            {
+            // Fetch all unvisited neighbours' vectors in one batched read
+            // (mnestic fork): on the snapshot read path this is one RocksDB
+            // MultiGet instead of a serial point get per neighbour.
+            let unvisited: Vec<CompoundKey> = self
+                .hnsw_get_neighbours(&candidate, cur_level, idx_table, false)?
+                .filter_map(|(k, _)| if visited.contains(&k) { None } else { Some(k) })
+                .collect();
+            vec_cache.ensure_keys(&unvisited, orig_table, self)?;
+            for neighbour_key in unvisited {
                 if visited.contains(&neighbour_key) {
                     continue;
                 }
-                vec_cache.ensure_key(&neighbour_key, orig_table, self)?;
                 let neighbour_dist = vec_cache.v_dist(q, &neighbour_key);
                 let (_, OrderedFloat(cand_furtherest_dist)) = found_nn.peek().unwrap();
                 if found_nn.len() < ef || neighbour_dist < *cand_furtherest_dist {

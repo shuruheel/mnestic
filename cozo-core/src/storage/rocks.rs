@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use log::info;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
 
-use cozorocks::{DbBuilder, DbIter, RocksDb, Tx};
+use cozorocks::{DbBuilder, DbIter, RocksDb, SnapReader, Tx};
 
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
@@ -130,9 +130,18 @@ impl Storage<'_> for RocksDbStorage {
         "rocksdb"
     }
 
-    fn transact(&self, _write: bool) -> Result<Self::Tx> {
-        let db_tx = self.db.transact().set_snapshot(true).start();
-        Ok(RocksDbTx { db_tx })
+    fn transact(&self, write: bool) -> Result<Self::Tx> {
+        // Read-only scripts read the base DB through a plain snapshot instead
+        // of a pessimistic transaction (mnestic fork): same consistent view as
+        // before — the old read path also pinned one snapshot — but with no
+        // lock-manager bookkeeping and no write-batch overlay consulted on
+        // every read. Writes keep the pessimistic transaction unchanged.
+        let inner = if write {
+            RocksTxInner::Txn(self.db.transact().set_snapshot(true).start())
+        } else {
+            RocksTxInner::Snap(self.db.snapshot_read())
+        };
+        Ok(RocksDbTx { inner })
     }
 
     fn range_compact(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
@@ -209,49 +218,110 @@ impl Storage<'_> for RocksDbStorage {
 }
 
 pub struct RocksDbTx {
-    db_tx: Tx,
+    inner: RocksTxInner,
+}
+
+enum RocksTxInner {
+    /// Pessimistic transaction — all writing scripts.
+    Txn(Tx),
+    /// Plain snapshot reads — read-only scripts (mnestic fork).
+    Snap(SnapReader),
 }
 
 unsafe impl Sync for RocksDbTx {}
 
+impl RocksDbTx {
+    #[inline]
+    fn read_only_write_err() -> miette::Report {
+        miette!("write operation attempted in a read-only transaction")
+    }
+
+    #[inline]
+    fn iter_builder(&self) -> cozorocks::IterBuilder {
+        match &self.inner {
+            RocksTxInner::Txn(tx) => tx.iterator(),
+            RocksTxInner::Snap(snap) => snap.iterator(),
+        }
+    }
+}
+
 impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn get(&self, key: &[u8], for_update: bool) -> Result<Option<Vec<u8>>> {
-        Ok(self.db_tx.get(key, for_update)?.map(|v| v.to_vec()))
+        match &self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.get(key, for_update)?.map(|v| v.to_vec())),
+            RocksTxInner::Snap(snap) => {
+                if for_update {
+                    return Err(Self::read_only_write_err());
+                }
+                Ok(snap.get(key)?.map(|v| v.to_vec()))
+            }
+        }
+    }
+
+    fn multi_get(&self, keys: &[Vec<u8>], for_update: bool) -> Result<Vec<Option<Vec<u8>>>> {
+        match &self.inner {
+            RocksTxInner::Txn(tx) => keys
+                .iter()
+                .map(|k| Ok(tx.get(k, for_update)?.map(|v| v.to_vec())))
+                .collect(),
+            RocksTxInner::Snap(snap) => {
+                if for_update {
+                    return Err(Self::read_only_write_err());
+                }
+                let refs: Vec<&[u8]> = keys.iter().map(|k| k.as_slice()).collect();
+                Ok(snap.multi_get(&refs)?)
+            }
+        }
     }
 
     #[inline]
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
-        Ok(self.db_tx.put(key, val)?)
+        match &self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.put(key, val)?),
+            RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
+        }
     }
 
     fn supports_par_put(&self) -> bool {
-        true
+        matches!(self.inner, RocksTxInner::Txn(_))
     }
 
     #[inline]
     fn par_put(&self, key: &[u8], val: &[u8]) -> Result<()> {
-        Ok(self.db_tx.put(key, val)?)
+        match &self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.put(key, val)?),
+            RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
+        }
     }
 
     #[inline]
     fn del(&mut self, key: &[u8]) -> Result<()> {
-        Ok(self.db_tx.del(key)?)
+        match &self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.del(key)?),
+            RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
+        }
     }
 
     #[inline]
     fn par_del(&self, key: &[u8]) -> Result<()> {
-        Ok(self.db_tx.del(key)?)
+        match &self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.del(key)?),
+            RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
+        }
     }
 
     fn del_range_from_persisted(&mut self, lower: &[u8], upper: &[u8]) -> Result<()> {
-        let mut inner = self.db_tx.iterator().upper_bound(upper).start();
+        let RocksTxInner::Txn(tx) = &self.inner else {
+            return Err(Self::read_only_write_err());
+        };
+        let mut inner = tx.iterator().upper_bound(upper).start();
         inner.seek(lower);
         while let Some(key) = inner.key()? {
             if key >= upper {
                 break;
             }
-            self.db_tx.del(key)?;
+            tx.del(key)?;
             inner.next();
         }
         Ok(())
@@ -259,11 +329,23 @@ impl<'s> StoreTx<'s> for RocksDbTx {
 
     #[inline]
     fn exists(&self, key: &[u8], for_update: bool) -> Result<bool> {
-        Ok(self.db_tx.exists(key, for_update)?)
+        match &self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.exists(key, for_update)?),
+            RocksTxInner::Snap(snap) => {
+                if for_update {
+                    return Err(Self::read_only_write_err());
+                }
+                Ok(snap.exists(key)?)
+            }
+        }
     }
 
     fn commit(&mut self) -> Result<()> {
-        Ok(self.db_tx.commit()?)
+        match &mut self.inner {
+            RocksTxInner::Txn(tx) => Ok(tx.commit()?),
+            // Nothing to commit: the snapshot read view simply ends.
+            RocksTxInner::Snap(_) => Ok(()),
+        }
     }
 
     fn range_scan_tuple<'a>(
@@ -274,7 +356,7 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     where
         's: 'a,
     {
-        let mut inner = self.db_tx.iterator().upper_bound(upper).start();
+        let mut inner = self.iter_builder().upper_bound(upper).start();
         inner.seek(lower);
         Box::new(RocksDbIterator {
             inner,
@@ -289,7 +371,7 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         upper: &[u8],
         valid_at: ValidityTs,
     ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        let inner = self.db_tx.iterator().upper_bound(upper).start();
+        let inner = self.iter_builder().upper_bound(upper).start();
         Box::new(RocksDbSkipIterator {
             inner,
             upper_bound: upper.to_vec(),
@@ -306,7 +388,7 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     where
         's: 'a,
     {
-        let mut inner = self.db_tx.iterator().upper_bound(upper).start();
+        let mut inner = self.iter_builder().upper_bound(upper).start();
         inner.seek(lower);
         Box::new(RocksDbIteratorRaw {
             inner,
@@ -319,7 +401,7 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     where
         's: 'a,
     {
-        let mut inner = self.db_tx.iterator().upper_bound(upper).start();
+        let mut inner = self.iter_builder().upper_bound(upper).start();
         inner.seek(lower);
         let mut count = 0;
         while let Some(k) = inner.key()? {

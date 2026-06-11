@@ -26,6 +26,36 @@ provenance and licensing.
   write merges with concurrently-arrived backlinks instead of replacing them
   (replacement severed edges and, on chain-shaped data, broke connectivity).
 
+### Changed — plain-snapshot read path for read-only scripts (RocksDB)
+- Read-only scripts no longer open a pessimistic transaction. They read the
+  base DB through a plain snapshot (`SnapshotReadBridge` in `mnestic-rocks`
+  0.1.9): the same consistent view as before — the old read path also pinned
+  one snapshot — but with no lock-manager bookkeeping and no transaction
+  write-batch overlay consulted on every read. This is the standard MVCC
+  read pattern (TiKV, CockroachDB). Writing scripts keep the pessimistic
+  transaction unchanged. Isolation semantics are pinned by
+  `tests/snapshot_reads.rs` (uncommitted writes invisible, read transactions
+  keep their snapshot view across concurrent commits).
+- Measured (RocksDB, immutable scripts, 50k rows): keyed point read p50
+  **28.5 → 23.9 µs** (−16%), p99 −19%; 20-row prefix scan p50 **46.0 →
+  41.5 µs**. Retrieval-scale queries (40–150 ms) on a block-cache-resident
+  corpus showed no measurable change, as expected — per-script transaction
+  overhead is µs-scale. Parse/compile (~20 µs) now dominates point reads,
+  which is the stored-queries → plan-cache item's territory.
+- A write attempted through a read-only transaction now errors explicitly
+  instead of silently succeeding inside a transaction that had no business
+  existing. (No in-tree path did this; the error guards against future ones.)
+
+### Changed — batched HNSW neighbour reads on the search path
+- `hnsw_search_level` fetches all unvisited neighbours' vectors per expansion
+  step through one `StoreTx::multi_get` — a true RocksDB `MultiGet` (shared
+  bloom-filter probes, batched block reads) on the snapshot read path —
+  instead of one serial point get per neighbour (`VectorCache::ensure_key`).
+  Other backends fall back to a serial loop via the trait default. Neutral on
+  a block-cache-resident corpus (fused p50 unchanged); the win case is
+  cold-cache / larger-than-RAM data, where serial point gets pay one block
+  read each.
+
 ### Changed — FTS bulk build (`::fts create`)
 - The populate loop no longer runs a del pass per row: the index relation is
   freshly created and empty, so the old code tokenised every document a

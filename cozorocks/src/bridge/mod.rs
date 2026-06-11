@@ -122,10 +122,33 @@ pub(crate) mod ffi {
 
         pub type SnapshotBridge;
 
+        // Snapshot-pinned read surface for read-only scripts (mnestic fork):
+        // plain snapshot reads on the base DB, no Transaction machinery.
+        type SnapshotReadBridge;
+        fn get(
+            self: &SnapshotReadBridge,
+            key: &[u8],
+            status: &mut RocksDbStatus,
+        ) -> UniquePtr<PinnableSlice>;
+        fn exists(self: &SnapshotReadBridge, key: &[u8], status: &mut RocksDbStatus);
+        fn iterator(self: &SnapshotReadBridge) -> UniquePtr<IterBridge>;
+        fn multi_get(
+            self: &SnapshotReadBridge,
+            keys_concat: &[u8],
+            key_lens: &[u64],
+            status: &mut RocksDbStatus,
+        );
+        fn multi_get_val<'a>(
+            self: &'a SnapshotReadBridge,
+            i: u64,
+            status: &mut RocksDbStatus,
+        ) -> &'a [u8];
+
         type RocksDbBridge;
         fn get_db_path(self: &RocksDbBridge) -> &CxxString;
         fn open_db(builder: &DbOpts, status: &mut RocksDbStatus) -> SharedPtr<RocksDbBridge>;
         fn transact(self: &RocksDbBridge) -> UniquePtr<TxBridge>;
+        fn snapshot_read(self: &RocksDbBridge) -> UniquePtr<SnapshotReadBridge>;
         fn del_range(self: &RocksDbBridge, lower: &[u8], upper: &[u8], status: &mut RocksDbStatus);
         fn put(self: &RocksDbBridge, key: &[u8], val: &[u8], status: &mut RocksDbStatus);
         fn compact_range(

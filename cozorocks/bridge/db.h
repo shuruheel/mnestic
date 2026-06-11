@@ -26,6 +26,79 @@ struct SnapshotBridge {
     }
 };
 
+// Snapshot-pinned read surface (mnestic fork): read-only scripts read the base
+// DB through a plain snapshot instead of constructing a pessimistic
+// Transaction (no lock manager, no write-batch overlay on every read). The
+// snapshot is released when the bridge is dropped; iterators created from it
+// must not outlive it (same discipline the Transaction-backed iterators
+// already require).
+struct SnapshotReadBridge {
+    DB *db;
+    const Snapshot *snapshot;
+    unique_ptr<ReadOptions> r_opts;
+    // multi_get scratch: results stay pinned here between `multi_get` and the
+    // per-index `multi_get_val` reads, so values cross the FFI zero-copy.
+    mutable std::vector<PinnableSlice> mg_vals;
+    mutable std::vector<Status> mg_statuses;
+
+    explicit SnapshotReadBridge(DB *db_)
+            : db(db_), snapshot(db_->GetSnapshot()), r_opts(new ReadOptions) {
+        r_opts->ignore_range_deletions = true;
+        r_opts->snapshot = snapshot;
+    }
+
+    ~SnapshotReadBridge() {
+        db->ReleaseSnapshot(snapshot);
+    }
+
+    inline unique_ptr<PinnableSlice> get(RustBytes key, RocksDbStatus &status) const {
+        auto ret = make_unique<PinnableSlice>();
+        auto s = db->Get(*r_opts, db->DefaultColumnFamily(), convert_slice(key), &*ret);
+        write_status(s, status);
+        return ret;
+    }
+
+    inline void exists(RustBytes key, RocksDbStatus &status) const {
+        auto ret = PinnableSlice();
+        auto s = db->Get(*r_opts, db->DefaultColumnFamily(), convert_slice(key), &ret);
+        write_status(s, status);
+    }
+
+    inline unique_ptr<IterBridge> iterator() const {
+        auto it = make_unique<IterBridge>(nullptr);
+        it->db = db;
+        it->set_snapshot(snapshot);
+        return it;
+    }
+
+    // Keys arrive concatenated (`keys_concat`) with per-key lengths
+    // (`key_lens`); one RocksDB MultiGet serves them all (shared bloom-filter
+    // probes and batched block reads). Values are read back per index via
+    // `multi_get_val`.
+    inline void multi_get(RustBytes keys_concat, rust::Slice<const ::std::uint64_t> key_lens,
+                          RocksDbStatus &status) const {
+        const size_t n = key_lens.size();
+        std::vector<Slice> keys;
+        keys.reserve(n);
+        const char *base = reinterpret_cast<const char *>(keys_concat.data());
+        size_t off = 0;
+        for (size_t i = 0; i < n; ++i) {
+            keys.emplace_back(base + off, key_lens[i]);
+            off += key_lens[i];
+        }
+        mg_vals = std::vector<PinnableSlice>(n);
+        mg_statuses = std::vector<Status>(n);
+        db->MultiGet(*r_opts, db->DefaultColumnFamily(), n, keys.data(), mg_vals.data(),
+                     mg_statuses.data());
+        write_status(Status::OK(), status);
+    }
+
+    inline RustBytes multi_get_val(::std::uint64_t i, RocksDbStatus &status) const {
+        write_status(mg_statuses[i], status);
+        return convert_pinnable_slice_back(mg_vals[i]);
+    }
+};
+
 struct SstFileWriterBridge {
     SstFileWriter inner;
 
@@ -77,6 +150,10 @@ struct RocksDbBridge {
     [[nodiscard]] inline unique_ptr<TxBridge> transact() const {
         auto ret = make_unique<TxBridge>(&*this->db, db->DefaultColumnFamily());
         return ret;
+    }
+
+    [[nodiscard]] inline unique_ptr<SnapshotReadBridge> snapshot_read() const {
+        return make_unique<SnapshotReadBridge>(get_base_db());
     }
 
     inline void del_range(RustBytes start, RustBytes end, RocksDbStatus &status) const {

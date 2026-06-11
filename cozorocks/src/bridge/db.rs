@@ -10,7 +10,8 @@ use cxx::*;
 use std::path::Path;
 
 use crate::bridge::ffi::*;
-use crate::bridge::tx::TxBuilder;
+use crate::bridge::iter::IterBuilder;
+use crate::bridge::tx::{PinSlice, TxBuilder};
 
 #[derive(Default, Clone)]
 pub struct DbBuilder {
@@ -147,6 +148,15 @@ impl RocksDb {
             inner: self.inner.transact(),
         }
     }
+    /// Snapshot-pinned read-only surface (mnestic fork): plain snapshot reads
+    /// on the base DB — no lock manager, no transaction write-batch overlay.
+    /// Iterators created from the reader must be dropped before it.
+    pub fn snapshot_read(&self) -> SnapReader {
+        SnapReader {
+            inner: self.inner.snapshot_read(),
+            mg_lock: std::sync::Mutex::new(()),
+        }
+    }
     #[inline]
     pub fn range_del(&self, lower: &[u8], upper: &[u8]) -> Result<(), RocksDbStatus> {
         let mut status = RocksDbStatus::default();
@@ -226,3 +236,80 @@ impl SstWriter {
 unsafe impl Send for RocksDb {}
 
 unsafe impl Sync for RocksDb {}
+
+/// Read-only view of the database pinned to one snapshot (mnestic fork).
+pub struct SnapReader {
+    pub(crate) inner: UniquePtr<SnapshotReadBridge>,
+    /// Serialises `multi_get`: the bridge keeps per-call scratch (pinned
+    /// values) inside the C++ object, so concurrent batch calls must not
+    /// interleave. Point reads and iterators are unaffected.
+    mg_lock: std::sync::Mutex<()>,
+}
+
+impl SnapReader {
+    #[inline]
+    pub fn get(&self, key: &[u8]) -> Result<Option<PinSlice>, RocksDbStatus> {
+        let mut status = RocksDbStatus::default();
+        let ret = self.inner.get(key, &mut status);
+        match status.code {
+            StatusCode::kOk => Ok(Some(PinSlice { inner: ret })),
+            StatusCode::kNotFound => Ok(None),
+            _ => Err(status),
+        }
+    }
+    #[inline]
+    pub fn exists(&self, key: &[u8]) -> Result<bool, RocksDbStatus> {
+        let mut status = RocksDbStatus::default();
+        self.inner.exists(key, &mut status);
+        match status.code {
+            StatusCode::kOk => Ok(true),
+            StatusCode::kNotFound => Ok(false),
+            _ => Err(status),
+        }
+    }
+    /// One RocksDB `MultiGet` over all `keys` (shared filter probes, batched
+    /// block reads). Returns one `Option<Vec<u8>>` per key, in order.
+    pub fn multi_get(&self, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, RocksDbStatus> {
+        if keys.is_empty() {
+            return Ok(vec![]);
+        }
+        let mut concat = Vec::with_capacity(keys.iter().map(|k| k.len()).sum());
+        let mut lens = Vec::with_capacity(keys.len());
+        for k in keys {
+            concat.extend_from_slice(k);
+            lens.push(k.len() as u64);
+        }
+        let _guard = self.mg_lock.lock().unwrap();
+        let mut status = RocksDbStatus::default();
+        self.inner.multi_get(&concat, &lens, &mut status);
+        if !status.is_ok() {
+            return Err(status);
+        }
+        let mut out = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let mut val_status = RocksDbStatus::default();
+            let val = self.inner.multi_get_val(i as u64, &mut val_status);
+            match val_status.code {
+                StatusCode::kOk => out.push(Some(val.to_vec())),
+                StatusCode::kNotFound => out.push(None),
+                _ => return Err(val_status),
+            }
+        }
+        Ok(out)
+    }
+    #[inline]
+    pub fn iterator(&self) -> IterBuilder {
+        IterBuilder {
+            inner: self.inner.iterator(),
+        }
+        .auto_prefix_mode(true)
+    }
+}
+
+// SAFETY: the bridge object is heap-allocated with no thread affinity;
+// RocksDB snapshots may be used and released from any thread. The multi_get
+// scratch buffers make `&self` calls non-reentrant across threads, but the
+// consumer (`RocksDbTx`) is used behind exclusive or externally-synchronised
+// access, matching the existing `Tx` discipline.
+unsafe impl Send for SnapReader {}
+unsafe impl Sync for SnapReader {}

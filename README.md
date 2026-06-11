@@ -22,8 +22,8 @@ Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
   adjacency arrays, the hnswlib/pgvector layout) with parallel insertion under
   per-node locks, then serialises once into the unchanged on-disk format.
   Measured on the 40k × 384-dim RocksDB benchmark corpus: **294 s → 19 s**
-  synthetic, **89 s → 11.1 s** with real embeddings, recall@10 unchanged
-  (0.8838 → 0.8831). Decomposition: 3.2× from the flat layout (serial), ~5×
+  synthetic, **89.1 s → 8.1 s** with real embeddings, recall@10 unchanged
+  (0.8838 → 0.8824). Decomposition: 3.2× from the flat layout (serial), ~5×
   from parallel insertion. `::fts create` drops a redundant second
   tokenisation pass and tokenises in parallel (~2× on short docs; the win
   scales with document length). Same search path, same incremental
