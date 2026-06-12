@@ -5,6 +5,15 @@ provenance and licensing.
 
 ## 0.8.5 — 2026-06-12
 
+### Fixed — `::index create` no longer panics on corrupt tuples
+- Index population extracted columns by position with no bounds check: one
+  truncated stored tuple (e.g. from an interrupted write) panicked the whole
+  build — and since applications may (re)create indexes while initializing a
+  database, one bad row made the database unopenable (observed in production
+  2026-06-12). Corrupt tuples are now skipped with a loud error naming the
+  relation, the index, and the arity mismatch, plus a build-level summary
+  ("N corrupt tuple(s) skipped — the base relation needs repair").
+
 ### Changed — flat in-RAM parallel HNSW bulk build (`::hnsw create`)
 - `::hnsw create` now constructs the graph in flat, integer-indexed memory
   (one contiguous vector slab + per-node adjacency arrays, the

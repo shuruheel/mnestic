@@ -1503,9 +1503,38 @@ impl<'a> SessionTx<'a> {
             })
             .collect_vec();
 
+        // A corrupt/truncated stored tuple (e.g. from an interrupted write)
+        // must degrade to "left out of this index" with a loud error — not
+        // panic the whole index build. Index builds run inside `::index
+        // create`, which applications may execute while (re)initializing a
+        // database: a panic here turns one bad row into an unopenable
+        // database (observed in production 2026-06-12: a 3-element tuple in
+        // a relation whose index needed column 5 made every open attempt
+        // panic until the tenant was blacklisted).
+        let mut skipped_corrupt = 0usize;
+        let mut check_tuple = |tuple: &Tuple| -> bool {
+            match extraction_indices.iter().find(|idx| **idx >= tuple.len()) {
+                None => true,
+                Some(&bad) => {
+                    skipped_corrupt += 1;
+                    error!(
+                        "skipping corrupt tuple in '{}' while building index '{}': \
+                         tuple has {} values, index needs column {}",
+                        rel_handle.name,
+                        idx_handle.name,
+                        tuple.len(),
+                        bad + 1
+                    );
+                    false
+                }
+            }
+        };
         if self.store_tx.supports_par_put() {
             for tuple in rel_handle.scan_all(self) {
                 let tuple = tuple?;
+                if !check_tuple(&tuple) {
+                    continue;
+                }
                 let extracted = extraction_indices
                     .iter()
                     .map(|idx| tuple[*idx].clone())
@@ -1519,6 +1548,9 @@ impl<'a> SessionTx<'a> {
                 existing.push(tuple?);
             }
             for tuple in existing.into_iter() {
+                if !check_tuple(&tuple) {
+                    continue;
+                }
                 let extracted = extraction_indices
                     .iter()
                     .map(|idx| tuple[*idx].clone())
@@ -1526,6 +1558,13 @@ impl<'a> SessionTx<'a> {
                 let key = idx_handle.encode_key_for_store(&extracted, Default::default())?;
                 self.store_tx.put(&key, &[])?;
             }
+        }
+        if skipped_corrupt > 0 {
+            error!(
+                "index '{}' built with {} corrupt tuple(s) skipped — the base \
+                 relation '{}' needs repair",
+                idx_handle.name, skipped_corrupt, rel_handle.name
+            );
         }
 
         // add index to relation
