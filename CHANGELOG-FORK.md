@@ -3,7 +3,7 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased
+## 0.8.5 — 2026-06-12
 
 ### Changed — flat in-RAM parallel HNSW bulk build (`::hnsw create`)
 - `::hnsw create` now constructs the graph in flat, integer-indexed memory

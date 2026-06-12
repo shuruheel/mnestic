@@ -15,7 +15,7 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
-**Unreleased (on `main`, ships in 0.8.5)**
+**0.8.5**
 
 - **Flat in-RAM parallel index builds** — `::hnsw create` now constructs the
   graph in flat, integer-indexed memory (contiguous vector slab + per-node
@@ -29,6 +29,15 @@ Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
   scales with document length). Same search path, same incremental
   maintenance, still non-blocking. `MNESTIC_INDEX_BUILD_THREADS=1` restores
   serial insertion order.
+- **Plain-snapshot read path (RocksDB)** — read-only scripts skip the
+  pessimistic transaction and read through a plain snapshot (same consistent
+  view, no lock-manager bookkeeping): keyed point reads p50 **28.5 → 23.9 µs**
+  (−16%), p99 −19%, and reads structurally cannot wait on writer locks.
+  HNSW search fetches neighbour vectors through one RocksDB `MultiGet` per
+  expansion step instead of serial point gets.
+- **`::describe` works** — documented and implemented upstream but never
+  reachable: the grammar rule was missing from the script-level alternations.
+  Wired in, with a read-only-mode guard.
 
 **0.8.4**
 
