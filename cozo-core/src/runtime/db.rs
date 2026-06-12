@@ -1453,7 +1453,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     .pop()
                     .unwrap();
                 let _guard = lock.write().unwrap();
-                let handle = tx.get_relation(&rel_name, true)?;
+                let handle = tx.get_relation(rel_name, true)?;
                 let expected = handle.metadata.keys.len() + handle.metadata.non_keys.len();
                 let lower = Tuple::default().encode_as_key(handle.id);
                 let upper = Tuple::default().encode_as_key(handle.id.next());
