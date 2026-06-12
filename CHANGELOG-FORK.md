@@ -3,7 +3,11 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## 0.8.5 — 2026-06-12
+## Unreleased — 0.8.6
+
+Corrupt-database tooling from the 2026-06-12 production incident. Both changes
+landed **after** the 0.8.5 crates.io publish the same day, so they ship in
+0.8.6 (the published 0.8.5 artifact contains neither).
 
 ### Fixed — `::index create` no longer panics on corrupt tuples
 - Index population extracted columns by position with no bounds check: one
@@ -13,6 +17,16 @@ provenance and licensing.
   2026-06-12). Corrupt tuples are now skipped with a loud error naming the
   relation, the index, and the arity mismatch, plus a build-level summary
   ("N corrupt tuple(s) skipped — the base relation needs repair").
+
+### New — `::repair_corrupt <relation>`: surgically delete truncated tuples
+- Tuples whose stored arity is shorter than the schema (truncated value bytes
+  from interrupted writes) are deleted by their intact store keys; returns the
+  removed count. Gives applications a surgical alternative to dropping a
+  database that fails integrity checks — the motivating incident (2026-06-12)
+  saw an application-level "repair" delete a production database over 15 bad
+  rows. Pinned by `tests/fork_regressions.rs`.
+
+## 0.8.5 — 2026-06-12
 
 ### Changed — flat in-RAM parallel HNSW bulk build (`::hnsw create`)
 - `::hnsw create` now constructs the graph in flat, integer-indexed memory
