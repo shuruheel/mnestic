@@ -224,3 +224,52 @@ fn describe_relation_is_rejected_in_read_only_mode() {
     )
     .expect("::describe must still work in mutable mode");
 }
+
+/// `::repair_corrupt` parses, runs against a healthy relation (reporting 0
+/// removed), respects read-only mode, and errors on a missing relation.
+/// True-corruption repair (truncated value bytes) is exercised against
+/// production data — crafting a short tuple requires raw store access the
+/// public API deliberately does not expose.
+#[test]
+fn repair_corrupt_basics() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new(
+        "sqlite",
+        dir.path().join("repair.db").to_str().unwrap(),
+        Default::default(),
+    )
+    .unwrap();
+    db.run_script(
+        ":create t { k: Int => a: Int, b: Int }",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )
+    .unwrap();
+    db.run_script(
+        "?[k, a, b] <- [[1, 2, 3], [4, 5, 6]] :put t {k => a, b}",
+        BTreeMap::new(),
+        ScriptMutability::Mutable,
+    )
+    .unwrap();
+
+    let res = db
+        .run_script("::repair_corrupt t", BTreeMap::new(), ScriptMutability::Mutable)
+        .unwrap();
+    assert_eq!(res.headers, vec!["removed".to_string()]);
+    assert_eq!(res.rows[0][0].get_int(), Some(0));
+
+    // healthy rows untouched
+    let rows = db
+        .run_script("?[k] := *t[k, _, _]", BTreeMap::new(), ScriptMutability::Immutable)
+        .unwrap();
+    assert_eq!(rows.rows.len(), 2);
+
+    let err = db
+        .run_script("::repair_corrupt t", BTreeMap::new(), ScriptMutability::Immutable)
+        .unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("read-only"));
+
+    assert!(db
+        .run_script("::repair_corrupt missing_rel", BTreeMap::new(), ScriptMutability::Mutable)
+        .is_err());
+}

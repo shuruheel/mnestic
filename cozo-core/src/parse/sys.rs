@@ -47,6 +47,10 @@ pub enum SysOp {
     CreateMinHashLshIndex(MinHashLshConfig),
     RemoveIndex(Symbol, Symbol),
     DescribeRelation(Symbol, SmartString<LazyCompact>),
+    /// Delete tuples whose stored arity is shorter than the schema
+    /// (truncated values from interrupted writes). Surgical alternative to
+    /// dropping a database that fails integrity checks.
+    RepairCorrupt(Symbol),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -139,6 +143,10 @@ pub(crate) fn parse_sys(
                 Some(desc_p) => parse_string(desc_p)?,
             };
             SysOp::DescribeRelation(rel, description)
+        }
+        Rule::repair_corrupt_op => {
+            let rels_p = inner.into_inner().next().unwrap();
+            SysOp::RepairCorrupt(Symbol::new(rels_p.as_str(), rels_p.extract_span()))
         }
         Rule::list_relations_op => SysOp::ListRelations,
         Rule::remove_relations_op => {

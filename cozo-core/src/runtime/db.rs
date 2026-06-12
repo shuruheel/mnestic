@@ -1444,6 +1444,38 @@ impl<'s, S: Storage<'s>> Db<S> {
                     vec![vec![DataValue::from(OK_STR)]],
                 ))
             }
+            SysOp::RepairCorrupt(rel_name) => {
+                if read_only {
+                    bail!("Cannot repair relation in read-only mode");
+                }
+                let lock = self
+                    .obtain_relation_locks(iter::once(&rel_name.name))
+                    .pop()
+                    .unwrap();
+                let _guard = lock.write().unwrap();
+                let handle = tx.get_relation(&rel_name, true)?;
+                let expected = handle.metadata.keys.len() + handle.metadata.non_keys.len();
+                let lower = Tuple::default().encode_as_key(handle.id);
+                let upper = Tuple::default().encode_as_key(handle.id.next());
+                // Key bytes survive value truncation (keys and values are
+                // separate byte strings), so a short DECODED tuple still has
+                // an intact store key we can delete by.
+                let mut bad_keys: Vec<Vec<u8>> = vec![];
+                for kv in tx.store_tx.range_scan(&lower, &upper) {
+                    let (k, v) = kv?;
+                    if decode_tuple_from_kv(&k, &v, None).len() < expected {
+                        bad_keys.push(k);
+                    }
+                }
+                let removed = bad_keys.len();
+                for k in &bad_keys {
+                    tx.store_tx.del(k)?;
+                }
+                Ok(NamedRows::new(
+                    vec!["removed".to_string()],
+                    vec![vec![DataValue::from(removed as i64)]],
+                ))
+            }
             SysOp::CreateIndex(rel_name, idx_name, cols) => {
                 if read_only {
                     bail!("Cannot create index in read-only mode");
