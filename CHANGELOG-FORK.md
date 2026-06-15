@@ -9,6 +9,23 @@ Corrupt-database tooling from the 2026-06-12 production incident. Both changes
 landed **after** the 0.8.5 crates.io publish the same day, so they ship in
 0.8.6 (the published 0.8.5 artifact contains neither).
 
+### Fixed — `cozo-bin` token-table bearer auth ignored on query-string URLs
+- The server's `authorize` evaluated `Authorization: Bearer` against the token
+  table only in the `uri().query() == None` branch, so any endpoint that takes
+  query params (`/transact?write=true`, `/rules/name?arity=2`) rejected valid
+  bearer tokens. Bearer auth is now evaluated independently of the query string
+  (a `?auth=<secret>` credential still takes precedence, then bearer falls
+  through regardless of other query params). CORS also now allows the
+  `Authorization` header so browser bearer clients pass preflight.
+
+### Fixed — `cozo-bin` had no default feature, failed to build bare
+- `cargo build -p cozo-bin` (no features) failed to resolve `rayon` — cozo-core
+  uses rayon unconditionally on non-wasm, but it is pulled in only via the
+  `graph-algo` feature, which `cozo-bin` did not enable by default — and any
+  binary it did produce had no storage backend. `cozo-bin` now defaults to the
+  `compact` combo (sqlite + requests + graph-algo): a runnable server/REPL out
+  of the box. Opt into rocksdb explicitly.
+
 ### Fixed — `::index create` no longer panics on corrupt tuples
 - Index population extracted columns by position with no bounds check: one
   truncated stored tuple (e.g. from an interrupted write) panicked the whole

@@ -14,6 +14,12 @@ documentation = "https://docs.cozodb.org"
 [features]
 #! # Features
 
+## Default build: the `compact` combo (sqlite backend + requests + graph-algo).
+## Without a default the bare `cargo build -p cozo-bin` failed to resolve `rayon`
+## (cozo-core uses rayon unconditionally on non-wasm, but it is only pulled in via
+## the `graph-algo` feature) and produced a backend-less binary. `compact` gives a
+## runnable sqlite-backed server/REPL out of the box; opt into rocksdb explicitly.
+default = ["compact"]
 ## Enables the `minimal`, `requests` and `graph-algo` features
 compact = ["minimal", "requests", "graph-algo"]
 ## Enables the `storage-sqlite` and `graph-algo` features

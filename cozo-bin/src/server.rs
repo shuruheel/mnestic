@@ -100,65 +100,53 @@ impl AsyncAuthorizeRequest<Body> for MyAuth
                 return Ok(request);
             }
 
+            // Token-table bearer auth, evaluated INDEPENDENTLY of any query string.
+            // Previously this lived only in the `query() == None` branch, so a
+            // valid `Authorization: Bearer ...` was ignored for every endpoint
+            // that needs query params (e.g. `/transact?write=true`,
+            // `/rules/name?arity=2`). Returns None when there's no token table or
+            // no usable bearer header, so callers can fall through to deny.
+            let bearer_grant = || -> Option<ScriptMutability> {
+                let tt = token_table.as_ref()?;
+                let (name, db) = tt.as_ref();
+                let auth_str = request.headers().get("Authorization")?.to_str().ok()?;
+                let token = auth_str.strip_prefix("Bearer ")?;
+                match db.run_script(
+                    &format!("?[mutable] := *{name} {{ token: $token, mutable }}"),
+                    BTreeMap::from([(String::from("token"), DataValue::from(token))]),
+                    ScriptMutability::Immutable,
+                ) {
+                    Ok(rows) => rows.rows.first().map(|val| {
+                        if val[0].get_bool() == Some(true) {
+                            ScriptMutability::Mutable
+                        } else {
+                            ScriptMutability::Immutable
+                        }
+                    }),
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        None
+                    }
+                }
+            };
+
             let mutability = match request.headers().get("x-cozo-auth") {
-                None => match request.uri().query() {
-                    Some(q_str) => {
-                        let mut bingo = false;
+                None => {
+                    // Try the `?auth=<secret>` query-string credential first, then
+                    // fall back to bearer-token auth regardless of the query string.
+                    let query_grant = request.uri().query().and_then(|q_str| {
                         for pair in q_str.split('&') {
                             if let Some((k, v)) = pair.split_once('=') {
                                 if k == "auth" {
-                                    if v == auth_guard.as_str() {
-                                        bingo = true
-                                    }
-                                    break;
+                                    return (v == auth_guard.as_str())
+                                        .then_some(ScriptMutability::Mutable);
                                 }
                             }
                         }
-                        if bingo {
-                            Some(ScriptMutability::Mutable)
-                        } else {
-                            None
-                        }
-                    }
-                    None => match token_table {
-                        None => None,
-                        Some(tt) => {
-                            let (name, db) = tt.as_ref();
-                            if let Some(auth_header) = request.headers().get("Authorization") {
-                                if let Ok(auth_str) = auth_header.to_str() {
-                                    if let Some(token) = auth_str.strip_prefix("Bearer ") {
-                                        match db.run_script(
-                                            &format!("?[mutable] := *{name} {{ token: $token, mutable }}"),
-                                            BTreeMap::from([(String::from("token"), DataValue::from(token))]),
-                                            ScriptMutability::Immutable,
-                                        ) {
-                                            Ok(rows) => match rows.rows.first() {
-                                                None => None,
-                                                Some(val) => {
-                                                    if val[0].get_bool() == Some(true) {
-                                                        Some(ScriptMutability::Mutable)
-                                                    } else {
-                                                        Some(ScriptMutability::Immutable)
-                                                    }
-                                                }
-                                            },
-                                            Err(err) => {
-                                                eprintln!("Error: {}", err);
-                                                None
-                                            }
-                                        }
-                                    } else {
-                                        None
-                                    }
-                                } else {
-                                    None
-                                }
-                            } else {
-                                None
-                            }
-                        }
-                    },
-                },
+                        None
+                    });
+                    query_grant.or_else(bearer_grant)
+                }
                 Some(data) => match data.to_str() {
                     Ok(s) => {
                         if s == auth_guard.as_str() {
@@ -238,7 +226,11 @@ pub(crate) async fn server_main(args: ServerArgs) {
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_origin(Any)
-        .allow_headers([header::CONTENT_TYPE, HeaderName::from_static("x-cozo-auth")]);
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            HeaderName::from_static("x-cozo-auth"),
+        ]);
 
     let app = Router::new()
         .route("/text-query", post(text_query))
