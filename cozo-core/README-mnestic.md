@@ -20,6 +20,12 @@ of upstream `481af05` (the last upstream commit, 2024-12-04).
 Highlights (full detail in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)):
 
+**0.8.6**
+
+- **`::repair_corrupt`** — surgical corruption repair: scan a relation and drop
+  only the unreadable tuples, leaving the rest of the data intact (no
+  delete-and-rebuild).
+
 **0.8.3**
 
 - **Native 3-way fused recall** — `hybrid_search` now fuses a graph-proximity leg
@@ -87,7 +93,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.8.3"
+mnestic = "0.8.6"
 ```
 
 ```rust
