@@ -26,9 +26,31 @@ permissions:
   contents: read
 
 jobs:
+  # --- lint + test gate: a broken engine must not ship ---
+  # The mnestic wheel wraps the Rust engine (cozo-lib-python/src/lib.rs), so its
+  # correctness gate is the engine test suite — same default/sqlite features and
+  # action versions as build.yml's `test`/`clippy` jobs. All build + publish jobs
+  # depend on this, so a tag push runs the gate before any artifact is uploaded.
+  test:
+    name: test + clippy (mnestic engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build -p mnestic --verbose
+      - name: Test (lib + integration, incl. fork regressions)
+        run: cargo test -p mnestic --verbose
+      - name: Clippy (-D warnings)
+        run: cargo clippy -p mnestic -- -D warnings
+
   # --- mnestic binding: cross-platform abi3 wheels via maturin ---
   build-mnestic:
     name: build mnestic (${{ matrix.platform.target }} / ${{ matrix.platform.os }})
+    needs: [test]
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
@@ -60,6 +82,7 @@ jobs:
 
   build-mnestic-sdist:
     name: build mnestic sdist
+    needs: [test]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,6 +99,7 @@ jobs:
   # --- pure-Python adapter packages ---
   build-adapters:
     name: build ${{ matrix.pkg }}
+    needs: [test]
     runs-on: ubuntu-latest
     strategy:
       matrix:
@@ -100,6 +124,25 @@ jobs:
     permissions:
       id-token: write
     steps:
+      - uses: actions/checkout@v4
+      # Guard: the triggering tag (py-vX.Y.Z) must match the published manifest
+      # version. workflow_dispatch runs have no tag, so the check is skipped (a
+      # manual dispatch is build/publish-on-demand and must not hard-fail here).
+      - name: Verify tag matches manifest version
+        run: |
+          MANIFEST_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('cozo-lib-python/pyproject.toml','rb'))['project']['version'])")"
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "workflow_dispatch run (ref=${{ github.ref }}): no tag to check; manifest version is $MANIFEST_VERSION. Skipping tag/version match guard."
+            exit 0
+          fi
+          TAG_VERSION="${GITHUB_REF#refs/tags/py-v}"
+          echo "Tag version:      $TAG_VERSION"
+          echo "Manifest version: $MANIFEST_VERSION"
+          if [ "$TAG_VERSION" != "$MANIFEST_VERSION" ]; then
+            echo "::error::Tag py-v$TAG_VERSION does not match cozo-lib-python/pyproject.toml version $MANIFEST_VERSION. Bump the manifest (and Cargo.toml/Cargo.lock) to match the tag before releasing."
+            exit 1
+          fi
+          echo "Version match OK."
       - uses: actions/download-artifact@v4
         with:
           pattern: "mnestic-*"
