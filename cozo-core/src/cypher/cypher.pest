@@ -1,0 +1,105 @@
+/*
+ * Copyright 2026, Shan Rizvi (mnestic fork).
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+ * If a copy of the MPL was not distributed with this file,
+ * You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+// Read-only Cypher subset grammar (mnestic fork, v1).
+// Translated to CozoScript; design + scope in docs/specs/cypher-read.md.
+// v1 covers: MATCH (fixed-length, directed/undirected, labels, types, inline
+// property maps), WHERE (boolean expr, comparisons, IS NULL, STARTS/ENDS WITH,
+// CONTAINS, IN, arithmetic, property access, params, literals), RETURN (DISTINCT,
+// AS aliases, aggregates), ORDER BY / SKIP / LIMIT. Deferred: variable-length
+// paths, OPTIONAL MATCH, WITH, CALL, write clauses (parse errors by omission).
+
+WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
+COMMENT = _{ ("//" ~ (!NEWLINE ~ ANY)*) | ("/*" ~ (!"*/" ~ ANY)* ~ "*/") }
+wb = _{ !(ASCII_ALPHANUMERIC | "_") }
+
+query = { SOI ~ reading_clause+ ~ return_clause ~ EOI }
+reading_clause = { kw_match ~ pattern ~ ("," ~ pattern)* ~ where_clause? }
+where_clause = { kw_where ~ expr }
+
+pattern = { node_pat ~ (rel_pat ~ node_pat)* }
+node_pat = { "(" ~ ident? ~ label? ~ prop_map? ~ ")" }
+label = { ":" ~ ident }
+rel_pat = { rel_left ~ rel_detail? ~ rel_right }
+rel_left = { "<-" | "-" }
+rel_right = { "->" | "-" }
+rel_detail = { "[" ~ ident? ~ rel_type? ~ prop_map? ~ "]" }
+rel_type = { ":" ~ ident }
+prop_map = { "{" ~ (prop_pair ~ ("," ~ prop_pair)*)? ~ "}" }
+prop_pair = { ident ~ ":" ~ expr }
+
+return_clause = { kw_return ~ distinct? ~ return_items ~ order_clause? ~ skip_clause? ~ limit_clause? }
+distinct = { kw_distinct }
+return_items = { return_item ~ ("," ~ return_item)* }
+return_item = { expr ~ as_alias? }
+as_alias = { kw_as ~ ident }
+order_clause = { kw_order ~ kw_by ~ sort_item ~ ("," ~ sort_item)* }
+sort_item = { expr ~ sort_dir? }
+sort_dir = { kw_desc | kw_asc }
+skip_clause = { kw_skip ~ expr }
+limit_clause = { kw_limit ~ expr }
+
+expr = { or_expr }
+or_expr = { and_expr ~ (kw_or ~ and_expr)* }
+and_expr = { not_expr ~ (kw_and ~ not_expr)* }
+not_expr = { kw_not? ~ comparison }
+comparison = { add_expr ~ comp_rhs? }
+comp_rhs = { comp_tail | null_tail | str_tail | in_tail }
+comp_tail = { comp_op ~ add_expr }
+null_tail = { kw_is ~ (isnot_null | is_null) }
+is_null = { null_kw }
+isnot_null = { kw_not ~ null_kw }
+str_tail = { str_op ~ add_expr }
+str_op = { starts_with | ends_with | kw_contains }
+starts_with = { kw_starts ~ kw_with }
+ends_with = { kw_ends ~ kw_with }
+in_tail = { kw_in ~ add_expr }
+comp_op = { "<=" | ">=" | "<>" | "!=" | "=" | "<" | ">" }
+
+add_expr = { mul_expr ~ (add_op ~ mul_expr)* }
+add_op = { "+" | "-" }
+mul_expr = { unary_expr ~ (mul_op ~ unary_expr)* }
+mul_op = { "*" | "/" | "%" }
+unary_expr = { neg_minus? ~ atom_expr }
+neg_minus = { "-" }
+atom_expr = _{ number | string | boolean | null_kw | param | func_call | property | grouping | list_lit | var_ref }
+property = { ident ~ "." ~ ident }
+var_ref = { ident }
+func_call = { ident ~ "(" ~ func_args? ~ ")" }
+func_args = { star_arg | (expr ~ ("," ~ expr)*) }
+star_arg = { "*" }
+grouping = { "(" ~ expr ~ ")" }
+list_lit = { "[" ~ (expr ~ ("," ~ expr)*)? ~ "]" }
+
+param = @{ "$" ~ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }
+number = @{ ASCII_DIGIT+ ~ ("." ~ ASCII_DIGIT+)? ~ (^"e" ~ ("+" | "-")? ~ ASCII_DIGIT+)? }
+string = @{ ("\"" ~ ("\\" ~ ANY | !"\"" ~ ANY)* ~ "\"") | ("'" ~ ("\\" ~ ANY | !"'" ~ ANY)* ~ "'") }
+boolean = @{ (^"true" | ^"false") ~ wb }
+null_kw = @{ ^"null" ~ wb }
+
+kw_match = @{ ^"match" ~ wb }
+kw_where = @{ ^"where" ~ wb }
+kw_return = @{ ^"return" ~ wb }
+kw_distinct = @{ ^"distinct" ~ wb }
+kw_as = @{ ^"as" ~ wb }
+kw_order = @{ ^"order" ~ wb }
+kw_by = @{ ^"by" ~ wb }
+kw_skip = @{ ^"skip" ~ wb }
+kw_limit = @{ ^"limit" ~ wb }
+kw_asc = @{ (^"ascending" | ^"asc") ~ wb }
+kw_desc = @{ (^"descending" | ^"desc") ~ wb }
+kw_or = @{ ^"or" ~ wb }
+kw_and = @{ ^"and" ~ wb }
+kw_not = @{ ^"not" ~ wb }
+kw_is = @{ ^"is" ~ wb }
+kw_in = @{ ^"in" ~ wb }
+kw_contains = @{ ^"contains" ~ wb }
+kw_starts = @{ ^"starts" ~ wb }
+kw_ends = @{ ^"ends" ~ wb }
+kw_with = @{ ^"with" ~ wb }

@@ -65,6 +65,10 @@ storage-sled = ["dep:sled"]
 ## significant network overhead. Simple point-lookup queries are fine, though.
 ## The TiKV engine does not support time travel.
 storage-tikv = ["dep:tikv-client", "dep:tokio"]
+## Read-only Cypher query surface (mnestic fork): translate an openCypher subset
+## to CozoScript. No extra dependencies (reuses the existing pest stack). Off by
+## default during alpha; see docs/specs/cypher-read.md.
+cypher = []
 
 #! # Recommendation for features to enable
 #!

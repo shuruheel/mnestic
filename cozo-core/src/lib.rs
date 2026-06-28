@@ -67,6 +67,8 @@ pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 pub use runtime::db::Db;
 pub use runtime::db::NamedRows;
 pub use runtime::hybrid::{build_hybrid_query, GraphLeg, HybridList, HybridSearch, MmrParams};
+#[cfg(feature = "cypher")]
+pub use cypher::{CypherGraphSchema, EdgeMap, NodeMap};
 pub use runtime::relation::decode_tuple_from_kv;
 pub use runtime::temp_store::RegularTempStore;
 pub use storage::mem::{new_cozo_mem, MemStorage};
@@ -96,6 +98,8 @@ pub use crate::runtime::db::Poison;
 pub use crate::runtime::db::ScriptMutability;
 pub use crate::runtime::db::TransactionPayload;
 
+#[cfg(feature = "cypher")]
+pub mod cypher;
 pub mod data;
 pub(crate) mod fixed_rule;
 pub(crate) mod fts;
