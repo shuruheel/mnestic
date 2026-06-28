@@ -258,6 +258,11 @@ impl DbInstance {
         schema: &CypherGraphSchema,
         mut params: BTreeMap<String, DataValue>,
     ) -> Result<NamedRows> {
+        if params.keys().any(|k| k.starts_with("cphr_")) {
+            return Err(miette::miette!(
+                "parameter names starting with `cphr_` are reserved by the Cypher translator"
+            ));
+        }
         let cs = crate::cypher::build_cypher_script(query, schema)?;
         for (k, v) in cs.params {
             params.insert(k, v);

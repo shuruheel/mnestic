@@ -8,21 +8,25 @@
 
 //! Translator: Cypher AST + property-graph schema -> CozoScript string + params.
 //!
-//! The output runs through the normal read-only query path (later step). Literals
-//! become params (`$cphr_N`) so nothing user-supplied is interpolated; every
-//! identifier from the schema is validated. Bag semantics are preserved via a
-//! hidden binding-key in the head (set semantics over distinct bindings = the
-//! Cypher bag); `RETURN DISTINCT` and aggregation collapse as Cypher specifies.
-//! See `docs/specs/cypher-read.md` §2–§6.
+//! The output runs through the normal read-only query path. Literals become
+//! params (`$cphr_N`) so nothing user-supplied is interpolated; every identifier
+//! from the schema and from user Cypher is validated. Bag semantics are preserved
+//! via a hidden binding-key in the head (set semantics over distinct bindings =
+//! the Cypher bag); `RETURN DISTINCT` and aggregation collapse as Cypher
+//! specifies. WHERE is lowered through a null-aware (three-valued-logic) emitter
+//! so a null operand excludes the row rather than aborting the query. See
+//! `docs/specs/cypher-read.md` §2–§6 and the review fix plan in
+//! `docs/specs/cypher-read-review-findings.json`.
 //!
 //! v1 scope (errors, not silent gaps, for the rest): directed relationships,
 //! labels (or unlabeled over a single shared node relation), WHERE, RETURN
 //! (DISTINCT / bag / aggregates), inline-property filters, edge-isomorphism,
 //! ORDER BY / SKIP / LIMIT over projected columns. Deferred: undirected
 //! relationships, the schema `filter` field, variable-length paths, OPTIONAL
-//! MATCH, WITH.
+//! MATCH, WITH. Known divergence: `sum` over an integer column returns a float
+//! (the engine's accumulator is f64).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use miette::{bail, Result};
@@ -64,11 +68,23 @@ struct RelB {
     props: Vec<(String, CExpr)>,
 }
 
+/// Per-relationship identity info used for edge-isomorphism disequalities.
+struct RelId {
+    clause: usize,
+    relation: String,
+    type_disc: Option<String>,
+    eid_var: Option<String>,
+    from_v: String,
+    to_v: String,
+}
+
 struct Translator<'s> {
     schema: &'s CypherGraphSchema,
     params: BTreeMap<String, DataValue>,
     pcount: usize,
     anon: usize,
+    /// Interned, injective names for (variable, property) pairs.
+    prop_names: BTreeMap<(String, String), String>,
 }
 
 impl<'s> Translator<'s> {
@@ -78,6 +94,7 @@ impl<'s> Translator<'s> {
             params: BTreeMap::new(),
             pcount: 0,
             anon: 0,
+            prop_names: BTreeMap::new(),
         }
     }
 
@@ -94,11 +111,25 @@ impl<'s> Translator<'s> {
         v
     }
 
+    /// Interned, injective binding variable for a (var, key) property access.
+    /// Underscore-joining `var` and `key` would be ambiguous (cyp_a_b_c could be
+    /// (a,"b_c") or (a_b,"c")), so each distinct pair gets an opaque `cyp_N`.
+    fn pvar(&mut self, var: &str, key: &str) -> String {
+        let k = (var.to_string(), key.to_string());
+        if let Some(n) = self.prop_names.get(&k) {
+            return n.clone();
+        }
+        let name = format!("cyp_{}", self.prop_names.len());
+        self.prop_names.insert(k, name.clone());
+        name
+    }
+
     fn run(&mut self, query: &CypherQuery) -> Result<CypherScript> {
         let (nodes, rels) = self.collect(query)?;
+        self.validate_bindings(query, &nodes, &rels)?;
 
-        // Properties referenced anywhere must be bound in the node access; those
-        // used in RETURN/ORDER must also be exposed in the cy_match head.
+        // Properties referenced anywhere must be bound in the node/rel access;
+        // those used in RETURN/ORDER must also be exposed in the cy_match head.
         let mut all_props = Vec::new();
         let mut head_props = Vec::new();
         for rc in &query.reading {
@@ -118,45 +149,50 @@ impl<'s> Translator<'s> {
         // --- cy_match body ---
         let mut body: Vec<String> = Vec::new();
         for n in &nodes {
-            body.push(self.node_atom(n, &all_props)?);
+            self.node_atom(n, &all_props, &mut body)?;
         }
-        // Edge atoms + identity tracking for edge-isomorphism.
-        let mut rel_ids: Vec<(usize, String, Option<String>, String, String)> = Vec::new();
+        let mut rel_ids: Vec<RelId> = Vec::new();
         for r in &rels {
-            let (atom, edge_relation, eid_var) = self.rel_atom(r, &all_props)?;
-            body.push(atom);
-            rel_ids.push((r.clause, edge_relation, eid_var, r.from_v.clone(), r.to_v.clone()));
+            let id = self.rel_atom(r, &all_props, &mut body)?;
+            rel_ids.push(id);
         }
-        // WHERE filters.
+        // WHERE filters, lowered null-aware (keep only exactly-TRUE rows).
         for rc in &query.reading {
             if let Some(p) = &rc.where_pred {
-                body.push(self.expr(p)?);
+                body.push(self.truthy(p)?);
             }
         }
-        // Edge-isomorphism: same clause + same edge relation must be distinct.
+        // Edge-isomorphism: within one MATCH, two relationships on the same
+        // stored relation AND the same type must be distinct edges.
         for i in 0..rel_ids.len() {
             for j in (i + 1)..rel_ids.len() {
-                let (ci, ri, eid_i, fi, ti) = &rel_ids[i];
-                let (cj, rj, eid_j, fj, tj) = &rel_ids[j];
-                if ci != cj || ri != rj {
+                let a = &rel_ids[i];
+                let b = &rel_ids[j];
+                if a.clause != b.clause || a.relation != b.relation || a.type_disc != b.type_disc {
                     continue;
                 }
-                match (eid_i, eid_j) {
-                    (Some(a), Some(b)) => body.push(format!("{a} != {b}")),
-                    _ => body.push(format!("({fi} != {fj} or {ti} != {tj})")),
+                match (&a.eid_var, &b.eid_var) {
+                    (Some(x), Some(y)) => body.push(format!("{x} != {y}")),
+                    _ => body.push(format!(
+                        "({} != {} or {} != {})",
+                        a.from_v, b.from_v, a.to_v, b.to_v
+                    )),
                 }
             }
         }
 
-        // cy_match head: node vars, then rel eid vars, then head-prop vars.
-        let mut match_head: Vec<String> = nodes.iter().map(|n| n.var.clone()).collect();
-        for (_, _, eid, _, _) in &rel_ids {
-            if let Some(e) = eid {
-                push_unique(&mut match_head, e.clone());
+        // Structural binding key: node vars + rel eid vars (never property vars).
+        let mut bind_key: Vec<String> = nodes.iter().map(|n| n.var.clone()).collect();
+        for id in &rel_ids {
+            if let Some(e) = &id.eid_var {
+                push_unique(&mut bind_key, e.clone());
             }
         }
+        // cy_match head = binding key + property vars needed downstream.
+        let mut match_head = bind_key.clone();
         for (var, key) in &head_props {
-            push_unique(&mut match_head, prop_var(var, key));
+            let pv = self.pvar(var, key);
+            push_unique(&mut match_head, pv);
         }
 
         let mut script = String::new();
@@ -168,7 +204,6 @@ impl<'s> Translator<'s> {
         )
         .unwrap();
 
-        // --- projection / aggregation ---
         let has_aggr = query
             .ret
             .items
@@ -180,16 +215,20 @@ impl<'s> Translator<'s> {
             .items
             .iter()
             .enumerate()
-            .map(|(i, it)| it.alias.clone().unwrap_or_else(|| default_col_name(&it.expr, i)))
+            .map(|(i, it)| {
+                it.alias
+                    .clone()
+                    .unwrap_or_else(|| default_col_name(&it.expr, i))
+            })
             .collect();
 
         if has_aggr {
             self.emit_aggregate(&mut script, query, &match_head, &nodes)?;
         } else {
-            self.emit_projection(&mut script, query, &match_head)?;
+            self.emit_projection(&mut script, query, &match_head, &bind_key)?;
         }
 
-        self.emit_epilogue(&mut script, &query.ret, &out_columns)?;
+        self.emit_epilogue(&mut script, &query.ret)?;
 
         Ok(CypherScript {
             script,
@@ -198,63 +237,100 @@ impl<'s> Translator<'s> {
         })
     }
 
-    /// Build a node relation access atom, binding id, discriminator, and props.
-    fn node_atom(&mut self, n: &NodeB, all_props: &[(String, String)]) -> Result<String> {
+    /// Push a node relation access atom (and any equality constraints) onto `body`.
+    fn node_atom(
+        &mut self,
+        n: &NodeB,
+        all_props: &[(String, String)],
+        body: &mut Vec<String>,
+    ) -> Result<()> {
         let nm = self.resolve_node(n)?;
         reject_filter(nm.filter.as_ref(), "NodeMap")?;
         ident_ok(&nm.relation)?;
         ident_ok(&nm.id_col)?;
         let mut args = vec![format!("{}: {}", nm.id_col, n.var)];
-
+        let mut label_param: Option<String> = None;
         if let Some(lc) = &nm.label_col {
             ident_ok(lc)?;
             let v = nm
                 .label_value
                 .clone()
                 .unwrap_or_else(|| DataValue::Str(n.label.clone().unwrap_or_default().into()));
-            args.push(format!("{}: {}", lc, self.param(v)));
+            let p = self.param(v);
+            args.push(format!("{}: {}", lc, p));
+            label_param = Some(p);
         }
 
-        // Columns this node touches: referenced props (bind) and inline props (filter).
-        let referenced: Vec<&str> = all_props
+        let referenced: Vec<String> = all_props
             .iter()
             .filter(|(v, _)| *v == n.var)
-            .map(|(_, k)| k.as_str())
+            .map(|(_, k)| k.clone())
             .collect();
-        let mut extra_eq: Vec<String> = Vec::new();
-        let mut seen_cols: Vec<String> = Vec::new();
-        for key in &referenced {
-            ident_ok(key)?;
-            args.push(format!("{}: {}", key, prop_var(&n.var, key)));
-            seen_cols.push((*key).to_string());
-            if let Some((_, val)) = n.props.iter().find(|(k, _)| k == key) {
-                let pv = self.expr(val)?;
-                extra_eq.push(format!("{} == {}", prop_var(&n.var, key), pv));
-            }
+        let mut cols: Vec<String> = Vec::new();
+        for k in &referenced {
+            ident_ok(k)?;
+            push_unique(&mut cols, k.clone());
         }
-        for (key, val) in &n.props {
-            if seen_cols.iter().any(|c| c == key) {
-                continue;
-            }
-            ident_ok(key)?;
-            let pv = self.expr(val)?;
-            args.push(format!("{}: {}", key, pv));
+        for (k, _) in &n.props {
+            ident_ok(k)?;
+            push_unique(&mut cols, k.clone());
         }
 
-        let mut atom = format!("*{}{{{}}}", nm.relation, args.join(", "));
-        for eq in extra_eq {
-            atom.push_str(", ");
-            atom.push_str(&eq);
+        let mut eqs: Vec<String> = Vec::new();
+        for col in &cols {
+            let is_ref = referenced.contains(col);
+            let inline: Vec<&CExpr> = n.props.iter().filter(|(k, _)| k == col).map(|(_, v)| v).collect();
+            if *col == nm.id_col {
+                // The id column is already bound to the node var; never re-bind it.
+                if is_ref {
+                    let pv = self.pvar(&n.var, col);
+                    eqs.push(format!("{pv} = {}", n.var));
+                }
+                for v in &inline {
+                    let e = self.expr(v)?;
+                    eqs.push(format!("{} == {e}", n.var));
+                }
+            } else if nm.label_col.as_deref() == Some(col.as_str()) {
+                // The discriminator already constrains this column.
+                if is_ref {
+                    if let Some(p) = &label_param {
+                        let pv = self.pvar(&n.var, col);
+                        eqs.push(format!("{pv} = {p}"));
+                    }
+                }
+            } else if is_ref {
+                let pv = self.pvar(&n.var, col);
+                args.push(format!("{col}: {pv}"));
+                for v in &inline {
+                    let e = self.expr(v)?;
+                    eqs.push(format!("{pv} == {e}"));
+                }
+            } else if inline.len() == 1 {
+                let e = self.expr(inline[0])?;
+                args.push(format!("{col}: {e}")); // direct filter -> keyed lookup (#1)
+            } else {
+                // Multiple inline constraints on one column: bind once, equate each.
+                let pv = self.pvar(&n.var, col);
+                args.push(format!("{col}: {pv}"));
+                for v in &inline {
+                    let e = self.expr(v)?;
+                    eqs.push(format!("{pv} == {e}"));
+                }
+            }
         }
-        Ok(atom)
+
+        body.push(format!("*{}{{{}}}", nm.relation, args.join(", ")));
+        body.extend(eqs);
+        Ok(())
     }
 
-    /// Build an edge relation access atom; returns (atom, edge_relation, eid_var).
+    /// Push an edge relation access atom (+ equalities) onto `body`; return its id info.
     fn rel_atom(
         &mut self,
         r: &RelB,
         all_props: &[(String, String)],
-    ) -> Result<(String, String, Option<String>)> {
+        body: &mut Vec<String>,
+    ) -> Result<RelId> {
         let em = self.resolve_edge(r)?;
         reject_filter(em.filter.as_ref(), "EdgeMap")?;
         ident_ok(&em.relation)?;
@@ -275,6 +351,17 @@ impl<'s> Translator<'s> {
             None => None,
         };
 
+        let type_disc = if em.type_col.is_some() {
+            Some(
+                em.type_value
+                    .as_ref()
+                    .and_then(|v| v.get_str().map(|s| s.to_string()))
+                    .or_else(|| r.rel_type.clone())
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
         if let Some(tc) = &em.type_col {
             ident_ok(tc)?;
             let v = em
@@ -284,35 +371,60 @@ impl<'s> Translator<'s> {
             args.push(format!("{}: {}", tc, self.param(v)));
         }
 
-        // Inline relationship property filters, and any referenced via the rel var.
+        // Relationship property columns: referenced (bind) and inline (filter).
         let rel_var = r.user_var.as_deref();
-        let mut seen_cols: Vec<String> = Vec::new();
-        if let Some(rv) = rel_var {
-            let referenced: Vec<&str> = all_props
+        let referenced: Vec<String> = match rel_var {
+            Some(rv) => all_props
                 .iter()
                 .filter(|(v, _)| v == rv)
-                .map(|(_, k)| k.as_str())
-                .collect();
-            for key in referenced {
-                ident_ok(key)?;
-                args.push(format!("{}: {}", key, prop_var(rv, key)));
-                seen_cols.push(key.to_string());
-            }
+                .map(|(_, k)| k.clone())
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut cols: Vec<String> = Vec::new();
+        for k in &referenced {
+            ident_ok(k)?;
+            push_unique(&mut cols, k.clone());
         }
-        for (key, val) in &r.props {
-            if seen_cols.iter().any(|c| c == key) {
-                continue;
-            }
-            ident_ok(key)?;
-            let pv = self.expr(val)?;
-            args.push(format!("{}: {}", key, pv));
+        for (k, _) in &r.props {
+            ident_ok(k)?;
+            push_unique(&mut cols, k.clone());
         }
 
-        Ok((
-            format!("*{}{{{}}}", em.relation, args.join(", ")),
-            em.relation.clone(),
+        let mut eqs: Vec<String> = Vec::new();
+        for col in &cols {
+            let is_ref = rel_var.is_some() && referenced.contains(col);
+            let inline: Vec<&CExpr> = r.props.iter().filter(|(k, _)| k == col).map(|(_, v)| v).collect();
+            if is_ref {
+                let pv = self.pvar(rel_var.unwrap(), col);
+                args.push(format!("{col}: {pv}"));
+                for v in &inline {
+                    let e = self.expr(v)?;
+                    eqs.push(format!("{pv} == {e}"));
+                }
+            } else if inline.len() == 1 {
+                let e = self.expr(inline[0])?;
+                args.push(format!("{col}: {e}"));
+            } else {
+                let placeholder = self.fresh("cyrp");
+                args.push(format!("{col}: {placeholder}"));
+                for v in &inline {
+                    let e = self.expr(v)?;
+                    eqs.push(format!("{placeholder} == {e}"));
+                }
+            }
+        }
+
+        body.push(format!("*{}{{{}}}", em.relation, args.join(", ")));
+        body.extend(eqs);
+        Ok(RelId {
+            clause: r.clause,
+            relation: em.relation.clone(),
+            type_disc,
             eid_var,
-        ))
+            from_v: r.from_v.clone(),
+            to_v: r.to_v.clone(),
+        })
     }
 
     fn emit_projection(
@@ -320,6 +432,7 @@ impl<'s> Translator<'s> {
         script: &mut String,
         query: &CypherQuery,
         match_head: &[String],
+        bind_key: &[String],
     ) -> Result<()> {
         let mut ret_vars = Vec::new();
         let mut unifies = Vec::new();
@@ -328,19 +441,17 @@ impl<'s> Translator<'s> {
             unifies.push(format!("{var} = {}", self.expr(&item.expr)?));
             ret_vars.push(var);
         }
-
-        // Bag mode: append the binding key (node vars + rel eids) as hidden
-        // columns so duplicate projected rows survive. DISTINCT omits them.
+        // Bag mode: append the binding key (hidden) so duplicate projected rows
+        // survive. DISTINCT omits it (Datalog set dedup = Cypher DISTINCT).
         let mut head = ret_vars.clone();
         if !query.ret.distinct {
-            for v in binding_key(match_head, query) {
-                push_unique(&mut head, v);
+            for v in bind_key {
+                push_unique(&mut head, v.clone());
             }
         }
-
-        let mut body = vec![format!("cy_match[{}]", match_head.join(", "))];
-        body.extend(unifies);
-        writeln!(script, "?[{}] := {}", head.join(", "), body.join(", ")).unwrap();
+        let mut rule_body = vec![format!("cy_match[{}]", match_head.join(", "))];
+        rule_body.extend(unifies);
+        writeln!(script, "?[{}] := {}", head.join(", "), rule_body.join(", ")).unwrap();
         Ok(())
     }
 
@@ -356,28 +467,29 @@ impl<'s> Translator<'s> {
             .map(|n| n.var.clone())
             .ok_or_else(|| miette::miette!("aggregation requires at least one node"))?;
 
-        // cy_agg head: group columns (computed) then aggregate head-args.
         let mut agg_head: Vec<String> = Vec::new();
         let mut group_unifies: Vec<String> = Vec::new();
-        let mut col_for_item: Vec<String> = Vec::new(); // var name to read each item back as
+        let mut guards: Vec<String> = Vec::new();
         for (i, item) in query.ret.items.iter().enumerate() {
             if let CExpr::Func { name, args } = &item.expr {
                 if is_aggregate(name) {
-                    let arg = self.aggregate_arg(args, &anchor)?;
-                    let col = format!("cy_a_{i}");
+                    let (arg, is_star) = self.aggregate_arg(args, &anchor)?;
+                    // Skip nulls per openCypher (and stop sum/avg aborting on null).
+                    if !is_star {
+                        guards.push(format!("!is_null({arg})"));
+                    }
                     agg_head.push(format!("{}({arg})", cozo_aggr(name)));
-                    col_for_item.push(col);
                     continue;
                 }
             }
             let gv = format!("cy_g_{i}");
             group_unifies.push(format!("{gv} = {}", self.expr(&item.expr)?));
-            agg_head.push(gv.clone());
-            col_for_item.push(gv);
+            agg_head.push(gv);
         }
 
         let mut agg_body = vec![format!("cy_match[{}]", match_head.join(", "))];
         agg_body.extend(group_unifies);
+        agg_body.extend(guards);
         writeln!(
             script,
             "cy_agg[{}] := {}",
@@ -386,23 +498,16 @@ impl<'s> Translator<'s> {
         )
         .unwrap();
 
-        // Final rule names cy_agg's columns and reorders to RETURN order.
-        // cy_agg's positional columns are exactly col_for_item order.
-        let bind_names: Vec<String> = col_for_item.clone();
-        let head: Vec<String> = col_for_item.clone();
-        writeln!(
-            script,
-            "?[{}] := cy_agg[{}]",
-            head.join(", "),
-            bind_names.join(", ")
-        )
-        .unwrap();
+        let cols: Vec<String> = (0..query.ret.items.len())
+            .map(|i| item_head_var(&query.ret, i, true))
+            .collect();
+        writeln!(script, "?[{}] := cy_agg[{}]", cols.join(", "), cols.join(", ")).unwrap();
         Ok(())
     }
 
-    fn aggregate_arg(&mut self, args: &FuncArgs, anchor: &str) -> Result<String> {
+    fn aggregate_arg(&mut self, args: &FuncArgs, anchor: &str) -> Result<(String, bool)> {
         match args {
-            FuncArgs::Star => Ok(anchor.to_string()),
+            FuncArgs::Star => Ok((anchor.to_string(), true)),
             FuncArgs::Exprs(es) => {
                 if es.len() != 1 {
                     bail!("aggregate functions take exactly one argument in v1");
@@ -410,25 +515,23 @@ impl<'s> Translator<'s> {
                 match &es[0] {
                     CExpr::Var(v) => {
                         ident_ok(v)?;
-                        Ok(v.clone())
+                        Ok((v.clone(), false))
                     }
-                    CExpr::Prop { var, key } => Ok(prop_var(var, key)),
+                    CExpr::Prop { var, key } => {
+                        ident_ok(key)?;
+                        Ok((self.pvar(var, key), false))
+                    }
                     _ => bail!("aggregate argument must be a variable or property in v1"),
                 }
             }
         }
     }
 
-    fn emit_epilogue(
-        &mut self,
-        script: &mut String,
-        ret: &ReturnClause,
-        out_columns: &[String],
-    ) -> Result<()> {
+    fn emit_epilogue(&mut self, script: &mut String, ret: &ReturnClause) -> Result<()> {
         if !ret.order_by.is_empty() {
             let mut parts = Vec::new();
             for s in &ret.order_by {
-                let col = self.order_var(&s.expr, ret, out_columns)?;
+                let col = self.order_var(&s.expr, ret)?;
                 parts.push(format!("{}{}", if s.descending { "-" } else { "+" }, col));
             }
             writeln!(script, ":order {}", parts.join(", ")).unwrap();
@@ -444,23 +547,16 @@ impl<'s> Translator<'s> {
 
     /// Resolve an ORDER BY term to a head variable: it must match a RETURN item
     /// (by alias or by identical expression).
-    fn order_var(
-        &self,
-        e: &CExpr,
-        ret: &ReturnClause,
-        _out_columns: &[String],
-    ) -> Result<String> {
+    fn order_var(&self, e: &CExpr, ret: &ReturnClause) -> Result<String> {
         let has_aggr = ret
             .items
             .iter()
             .any(|it| matches!(&it.expr, CExpr::Func { name, .. } if is_aggregate(name)));
-        // Match by alias.
         if let CExpr::Var(name) = e {
             if let Some(i) = ret.items.iter().position(|it| it.alias.as_deref() == Some(name)) {
                 return Ok(item_head_var(ret, i, has_aggr));
             }
         }
-        // Match by identical projected expression.
         if let Some(i) = ret.items.iter().position(|it| expr_eq(&it.expr, e)) {
             return Ok(item_head_var(ret, i, has_aggr));
         }
@@ -477,7 +573,6 @@ impl<'s> Translator<'s> {
                 .cloned()
                 .ok_or_else(|| miette::miette!("no schema mapping for node label `{l}`")),
             None => {
-                // Allowed only when all node mappings share one relation+id_col.
                 let first = self
                     .schema
                     .nodes
@@ -516,11 +611,7 @@ impl<'s> Translator<'s> {
                     .edges
                     .first()
                     .ok_or_else(|| miette::miette!("relationship needs a type (empty schema)"))?;
-                let shared = self
-                    .schema
-                    .edges
-                    .iter()
-                    .all(|m| m.relation == first.relation);
+                let shared = self.schema.edges.iter().all(|m| m.relation == first.relation);
                 if !shared {
                     bail!("untyped relationship requires a single shared edge relation");
                 }
@@ -543,6 +634,7 @@ impl<'s> Translator<'s> {
     fn collect(&mut self, query: &CypherQuery) -> Result<(Vec<NodeB>, Vec<RelB>)> {
         let mut nodes: Vec<NodeB> = Vec::new();
         let mut rels: Vec<RelB> = Vec::new();
+        let mut rel_var_names: Vec<String> = Vec::new();
         for (ci, rc) in query.reading.iter().enumerate() {
             for pat in &rc.patterns {
                 let mut prev = self.upsert_node(&mut nodes, &pat.start)?;
@@ -555,6 +647,14 @@ impl<'s> Translator<'s> {
                             bail!("undirected relationships are not yet supported in v1")
                         }
                     };
+                    if let Some(rv) = &rel.var {
+                        ident_ok(rv)?;
+                        reserved_check(rv)?;
+                        if rel_var_names.contains(rv) {
+                            bail!("relationship variable `{rv}` is reused; each relationship needs a distinct variable");
+                        }
+                        rel_var_names.push(rv.clone());
+                    }
                     rels.push(RelB {
                         clause: ci,
                         rel_type: rel.rel_type.clone(),
@@ -567,6 +667,12 @@ impl<'s> Translator<'s> {
                 }
             }
         }
+        // A name cannot be both a node and a relationship variable.
+        for n in &nodes {
+            if rel_var_names.contains(&n.var) {
+                bail!("`{}` is used as both a node and a relationship variable", n.var);
+            }
+        }
         Ok((nodes, rels))
     }
 
@@ -574,6 +680,7 @@ impl<'s> Translator<'s> {
         let var = match &np.var {
             Some(v) => {
                 ident_ok(v)?;
+                reserved_check(v)?;
                 v.clone()
             }
             None => self.fresh("cyn"),
@@ -599,13 +706,82 @@ impl<'s> Translator<'s> {
         Ok(var)
     }
 
-    // --- expression translation ---
+    /// Reject references to variables that aren't bound by a pattern, so callers
+    /// get a clear error instead of an opaque engine "unbound variable".
+    fn validate_bindings(
+        &self,
+        query: &CypherQuery,
+        nodes: &[NodeB],
+        rels: &[RelB],
+    ) -> Result<()> {
+        let node_vars: BTreeSet<String> = nodes.iter().map(|n| n.var.clone()).collect();
+        let mut rel_eid: BTreeMap<String, bool> = BTreeMap::new();
+        for r in rels {
+            if let Some(rv) = &r.user_var {
+                let em = self.resolve_edge(r)?;
+                rel_eid.insert(rv.clone(), em.eid_col.is_some());
+            }
+        }
+        let aliases: BTreeSet<String> = query
+            .ret
+            .items
+            .iter()
+            .filter_map(|it| it.alias.clone())
+            .collect();
+
+        // Property accesses (`x.k`): `x` must be a node or relationship variable.
+        let mut props = Vec::new();
+        for rc in &query.reading {
+            if let Some(p) = &rc.where_pred {
+                collect_props(p, &mut props);
+            }
+        }
+        for it in &query.ret.items {
+            collect_props(&it.expr, &mut props);
+        }
+        for s in &query.ret.order_by {
+            collect_props(&s.expr, &mut props);
+        }
+        for (var, _) in &props {
+            if !node_vars.contains(var) && !rel_eid.contains_key(var) {
+                bail!("variable `{var}` is not defined");
+            }
+        }
+
+        // Bare variable references in WHERE/RETURN.
+        let mut bares = Vec::new();
+        for rc in &query.reading {
+            if let Some(p) = &rc.where_pred {
+                collect_bare_vars(p, &mut bares);
+            }
+        }
+        for it in &query.ret.items {
+            collect_bare_vars(&it.expr, &mut bares);
+        }
+        for v in &bares {
+            check_bare(v, &node_vars, &rel_eid, &aliases, false)?;
+        }
+        // ORDER BY may also reference RETURN aliases.
+        let mut order_bares = Vec::new();
+        for s in &query.ret.order_by {
+            collect_bare_vars(&s.expr, &mut order_bares);
+        }
+        for v in &order_bares {
+            check_bare(v, &node_vars, &rel_eid, &aliases, true)?;
+        }
+        Ok(())
+    }
+
+    // --- expression translation (value position: RETURN, inline props, args) ---
 
     fn expr(&mut self, e: &CExpr) -> Result<String> {
         Ok(match e {
             CExpr::Lit(v) => self.param(v.clone()),
             CExpr::Param(name) => {
                 ident_ok(name)?;
+                if name.starts_with("cphr_") {
+                    bail!("parameter names starting with `cphr_` are reserved");
+                }
                 format!("${name}")
             }
             CExpr::Var(v) => {
@@ -614,7 +790,7 @@ impl<'s> Translator<'s> {
             }
             CExpr::Prop { var, key } => {
                 ident_ok(key)?;
-                prop_var(var, key)
+                self.pvar(var, key)
             }
             CExpr::List(items) => {
                 let parts: Result<Vec<_>> = items.iter().map(|i| self.expr(i)).collect();
@@ -645,6 +821,95 @@ impl<'s> Translator<'s> {
             }
         })
     }
+
+    // --- WHERE translation (predicate position: null-aware three-valued logic) ---
+
+    /// Emit a CozoScript boolean that is true iff `e` is exactly TRUE in Cypher's
+    /// 3VL (null and false both yield false; a null operand never aborts).
+    fn truthy(&mut self, e: &CExpr) -> Result<String> {
+        Ok(match e {
+            CExpr::Binary { op, lhs, rhs } => match op {
+                BinOp::And => format!("({} && {})", self.truthy(lhs)?, self.truthy(rhs)?),
+                BinOp::Or => format!("({} || {})", self.truthy(lhs)?, self.truthy(rhs)?),
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                    let l = self.expr(lhs)?;
+                    let r = self.expr(rhs)?;
+                    format!("(!is_null({l}) && !is_null({r}) && ({l} {} {r}))", infix(op))
+                }
+                BinOp::StartsWith | BinOp::EndsWith | BinOp::Contains => {
+                    let l = self.expr(lhs)?;
+                    let r = self.expr(rhs)?;
+                    let f = strfn(op);
+                    format!("(!is_null({l}) && !is_null({r}) && {f}({l}, {r}))")
+                }
+                BinOp::In => {
+                    let l = self.expr(lhs)?;
+                    let r = self.expr(rhs)?;
+                    format!("(!is_null({l}) && is_in({l}, {r}))")
+                }
+                _ => {
+                    let v = self.expr(e)?;
+                    format!("(!is_null({v}) && {v})")
+                }
+            },
+            CExpr::Unary { op, operand } => match op {
+                UnOp::Not => self.falsy(operand)?,
+                UnOp::IsNull => format!("is_null({})", self.expr(operand)?),
+                UnOp::IsNotNull => format!("(!is_null({}))", self.expr(operand)?),
+                UnOp::Neg => {
+                    let v = self.expr(e)?;
+                    format!("(!is_null({v}) && {v})")
+                }
+            },
+            _ => {
+                let v = self.expr(e)?;
+                format!("(!is_null({v}) && {v})")
+            }
+        })
+    }
+
+    /// Emit a boolean that is true iff `e` is exactly FALSE in Cypher's 3VL.
+    fn falsy(&mut self, e: &CExpr) -> Result<String> {
+        Ok(match e {
+            CExpr::Binary { op, lhs, rhs } => match op {
+                BinOp::And => format!("({} || {})", self.falsy(lhs)?, self.falsy(rhs)?),
+                BinOp::Or => format!("({} && {})", self.falsy(lhs)?, self.falsy(rhs)?),
+                BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
+                    let l = self.expr(lhs)?;
+                    let r = self.expr(rhs)?;
+                    format!("(!is_null({l}) && !is_null({r}) && !({l} {} {r}))", infix(op))
+                }
+                BinOp::StartsWith | BinOp::EndsWith | BinOp::Contains => {
+                    let l = self.expr(lhs)?;
+                    let r = self.expr(rhs)?;
+                    let f = strfn(op);
+                    format!("(!is_null({l}) && !is_null({r}) && !{f}({l}, {r}))")
+                }
+                BinOp::In => {
+                    let l = self.expr(lhs)?;
+                    let r = self.expr(rhs)?;
+                    format!("(!is_null({l}) && !is_in({l}, {r}))")
+                }
+                _ => {
+                    let v = self.expr(e)?;
+                    format!("(!is_null({v}) && (!{v}))")
+                }
+            },
+            CExpr::Unary { op, operand } => match op {
+                UnOp::Not => self.truthy(operand)?,
+                UnOp::IsNull => format!("(!is_null({}))", self.expr(operand)?),
+                UnOp::IsNotNull => format!("is_null({})", self.expr(operand)?),
+                UnOp::Neg => {
+                    let v = self.expr(e)?;
+                    format!("(!is_null({v}) && (!{v}))")
+                }
+            },
+            _ => {
+                let v = self.expr(e)?;
+                format!("(!is_null({v}) && (!{v}))")
+            }
+        })
+    }
 }
 
 // --- free helpers ---
@@ -668,8 +933,13 @@ fn infix(op: &BinOp) -> &'static str {
     }
 }
 
-fn prop_var(var: &str, key: &str) -> String {
-    format!("cyp_{var}_{key}")
+fn strfn(op: &BinOp) -> &'static str {
+    match op {
+        BinOp::StartsWith => "starts_with",
+        BinOp::EndsWith => "ends_with",
+        BinOp::Contains => "str_includes",
+        _ => unreachable!("non-string op routed to strfn()"),
+    }
 }
 
 /// The head variable a RETURN item `i` is exposed as in the final `?` rule.
@@ -720,13 +990,43 @@ fn collect_props(e: &CExpr, out: &mut Vec<(String, String)>) {
     }
 }
 
-/// The binding-key columns (node vars + rel eid vars) within a cy_match head.
-fn binding_key(match_head: &[String], _query: &CypherQuery) -> Vec<String> {
-    match_head
-        .iter()
-        .filter(|v| !v.starts_with("cyp_"))
-        .cloned()
-        .collect()
+fn collect_bare_vars(e: &CExpr, out: &mut Vec<String>) {
+    match e {
+        CExpr::Var(v) => push_unique(out, v.clone()),
+        CExpr::List(items) => items.iter().for_each(|i| collect_bare_vars(i, out)),
+        CExpr::Unary { operand, .. } => collect_bare_vars(operand, out),
+        CExpr::Binary { lhs, rhs, .. } => {
+            collect_bare_vars(lhs, out);
+            collect_bare_vars(rhs, out);
+        }
+        CExpr::Func {
+            args: FuncArgs::Exprs(es),
+            ..
+        } => es.iter().for_each(|i| collect_bare_vars(i, out)),
+        _ => {}
+    }
+}
+
+fn check_bare(
+    v: &str,
+    node_vars: &BTreeSet<String>,
+    rel_eid: &BTreeMap<String, bool>,
+    aliases: &BTreeSet<String>,
+    allow_alias: bool,
+) -> Result<()> {
+    if node_vars.contains(v) {
+        return Ok(());
+    }
+    if let Some(has_eid) = rel_eid.get(v) {
+        if *has_eid {
+            return Ok(());
+        }
+        bail!("relationship `{v}` cannot be returned: its edge relation has no identity column (set eid_col)");
+    }
+    if allow_alias && aliases.contains(v) {
+        return Ok(());
+    }
+    bail!("variable `{v}` is not defined")
 }
 
 fn default_col_name(e: &CExpr, i: usize) -> String {
@@ -761,11 +1061,36 @@ fn ident_ok(s: &str) -> Result<()> {
     }
 }
 
+/// Reject user variable names that collide with the translator's generated
+/// namespace, preventing variable capture in the emitted CozoScript.
+fn reserved_check(s: &str) -> Result<()> {
+    let reserved = s == "cy_match"
+        || s == "cy_agg"
+        || s.starts_with("cy_ret_")
+        || s.starts_with("cy_g_")
+        || s.starts_with("cy_a_")
+        || s.starts_with("cyp_")
+        || s.starts_with("cphr_")
+        || tagged_digits(s, "cyn")
+        || tagged_digits(s, "cyr")
+        || tagged_digits(s, "cyrp");
+    if reserved {
+        bail!("variable name `{s}` is reserved by the Cypher translator; please rename it");
+    }
+    Ok(())
+}
+
 fn reject_filter(filter: Option<&String>, which: &str) -> Result<()> {
     if filter.is_some() {
         bail!("{which}.filter is reserved and not yet implemented in v1");
     }
     Ok(())
+}
+
+fn tagged_digits(s: &str, prefix: &str) -> bool {
+    s.strip_prefix(prefix)
+        .map(|rest| !rest.is_empty() && rest.chars().all(|c| c.is_ascii_digit()))
+        .unwrap_or(false)
 }
 
 fn push_unique(v: &mut Vec<String>, item: String) {
@@ -787,248 +1112,27 @@ fn expr_eq(a: &CExpr, b: &CExpr) -> bool {
         (CExpr::Prop { var: v1, key: k1 }, CExpr::Prop { var: v2, key: k2 }) => v1 == v2 && k1 == k2,
         (CExpr::Lit(x), CExpr::Lit(y)) => x == y,
         (CExpr::Param(x), CExpr::Param(y)) => x == y,
+        (CExpr::List(x), CExpr::List(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| expr_eq(a, b)),
+        (CExpr::Unary { op: o1, operand: e1 }, CExpr::Unary { op: o2, operand: e2 }) => {
+            o1 == o2 && expr_eq(e1, e2)
+        }
+        (
+            CExpr::Binary { op: o1, lhs: l1, rhs: r1 },
+            CExpr::Binary { op: o2, lhs: l2, rhs: r2 },
+        ) => o1 == o2 && expr_eq(l1, l2) && expr_eq(r1, r2),
+        (CExpr::Func { name: n1, args: a1 }, CExpr::Func { name: n2, args: a2 }) => {
+            n1.eq_ignore_ascii_case(n2)
+                && match (a1, a2) {
+                    (FuncArgs::Star, FuncArgs::Star) => true,
+                    (FuncArgs::Exprs(x), FuncArgs::Exprs(y)) => {
+                        x.len() == y.len() && x.iter().zip(y).all(|(a, b)| expr_eq(a, b))
+                    }
+                    _ => false,
+                }
+        }
         _ => false,
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cypher::parse::parse_cypher;
-    use crate::{DbInstance, ScriptMutability};
-
-    fn tr(q: &str, schema: &CypherGraphSchema) -> CypherScript {
-        cypher_to_script(&parse_cypher(q).unwrap(), schema).unwrap()
-    }
-
-    fn nm(label: &str, relation: &str, id_col: &str, label_col: Option<&str>) -> NodeMap {
-        NodeMap {
-            label: label.into(),
-            relation: relation.into(),
-            id_col: id_col.into(),
-            label_col: label_col.map(|s| s.into()),
-            label_value: None,
-            filter: None,
-        }
-    }
-
-    fn relation_per_label() -> CypherGraphSchema {
-        CypherGraphSchema {
-            nodes: vec![nm("Person", "person", "id", None)],
-            edges: vec![EdgeMap {
-                rel_type: "KNOWS".into(),
-                relation: "knows".into(),
-                from_col: "fr".into(),
-                to_col: "to".into(),
-                type_col: None,
-                type_value: None,
-                eid_col: None,
-                filter: None,
-            }],
-        }
-    }
-
-    fn shared_relation() -> CypherGraphSchema {
-        CypherGraphSchema {
-            nodes: vec![nm("Person", "node", "uid", Some("node_type"))],
-            edges: vec![EdgeMap {
-                rel_type: "KNOWS".into(),
-                relation: "edge".into(),
-                from_col: "from_uid".into(),
-                to_col: "to_uid".into(),
-                type_col: Some("edge_type".into()),
-                type_value: None,
-                eid_col: Some("uid".into()),
-                filter: None,
-            }],
-        }
-    }
-
-    /// Project each result row to the user-visible columns and return as strings
-    /// for order-independent comparison.
-    fn run(db: &DbInstance, cs: &CypherScript) -> Vec<Vec<DataValue>> {
-        let out = db
-            .run_script(&cs.script, cs.params.clone(), ScriptMutability::Immutable)
-            .unwrap_or_else(|e| panic!("script failed:\n{}\nerror: {e}", cs.script));
-        let n = cs.out_columns.len();
-        out.rows.into_iter().map(|r| r[..n].to_vec()).collect()
-    }
-
-    #[test]
-    fn golden_relation_per_label() {
-        let cs = tr(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 30 RETURN b.name AS name ORDER BY name",
-            &relation_per_label(),
-        );
-        assert!(cs.script.contains("*person{id: a, age: cyp_a_age}"), "{}", cs.script);
-        assert!(cs.script.contains("*person{id: b, name: cyp_b_name}"), "{}", cs.script);
-        assert!(cs.script.contains("*knows{fr: a, to: b}"), "{}", cs.script);
-        assert!(cs.script.contains(":order +cy_ret_0"), "{}", cs.script);
-        assert_eq!(cs.out_columns, vec!["name"]);
-        assert_eq!(cs.params.len(), 1); // the literal 30
-    }
-
-    #[test]
-    fn golden_shared_relation_with_eid_and_iso() {
-        let cs = tr(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN c.name",
-            &shared_relation(),
-        );
-        // discriminators are params; reified edge bound by uid.
-        assert!(cs.script.contains("node_type: $cphr"), "{}", cs.script);
-        assert!(cs.script.contains("edge_type: $cphr"), "{}", cs.script);
-        assert!(cs.script.contains("uid:"), "{}", cs.script);
-        // edge-isomorphism over the two reified edge ids.
-        assert!(cs.script.contains(" != "), "missing iso disequality:\n{}", cs.script);
-    }
-
-    #[test]
-    fn exec_relation_per_label_where_order() {
-        let db = DbInstance::default();
-        db.run_default(":create person {id => name, age}").unwrap();
-        db.run_default(":create knows {fr, to}").unwrap();
-        db.run_default(
-            "?[id, name, age] <- [[1,'Alice',30],[2,'Bob',40],[3,'Carol',35]] :put person {id => name, age}",
-        )
-        .unwrap();
-        db.run_default("?[fr, to] <- [[1,2],[1,3],[2,3]] :put knows {fr, to}").unwrap();
-
-        let cs = tr(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 30 RETURN b.name AS name ORDER BY name",
-            &relation_per_label(),
-        );
-        assert_eq!(run(&db, &cs), vec![vec![DataValue::from("Carol")]]);
-    }
-
-    #[test]
-    fn exec_aggregate_count() {
-        let db = DbInstance::default();
-        db.run_default(":create person {id => name}").unwrap();
-        db.run_default(":create knows {fr, to}").unwrap();
-        db.run_default("?[id, name] <- [[1,'Alice'],[2,'Bob'],[3,'Carol']] :put person {id => name}")
-            .unwrap();
-        db.run_default("?[fr, to] <- [[1,2],[1,3],[2,3]] :put knows {fr, to}").unwrap();
-
-        let cs = tr(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS who, count(*) AS c ORDER BY who",
-            &relation_per_label(),
-        );
-        assert_eq!(
-            run(&db, &cs),
-            vec![
-                vec![DataValue::from("Alice"), DataValue::from(2i64)],
-                vec![DataValue::from("Bob"), DataValue::from(1i64)],
-            ]
-        );
-    }
-
-    #[test]
-    fn exec_bag_vs_distinct() {
-        let db = DbInstance::default();
-        db.run_default(":create person {id => name}").unwrap();
-        db.run_default(":create knows {fr, to}").unwrap();
-        db.run_default("?[id, name] <- [[1,'Alice'],[2,'Bob'],[3,'Carol']] :put person {id => name}")
-            .unwrap();
-        db.run_default("?[fr, to] <- [[1,2],[1,3],[2,3]] :put knows {fr, to}").unwrap();
-
-        let schema = relation_per_label();
-        // bag: a.name once per edge → Alice, Alice, Bob (3 rows).
-        let bag = tr("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name", &schema);
-        assert_eq!(run(&db, &bag).len(), 3);
-        // distinct: Alice, Bob (2 rows).
-        let dis = tr("MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN DISTINCT a.name", &schema);
-        assert_eq!(run(&db, &dis).len(), 2);
-    }
-
-    #[test]
-    fn exec_shared_relation_mindgraph_style() {
-        let db = DbInstance::default();
-        db.run_default(":create node {uid => node_type, name}").unwrap();
-        db.run_default(":create edge {uid => from_uid, to_uid, edge_type}").unwrap();
-        db.run_default(
-            "?[uid, node_type, name] <- [['n1','Person','Alice'],['n2','Person','Bob']] :put node {uid => node_type, name}",
-        )
-        .unwrap();
-        db.run_default(
-            "?[uid, from_uid, to_uid, edge_type] <- [['e1','n1','n2','KNOWS']] :put edge {uid => from_uid, to_uid, edge_type}",
-        )
-        .unwrap();
-
-        let cs = tr(
-            "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS name",
-            &shared_relation(),
-        );
-        assert_eq!(run(&db, &cs), vec![vec![DataValue::from("Bob")]]);
-    }
-
-    #[test]
-    fn run_cypher_entry_projects_and_names_columns() {
-        let db = DbInstance::default();
-        db.run_default(":create person {id => name, age}").unwrap();
-        db.run_default(":create knows {fr, to}").unwrap();
-        db.run_default(
-            "?[id, name, age] <- [[1,'Alice',30],[2,'Bob',40],[3,'Carol',35]] :put person {id => name, age}",
-        )
-        .unwrap();
-        db.run_default("?[fr, to] <- [[1,2],[1,3],[2,3]] :put knows {fr, to}").unwrap();
-
-        let out = db
-            .run_cypher(
-                "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 30 RETURN b.name AS name ORDER BY name",
-                &relation_per_label(),
-                BTreeMap::new(),
-            )
-            .unwrap();
-        // Headers are the RETURN columns; hidden binding-key columns are stripped.
-        assert_eq!(out.headers, vec!["name"]);
-        assert_eq!(out.rows, vec![vec![DataValue::from("Carol")]]);
-    }
-
-    #[test]
-    fn run_cypher_passes_user_params() {
-        let db = DbInstance::default();
-        db.run_default(":create person {id => name, age}").unwrap();
-        db.run_default(
-            "?[id, name, age] <- [[1,'Alice',30],[2,'Bob',40],[3,'Carol',35]] :put person {id => name, age}",
-        )
-        .unwrap();
-
-        let mut params = BTreeMap::new();
-        params.insert("minAge".to_string(), DataValue::from(30i64));
-        let out = db
-            .run_cypher(
-                "MATCH (a:Person) WHERE a.age > $minAge RETURN a.name AS name ORDER BY name",
-                &relation_per_label(),
-                params,
-            )
-            .unwrap();
-        assert_eq!(out.headers, vec!["name"]);
-        assert_eq!(
-            out.rows,
-            vec![vec![DataValue::from("Bob")], vec![DataValue::from("Carol")]]
-        );
-    }
-
-    #[test]
-    fn cypher_to_script_is_inspectable() {
-        let db = DbInstance::default();
-        let (script, params) = db
-            .cypher_to_script("MATCH (a:Person) WHERE a.age > 30 RETURN a.name", &relation_per_label())
-            .unwrap();
-        assert!(script.contains("*person{"), "{script}");
-        assert_eq!(params.len(), 1); // the literal 30
-    }
-
-    #[test]
-    fn deferred_features_error_clearly() {
-        let s = relation_per_label();
-        // Undirected relationships are deferred.
-        assert!(cypher_to_script(&parse_cypher("MATCH (a:Person)-[:KNOWS]-(b:Person) RETURN a").unwrap(), &s).is_err());
-        // Unknown label.
-        assert!(cypher_to_script(&parse_cypher("MATCH (a:Ghost) RETURN a").unwrap(), &s).is_err());
-        // Schema filter is reserved.
-        let mut s2 = relation_per_label();
-        s2.nodes[0].filter = Some("age > 0".into());
-        assert!(cypher_to_script(&parse_cypher("MATCH (a:Person) RETURN a").unwrap(), &s2).is_err());
-    }
-}
+mod tests;

@@ -517,13 +517,25 @@ fn unquote(s: &str) -> String {
     let mut chars = inner.chars();
     while let Some(c) = chars.next() {
         if c == '\\' {
-            if let Some(n) = chars.next() {
-                out.push(match n {
-                    'n' => '\n',
-                    't' => '\t',
-                    'r' => '\r',
-                    other => other,
-                });
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('t') => out.push('\t'),
+                Some('r') => out.push('\r'),
+                Some('b') => out.push('\u{0008}'),
+                Some('f') => out.push('\u{000C}'),
+                Some('0') => out.push('\0'),
+                Some('u') => {
+                    // \uXXXX — four hex digits (matches the CozoScript char rule).
+                    let hex: String = chars.by_ref().take(4).collect();
+                    match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                        Some(ch) => out.push(ch),
+                        None => {
+                            out.push('\u{FFFD}');
+                        }
+                    }
+                }
+                Some(other) => out.push(other),
+                None => {}
             }
         } else {
             out.push(c);
