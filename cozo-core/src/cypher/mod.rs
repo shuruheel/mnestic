@@ -23,3 +23,13 @@ mod schema;
 mod translate;
 
 pub use schema::{CypherGraphSchema, EdgeMap, NodeMap};
+pub(crate) use translate::CypherScript;
+
+/// Parse + translate a read-only Cypher query into runnable CozoScript against a
+/// property-graph schema. The entry point for `DbInstance::run_cypher`.
+pub(crate) fn build_cypher_script(
+    query: &str,
+    schema: &CypherGraphSchema,
+) -> miette::Result<CypherScript> {
+    translate::cypher_to_script(&parse::parse_cypher(query)?, schema)
+}

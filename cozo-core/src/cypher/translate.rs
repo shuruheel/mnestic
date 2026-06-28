@@ -962,6 +962,64 @@ mod tests {
     }
 
     #[test]
+    fn run_cypher_entry_projects_and_names_columns() {
+        let db = DbInstance::default();
+        db.run_default(":create person {id => name, age}").unwrap();
+        db.run_default(":create knows {fr, to}").unwrap();
+        db.run_default(
+            "?[id, name, age] <- [[1,'Alice',30],[2,'Bob',40],[3,'Carol',35]] :put person {id => name, age}",
+        )
+        .unwrap();
+        db.run_default("?[fr, to] <- [[1,2],[1,3],[2,3]] :put knows {fr, to}").unwrap();
+
+        let out = db
+            .run_cypher(
+                "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 30 RETURN b.name AS name ORDER BY name",
+                &relation_per_label(),
+                BTreeMap::new(),
+            )
+            .unwrap();
+        // Headers are the RETURN columns; hidden binding-key columns are stripped.
+        assert_eq!(out.headers, vec!["name"]);
+        assert_eq!(out.rows, vec![vec![DataValue::from("Carol")]]);
+    }
+
+    #[test]
+    fn run_cypher_passes_user_params() {
+        let db = DbInstance::default();
+        db.run_default(":create person {id => name, age}").unwrap();
+        db.run_default(
+            "?[id, name, age] <- [[1,'Alice',30],[2,'Bob',40],[3,'Carol',35]] :put person {id => name, age}",
+        )
+        .unwrap();
+
+        let mut params = BTreeMap::new();
+        params.insert("minAge".to_string(), DataValue::from(30i64));
+        let out = db
+            .run_cypher(
+                "MATCH (a:Person) WHERE a.age > $minAge RETURN a.name AS name ORDER BY name",
+                &relation_per_label(),
+                params,
+            )
+            .unwrap();
+        assert_eq!(out.headers, vec!["name"]);
+        assert_eq!(
+            out.rows,
+            vec![vec![DataValue::from("Bob")], vec![DataValue::from("Carol")]]
+        );
+    }
+
+    #[test]
+    fn cypher_to_script_is_inspectable() {
+        let db = DbInstance::default();
+        let (script, params) = db
+            .cypher_to_script("MATCH (a:Person) WHERE a.age > 30 RETURN a.name", &relation_per_label())
+            .unwrap();
+        assert!(script.contains("*person{"), "{script}");
+        assert_eq!(params.len(), 1); // the literal 30
+    }
+
+    #[test]
     fn deferred_features_error_clearly() {
         let s = relation_per_label();
         // Undirected relationships are deferred.

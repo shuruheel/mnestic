@@ -246,6 +246,42 @@ impl DbInstance {
     pub fn hybrid_search_script(&self, q: &HybridSearch) -> Result<String> {
         Ok(build_hybrid_query(q)?.0)
     }
+    /// Run a read-only Cypher query (mnestic fork; feature `cypher`). Translates an
+    /// openCypher subset to CozoScript against the property-graph `schema`, runs it
+    /// read-only, and returns rows whose columns are the `RETURN` items. Cypher
+    /// literals are passed as params; user `$name` params are supplied via `params`.
+    /// See [`CypherGraphSchema`] and `docs/specs/cypher-read.md`.
+    #[cfg(feature = "cypher")]
+    pub fn run_cypher(
+        &self,
+        query: &str,
+        schema: &CypherGraphSchema,
+        mut params: BTreeMap<String, DataValue>,
+    ) -> Result<NamedRows> {
+        let cs = crate::cypher::build_cypher_script(query, schema)?;
+        for (k, v) in cs.params {
+            params.insert(k, v);
+        }
+        let mut out = self.run_script(&cs.script, params, ScriptMutability::Immutable)?;
+        // Bag mode appends hidden binding-key columns; keep only the RETURN columns.
+        let n = cs.out_columns.len();
+        for row in &mut out.rows {
+            row.truncate(n);
+        }
+        out.headers = cs.out_columns;
+        Ok(out)
+    }
+    /// Build the CozoScript that [`DbInstance::run_cypher`] would run, without
+    /// executing it — for inspection or hand-tuning. Returns `(script, literal params)`.
+    #[cfg(feature = "cypher")]
+    pub fn cypher_to_script(
+        &self,
+        query: &str,
+        schema: &CypherGraphSchema,
+    ) -> Result<(String, BTreeMap<String, DataValue>)> {
+        let cs = crate::cypher::build_cypher_script(query, schema)?;
+        Ok((cs.script, cs.params))
+    }
     /// Run a parsed (AST) program. If you have a string script, use `run_script` or `run_default`.
     pub fn run_script_ast(
         &self,
