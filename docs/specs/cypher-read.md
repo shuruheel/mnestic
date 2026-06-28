@@ -1,8 +1,8 @@
 # Spec — Read-Only Cypher Surface
 
-_Status: **Implementation in progress — steps 2–5 landed (parser, translator, `run_cypher` entry, adversarial-review hardening); the surface is callable and review-hardened** (2026-06-28); step 6 (Python binding + default-on) remains. Owner: TBD. Companion to the research briefing [`../research/cypher-read.md`](../research/cypher-read.md) (prior art, semantics, scoping), `../../ROADMAP.md` (Tier 1, sequenced **first**), and `../../DEVELOPMENT.md` §3.5. Grounded in the actual CozoScript target grammar (`cozo-core/src/cozoscript.pest`) and the `hybrid_search` translate-to-CozoScript precedent (`cozo-core/src/runtime/hybrid.rs`); citations are `file:line` in `cozo-core/src/`._
+_Status: **Shipped in 0.9.0 — alpha, behind the off-by-default `cypher` Cargo feature** (the published PyPI wheel ships without it; build `--features cypher`). Flipping it on by default is intentionally deferred until real-usage soak. Companion research: [`../research/cypher-read.md`](../research/cypher-read.md). Grounded in the CozoScript target grammar (`cozo-core/src/cozoscript.pest`) and the `hybrid_search` translate-to-CozoScript precedent; citations are `file:line` in `cozo-core/src/`._
 
-> **One-line goal.** Let a developer query mnestic with a **read-only subset of openCypher** that the engine translates to CozoScript and runs — so the engine is easy to *evaluate and adopt* without first learning Datalog. Datalog stays the native, full-power language; Cypher is an on-ramp. **No write clauses** (CREATE/MERGE/SET/DELETE) — that's `ENGINEERING-PRIORITIES.md` X4.
+> **One-line goal.** Let a developer query mnestic with a **read-only subset of openCypher** that the engine translates to CozoScript and runs — so the engine is easy to *evaluate and adopt* without first learning Datalog. Datalog stays the native, full-power language; Cypher is an on-ramp. **No write clauses** (CREATE/MERGE/SET/DELETE) — read interop only; write support is explicitly out of scope.
 
 ## 1. Goals & non-goals
 
@@ -14,7 +14,7 @@ _Status: **Implementation in progress — steps 2–5 landed (parser, translator
 
 The proven pattern in this codebase (`runtime/hybrid.rs`, the `HybridSearch` builder) is: **a typed request → assemble a CozoScript *string* → pass literal values as query params (never string-interpolated) → validate every interpolated identifier → run via the normal query path, and expose the generated script for inspection.** The Cypher surface is the same shape:
 
-- **Translate Cypher AST → a CozoScript source string**, not to the engine's internal AST. Rationale: the string path is fully inspectable/testable, and it decouples the Cypher layer from internal compiler types that are deliberately not `Clone`/stable (the plan-cache finding in `DEVELOPMENT.md` item 9). The translated script then runs through the existing, optimized query pipeline for free.
+- **Translate Cypher AST → a CozoScript source string**, not to the engine's internal AST. Rationale: the string path is fully inspectable/testable, and it decouples the Cypher layer from internal compiler types that are deliberately not `Clone`/stable, so the surface avoids coupling to them. The translated script then runs through the existing, optimized query pipeline for free.
 - **Run via `run_script_read_only`** (`runtime/db.rs:470`). Because the surface is read-only, routing through the read-only entry means *the engine itself rejects any mutation* even if a translation bug emitted one — defense in depth, and it picks up the snapshot read path (0.8.5) automatically.
 - **Injection safety (non-negotiable, copy `hybrid.rs`'s discipline):** every Cypher *literal* becomes a CozoScript **param** (`$p0`, `$p1`, … in the `params` map `run_script` already accepts); every *identifier* that gets interpolated (relation/column names from the property-graph schema, fusion-style tags) is **validated as a bare identifier** via `miette::ensure` before it touches the string. No user value is ever concatenated into the script.
 - **Module:** new `cozo-core/src/cypher/` — `mod.rs` (schema types + public `run_cypher` / `cypher_to_script`), `parse.rs` (pest → Cypher AST), `translate.rs` (AST → CozoScript string). Behind a **`cypher` cargo feature** (see §11, decision 5).
@@ -29,7 +29,7 @@ run_cypher(query, schema, params)
 
 ## 3. The property-graph schema (decision 1 — the crux)
 
-openCypher assumes a **property graph** (labeled nodes with properties; typed, directed relationships with properties). mnestic stores **arbitrary relations** and — per `LAYERING.md` — must not bake in any fixed "node/edge" notion (that's cognitive policy; it lives in MindGraph). So the caller supplies a **typed property-graph schema** mapping Cypher's model onto stored relations — general, describable without cognitive vocabulary, and reusable by any property-graph-over-Cozo user (MindGraph just passes *its* node/edge relations).
+openCypher assumes a **property graph** (labeled nodes with properties; typed, directed relationships with properties). mnestic stores **arbitrary relations** and — to stay a general-purpose engine — must not bake in any fixed "node/edge" notion (that cognitive policy lives in MindGraph). So the caller supplies a **typed property-graph schema** mapping Cypher's model onto stored relations — general, describable without cognitive vocabulary, and reusable by any property-graph-over-Cozo user (MindGraph just passes *its* node/edge relations).
 
 ```rust
 /// How Cypher's property-graph model maps onto stored relations. Caller-supplied.
@@ -158,7 +158,7 @@ impl DbInstance {
 }
 ```
 
-- **Python binding** (`cozo-lib-python`): expose `run_cypher(query, schema_dict, params)` so the wheel + `langchain-mnestic` can use it (same way `hybrid_search` gained `graph_legs`).
+- **Python binding** (`cozo-lib-python`): expose `run_cypher(query, schema_dict, params)` so the wheel + `langchain-mnestic` can use it (same way `hybrid_search` gained `graph_legs`) (behind the `cypher` feature; the default published wheel does not include it — build with `--features cypher`).
 - **Schema delivery (decision 2):** per-call `CypherGraphSchema` in v1 (simplest). A *registered/persisted* graph view (define once, query by name) is a v2 convenience.
 
 ## 8. Grammar choice (decision 4)
@@ -169,7 +169,7 @@ impl DbInstance {
 
 ## 9. Testing
 
-- **Backend: SQLite + `tempfile::tempdir()`** for execution tests (per `CLAUDE.md`; the stored/scan path differs from `mem`).
+- **Backend: SQLite + `tempfile::tempdir()`** for execution tests (the stored/scan path differs from the `mem` backend).
 - **Golden translation tests** on `cypher_to_script` — assert exact CozoScript output for each subset feature (the core correctness surface; fast, no execution).
 - **openCypher TCK subset** — vendor the Apache-2.0 `.feature` files for `clauses/match`, `clauses/return` (and `clauses/with` when WITH lands), with attribution; gate CI on the shippable subset. (Real engines do this — ArcadeDB self-reports 97.8%.)
 - **Correctness traps**: bag fidelity (`count(*)` and `LIMIT` match Cypher on a graph with duplicate paths); edge-isomorphism (a triangle doesn't match the same edge twice); null/3VL (`WHERE` excludes null); injection (literals are params, hostile relation/column names rejected).
@@ -180,10 +180,10 @@ impl DbInstance {
 2. **Schema types + `cypher.pest` + parser → Cypher AST.** — ✅ done (2026-06-27). Module `cozo-core/src/cypher/` (`schema.rs`, `ast.rs`, `cypher.pest`, `parse.rs`) behind the off-by-default `cypher` feature; 8 parser unit tests green; clippy clean on default *and* `--features cypher`. No execution path yet.
 3. **Translator `cypher_to_script`** (AST + schema → CozoScript string + params). — ✅ done (2026-06-27). `translate.rs`: both schema conventions, WHERE/RETURN/DISTINCT/aggregates, inline-prop filters → keyed lookups, edge-isomorphism (eid or best-effort), bag fidelity via hidden binding-key, ORDER/SKIP/LIMIT → native epilogue. 8 tests incl. **end-to-end execution** against an in-memory DB (relation-per-label, MindGraph shared-relation, count, bag-vs-distinct) — the generated CozoScript runs and returns correct rows. Returns `CypherScript { script, params, out_columns }`. Deferred with clear errors: undirected rels, the schema `filter` field. *(Total cypher tests: 15 green; clippy clean.)*
 4. **`run_cypher`** → run read-only + NamedRows column-projection adapter. — ✅ done (2026-06-27). `DbInstance::run_cypher(query, schema, params)` and `DbInstance::cypher_to_script(query, schema)` (mirrors `hybrid_search`/`hybrid_search_script`): parse → translate → merge user `$params` with generated literal params → `run_script(.., Immutable)` → truncate each row to the RETURN columns and set headers. 3 entry tests (projection + column naming, user-param passthrough, script inspection). *(21 cypher tests green; clippy clean default + `--features cypher`.)*
-5. **Adversarial review + conformance hardening.** — ✅ done (2026-06-28). A multi-agent review (6 dimensions × 2 verifiers per finding; `docs/specs/cypher-read-review-findings.json`) surfaced 21 confirmed defects; all must-fix + should-fix landed: **null-aware WHERE (3VL)** so a null operand drops the row instead of aborting the query; **injective `cyp_N` prop vars**; **aggregate null-skipping** (sum/avg no longer abort); **no duplicate `id_col` binding** (RETURN/WHERE on the id column works); **structural bag-key**; **type-discriminator in edge-iso**; **binding validation** with clear errors; **reserved generated-namespace** rejection; **param-collision** rejection; **unicode/control escapes**; recursive `expr_eq`. 26 conformance-derived tests encoded (34 cypher tests total green; clippy clean both gates). *Known divergence:* `sum` over an integer column returns a float (engine accumulator is f64). *(TCK Gherkin vendoring deferred — the conformance cases are encoded directly as Rust tests.)*
+5. **Adversarial review + conformance hardening.** — ✅ done (2026-06-28). An internal hardening review landed the must-fix and should-fix items: **null-aware WHERE (3VL)** so a null operand drops the row instead of aborting the query; **injective `cyp_N` prop vars**; **aggregate null-skipping** (sum/avg no longer abort); **no duplicate `id_col` binding** (RETURN/WHERE on the id column works); **structural bag-key**; **type-discriminator in edge-iso**; **binding validation** with clear errors; **reserved generated-namespace** rejection; **param-collision** rejection; **unicode/control escapes**; recursive `expr_eq`. 26 conformance-derived tests encoded (34 cypher tests total green; clippy clean both gates). *Known divergence:* `sum` over an integer column returns a float (engine accumulator is f64). *(TCK Gherkin vendoring deferred — the conformance cases are encoded directly as Rust tests.)*
 6. **Python binding + docs.** — ✅ done (2026-06-28). `cozo-lib-python`: a `cypher = ["cozo/cypher"]` feature + a gated `run_cypher(query, schema_dict, params)` pymethod (`py_to_cypher_schema` mirrors `py_to_hybrid_search`); compiles under `--features cypher,compact`. README "Status" section points to this spec; the spec is the design doc. **Flip default-on: deferred** — the feature is alpha (just review-hardened, no production soak, no real users). Keep it feature-gated (core + wheel) until it has real usage; the criteria to flip default-on: ≥1 real consumer exercising it + a clean soak, at which point it earns a CHANGELOG-FORK entry + README highlight in the release that turns it on.
 
-Each step: failing test first, CHANGELOG-FORK entry, `cargo test -p mnestic --lib` green (per `CLAUDE.md`). Steps 3–4 are the substance.
+Each step: failing test first, CHANGELOG-FORK entry, `cargo test -p mnestic --lib` green. Steps 3–4 are the substance.
 
 ## 11. Settled decisions (2026-06-27)
 
@@ -204,7 +204,7 @@ Each step: failing test first, CHANGELOG-FORK entry, `cargo test -p mnestic --li
 
 ## 13. Rejected alternatives
 
-- **Full Cypher / write semantics** — doubles surface, undercuts Datalog (X4). Read-only on-ramp only.
+- **Full Cypher / write semantics** — doubles surface, undercuts Datalog (out of scope by design). Read-only on-ramp only.
 - **Translating to the internal AST/`Program`** instead of a CozoScript string — couples to non-`Clone` compiler internals; the string is inspectable and rides the existing pipeline.
 - **`antlr-rust` + vendored ANTLR grammar** — heavy/immature dep + Java build step in a lean engine (§8).
 - **Targeting ISO GQL instead of openCypher** — no open GQL TCK, no full implementations yet; openCypher has the open grammar + TCK *and* is the on-ramp to GQL (research §4).

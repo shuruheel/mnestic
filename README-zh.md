@@ -1,25 +1,18 @@
+# mnestic
+
+> mnestic 是 [CozoDB](https://github.com/cozodb/cozo) 的一个独立维护的分支（fork），专注于成为**智能体记忆（agentic memory）**的底层引擎。mnestic **不是**官方 CozoDB，也未获其原作者背书或与之关联。原始设计的全部功劳归于 Ziyang Hu 与 Cozo Project Authors。详见 [`FORK.md`](FORK.md) 与 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。以下为保留的上游 CozoDB 文档。
+
+---
+
 <img src="static/logo_c.png" width="200" height="175" alt="Logo">
 
-[![docs](https://img.shields.io/readthedocs/cozo/latest)](https://docs.cozodb.org/zh_CN/latest/)
-[![cozo-node](https://img.shields.io/npm/v/cozo-node)](https://www.npmjs.com/package/cozo-node)
-[![npm (web)](https://img.shields.io/npm/v/cozo-lib-wasm?label=browser)](https://www.npmjs.com/package/cozo-lib-wasm)
-[![Crates.io](https://img.shields.io/crates/v/cozo)](https://crates.io/crates/cozo)
-[![docs.rs](https://img.shields.io/docsrs/cozo?label=docs.rs)](https://docs.rs/cozo)
-[![pypi](https://img.shields.io/pypi/v/pycozo)](https://pypi.org/project/pycozo/)
-[![java](https://img.shields.io/maven-central/v/io.github.cozodb/cozo_java?label=java)](https://mvnrepository.com/artifact/io.github.cozodb/cozo_java)
-[![clj](https://img.shields.io/maven-central/v/io.github.cozodb/cozo-clj?label=clj)](https://mvnrepository.com/artifact/io.github.cozodb/cozo-clj)
-[![android](https://img.shields.io/maven-central/v/io.github.cozodb/cozo_android?label=android)](https://mvnrepository.com/artifact/io.github.cozodb/cozo_android)
-[![pod](https://img.shields.io/cocoapods/v/CozoSwiftBridge)](https://github.com/cozodb/cozo/tree/main/cozo-lib-swift)
-[![Go](https://img.shields.io/github/v/release/cozodb/cozo-lib-go?label=go)](https://github.com/cozodb/cozo-lib-go)
-[![C](https://img.shields.io/github/v/release/cozodb/cozo?label=C)](https://github.com/cozodb/cozo/releases)
-[![GitHub Workflow Status](https://img.shields.io/github/actions/workflow/status/cozodb/cozo/build.yml?branch=main)](https://github.com/cozodb/cozo/actions/workflows/build.yml)
-[![GitHub](https://img.shields.io/github/license/cozodb/cozo)](https://github.com/cozodb/cozo/blob/main/LICENSE.txt)
+[![Crates.io](https://img.shields.io/crates/v/mnestic)](https://crates.io/crates/mnestic) [![PyPI](https://img.shields.io/pypi/v/mnestic)](https://pypi.org/project/mnestic/)
 
 # Cozo 数据库
 
-## 🎉🎉🎉 新版本发布 🎉🎉🎉
+## mnestic 0.9.0
 
-CozoDB v0.6 已发布！本版本在 Datalog 内引入了带有 HNSW 索引的向量搜索，可以与即席连接、递归 Datalog 和经典的整个图算法等强大功能无缝集成。这显著扩展了 CozoDB 的可能性。 [详情见此](https://docs.cozodb.org/en/latest/releases/v0.6.html)。
+本版本新增**只读 Cypher 查询面**（alpha，位于默认关闭的 `cypher` feature 之后）与数据库损坏修复工具（`::repair_corrupt`）。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 
 ## 简介
 

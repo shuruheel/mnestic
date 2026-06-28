@@ -31,10 +31,7 @@ Highlights (full detail in
   RETURN (DISTINCT, aggregates) / ORDER BY / SKIP / LIMIT with true bag semantics,
   null-aware WHERE, and edge-isomorphism. Design:
   [`docs/specs/cypher-read.md`](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cypher-read.md).
-  0.9.0 also bundles the corrupt-database tooling banked as 0.8.6 (below).
-
-**0.8.6**
-
+  0.9.0 also bundles the corrupt-database tooling first banked internally as 0.8.6:
 - **`::repair_corrupt`** — surgical corruption repair: scan a relation and drop
   only the unreadable tuples, leaving the rest of the data intact (no
   delete-and-rebuild).
@@ -45,7 +42,7 @@ Highlights (full detail in
   *in-engine* alongside vector (HNSW) and full-text (FTS). A typed `GraphLeg`
   generates a recursive bounded shortest-path rule (k-hop, `min(dist)` scoring) and
   folds it into the same RRF, so one call returns the vector+FTS+graph ranking — a
-  capability no other embedded engine here offers. Measured **41.55 ms p50**, ~4×
+  capability no other embedded engine offers. Measured **41.55 ms p50**, ~4×
   faster than the hand-decomposed three-query path.
 - **BM25-correct FTS, with O(1) `avgdl`** — the default `::fts` scorer is now Okapi
   **`bm25`** (term-frequency saturation `k1` + document-length normalization `b`,
@@ -106,7 +103,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.8.6"
+mnestic = "0.9.0"
 ```
 
 ```rust

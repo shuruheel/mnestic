@@ -1,8 +1,8 @@
 # Research + Design Seed — Read-Only Cypher Surface
 
-_Status: **research complete, design not started** (2026-06-27). Seeds a future `docs/specs/cypher-read.md`. Companion to `../../ROADMAP.md` (Tier 1, sequenced **first**) and `../../DEVELOPMENT.md` §3.5. Sources cited inline; evidence-quality flagged where thin._
+_Status: **historical research seed (2026-06)** — the read-only Cypher surface it scopes SHIPPED in 0.9.0 (alpha, off-by-default `cypher` feature). Kept for the prior-art/semantics background; for current behavior see the spec [`../specs/cypher-read.md`](../specs/cypher-read.md). Sources cited inline; evidence-quality flagged where thin._
 
-> **Goal.** A **read-only** query path that translates a *subset* of openCypher into CozoScript (Datalog), so developers can evaluate and adopt mnestic without first learning Datalog — the single biggest evaluation-friction remover for the Cozo/Kùzu community. Datalog stays the native, full-power language; Cypher is an on-ramp, not a replacement. **Read interop only** — no CREATE/MERGE/SET/DELETE (that's `ENGINEERING-PRIORITIES.md` X4).
+> **Goal.** A **read-only** query path that translates a *subset* of openCypher into CozoScript (Datalog), so developers can evaluate and adopt mnestic without first learning Datalog — the single biggest evaluation-friction remover for the Cozo/Kùzu community. Datalog stays the native, full-power language; Cypher is an on-ramp, not a replacement. **Read interop only** — no CREATE/MERGE/SET/DELETE (write support is explicitly out of scope).
 
 ## Why this is first on the roadmap
 

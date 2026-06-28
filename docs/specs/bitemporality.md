@@ -1,6 +1,6 @@
-# Spec — Bitemporality ("Bet 2")
+# Spec — Bitemporality
 
-_Status: **DRAFT for design review** (2026-06-27). Owner: TBD. Companion to `../../DEVELOPMENT.md` (Bet 2 entry), `../../ROADMAP.md`, and the design grounding in the MindGraph strategy doc `ENGINE-SOTA-2026-06.md` §4. This spec is grounded in the actual current valid-time code (citations are `file:line` in `cozo-core/src/`)._
+_Status: **Design spec — proposed, not yet implemented** (2026-06-28). Companion to [`../../ROADMAP.md`](../../ROADMAP.md). Grounded in the current valid-time code (citations are `file:line` in `cozo-core/src/`)._
 
 > **One-line goal.** Add an **engine-assigned transaction-time axis** alongside Cozo's existing valid-time axis, so a relation can answer **"what did the database *believe* at transaction-time T about valid-time V"** — opt-in per relation, zero cost for relations that don't use it, and degenerating to today's exact fast path at "now / now".
 
@@ -33,7 +33,7 @@ Nothing embedded serves bitemporality *in-engine* today (Graphiti's four-timesta
 
 **Two facts that shape the whole design:** (a) the temporal axis is the *trailing* key component with `Reverse` ordering and a skip-scan that's a single seek at "now"; (b) **there is no transaction clock at all** — so tt is not "expose an existing thing," it's "add a new monotonic clock."
 
-## 3. Design overview (Option A from `ENGINE-SOTA-2026-06.md` §4)
+## 3. Design overview
 
 - **Keep vt exactly as-is** (user-facing, user-settable, `@ vt`). Purely additive — no behavior change for existing relations or queries.
 - **Add tt as a second, engine-assigned, trailing key component** *behind* vt: key layout for a bitemporal relation becomes
@@ -112,11 +112,11 @@ tt must be **monotonic, collision-free, and identical for every write in one tra
 
 - **Non-bitemporal relations**: byte-identical encoding, zero new cost. Pinned by a "single-axis unchanged" test.
 - **vt-only relations** (`Validity` last, no `TxTime`): unchanged — `@ vt` behaves exactly as today; `@! ` on a non-bitemporal relation is a clear error.
-- **Backends**: all logic is key-encoding + scan, so it rides the existing `range_skip_scan_tuple` trait across **rocks / sqlite / mem** by generalizing it to a two-axis `range_bitemporal_scan_tuple` (the single-axis function stays for vt-only relations). **No RocksDB user-defined timestamps** — rejected with evidence in `ENGINE-SOTA-2026-06.md` §4 (per-CF all-or-nothing, +8 B/key, single global GC floor, no SQLite parity; TiKV and CRDB both chose key encoding). Key-encoding gives us SQLite parity for free.
+- **Backends**: all logic is key-encoding + scan, so it rides the existing `range_skip_scan_tuple` trait across **rocks / sqlite / mem** by generalizing it to a two-axis `range_bitemporal_scan_tuple` (the single-axis function stays for vt-only relations). **No RocksDB user-defined timestamps** — rejected (see §12) (per-CF all-or-nothing, +8 B/key, single global GC floor, no SQLite parity; TiKV and CRDB both chose key encoding). Key-encoding gives us SQLite parity for free.
 
 ## 9. Testing & performance budget
 
-- **Backend for tests: SQLite + `tempfile::tempdir()`** (per `CLAUDE.md` — `mem` uses a different join operator; stored/scan-path regressions must use sqlite).
+- **Backend for tests: SQLite + `tempfile::tempdir()`** (the `mem` backend uses a different join operator; stored/scan-path regressions must use sqlite).
 - **Pin the four bitemporal quadrants**: (now, now), (past-vt, now), (now, past-tt), (past-vt, past-tt); the **correction case** (a higher-tt row overrides an earlier belief about a past vt; the as-of-past-tt query still returns the old belief); **retraction vs eviction**; **`::history_gc` preserves as-of-now and as-of-(≥cutoff)**; **opt-in isolation** (non-bitemporal relations byte-identical; vt-only unchanged); **HLC monotonicity** across same-µs writes and a simulated backward clock step.
 - **Regression budget**: ≤~10% on bitemporal relations (AeonG envelope), **zero** on non-bitemporal (opt-in). Extend `benches/time_travel.rs` with a bitemporal matrix (versions × corrections-depth) and confirm the (now, now) path matches the current single-axis number.
 
@@ -129,17 +129,17 @@ tt must be **monotonic, collision-free, and identical for every write in one tra
 5. **Sys ops** — `::history`, `::history_gc`, `::evict` (+ audit relation), all read-only-guarded.
 6. **Benches + budget validation** — confirm ≤10% / zero, and the (now, now) fast-path parity.
 
-Each step is its own PR with a failing test first, CHANGELOG-FORK entry, and `cargo test -p mnestic --lib` green (per `CLAUDE.md`). Steps 2–4 are the substance; 1 and 6 bracket them.
+Each step is its own PR with a failing test first, CHANGELOG-FORK entry, and `cargo test -p mnestic --lib` green. Steps 2–4 are the substance; 1 and 6 bracket them.
 
 ## 11. Open decisions (resolve before step 3)
 
 1. **Opt-in surface.** A `TxTime` column type (as drafted) vs a relation-level flag (`:create rel {…} bitemporal`) vs reusing `Validity` with a second mode. The column type is the most explicit and reuses `ColType`/index machinery — **recommended** — but confirm we want the user to *name* the tt column (useful for `::history` projection) vs the engine hiding it.
-2. **Syntax for tt selector.** `@! <expr>` (recommended; matches `ENGINE-SOTA` §4) vs `@@` / `@tx`. `@!` reads as "and-also-at"; low grammar-collision risk (the `!`-prefixed forms are unused in relation-access position).
+2. **Syntax for tt selector.** `@! <expr>` (recommended) vs `@@` / `@tx`. `@!` reads as "and-also-at"; low grammar-collision risk (the `!`-prefixed forms are unused in relation-access position).
 3. **Bulk path** (`import_relations`/`batch_put`) into a bitemporal relation: reject, or stamp one tt per batch? Recommend **stamp-one-tt-per-batch** (a bulk import is one belief event) with a clear note that it bypasses per-row vt defaulting.
-4. **Relationship to MindGraph's tombstones/supersession.** MindGraph already has app-level tombstones + `Supersedes` edges (curation work). Per `LAYERING.md`, the engine ships the **mechanism** (bitemporal tt); whether MindGraph *adopts* it (collapsing its tombstones into tt) is a separate platform decision. They compose, don't duplicate: supersession is assertion-level cognitive lineage; bitemporality is storage-level versioning. Flag for the platform roadmap; **not** a blocker here.
+4. **Relationship to MindGraph's tombstones/supersession.** MindGraph already has app-level tombstones + `Supersedes` edges (curation work). By the engine/cognitive-layer split, the engine ships the **mechanism** (bitemporal tt); whether MindGraph *adopts* it (collapsing its tombstones into tt) is a separate platform decision. They compose, don't duplicate: supersession is assertion-level cognitive lineage; bitemporality is storage-level versioning. Flag for the platform roadmap; **not** a blocker here.
 5. **Event-time?** Explicitly **out of scope.** "When the real-world event occurred" is a domain attribute (a normal column), not a third temporal axis. vt already models "true in the world"; tt models "known to the DB." Two axes, no more (rejecting tri-temporal per §4's "default-on versioning rejected" discipline).
 
-## 12. Rejected alternatives (from `ENGINE-SOTA-2026-06.md` §4, with evidence)
+## 12. Rejected alternatives (with evidence)
 
 - **RocksDB user-defined timestamps** — per-CF all-or-nothing, +8 B/key on every index, single global GC floor, no SQLite parity. TiKV and CRDB both rejected it for key encoding. ❌
 - **SQL:2011 interval-column rewrites / interval-tree indexes** — wrong shape for a memcmp-keyed LSM store; reintroduce range-overlap complexity the skip-scan avoids. ❌

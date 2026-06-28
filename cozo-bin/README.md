@@ -1,16 +1,13 @@
-# Cozo (standalone executable)
+# mnestic standalone server / REPL (cozo-bin)
 
-[![server](https://img.shields.io/github/v/release/cozodb/cozo)](https://github.com/cozodb/cozo/releases)
+> Part of **mnestic**, an independently maintained fork of CozoDB; **not** official CozoDB. See [`../FORK.md`](../FORK.md). Original design © Ziyang Hu and the Cozo Project Authors.
 
 This document describes how to set up cozo (standalone executable).
 To learn how to use CozoDB (CozoScript), read the [docs](https://docs.cozodb.org/en/latest/index.html).
 
 ## Download
 
-The standalone executable for Cozo can be downloaded from the [release page](https://github.com/cozodb/cozo/releases).
-Look for those with names `cozo-*`.
-Those with names `cozo_all-*` supports additional storage backends
-such as [TiKV](https://tikv.org/) storage, but are larger.
+mnestic does not currently publish prebuilt binaries. Build from source as described in the Building section below (or run with `cargo run -p cozo-bin`).
 
 ## Starting the server
 

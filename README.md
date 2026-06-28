@@ -11,6 +11,8 @@
 > the Cozo Project Authors. See [`FORK.md`](FORK.md) for provenance and licensing,
 > and [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) for what diverges from upstream.
 
+[ English | [中文](./README-zh.md) ]
+
 ## What mnestic adds over CozoDB
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
@@ -347,6 +349,10 @@ We suggest that you [try out](#Getting-started) CozoDB before you install it in 
 
 How you install CozoDB depends on which environment you want to use it in.
 Follow the links in the table below:
+
+> **mnestic** currently ships the Rust crate ([crates.io/mnestic](https://crates.io/crates/mnestic))
+> and a Python binding ([PyPI `mnestic`](https://pypi.org/project/mnestic/) — `pip install mnestic`).
+> The matrix below is upstream CozoDB's binding set, preserved for reference.
 
 | Language/Environment                                     | Official platform support                                                                                               | Storage |
 |----------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------------|---------|

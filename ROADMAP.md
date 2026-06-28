@@ -1,6 +1,6 @@
 # mnestic — Roadmap
 
-mnestic is a maintained, independently-developed fork of [CozoDB](https://github.com/cozodb/cozo) — a transactional relational–graph–vector database that uses Datalog — focused on being a first-class **substrate for agentic memory**. See [`FORK.md`](./FORK.md) for provenance and attribution (all credit for the original design belongs to Ziyang Hu and the Cozo Project Authors), [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for everything shipped since the fork point, and [`DEVELOPMENT.md`](./DEVELOPMENT.md) for the deeper, research-grounded engineering plan behind the items here.
+mnestic is a maintained, independently-developed fork of [CozoDB](https://github.com/cozodb/cozo) — a transactional relational–graph–vector database that uses Datalog — focused on being a first-class **substrate for agentic memory**. See [`FORK.md`](./FORK.md) for provenance and attribution (all credit for the original design belongs to Ziyang Hu and the Cozo Project Authors), [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for everything shipped since the fork point, and the design specs under [`docs/specs/`](docs/specs/) for the deeper engineering plans behind the items here.
 
 This document is the **public, forward-looking roadmap**: where the project is going and how to help.
 
@@ -20,10 +20,11 @@ Make the engine the best **substrate for agentic memory**: in *one embedded engi
 
 Every item is judged against that goal — and described as a general database mechanism, not in terms of any specific application.
 
-## What's already shipped (0.8.x)
+## What's already shipped (through 0.9.0)
 
 The agentic-memory *retrieval* foundation is largely in place. Highlights (see [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for detail):
 
+- **Read-only Cypher query surface** (alpha; behind the off-by-default `cypher` Cargo feature) — translates a subset of openCypher (`MATCH` / `WHERE` / `RETURN` with `DISTINCT` & aggregates / `ORDER BY` / `SKIP` / `LIMIT`; true bag semantics; null-aware `WHERE`; edge-isomorphism) to CozoScript, so the engine is easy to evaluate without learning Datalog first. Read interop only; Datalog stays the native, full-power language. API: `run_cypher` / `cypher_to_script`. The PyPI wheel ships without it for now (build `--features cypher`). Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
 - **One-call hybrid retrieval** (`HybridSearch`) with **Reciprocal Rank Fusion** and **MMR** diversity reranking.
 - **Native 3-way fused recall** — vector + full-text + *k*-hop graph proximity fused in a single query (typed `GraphLeg`).
 - **Okapi BM25 full-text scoring** with `k1`/`b` tuning, multi-term OR-summation, and O(1) average-document-length.
@@ -46,7 +47,7 @@ Tiered by value and how ready each item is. This is direction, not dated commitm
 
 ### The differentiators we're building
 
-- **Read-only Cypher surface** *(next up)* — a Cypher-readable query path (translated to Datalog rules) so the engine is easy to evaluate and adopt without first learning Datalog. (Read interop only; Datalog remains the native, full-power language.) Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md); research + scoping: [`docs/research/cypher-read.md`](docs/research/cypher-read.md).
+- **Extending the Cypher-read surface** — variable-length paths, `OPTIONAL MATCH`, `WITH`, and undirected relationships (today these return explicit not-yet-supported errors). Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
 - **Stored / named queries** — reusable, parameterized retrieval rules; also the substrate for a future compiled-plan cache.
 - **Bi-temporality** — a transaction-time axis alongside Cozo's existing valid-time, with invalidation-without-deletion. Query "what did we believe at time *T* about period *Y*," plus `::history`, history GC, and recorded eviction. The design is being specified now (a second engine-assigned key component behind `Validity`, opt-in per relation); this is the marquee feature — nothing comparable exists *in-engine* in an embedded database — and lands after the developer-experience items above. Spec: [`docs/specs/bitemporality.md`](docs/specs/bitemporality.md).
 - **A first-class ULID type** and sortable auto-keys (the scalar functions already ship; the type does not yet).
@@ -70,7 +71,7 @@ mnestic is an **embedded, single-node** engine specialized for agentic memory. T
 - **Distributed clustering / replication / consensus** inside the engine.
 - **Multi-model breadth** (becoming a general document/time-series/KV store with many query languages) — the opinionated graph+vector+FTS focus is the point.
 - **Data federation / virtualization** over external warehouses or lakehouses (mapping a schema onto external sources without copying). Agentic memory is copy-and-transform; that's a different kind of system.
-- **Cypher *write* semantics** (read interop is planned; full Cypher is not).
+- **Cypher *write* semantics** (read interop already ships as an alpha feature; full/write Cypher is not on the path).
 - **CRDT multi-device sync** and **browser/WASM persistence** — real demand, but off this project's focus.
 
 These can be revisited if a concrete agentic-memory need ever forces them, but they are not on the path today.
@@ -81,10 +82,10 @@ Contributions are very welcome — mnestic is meant to serve the whole Cozo/Kùz
 
 - **Good first issues** are labeled in the tracker; the "near-term" items above are the best on-ramps.
 - **Performance work must be baseline-first** — include before/after numbers; the repo has criterion benches to build on.
-- **Tests:** keep the inherited engine tests green (they encode upstream semantics), and use the **SQLite** backend for any planner/stored-relation test (the in-memory backend uses a different join operator). See [`CLAUDE.md`](./CLAUDE.md) and [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+- **Tests:** keep the inherited engine tests green (they encode upstream semantics), and use the **SQLite** backend for any planner/stored-relation test (the in-memory backend uses a different join operator). See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the test-backend conventions.
 - **Licensing:** mnestic is MPL-2.0. Preserve the original `Copyright … The Cozo Project Authors` headers on any file you modify.
 
-If you're considering a larger feature (especially bi-temporality or the Cypher-read surface), open an issue to discuss the design first.
+If you're considering a larger feature (especially bi-temporality, or extending the Cypher-read surface), open an issue to discuss the design first.
 
 ## Releases & versioning
 

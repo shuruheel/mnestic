@@ -26,8 +26,8 @@ the corrupt-database tooling that was banked as 0.8.6 but never published
   bag semantics (`count(*)`/`LIMIT` match openCypher), **null-aware `WHERE`**
   (a null operand drops the row instead of aborting the query), and per-`MATCH`
   edge-isomorphism. Module `cozo-core/src/cypher/`; design + scope in
-  `docs/specs/cypher-read.md`; hardened against a multi-agent adversarial review
-  (`docs/specs/cypher-read-review-findings.json`). Off by default — enable the
+  `docs/specs/cypher-read.md`; hardened against a multi-agent adversarial review.
+  Off by default — enable the
   `cypher` feature (the published PyPI wheel ships without it for now; build with
   `--features cypher` to get the Python `run_cypher`). Deferred with explicit
   errors: undirected relationships, the
@@ -242,7 +242,7 @@ lib tests + feature suites pass; `cargo clippy -p mnestic -- -D warnings` is cle
   input validation). Backward compatible: an empty `graph_legs` generates the exact
   prior script.
 
-### Added — read-path latency baseline (groundwork for Item 9)
+### Added — read-path latency baseline (groundwork for a future plan/stored-query cache)
 - `benches/read_path.rs` (criterion) times `parse_only` (parse + compile-to-AST)
   vs `full_run` (end-to-end `run_script`) for a point read and a multi-rule
   retrieval query on SQLite, to size the parse/compile fraction a compiled-plan
@@ -252,9 +252,9 @@ lib tests + feature suites pass; `cargo clippy -p mnestic -- -D warnings` is cle
   a plan cache helps cheap point reads but is noise for the retrieval workload,
   where execution (and, on RocksDB, the pessimistic txn) dominates. That makes
   **Bet 1a (one fused call instead of three `run_script`s) the read-path latency
-  fix that matters**, not the plan cache. See the "Item 9" note in `DEVELOPMENT.md`
-  for the two structural blockers a real cache must also clear (parse-time param
-  inlining; no reusable-plan execute entry point).
+  fix that matters**, not the plan cache. A real plan cache must also clear two
+  structural blockers: parse-time param inlining, and the lack of a reusable-plan
+  execute entry point.
 
 ### FTS — Okapi BM25 scoring + summed disjunction + O(1) `avgdl`
 
@@ -419,7 +419,7 @@ pass.
 
 ### Audit of MindGraph's drafted upstream bugs against the fork point
 
-The drafts in `mindgraph-rs/docs/upstream_bugs/` were written against the
+The fork's pre-fork bug drafts were written against the
 **crates.io 0.7.6 release**. Our fork point (`481af05`) is the upstream `main`
 HEAD, which is **30 commits ahead of the `v0.7.6` tag** (Ziyang merged fixes
 after the release but never cut another version). Each draft was therefore

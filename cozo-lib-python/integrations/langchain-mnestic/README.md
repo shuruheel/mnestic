@@ -6,6 +6,8 @@ full-text database (a maintained fork of CozoDB). Retrieval is **hybrid** by
 default: dense (HNSW) + keyword (full-text) fused with Reciprocal Rank Fusion, in
 one call.
 
+> mnestic is a maintained fork of [CozoDB](https://github.com/cozodb/cozo); it is not the official CozoDB. Original design credit belongs to Ziyang Hu and the Cozo Project Authors.
+
 ```bash
 pip install langchain-mnestic
 ```
