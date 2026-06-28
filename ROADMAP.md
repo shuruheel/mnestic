@@ -1,0 +1,97 @@
+# mnestic — Roadmap
+
+mnestic is a maintained, independently-developed fork of [CozoDB](https://github.com/cozodb/cozo) — a transactional relational–graph–vector database that uses Datalog — focused on being a first-class **substrate for agentic memory**. See [`FORK.md`](./FORK.md) for provenance and attribution (all credit for the original design belongs to Ziyang Hu and the Cozo Project Authors), [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for everything shipped since the fork point, and [`DEVELOPMENT.md`](./DEVELOPMENT.md) for the deeper, research-grounded engineering plan behind the items here.
+
+This document is the **public, forward-looking roadmap**: where the project is going and how to help.
+
+## Our commitment
+
+The single most important promise of this fork is that it is **actively maintained.** Upstream Cozo has been dormant since late 2024; mnestic exists to carry the engine forward for everyone building on it. Concretely that means a steady release cadence, responsiveness to issues, and a clear public direction — this doc.
+
+## North star
+
+Make the engine the best **substrate for agentic memory**: in *one embedded engine*, deliver
+
+- **Hybrid retrieval** — vector (HNSW) + keyword (BM25) + graph traversal, fused in a single call;
+- **Temporally-correct knowledge** — query memory as-of any point in time, and (next) bi-temporally ("what did we believe *when*");
+- **Incremental index maintenance** — upserts that keep vector/FTS indexes current without full rebuilds or long write locks;
+- **Fast point-lookups co-located with semantic search**; and
+- **The operational tooling** to run long-lived graph memory in production.
+
+Every item is judged against that goal — and described as a general database mechanism, not in terms of any specific application.
+
+## What's already shipped (0.8.x)
+
+The agentic-memory *retrieval* foundation is largely in place. Highlights (see [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for detail):
+
+- **One-call hybrid retrieval** (`HybridSearch`) with **Reciprocal Rank Fusion** and **MMR** diversity reranking.
+- **Native 3-way fused recall** — vector + full-text + *k*-hop graph proximity fused in a single query (typed `GraphLeg`).
+- **Okapi BM25 full-text scoring** with `k1`/`b` tuning, multi-term OR-summation, and O(1) average-document-length.
+- **Per-leg fusion detail** — reconstruct exactly why each result was retrieved.
+- **LangChain & LlamaIndex integrations** on PyPI (`mnestic`, `langchain-mnestic`, `llama-index-vector-stores-mnestic`).
+- **Fast, non-blocking HNSW index builds** — a flat in-RAM parallel build (~15× faster on a 40k×384 corpus) that doesn't stall readers.
+- **Snapshot read path** + batched neighbour fetch (`multi_get`) for read-only queries.
+- **Corruption resilience** — `::repair_corrupt` and tolerant index builds, so one bad row never makes a database unopenable.
+- **Planner & DX fixes** — equality-pushdown keyed lookups (~28× on point queries), keyword-prefixed identifier parsing, ULID functions.
+
+## What's next
+
+Tiered by value and how ready each item is. This is direction, not dated commitments.
+
+### Near-term — correctness, cadence & developer experience
+
+- **Steady release cadence** with clear migration notes.
+- **Closing long-open upstream issues** under active maintenance — e.g. Sled backend `del()` correctness, SQLite-backend performance (prepared statements / `WITHOUT ROWID`), and modeling ergonomics for tree-shaped / JSON-LD data.
+- **Better onboarding** — clearer binder errors and worked examples, lowering the "modeling my data in Datalog" learning curve.
+
+### The differentiators we're building
+
+- **Read-only Cypher surface** *(next up)* — a Cypher-readable query path (translated to Datalog rules) so the engine is easy to evaluate and adopt without first learning Datalog. (Read interop only; Datalog remains the native, full-power language.) Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md); research + scoping: [`docs/research/cypher-read.md`](docs/research/cypher-read.md).
+- **Stored / named queries** — reusable, parameterized retrieval rules; also the substrate for a future compiled-plan cache.
+- **Bi-temporality** — a transaction-time axis alongside Cozo's existing valid-time, with invalidation-without-deletion. Query "what did we believe at time *T* about period *Y*," plus `::history`, history GC, and recorded eviction. The design is being specified now (a second engine-assigned key component behind `Validity`, opt-in per relation); this is the marquee feature — nothing comparable exists *in-engine* in an embedded database — and lands after the developer-experience items above. Spec: [`docs/specs/bitemporality.md`](docs/specs/bitemporality.md).
+- **A first-class ULID type** and sortable auto-keys (the scalar functions already ship; the type does not yet).
+- **An official schema-migration tool** — versioned schema, diff, and rollback.
+- **`LOAD FROM` Parquet/Arrow** + zero-copy Arrow export, for clean handoff with Python/Rust data pipelines.
+
+### Performance at scale (evidence-gated)
+
+Pursued when a real workload demonstrates the need, always with before/after measurements (the project's baseline-first rule):
+
+- Compiled-plan / prepared-statement caching for high-frequency point reads.
+- Selectivity-tiered filtered vector search (efficient metadata-filtered ANN).
+- Full-text scale headroom (compact posting-list storage + top-*k* pruning).
+- Tunable/weighted fusion and graph-leg improvements, gated on retrieval benchmarks.
+- Vector quantization with float rescore, gated on corpus-scale evidence.
+
+## Non-goals (deliberate scope)
+
+mnestic is an **embedded, single-node** engine specialized for agentic memory. To stay excellent at that, the following are intentionally out of scope:
+
+- **Distributed clustering / replication / consensus** inside the engine.
+- **Multi-model breadth** (becoming a general document/time-series/KV store with many query languages) — the opinionated graph+vector+FTS focus is the point.
+- **Data federation / virtualization** over external warehouses or lakehouses (mapping a schema onto external sources without copying). Agentic memory is copy-and-transform; that's a different kind of system.
+- **Cypher *write* semantics** (read interop is planned; full Cypher is not).
+- **CRDT multi-device sync** and **browser/WASM persistence** — real demand, but off this project's focus.
+
+These can be revisited if a concrete agentic-memory need ever forces them, but they are not on the path today.
+
+## How to contribute
+
+Contributions are very welcome — mnestic is meant to serve the whole Cozo/Kùzu-refugee community, not just its primary downstream consumer.
+
+- **Good first issues** are labeled in the tracker; the "near-term" items above are the best on-ramps.
+- **Performance work must be baseline-first** — include before/after numbers; the repo has criterion benches to build on.
+- **Tests:** keep the inherited engine tests green (they encode upstream semantics), and use the **SQLite** backend for any planner/stored-relation test (the in-memory backend uses a different join operator). See [`CLAUDE.md`](./CLAUDE.md) and [`CONTRIBUTING.md`](./CONTRIBUTING.md).
+- **Licensing:** mnestic is MPL-2.0. Preserve the original `Copyright … The Cozo Project Authors` headers on any file you modify.
+
+If you're considering a larger feature (especially bi-temporality or the Cypher-read surface), open an issue to discuss the design first.
+
+## Releases & versioning
+
+- **SemVer on the 0.x line** — patch for fixes, minor for non-drop-in behavior/feature changes.
+- Releases are published to **crates.io** (`mnestic`, `mnestic-rocks`) and **PyPI** (`mnestic`), with divergences recorded in [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md).
+- Work is banked and released on a regular rhythm with migration notes — steady stewardship over churn.
+
+## Relationship to MindGraph
+
+mnestic is developed alongside, and consumed by, [MindGraph](https://crates.io/crates/mindgraph), a typed cognitive knowledge-graph library built on top of it. MindGraph is the engine's most demanding user and drives much of its hardening — but mnestic is a general-purpose database in its own right, and its roadmap is set to serve the broader community of developers building local-first and embedded AI memory.

@@ -1,0 +1,271 @@
+{
+  "reviewed_count": 22,
+  "confirmed_count": 21,
+  "plan": {
+    "summary": "Reviewed the read-only Cypher->CozoScript translator (cozo-core/src/cypher/translate.rs, with unquote in parse.rs) against 18 adversarially-verified findings. All were confirmed real; none are refuted. After deduplication the distinct defects are: (1) WHERE has no 3VL/null handling \u2014 comparisons/NOT/AND/OR/STARTS WITH/ENDS WITH/CONTAINS abort the whole query on a null operand, and =/<>/IN return wrong truth on null (the prop_var-underscore bug and the namespace-collision bug each appeared 4-5 times across dimensions and are merged here). I also added one bug found only as a verdict side-note but independently traced in the source: node_atom emits a duplicate id_col binding, so RETURN n.id / WHERE n.id = x errors. Priorities: must_fix = correctness bugs that break ordinary queries (null handling, non-injective prop_var, aggregate nulls, duplicate id binding); should_fix = real but narrower/pathological-trigger or loud-error bugs; nice_to_have = ORDER BY structural matching. A single refactor (intern property accesses + rename all user variables to opaque names) closes must_fix #2 and should_fix #5/#6 at once. All locations are absolute-file line refs in /Users/shuruheel/Code/mindgraph/mnestic/cozo-core/src/cypher/translate.rs unless noted. Note the cypher feature is off by default (Cargo.toml cypher = []) and pre-TCK, but these are defects in the currently-implemented v1 subset.",
+    "must_fix": [
+      {
+        "title": "WHERE clause is not null-aware (3VL): predicates over a null operand abort the whole query, and =/<>/IN keep rows openCypher drops",
+        "severity": "high",
+        "location": "translate.rs:131-135 (WHERE body push) and expr() 604-647 (BinOp/UnOp emission); engine ops in cozo-core/src/data/functions.rs (op_gt/ge/lt/le, op_and/or/negate, op_starts_with/ends_with/str_includes are strict; op_eq/op_neq/op_is_in silently mis-return on null)",
+        "fix": "Lower WHERE predicates through a dedicated null-aware emitter instead of raw expr(). Emit a 'truthy(e)' expression that is true only when e is exactly TRUE, with a mutually-recursive 'falsy(e)' for NOT. Guard ordered comparisons and = / <> / IN / STARTS WITH / ENDS WITH / CONTAINS with !is_null(...) on each operand so a null yields false (never an engine bail! and never a spurious true for null==null or null<>x); truthy(NOT x)=falsy(x), truthy(AND)=truthy(l)&&truthy(r), truthy(OR)=truthy(l)||truthy(r), bool columns -> (!is_null(c) && c). Use truthy(pred) as the cy_match WHERE body. This collapses 3VL to keep-only-TRUE, matching openCypher (null and false both excluded, never error)."
+      },
+      {
+        "title": "prop_var encoding cyp_{var}_{key} is non-injective (underscore-delimited) \u2014 distinct property columns silently collapse to one variable, injecting spurious equi-joins on ordinary snake_case identifiers",
+        "severity": "high",
+        "location": "translate.rs:671-673 (fn prop_var); consumed at node_atom:228/232, rel_atom:298, expr Prop:615-617, aggregate_arg:415, head_props:158-160",
+        "fix": "Make the (var,key)->name mapping injective. Add a BTreeMap<(String,String),String> on Translator, precompute it over all_props in run(), and replace the free prop_var with a method that returns an interned name (e.g. cyp_0, cyp_1) per distinct pair. This removes the ambiguity where (a,'b_c') and (a_b,'c') both produce cyp_a_b_c and force-unify two columns (e.g. RETURN n.from_uid, n_from.uid silently joins on equality). Doing the opaque-rename refactor in should_fix #5 also satisfies this."
+      },
+      {
+        "title": "Aggregates ignore openCypher null semantics: sum/avg hard-abort on a null cell, count(expr) overcounts nulls, collect includes nulls",
+        "severity": "medium",
+        "location": "translate.rs:347-401 (emit_aggregate) and 403-420 (aggregate_arg); engine impls in cozo-core/src/data/aggr.rs (AggrSum/AggrMean bail! on null, AggrCount counts all, AggrCollect pushes null)",
+        "fix": "For aggregates whose argument is a property/variable (not count(*)), restrict the cy_agg input to non-null values: add a !is_null(arg) filter to the cy_agg rule body before aggregating, so count/sum/avg/min/max/collect skip nulls per openCypher (and sum/avg stop aborting the query). Leave count(*) on the always-present anchor node var untouched. Sparse/optional properties are the norm for the primary consumer, so nullable aggregate inputs are common."
+      },
+      {
+        "title": "node_atom emits a duplicate id_col (and label_col) binding, so RETURN n.id / WHERE n.id = x fails with an unbound-variable error",
+        "severity": "medium",
+        "location": "translate.rs:207 (id binding `id: n.var`), 226-234 (referenced loop) and 235-242 (inline loop) push a second `id: cyp_..._id` named field",
+        "fix": "When a referenced or inline property key equals nm.id_col (or nm.label_col), do NOT push a second named-field arg \u2014 the column is already bound to n.var (or the label param). For a referenced id, bind the prop var via a body equality (e.g. `cyp_a_id = a`) so projection still works; for an inline id constraint, emit an equality filter (`a == <param>`) instead of a duplicate field. Otherwise `*person{id: a, id: cyp_a_id}` collapses via the named-field BTreeMap, leaving the node var `a` unbound -> 'Symbol a in rule head is unbound'. This breaks the extremely common RETURN n.id / WHERE n.uid = $x shapes outright."
+      }
+    ],
+    "should_fix": [
+      {
+        "title": "Generated variable/rule namespace is not isolated from user identifiers (variable capture) and the bag key is derived by a fragile name-prefix filter",
+        "severity": "medium",
+        "location": "translate.rs:753-762 (ident_ok, charset only), 91-95 (fresh cyn/cyr), 671-673 (prop_var), 327 (cy_ret_N), 366/373 (cy_a_N/cy_g_N), 724-730 (binding_key string-filter on cyp_), 271 (rel user_var bypasses ident_ok), 615-617 (Prop var half bypasses ident_ok)",
+        "fix": "Two parts. (a) Stop computing the bag binding key by string-filtering match_head for !starts_with(cyp_); pass the structural key (node `var`s + rel eid vars, both already available in run()) into emit_projection. (b) Prevent user/generated collisions: preferred robust fix is to rename every user node/rel variable to an opaque generated name via a lookup table built in collect() so no user identifier ever reaches the emitted script (this also satisfies must_fix #2's disjointness). Minimum: reject user identifiers matching reserved prefixes (^cy, ^cyp_, ^cphr_) and route rel user_var and the Prop var-half through ident_ok (currently unvalidated). Closes the cyp_*/cy_ret_*/cyn*/cyr* capture cases and the binding_key bag undercount."
+      },
+      {
+        "title": "Generated $cphr_N literal params collide with user-supplied params of the same name; the generated value silently overwrites the user's",
+        "severity": "medium",
+        "location": "translate.rs:84-89 (param naming cphr_N) and 607-610 (Param passthrough); cozo-core/src/lib.rs:261-264 (run_cypher merge blindly inserts generated params into the user map)",
+        "fix": "Reserve the cphr_ namespace. Before the lib.rs merge, reject any user param key matching ^cphr_ (clear error), and reject `$cphr_*` Param references in expr(); or detect a collision during the merge and error instead of insert-overwriting. This is param shadowing, not string injection (values still bind as params), but a user param named cphr_N is silently clobbered by a generated literal, producing wrong results or a type error."
+      },
+      {
+        "title": "No-eid edge-isomorphism disequality omits the type discriminator, dropping valid distinct-type matches on shared relations",
+        "severity": "medium",
+        "location": "translate.rs:124-128 (rel_ids tuple lacks the type discriminator) and 137-149 (iso loop gate `ci != cj || ri != rj`; no-eid branch emits `(from!=from' or to!=to')`)",
+        "fix": "Capture the resolved type discriminator per relationship in rel_ids (the rel_type / EdgeMap.type_value, or None when type_col is None) \u2014 rel_atom already resolves it. Extend the skip gate to `if ci != cj || ri != rj || type_i != type_j { continue; }`. Then two different Cypher types on one shared stored relation (e.g. KNOWS and LIKES over `edge`) no longer generate the always-false `(a!=a or b!=b)`; distinct-type matches survive. Same-type/no-eid keeps the correct (from,to) disequality; relation-per-label and eid schemas are unaffected."
+      },
+      {
+        "title": "Illegal variable reuse is silently accepted instead of rejected (reused relationship var -> r != r; one name as both node and relationship -> uid==from_uid)",
+        "severity": "low",
+        "location": "translate.rs:543-571 (collect \u2014 no rel-var dedup), 573-600 (upsert_node merges node vars only), 271 (eid_var = user_var), 145 (iso emits `r != r`)",
+        "fix": "Track variable kind during collection. Bail with a clear error when a relationship variable is reused across patterns (Neo4j rejects this; today it emits the always-false `r != r` and binds both edges to one uid -> 0 rows), and when the same name is used as both a node and a relationship (`(x)-[x:KNOWS]->` forces edge.uid==edge.from_uid==node.uid). Turns silent-empty results into Cypher-conformant errors."
+      },
+      {
+        "title": "No validation that RETURN/WHERE/ORDER BY variables are bound; bare RETURN r works on eid schemas but opaque-fails on relation-per-label",
+        "severity": "medium",
+        "location": "translate.rs:97-199 (run has no binding pass), 158-160 (head_props pushes cyp_b_name unbound), 131-135 (WHERE pushes cyp_b_x unbound), 328 (emit_projection unifies bare unbound var), 268-276 (rel eid_var only when eid_col set)",
+        "fix": "After collect(), build bound = node vars + rel user_vars and walk every Var/Prop referenced in WHERE/RETURN/ORDER BY (treating RETURN aliases as defined for ORDER BY); bail with 'variable `x` is not defined' before emitting, instead of leaking internal names like cyp_b_name in an engine error. Separately, for a bare relationship variable whose EdgeMap.eid_col is None, bail with 'relationship `r` cannot be projected: edge relation has no identity column' \u2014 this fixes the inconsistency where RETURN r succeeds on a shared-relation eid schema but opaque-fails on relation-per-label."
+      },
+      {
+        "title": "Duplicate property keys on a pattern silently drop all but one constraint; referenced-and-inline rel property filters are dropped entirely",
+        "severity": "medium",
+        "location": "translate.rs:226-242 (node_atom: referenced .find() is first-wins; inline loop never adds its keys to seen_cols so duplicates become last-wins via the named-field BTreeMap) and 289-309 (rel_atom: a referenced inline rel prop binds the var but emits no equality, unlike node_atom's extra_eq)",
+        "fix": "After merging props per node/rel, detect repeated columns: bind each column once and emit one equality per distinct constraint value so contradictory patterns (name='Bob' AND name='Alice') correctly yield 0 rows, or reject duplicate keys with an explicit error. Make the inline loop push its keys into seen_cols to stop emitting duplicate named fields. In rel_atom, mirror node_atom's extra_eq so an inline filter on a rel property that is also referenced is actually applied (currently silently ignored)."
+      },
+      {
+        "title": "String-literal unicode/control escapes (\\uXXXX, \\b, \\f) are mishandled, silently producing the wrong value",
+        "severity": "low",
+        "location": "cozo-core/src/cypher/parse.rs:514-533 (fn unquote: only \\n/\\t/\\r, fallthrough `other => other`)",
+        "fix": "In unquote, handle `\\u` by reading the next 4 hex digits and pushing char::from_u32 (matching the CozoScript char rule), and add `\\b`,`\\f`,`\\0`; reject malformed escapes explicitly rather than dropping the backslash. Today `'A'` decodes to the 5-char string `u0041` instead of `A`, which becomes a query param and silently mismatches. Low likelihood (the grammar accepts raw UTF-8 so users usually type the char), but it is silent-wrong and a small fix."
+      }
+    ],
+    "nice_to_have": [
+      {
+        "title": "ORDER BY an unaliased compound or aggregate expression that is already in RETURN is wrongly rejected",
+        "severity": "low",
+        "location": "translate.rs:447-468 (order_var) and 784-792 (expr_eq \u2014 only handles Var/Prop/Lit/Param, `_ => false`)",
+        "fix": "Extend expr_eq to structurally compare Func (name + args), Binary (op+lhs+rhs), Unary, and List recursively, so `RETURN count(*) ORDER BY count(*)` and `RETURN a.age + 1 ORDER BY a.age + 1` match the projected column; item_head_var already routes to the correct cy_a_*/cy_ret_* head var. Low priority: it is a clean error (not silent), and the AS-alias workaround already works (the alias branch matches a Var)."
+      }
+    ]
+  },
+  "conformance": {
+    "cases": [
+      {
+        "name": "match_single_node_property",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) RETURN a.name AS name ORDER BY name",
+        "expect": "Fixture person{id=>name,age}: (1,Alice,30),(2,Bob,40),(3,Carol,35). Result (3 rows, 1 col): [[Alice],[Bob],[Carol]]. Header = [name].",
+        "traps": "Smallest end-to-end path: label->relation selection, property column binding (a.name -> cyp_a_name in *person{id:a, name:cyp_a_name}), alias becomes the header, bag = one row per node id, hidden binding-key column [a] is truncated away by the runner."
+      },
+      {
+        "name": "match_single_hop_where_comparison",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > 30 RETURN b.name AS name ORDER BY name",
+        "expect": "Canonical fixture: person (1,Alice,30),(2,Bob,40),(3,Carol,35); knows (1,2),(1,3),(2,3). a.age>30 => Bob(40); Bob->Carol. Result: [[Carol]].",
+        "traps": "WHERE numeric comparison emitted as a filter atom (cyp_a_age > $cphr) appended to the cy_match body, not pushed into the relation access; single directed hop joins a->b on knows{fr:a,to:b}; literal 30 becomes a param."
+      },
+      {
+        "name": "match_two_hop_chain_fixed_length",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name AS a, b.name AS b, c.name AS c",
+        "expect": "Canonical fixture (edges 1->2,1->3,2->3). Only 2-hop path is 1->2->3. Result: [[Alice,Bob,Carol]] (1 row).",
+        "traps": "Multi-hop fixed-length chain compiles to two knows atoms sharing the middle var b; the two same-relation edges in one MATCH get the no-eid edge-iso disequality (a!=b or b!=c), which is TRUE here (distinct endpoints) so the legit path survives."
+      },
+      {
+        "name": "edge_isomorphism_self_loop_must_exclude_reuse",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name AS a, b.name AS b, c.name AS c",
+        "expect": "Fixture person (1,Alice),(2,Bob); knows with a SELF-LOOP: (1,1),(1,2). Datalog homomorphism would yield (1,1,1) [self-loop used for BOTH hops] and (1,1,2). Edge-isomorphism MUST drop (1,1,1). Result: [[Alice,Alice,Bob]] (1 row).",
+        "traps": "THE same-edge-reuse guard. With eid_col=None the identity is the (fr,to) tuple, so the emitted disequality is (a!=b or b!=c); for (1,1,1) that is (false or false)=false -> excluded. If edge-iso were omitted you would wrongly get 2 rows incl. (Alice,Alice,Alice)."
+      },
+      {
+        "name": "edge_isomorphism_parallel_edges_via_eid",
+        "schema": "shared-relation",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS name",
+        "expect": "Fixture node{uid=>node_type,name,age}: (n1,Person,Alice,30),(n2,Person,Bob,40). edge{uid=>from_uid,to_uid,edge_type} with TWO PARALLEL edges: (e1,n1,n2,KNOWS),(e2,n1,n2,KNOWS). Result: 2 rows [[Alice],[Alice]].",
+        "traps": "Parallel-edge multiplicity. eid_col=uid is bound as a fresh var and appended to the cy_match head + binding key, so the two parallel edges are distinct bindings -> bag size 2. Without the eid in the binding key this collapses to 1 row. Cannot be expressed in relation-per-label (a {fr,to} key forbids parallel rows)."
+      },
+      {
+        "name": "return_distinct_set_dedup",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN DISTINCT a.name AS name ORDER BY name",
+        "expect": "Canonical fixture. a appears for edges (1,2),(1,3),(2,3) => Alice,Alice,Bob; DISTINCT collapses to [[Alice],[Bob]] (2 rows).",
+        "traps": "RETURN DISTINCT omits the hidden binding key from the projection head, so Datalog set semantics = Cypher DISTINCT. Pairs with bag_multiplicity_rowcount (same query without DISTINCT must give 3)."
+      },
+      {
+        "name": "bag_multiplicity_rowcount",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name",
+        "expect": "Canonical fixture. Row COUNT must be 3 (Alice,Alice,Bob in some order) because b is in the binding key.",
+        "traps": "True bag semantics: a.name duplicates survive because the projection head appends the binding key (node vars a,b). A naive set translation would give 2. Assert row count = 3 (order unspecified). Default header is 'a.name'."
+      },
+      {
+        "name": "count_star_grouped_implicit_groupby",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS who, count(*) AS c ORDER BY who",
+        "expect": "Canonical fixture. Result: [[Alice,2],[Bob,1]].",
+        "traps": "count(*) is rewritten to count(<anchor=a>) over cy_agg which reads the per-binding cy_match SET; cozo count() does NOT dedup (aggr.rs ~423), and each cy_match row is a distinct (a,b) binding, so the count equals the true bag size per group. Implicit group-by = the non-aggregating RETURN column (who)."
+      },
+      {
+        "name": "count_star_ungrouped",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN count(*) AS c",
+        "expect": "Canonical fixture (3 edges). Result: [[3]] (single row).",
+        "traps": "Pure aggregate with NO group columns -> cy_agg head is a single aggregate (count(a)) with body-only var b projected away; exercises a head consisting only of a head-position aggregate. Verifies count(*) -> count(anchor) where the anchor (node id) is always bound/non-null."
+      },
+      {
+        "name": "aggregate_min_max_preserve_int",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) RETURN min(a.age) AS lo, max(a.age) AS hi",
+        "expect": "Canonical fixture (ages 30,40,35). Result: [[30,40]] as integers.",
+        "traps": "min/max name-map straight through (cozo_aggr min->min, max->max); ungrouped aggregate over a single-node match; min/max preserve the integer type (unlike sum). Property var cyp_a_age must be hoisted into the cy_match head for the aggregate to read."
+      },
+      {
+        "name": "aggregate_sum_returns_float_divergence",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) RETURN sum(a.age) AS total",
+        "expect": "Canonical fixture (30+40+35). openCypher expects integer 105; mnestic currently returns FLOAT 105.0.",
+        "traps": "DIVERGENCE: AggrSum accumulates into f64 and returns DataValue::from(f64), so sum over an integer column yields a float (Cypher preserves integer). Also AggrSum::set bails on any non-Num value, so a null in the column would hard-error rather than skip (Cypher skips nulls). Decide whether to coerce/round in the translator."
+      },
+      {
+        "name": "aggregate_avg_maps_to_mean",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) RETURN avg(a.age) AS m",
+        "expect": "Canonical fixture. Result: [[35.0]] (float).",
+        "traps": "Name-mapping guard: Cypher avg() must translate to cozo mean() (cozo_aggr), not a literal avg() (which does not exist and would error). Result is a float, matching Cypher avg. Like sum, mean bails on non-Num/null inputs."
+      },
+      {
+        "name": "aggregate_collect_grouped",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS who, collect(b.name) AS friends ORDER BY who",
+        "expect": "Canonical fixture. Group by who: Alice -> list containing {Bob,Carol}; Bob -> list [Carol]. Assert membership/length (collect order is unspecified): row Alice has a 2-element list, row Bob a 1-element list.",
+        "traps": "collect aggregates a PROPERTY of a non-anchor node (b.name); collect_props must hoist cyp_b_name into the cy_match head so the aggregate arg resolves. Implicit group-by on who. Returns a List value; do not assert intra-list ordering."
+      },
+      {
+        "name": "order_by_desc_skip_limit_pagination",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) RETURN a.name AS name, a.age AS age ORDER BY age DESC SKIP 1 LIMIT 1",
+        "expect": "Canonical fixture (ages 40,35,30). DESC -> Bob(40),Carol(35),Alice(30); SKIP 1 drops Bob; LIMIT 1 keeps Carol. Result: [[Carol,35]].",
+        "traps": "ORDER BY references the alias 'age' (matched to cy_ret_1 -> :order -cy_ret_1), SKIP -> :offset 1, LIMIT -> :limit 1 via the native CozoScript epilogue; pagination runs over the multiplied/ordered rows before the runner truncates the hidden key. const_int extracts the integer literals for offset/limit."
+      },
+      {
+        "name": "order_by_aggregate_alias_desc",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS who, count(*) AS c ORDER BY c DESC",
+        "expect": "Canonical fixture. Result: [[Alice,2],[Bob,1]].",
+        "traps": "ORDER BY an AGGREGATE alias: order_var must resolve 'c' to item_head_var with has_aggr=true, i.e. the aggregate head var cy_a_1 (NOT cy_ret_1), and the final ?-rule must expose cy_a_1 so :order -cy_a_1 is bound. Guards the aggregate-vs-projection head-var selection in item_head_var."
+      },
+      {
+        "name": "limit_counts_bag_rows_not_distinct",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS name ORDER BY name LIMIT 2",
+        "expect": "Canonical fixture. Bag ordered by name = Alice,Alice,Bob; LIMIT 2 => [[Alice],[Alice]] (2 rows).",
+        "traps": "LIMIT must apply to the MULTIPLIED bag (binding key present in the head) so it can cut within duplicates; if LIMIT were applied to distinct projected values you would wrongly get Alice,Bob. Confirms :limit sees the hidden-key-expanded rows before truncation."
+      },
+      {
+        "name": "where_in_list",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) WHERE a.age IN [30, 40] RETURN a.name AS name ORDER BY name",
+        "expect": "Canonical fixture. 30->Alice, 40->Bob, 35->Carol excluded. Result: [[Alice],[Bob]].",
+        "traps": "IN -> is_in(cyp_a_age, [$cphr,$cphr]); the list literal becomes a list of params (every literal parameterized), and is_in checks DataValue membership. Property must be bound for the filter to reference it."
+      },
+      {
+        "name": "where_string_predicates",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) WHERE a.name STARTS WITH 'A' RETURN a.name AS name",
+        "expect": "Canonical fixture. Only Alice starts with 'A'. Result: [[Alice]]. (Sibling forms: CONTAINS 'o' -> Bob,Carol via str_includes; ENDS WITH 'b' -> Bob via ends_with.)",
+        "traps": "String-op routing: STARTS WITH->starts_with, CONTAINS->str_includes, ENDS WITH->ends_with (NOT the infix path). Each bails on a non-string operand, so a null name would hard-error rather than be excluded (3VL boundary)."
+      },
+      {
+        "name": "where_boolean_and_range",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) WHERE a.age > 30 AND a.age < 40 RETURN a.name AS name",
+        "expect": "Canonical fixture. Only Carol(35) satisfies both. Result: [[Carol]].",
+        "traps": "Boolean AND -> && (op_and), which requires boolean operands; both comparisons yield bool here. Exercises operator precedence (comparison binds tighter than AND) and the boolean conjunction path. (With a null age operand op_gt would error before AND short-circuits.)"
+      },
+      {
+        "name": "where_is_null_and_is_not_null",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) WHERE a.age IS NULL RETURN a.name AS name",
+        "expect": "Fixture person: (1,Alice,30),(2,Bob,null). Result: [[Bob]]. Companion 'IS NOT NULL' must return [[Alice]].",
+        "traps": "The null-SAFE 3VL path. The age column is still BOUND for Bob (value=DataValue::Null), and is_null(cyp_a_age) matches it (op_is_null just pattern-matches Null). UnOp::IsNotNull emits (!is_null(...)). Contrast with the comparison case below, which is NOT null-safe."
+      },
+      {
+        "name": "where_comparison_excludes_null_3vl_divergence",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person) WHERE a.age >= 40 RETURN a.name AS name",
+        "expect": "Fixture person: (1,Alice,30),(2,Bob,40),(3,Dave,null). openCypher: null>=40 is null -> Dave excluded; Alice 30<40 excluded -> Result: [[Bob]]. mnestic CURRENTLY HARD-ERRORS instead of returning a row.",
+        "traps": "KEY 3VL DEFECT. The filter (cyp_a_age >= $cphr) compiles to op_ge, which calls ensure_same_value_type and BAILS on (Null, Num); evaluating Dave's binding aborts the whole query rather than silently excluding the row as Cypher requires. Any range/comparison WHERE over a column that can hold nulls is unsafe. Fix candidates: guard with is_null/null-coalescing in the translator. This case documents the divergence (currently failing)."
+      },
+      {
+        "name": "shared_relation_single_hop_bag",
+        "schema": "shared-relation",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN b.name AS name ORDER BY name",
+        "expect": "Fixture node (n1,Person,Alice,30),(n2,Person,Bob,40),(n3,Person,Carol,35); edge (e1,n1,n2,KNOWS),(e2,n1,n3,KNOWS),(e3,n2,n3,KNOWS). b names = Bob,Carol,Carol. Result (bag, 3 rows): [[Bob],[Carol],[Carol]].",
+        "traps": "MindGraph shared-relation convention: label->discriminator param node_type:$cphr='Person', type->edge_type:$cphr='KNOWS' (hitting type indexes), and eid_col=uid is bound and lands in the binding key. Duplicate name Carol survives (bag); ORDER BY name ties broken by the hidden key."
+      },
+      {
+        "name": "shared_relation_two_hop_eid_isomorphism",
+        "schema": "shared-relation",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person)-[:KNOWS]->(c:Person) RETURN a.name AS a, b.name AS b, c.name AS c",
+        "expect": "Shared-relation fixture (edges n1->n2,n1->n3,n2->n3). Only path n1->n2->n3. Result: [[Alice,Bob,Carol]] (1 row).",
+        "traps": "Edge-isomorphism over the explicit eid (reified edge uid): the two edge atoms bind fresh uid vars and the disequality is eid_r0 != eid_r1 (not the from/to-tuple fallback). Discriminators are params; both hops carry node_type/edge_type filters. Confirms the eid branch of the iso logic for the primary consumer's schema."
+      },
+      {
+        "name": "multi_match_no_cross_clause_edge_iso",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[:KNOWS]->(b:Person) MATCH (a:Person)-[:KNOWS]->(b:Person) RETURN a.name AS a, b.name AS b ORDER BY a, b",
+        "expect": "Canonical fixture. Two identical MATCH clauses sharing a,b. Edge-iso is PER-MATCH, so the same edge satisfies both clauses; result = each edge once: [[Alice,Bob],[Alice,Carol],[Bob,Carol]] (3 rows).",
+        "traps": "Edge-iso scoping: rel_ids carry the reading-clause index; the disequality is emitted only when clause indices match, so cross-clause edges are NOT forced distinct (correct per Cypher). If iso were applied globally with no eid, the disequality (a!=a or b!=b)=false would wrongly drop ALL rows -> 0. Correct=3 vs buggy=0 sharply distinguishes the behavior."
+      },
+      {
+        "name": "relationship_property_filter_no_eid",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[r:KNOWS]->(b:Person) WHERE r.since >= 2001 RETURN a.name AS a, b.name AS b ORDER BY a, b",
+        "expect": "Fixture person (1,Alice),(2,Bob),(3,Carol); knows{fr,to=>since}: (1,2,2001),(1,3,1999),(2,3,2005). since>=2001 keeps (1,2),(2,3). Result: [[Alice,Bob],[Bob,Carol]].",
+        "traps": "Relationship PROPERTY binding works even when EdgeMap.eid_col is None: rel_atom's referenced-props loop binds r.since -> cyp_r_since into *knows{fr:a,to:b,since:cyp_r_since}, independent of eid. (Pairs with the bare-rel-var risk case, which is the part that does NOT work.) Same null-comparison caveat applies if since can be null."
+      },
+      {
+        "name": "return_bare_relationship_var_no_eid_risk",
+        "schema": "relation-per-label",
+        "cypher": "MATCH (a:Person)-[r:KNOWS]->(b:Person) RETURN r",
+        "expect": "Canonical fixture, knows{fr,to} with eid_col=None. openCypher would return relationship objects; mnestic produces an OPAQUE engine error (unbound variable r), not a row set and not a clear translator error.",
+        "traps": "CORRECTNESS RISK. In rel_atom the relationship user_var is consumed ONLY inside the eid_col=Some branch, so with no eid_col 'r' is never bound. The final ?-rule then emits cy_ret_0 = r over an unbound r, which the engine rejects with a confusing message. The translator should either (a) fail fast at translate time with a clear 'relationship variable requires eid_col' error, or (b) bind r to the (from,to) tuple. Mirror-check: r.since (properties) still works; only the bare var is broken."
+      }
+    ]
+  }
+}
