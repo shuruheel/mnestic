@@ -3,11 +3,35 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased — 0.8.6
+## 0.9.0 — 2026-06-28
 
-Corrupt-database tooling from the 2026-06-12 production incident. Both changes
-landed **after** the 0.8.5 crates.io publish the same day, so they ship in
-0.8.6 (the published 0.8.5 artifact contains neither).
+Adds the **read-only Cypher query surface** (the headline feature) and bundles
+the corrupt-database tooling that was banked as 0.8.6 but never published
+(0.8.5 → 0.9.0 ships both; there is no separate 0.8.6 crates.io artifact).
+
+### New — read-only Cypher query surface (alpha, feature `cypher`, off by default)
+- Translate a subset of **openCypher** to CozoScript so the engine can be
+  evaluated and adopted without first learning Datalog. Datalog stays the native,
+  full-power language; this is a **read-only** on-ramp (no write clauses). New API:
+  `DbInstance::run_cypher` / `cypher_to_script` (+ Python `run_cypher`), driven by
+  a caller-supplied `CypherGraphSchema` / `NodeMap` / `EdgeMap` mapping the
+  property-graph model onto stored relations — supporting both the
+  relation-per-label and the shared-relation-with-discriminator conventions
+  (the latter matches MindGraph's reified `node`/`edge` model).
+- v1 subset: `MATCH` (fixed-length, directed, labels, types, inline property
+  maps), `WHERE` (comparisons, `AND`/`OR`/`NOT`, `IN`, `IS NULL`, `STARTS`/`ENDS
+  WITH`, `CONTAINS`), `RETURN` (`DISTINCT`, aliases, aggregates
+  `count`/`sum`/`avg`/`min`/`max`/`collect`), `ORDER BY` / `SKIP` / `LIMIT`.
+  Literals pass as params and every interpolated identifier is validated. True
+  bag semantics (`count(*)`/`LIMIT` match openCypher), **null-aware `WHERE`**
+  (a null operand drops the row instead of aborting the query), and per-`MATCH`
+  edge-isomorphism. Module `cozo-core/src/cypher/`; design + scope in
+  `docs/specs/cypher-read.md`; hardened against a multi-agent adversarial review
+  (`docs/specs/cypher-read-review-findings.json`). Off by default — enable the
+  `cypher` feature. Deferred with explicit errors: undirected relationships, the
+  schema `filter` field, variable-length paths, `OPTIONAL MATCH`, `WITH`. Known
+  divergence: `sum` over an integer column returns a float (engine accumulator is
+  f64).
 
 ### Fixed — `cozo-bin` token-table bearer auth ignored on query-string URLs
 - The server's `authorize` evaluated `Authorization: Bearer` against the token
