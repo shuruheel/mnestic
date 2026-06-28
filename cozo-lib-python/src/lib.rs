@@ -102,6 +102,66 @@ fn convert_params(ob: &PyDict) -> PyResult<BTreeMap<String, DataValue>> {
 
 /// Build a [`HybridSearch`] from a Python dict, applying the Rust `Default` for
 /// any omitted field (mnestic fork). Mirrors the field names of the Rust struct.
+#[cfg(feature = "cypher")]
+fn cy_req_str(d: &PyDict, k: &str) -> PyResult<String> {
+    d.get_item(k)?
+        .ok_or_else(|| PyException::new_err(format!("schema entry needs '{k}'")))?
+        .extract()
+}
+
+#[cfg(feature = "cypher")]
+fn cy_opt_str(d: &PyDict, k: &str) -> PyResult<Option<String>> {
+    Ok(match d.get_item(k)? {
+        Some(x) if !x.is_none() => Some(x.extract()?),
+        _ => None,
+    })
+}
+
+#[cfg(feature = "cypher")]
+fn cy_opt_val(d: &PyDict, k: &str) -> PyResult<Option<DataValue>> {
+    Ok(match d.get_item(k)? {
+        Some(x) if !x.is_none() => Some(py_to_value(x)?),
+        _ => None,
+    })
+}
+
+/// Build a `CypherGraphSchema` from a Python dict mirroring the Rust fields:
+/// `{"nodes": [{label, relation, id_col, label_col?, label_value?, filter?}, ...],
+///   "edges": [{rel_type, relation, from_col, to_col, type_col?, type_value?, eid_col?, filter?}, ...]}`.
+#[cfg(feature = "cypher")]
+fn py_to_cypher_schema(d: &PyDict) -> PyResult<CypherGraphSchema> {
+    let mut schema = CypherGraphSchema::default();
+    if let Some(v) = d.get_item("nodes")? {
+        for it in v.downcast::<PyList>()? {
+            let nd = it.downcast::<PyDict>()?;
+            schema.nodes.push(NodeMap {
+                label: cy_req_str(nd, "label")?,
+                relation: cy_req_str(nd, "relation")?,
+                id_col: cy_req_str(nd, "id_col")?,
+                label_col: cy_opt_str(nd, "label_col")?,
+                label_value: cy_opt_val(nd, "label_value")?,
+                filter: cy_opt_str(nd, "filter")?,
+            });
+        }
+    }
+    if let Some(v) = d.get_item("edges")? {
+        for it in v.downcast::<PyList>()? {
+            let ed = it.downcast::<PyDict>()?;
+            schema.edges.push(EdgeMap {
+                rel_type: cy_req_str(ed, "rel_type")?,
+                relation: cy_req_str(ed, "relation")?,
+                from_col: cy_req_str(ed, "from_col")?,
+                to_col: cy_req_str(ed, "to_col")?,
+                type_col: cy_opt_str(ed, "type_col")?,
+                type_value: cy_opt_val(ed, "type_value")?,
+                eid_col: cy_opt_str(ed, "eid_col")?,
+                filter: cy_opt_str(ed, "filter")?,
+            });
+        }
+    }
+    Ok(schema)
+}
+
 fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
     let mut q = HybridSearch::default();
     if let Some(v) = d.get_item("relation")? {
@@ -396,6 +456,37 @@ impl CozoDbPy {
                 Ok(rows) => Ok(named_rows_to_py(rows, py)),
                 Err(err) => {
                     let reports = format_error_as_json(err, None).to_string();
+                    let json_mod = py.import("json")?;
+                    let loads_fn = json_mod.getattr("loads")?;
+                    let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+                    let msg = loads_fn.call1(args)?;
+                    Err(PyException::new_err(PyObject::from(msg)))
+                }
+            }
+        } else {
+            Err(PyException::new_err(DB_CLOSED_MSG))
+        }
+    }
+    /// Run a read-only Cypher query (mnestic fork; built with the `cypher`
+    /// feature). `query` is openCypher (subset); `schema` is a dict mapping the
+    /// property graph onto stored relations (see `py_to_cypher_schema`); `params`
+    /// supplies any `$name` parameters. Returns `{rows, headers, next}` like
+    /// `run_script`, with headers = the RETURN columns.
+    #[cfg(feature = "cypher")]
+    pub fn run_cypher(
+        &self,
+        py: Python<'_>,
+        query: &str,
+        schema: &PyDict,
+        params: &PyDict,
+    ) -> PyResult<PyObject> {
+        if let Some(db) = &self.db {
+            let sch = py_to_cypher_schema(schema)?;
+            let params = convert_params(params)?;
+            match py.allow_threads(|| db.run_cypher(query, &sch, params)) {
+                Ok(rows) => Ok(named_rows_to_py(rows, py)),
+                Err(err) => {
+                    let reports = format_error_as_json(err, Some(query)).to_string();
                     let json_mod = py.import("json")?;
                     let loads_fn = json_mod.getattr("loads")?;
                     let args = PyTuple::new(py, [PyString::new(py, &reports)]);

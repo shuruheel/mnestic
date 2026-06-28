@@ -459,6 +459,13 @@ Any feedback is welcome.
 
 Versions before 1.0 do not promise syntax/API stability or storage compatibility.
 
+**Experimental (alpha):** a **read-only Cypher query surface** — translate an
+openCypher subset to CozoScript so you can evaluate the engine without first
+learning Datalog — is available behind the off-by-default `cypher` feature
+(`DbInstance::run_cypher` / `cypher_to_script`; Python `run_cypher`). Design,
+scope, and limitations: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
+Datalog remains the native, full-power query language.
+
 ## Links
 
 * [Project page](https://cozodb.org/)
