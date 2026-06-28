@@ -1,6 +1,6 @@
 # Spec — Read-Only Cypher Surface
 
-_Status: **Implementation in progress — step 2 (parser) landed** (2026-06-27); steps 3–6 remain. Owner: TBD. Companion to the research briefing [`../research/cypher-read.md`](../research/cypher-read.md) (prior art, semantics, scoping), `../../ROADMAP.md` (Tier 1, sequenced **first**), and `../../DEVELOPMENT.md` §3.5. Grounded in the actual CozoScript target grammar (`cozo-core/src/cozoscript.pest`) and the `hybrid_search` translate-to-CozoScript precedent (`cozo-core/src/runtime/hybrid.rs`); citations are `file:line` in `cozo-core/src/`._
+_Status: **Implementation in progress — steps 2 (parser) + 3 (translator) landed** (2026-06-27); steps 4–6 remain. Owner: TBD. Companion to the research briefing [`../research/cypher-read.md`](../research/cypher-read.md) (prior art, semantics, scoping), `../../ROADMAP.md` (Tier 1, sequenced **first**), and `../../DEVELOPMENT.md` §3.5. Grounded in the actual CozoScript target grammar (`cozo-core/src/cozoscript.pest`) and the `hybrid_search` translate-to-CozoScript precedent (`cozo-core/src/runtime/hybrid.rs`); citations are `file:line` in `cozo-core/src/`._
 
 > **One-line goal.** Let a developer query mnestic with a **read-only subset of openCypher** that the engine translates to CozoScript and runs — so the engine is easy to *evaluate and adopt* without first learning Datalog. Datalog stays the native, full-power language; Cypher is an on-ramp. **No write clauses** (CREATE/MERGE/SET/DELETE) — that's `ENGINEERING-PRIORITIES.md` X4.
 
@@ -178,8 +178,8 @@ impl DbInstance {
 
 1. **Spec + decisions** — ✅ done (this doc; §11 settled 2026-06-27).
 2. **Schema types + `cypher.pest` + parser → Cypher AST.** — ✅ done (2026-06-27). Module `cozo-core/src/cypher/` (`schema.rs`, `ast.rs`, `cypher.pest`, `parse.rs`) behind the off-by-default `cypher` feature; 8 parser unit tests green; clippy clean on default *and* `--features cypher`. No execution path yet.
-3. **Translator `cypher_to_script`** (AST + schema → CozoScript string + params). Golden tests. *The core.* *(next)*
-4. **`run_cypher`** → `run_script_read_only` + the NamedRows column-projection adapter (bag handling).
+3. **Translator `cypher_to_script`** (AST + schema → CozoScript string + params). — ✅ done (2026-06-27). `translate.rs`: both schema conventions, WHERE/RETURN/DISTINCT/aggregates, inline-prop filters → keyed lookups, edge-isomorphism (eid or best-effort), bag fidelity via hidden binding-key, ORDER/SKIP/LIMIT → native epilogue. 8 tests incl. **end-to-end execution** against an in-memory DB (relation-per-label, MindGraph shared-relation, count, bag-vs-distinct) — the generated CozoScript runs and returns correct rows. Returns `CypherScript { script, params, out_columns }`. Deferred with clear errors: undirected rels, the schema `filter` field. *(Total cypher tests: 15 green; clippy clean.)*
+4. **`run_cypher`** → `run_script_read_only` + the NamedRows column-projection adapter (keep first `out_columns.len()` columns for bag mode). *(next)*
 5. **TCK conformance harness** (vendored subset) + correctness-trap tests.
 6. **Python binding + docs**; flip the `cypher` feature on by default once the subset passes the TCK gate.
 
