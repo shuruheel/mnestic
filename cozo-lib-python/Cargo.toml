@@ -34,6 +34,8 @@ storage-rocksdb = ["cozo/storage-rocksdb"]
 graph-algo = ["cozo/graph-algo"]
 ## Allows the utilities to make web requests to fetch data
 requests = ["cozo/requests"]
+## Read-only Cypher query surface (mnestic fork): exposes `run_cypher`.
+cypher = ["cozo/cypher"]
 ## Uses jemalloc as the global allocator, can make a difference in performance
 jemalloc = ["cozo/jemalloc"]
 ## Enables io-uring option for the RocksDB storage
