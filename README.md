@@ -15,6 +15,25 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
+**0.9.0**
+
+- **Read-only Cypher query surface** (alpha, feature `cypher`, off by default) —
+  translate a subset of openCypher to CozoScript so the engine can be evaluated
+  and adopted without first learning Datalog (Datalog stays the native,
+  full-power language; read-only, no write clauses). `DbInstance::run_cypher` /
+  `cypher_to_script` (+ Python `run_cypher`), driven by a caller-supplied
+  `CypherGraphSchema` mapping the property-graph model onto stored relations
+  (both relation-per-label and shared-relation+discriminator conventions). v1
+  covers `MATCH` / `WHERE` / `RETURN` (DISTINCT, aggregates) / `ORDER BY` /
+  `SKIP` / `LIMIT` with true bag semantics, null-aware `WHERE` (a null operand
+  drops the row instead of aborting the query), and per-`MATCH` edge-isomorphism;
+  hardened against a multi-agent adversarial review. Design and scope:
+  [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
+- **Corrupt-database tooling** (the fixes banked as 0.8.6, shipped within 0.9.0;
+  there was no separate 0.8.6 release) — `::repair_corrupt` surgically deletes
+  truncated tuples; `::index create` no longer panics on corrupt tuples (skips
+  with a loud error); plus `cozo-bin` bearer-auth and default-feature fixes.
+
 **0.8.5**
 
 - **Flat in-RAM parallel index builds** — `::hnsw create` now constructs the

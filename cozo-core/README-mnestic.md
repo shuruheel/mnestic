@@ -20,6 +20,19 @@ of upstream `481af05` (the last upstream commit, 2024-12-04).
 Highlights (full detail in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)):
 
+**0.9.0**
+
+- **Read-only Cypher query surface** (alpha, feature `cypher`, off by default) —
+  translate a subset of openCypher to CozoScript so you can evaluate and adopt
+  the engine without first learning Datalog (Datalog stays the native,
+  full-power language; read-only, no write clauses). `run_cypher` /
+  `cypher_to_script` (+ Python `run_cypher`) over a caller-supplied property-graph
+  schema mapping labels/types onto stored relations; covers MATCH / WHERE /
+  RETURN (DISTINCT, aggregates) / ORDER BY / SKIP / LIMIT with true bag semantics,
+  null-aware WHERE, and edge-isomorphism. Design:
+  [`docs/specs/cypher-read.md`](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cypher-read.md).
+  0.9.0 also bundles the corrupt-database tooling banked as 0.8.6 (below).
+
 **0.8.6**
 
 - **`::repair_corrupt`** — surgical corruption repair: scan a relation and drop
