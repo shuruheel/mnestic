@@ -28,7 +28,9 @@ the corrupt-database tooling that was banked as 0.8.6 but never published
   edge-isomorphism. Module `cozo-core/src/cypher/`; design + scope in
   `docs/specs/cypher-read.md`; hardened against a multi-agent adversarial review
   (`docs/specs/cypher-read-review-findings.json`). Off by default — enable the
-  `cypher` feature. Deferred with explicit errors: undirected relationships, the
+  `cypher` feature (the published PyPI wheel ships without it for now; build with
+  `--features cypher` to get the Python `run_cypher`). Deferred with explicit
+  errors: undirected relationships, the
   schema `filter` field, variable-length paths, `OPTIONAL MATCH`, `WITH`. Known
   divergence: `sum` over an integer column returns a float (engine accumulator is
   f64).
