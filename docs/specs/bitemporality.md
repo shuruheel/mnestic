@@ -86,7 +86,7 @@ Grammar: add `tx_validity_clause = {"@!" ~ expr}` after `validity_clause` in the
 
 tt must be **monotonic, collision-free, and identical for every write in one transaction** (a transaction is one atomic belief-update). Today none of this exists. Design:
 
-- A **hybrid logical clock (HLC)**, CockroachDB-style: `tt = max(physical_now_µs, last_tt + 1)`. Wall-clock-meaningful, strictly monotonic, never collides even within a microsecond or across a backward clock step.
+- A **monotonic, wall-clock-floored commit counter**: `tt = max(physical_now_µs, last_tt + 1)`. Wall-clock-meaningful, strictly monotonic, never collides even within a microsecond or across a backward clock step. (Deliberately *not* a true hybrid logical clock — there is no separate logical component and no cross-node causality merge, neither of which a single-process embedded DB needs; the floor-to-wall-clock + increment is all that's required here.)
 - **In-process source of truth = an `AtomicI64` high-water mark** on the `Db` (lock-free read/advance), **seeded at open** from a persisted system key and **persisted once per committing write-transaction** that touched a bitemporal relation.
 - The whole committing transaction stamps its bitemporal writes with **one** tt, captured at commit time (or first bitemporal write, then frozen). Add a `tx_time: Option<ValidityTs>` field to `SessionTx` (`runtime/transact.rs:26-35`); set it lazily; persist + advance the high-water mark in `commit_tx` (`:137-140`).
 
@@ -117,13 +117,13 @@ tt must be **monotonic, collision-free, and identical for every write in one tra
 ## 9. Testing & performance budget
 
 - **Backend for tests: SQLite + `tempfile::tempdir()`** (the `mem` backend uses a different join operator; stored/scan-path regressions must use sqlite).
-- **Pin the four bitemporal quadrants**: (now, now), (past-vt, now), (now, past-tt), (past-vt, past-tt); the **correction case** (a higher-tt row overrides an earlier belief about a past vt; the as-of-past-tt query still returns the old belief); **retraction vs eviction**; **`::history_gc` preserves as-of-now and as-of-(≥cutoff)**; **opt-in isolation** (non-bitemporal relations byte-identical; vt-only unchanged); **HLC monotonicity** across same-µs writes and a simulated backward clock step.
+- **Pin the four bitemporal quadrants**: (now, now), (past-vt, now), (now, past-tt), (past-vt, past-tt); the **correction case** (a higher-tt row overrides an earlier belief about a past vt; the as-of-past-tt query still returns the old belief); **retraction vs eviction**; **`::history_gc` preserves as-of-now and as-of-(≥cutoff)**; **opt-in isolation** (non-bitemporal relations byte-identical; vt-only unchanged); **commit-clock monotonicity** across same-µs writes and a simulated backward clock step.
 - **Regression budget**: ≤~10% on bitemporal relations (AeonG envelope), **zero** on non-bitemporal (opt-in). Extend `benches/time_travel.rs` with a bitemporal matrix (versions × corrections-depth) and confirm the (now, now) path matches the current single-axis number.
 
 ## 10. Phased implementation plan
 
 1. **Spec + design review** — this doc; resolve §11. *(now)*
-2. **HLC transaction clock** — `AtomicI64` high-water mark on `Db`, persisted system key, `tx_time` on `SessionTx`, advance+persist in `commit_tx`. Testable in isolation (monotonicity, restart, backward-clock). *Foundational; no user-visible surface yet.*
+2. **Transaction-commit clock** — `AtomicI64` high-water mark on `Db`, persisted system key, `tx_time` on `SessionTx`, advance+persist in `commit_tx`. Testable in isolation (monotonicity, restart, backward-clock). *Foundational; no user-visible surface yet.*
 3. **Schema opt-in + key encoding** — `TxTime` ColType + grammar; generalize the "validity is last key" invariant (`runtime/relation.rs:222-225`) to the (vt, tt) trailing pair; write-path stamping (`query/stored.rs`); reject user-supplied tt.
 4. **Read path** — `@! tt` grammar (`cozoscript.pest`) + parse (`tx_valid_at` on `FixedRuleArg`) + the two-level skip-scan (`range_bitemporal_scan_tuple` across the three backends, generalizing `check_key_for_validity`).
 5. **Sys ops** — `::history`, `::history_gc`, `::evict` (+ audit relation), all read-only-guarded.
