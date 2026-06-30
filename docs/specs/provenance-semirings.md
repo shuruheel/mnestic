@@ -1,0 +1,152 @@
+# Plan: Pluggable Provenance Semirings (engine algebra registration)
+
+_Created 2026-06-30. Source: design note from Matthias Autrata (JP Morgan), "Provenance Semirings in the mnestic Engine," 2026-06-30. Status: build-now (2026-06-30). **Sequenced after bitemporality** (`ROADMAP.md` Phase 2C #7 + the Phase 2 engine storage-versioning half) — a real storage-key dependency, not a wait: R3 (retraction) composes directly with the bitemporal `Reverse<i64>` storage key, so it follows that key landing. Bitemporality is itself building now, so this is sequencing on a concurrently-built substrate, not deferral. Execution-grounded 2026-06-30 — R0a/R0b/R1 batches verified against `mnestic/cozo-core` + `mindgraph-rs` this session (§5); open decisions resolved in §9._
+
+> **Anti-overbuild guardrails (apply throughout).** Each phase below has an explicit **NOT in scope** line. The whole feature is a *generalization of machinery that already ships* (`MeetAggrObj`), not a new subsystem — the discipline is to expose the existing absorptive-aggregate slot as a registration, ship the two algebras that fall out for free, and **stop**. Ship the R0 algebras and the registration slot first, then proceed phase by phase rather than building top-k proofs, tag persistence, and retraction all at once. R0/R1 build now; R2/R3 sequence on the genuine storage-format/bitemporal-key dependency (see §8), not on adoption.
+
+---
+
+## 1. Problem / why this exists
+
+Mnestic grows feature-by-feature scorers — RRF, MMR, BM25, the fused shortest-path graph leg with `min(dist)`. Each is a bespoke fixed rule. **Provenance semirings are the general pattern those are special cases of:** one mechanism attaches a computed annotation to each derived tuple, where the annotation can be a truth value, a cost, a confidence, or a set of proofs — chosen per query, with the recursive rules unchanged.
+
+The payoff in one sentence: the *same* graph walk produces a relevance ranking (cheapest derivation), a confidence (most-likely derivation), and — eventually — an audit trail (the actual proofs), by swapping the algebra rather than rewriting the logic. "Add a new scorer" turns from "write another fixed rule" into "register another algebra."
+
+**Why a design partner would care (the JP Morgan signal).** The note originates from a fraud/marketing framing: a *perspective* is a choice of which edges/weights matter and what you optimize. Marketing weights some relationships as interesting; fraud weights others. "Walking the neighborhood under (min,+) semiring algebra with perspective-specific weights" *is* "what is relevant under this perspective." The deeper fact Matthias points at: **min-sum and max-product over a graph are exactly the inference operators of a factor graph / Bayesian network** (max-product = Viterbi = our max-prob semiring; min-sum = its log-space twin = our shortest-path semiring). So a graph traversal under the right algebra *computes the most-likely explanation a Bayesian network would* — without building one. For a regulated financial institution the killer is the proof-preserving variant (R1): "most-likely fraud path + the exact evidence chain that justifies it" is precisely what model-risk and compliance (SR 11-7-style explainability) require. The same shape sells as a **diagnostic engine** (symptoms→disease graph, most-probable diagnosis + the differential reasoning). See §3 for the honest novelty read and §8 for sequencing — the part most valuable to finance (audit trail) is the harder R1 build, not the cheap R0.
+
+---
+
+## 2. What mnestic already has (verified this session)
+
+The note's central claim — "this is mostly a generalization of machinery you already shipped" — is **correct and code-grounded**. Our recursive shortest-path idiom is already a hand-wired provenance semiring:
+
+```datalog
+reach[a, b, shortest(path)] := *link{from: a, to: b}, path = [a, b]
+reach[a, b, shortest(path)] := reach[a, m, prev], *link{from: m, to: b},
+                               path = append(prev, b)
+```
+
+`shortest(...)` in the head is **⊕** (merge alternatives, keep the best); `append(prev, b)` in the body is **⊗** (combine jointly-needed facts). The reason it recurses correctly is that `shortest`/`min` are *meet* (semilattice) aggregates — exactly the absorptive-⊕ semirings whose fixpoint converges (Dannert–Grädel CSL 2021: idempotent/absorptive ⊕ stabilizes; non-idempotent ⊕ runs away to ∞). **Our existing allow-list of "aggregates permitted inside recursion" is precisely the set of safe ⊕ operators.** We drew the right line; this feature names it and lets users extend along it.
+
+The machinery, with citations into `mnestic/cozo-core/`:
+
+| Semiring concept | Already in mnestic | Location |
+|---|---|---|
+| **⊕ (combine alternatives)** | `MeetAggrObj::update(&mut left, &right) -> Result<bool>` — combines two partial values; returns whether `left` changed | `src/data/aggr.rs:40-43` |
+| **0̄ / seed annotation** | `MeetAggrObj::init_val()` (e.g. `Null` for `min`/`shortest`, `[Null, ∞]` for `min_cost`) | `src/data/aggr.rs:40-43` |
+| **⊗ (combine jointly-needed)** | ordinary rule-body expression eval (`append`, `+`, `*`) via `eval_bytecode` in `UnificationRA` | `src/query/ra.rs:99-180` (eval at `:139`) |
+| **"safe in recursion" flag** | `Aggregation.is_meet: bool` | `src/data/aggr.rs:17-22` |
+| **recursion guard (the law check)** | stratifier rejects any SCC containing a non-meet aggregate | `src/query/stratify.rs:50-59`, `:102-127`, error `:170` |
+| **saturation / fixpoint stop** | semi-naive loop breaks when no store `has_delta()`; `meet_put` applies ⊕ and propagates the `changed` bit | loop `src/query/eval.rs:113-303`; `has_delta()` `src/runtime/temp_store.rs:288-293`; ⊕ applied at `meet_put` `:124-140` |
+| **algebra registration (dispatch)** | `parse_aggr(name) -> Option<&'static Aggregation>` — a hardcoded `match` over 11 meet + ~9 ordinary built-ins | `src/data/aggr.rs:1158-1187` |
+
+Two things are currently *bundled by hand* that the abstraction would name: ⊗ is written as ordinary body arithmetic (the engine never sees it as "the algebra's multiply"), and the algebra is fixed per built-in aggregate name. The whole feature is: **make the `parse_aggr` slot user-pluggable as a declared `(⊕, ⊗, 0̄, 1̄, saturated?)` instead of a closed list of 11.** The `changed`-bit contract already *is* the saturation check for absorptive algebras ("stop when no value changed").
+
+**The mechanism, verified this session (see §5 R0b):** registration is a `meet_factory` field on `Aggregation` + a `Db.custom_aggrs` registry that mirrors the existing `fixed_rules` runtime registry — **not** a lifetime refactor. The worrying `parse_aggr -> Option<&'static Aggregation>` (`aggr.rs:1158`) is cloned to an *owned* `Aggregation` at the sole caller (`parse/query.rs:835`) and stored by value through the program, so `'static` never propagates. The one real subtlety: `Aggregation::Clone` (`aggr.rs:24-33`) drops the op box and `meet_init` (`aggr.rs:1190`) rebuilds it from a hardcoded name `match` that `unreachable!()`s on unknowns — so a custom op must ride a factory field, not the name match.
+
+---
+
+## 3. Novelty & prior art (the honest read)
+
+**Conceptually this is not novel** — it is textbook provenance-semiring theory, and it has shipped twice as a pluggable framework. Name the prior art up front; claiming concept novelty does not survive a literature check and a Hacker News skeptic will (correctly) call it.
+
+- **Green, Karvounarakis, Tannen, "Provenance Semirings," PODS 2007** — the foundation: tag source tuples, joins multiply / unions add, and one universal polynomial specializes by homomorphism to existence / count / probability / security, so the readings can't disagree.
+- **Dannert, Grädel, Naaf, Tannen, "Semiring Provenance for Fixed-Point Logic," CSL 2021** — the recursion conditions: absorptive / idempotent ⊕ makes the fixpoint converge; non-idempotent ⊕ (counting, additive probability) blows up. This is the formal version of our `is_meet` rule.
+- **Scallop, PLDI 2023** — a working *pluggable provenance interface* (the 7-tuple `(T, 0, 1, ⊕, ⊗, ⊖, saturation-check)`), the saturation-check generalization, and the top-k-proofs instance. **The strongest "this already exists" hit** — rebuttal: Scallop is an in-memory neurosymbolic research library (PyTorch-coupled), with no persistence, MVCC, or embedded-DB story.
+- **ProvSQL (VLDB 2018)** — semiring provenance as a PostgreSQL extension, user picks the semiring. Rebuttal: result-provenance over SQL, limited recursion, academic adoption — not recursive graph-traversal aggregation in an embedded engine.
+- **TigerGraph accumulators** — the closest *commercial* analog and covers the same quantities (min-plus, top-k via `HeapAccum`, boolean), but a **fixed built-in set**, no user-defined ⊕, imperative not declarative-rule-reuse, not a semiring abstraction.
+- **Differential Dataflow / DBSP** — genuinely semiring-generic, but a *compile-time Rust trait* for IVM diffs, never a runtime user-registered query algebra.
+
+**The defensible claim (every qualifier load-bearing):** *first embedded, persistent, MVCC/time-travel knowledge-graph engine to expose an arbitrary user-registered commutative semiring as a query-scoped algebra over recursive Datalog — so the same rules compute existence, min-plus cost, max-probability, or top-k proofs without rewriting them.* The novelty is integration/packaging, not theory. For any patent-grade claim, lean on runtime registration + persistent/MVCC-engine integration (R2/R3), not the semiring math.
+
+---
+
+## 4. Phasing
+
+| Phase | Deliverable | Smallest useful output | Engine? | Gate |
+|---|---|---|---|---|
+| **R0a** | Confidence (max-prob) + relevance (min-plus) scoring. **`/retrieve` already returns both** (`SearchResult.score` + `node.confidence`); **`/traverse` needs a Rust semiring fold** for path-level cost/confidence (Option A, §5/§9). | Retrieve exposes the existing scores; traverse returns a per-path cost + confidence. | No `mnestic` change (retrieve ≈ free; traverse ≈ 2 fns + 1 struct) | Build now; smallest first cut |
+| **R0b** | **Register a custom absorptive semiring** — make `parse_aggr` consult a query/session-scoped registry of user-supplied `MeetAggrObj`. User declares `(⊕, init_val, is_meet=true)`; the existing stratifier guard + `changed`-bit saturation handle the rest. | A user registers a domain-specific absorptive combine by name and uses it anywhere `min`/`shortest` work today. | Yes (small, contained) | Build now, after R0a |
+| **R1** | **Top-k proofs** (audit trail). Non-idempotent → needs engine-controlled truncation + a *generalized* saturation predicate (Scallop's `○=`), so it cannot be `is_meet=true` and cannot ride the existing recursion path — a new "bounded/approximate meet" aggregate category. | A query returns the k best whole derivations (paths + the input facts that justify them) for each answer. **The finance/diagnostic differentiator.** | Yes (the genuinely-new engine work) | After R0; the genuinely-new engine build (top-k aggregate category) |
+| **R2** | **Persist tags** in the memcomparable stored-relation row format, so annotations survive across transactions/restarts rather than being query-scoped. | An annotated derivation is materialized and queryable without recompute. | Yes | After the bitemporal storage key lands (shares the memcomparable row format); that key is building now |
+| **R3** | **Retraction under MVCC / time-travel** — deleting a base fact updates derived tags. Absorptive semirings admit DRed-style incremental maintenance; non-idempotent ones force stratum recompute. **The TMS prize.** | "What did we believe, and why, as of time T" with derived annotations kept consistent under retraction. | Yes (hardest) | **Composes with bitemporality** — do not start before the `Reverse<i64>` storage-versioning key lands (Phase 2 engine half) |
+
+---
+
+## 5. R0 — the minimal first cut (detail)
+
+### R0a — confidence + relevance scoring (no `mnestic` engine change). Verified this session; the honest split is per-surface.
+
+_What "no engine change" means:_ `mnestic` already registers `min`/`max`/`min_cost`/`shortest` as **meet** aggregates usable in recursion (`aggr.rs:1172-1230`, all `is_meet=true`) and ships `ShortestPathBFS`/`Dijkstra`; and `mindgraph-rs` can issue an arbitrary recursive CozoScript through the `run_query` escape hatch (`cozo.rs:580`, reachable via `MindGraph::storage()` `graph.rs:144` / `AsyncMindGraph::inner()` `async_graph.rs:265`). So no `mnestic` change is needed. **But "the scores already exist, just surface them" is true for `/retrieve` and false for `/traverse`** — state it precisely (a literature-and-code-literate reviewer will check).
+
+- **`/retrieve` — already shipped (≈ zero net-new).** A relevance score rides every result: `SearchResult.score` (RRF-fused / cosine / BM25; `query.rs:58-65`, in-engine RRF at `cozo.rs:4295`, per-leg `explain` legs), and a per-node confidence on every node (`GraphNode.confidence`, `node.rs:18`). Surfacing "confidence + relevance" on retrieval is at most a labelling/exposure pass in the SDK response shape.
+- **`/traverse` — the real net-new work (more than plumbing).** All traversal is **fixed Rust BFS** (`traverse_reachable`, `cozo.rs:1687`) and `find_path` is **Rust parent-pointer backtracking** (`graph.rs:1269`) — no path-level cost or confidence today, and mindgraph issues *none* of `shortest`/`min_cost` (only `count()` and a flat `max(score)` in FTS fusion, which is **not** a recursive path fold). Two routes, both still no-`mnestic`-change:
+  - **Option A — Rust semiring fold (recommended for R0; genuine product plumbing).** (i) extend `query_neighbors_batch`'s projection to also return edge `weight` + `confidence` (`cozo.rs:1791`; it already conditionally selects `weight` at `:1803-1812`); (ii) accumulate `cost = Σ(−log weight)` [min-plus / relevance] and `conf = Π weight` (or `min`) [max-product / confidence] along the parent chain in `traverse_reachable` (`cozo.rs:1701/1730`); (iii) add `cost: f64` + `confidence: f64` to `PathStep` (`traversal.rs:62`) — the handler serializes it automatically (`handlers.rs:3212-3261`). ~2 functions + 1 struct; no engine, no Datalog.
+  - **Option B — faithful semiring CozoScript (the principled path; deferred).** A new `cozo.rs` method builds a recursive CozoScript over the engine's `min_cost`/`shortest`/`max` meet aggregates and runs it via `run_query` (`cozo.rs:580`) + a new `graph.rs`/`async_graph.rs` method (dispatched on the read pool, `async_graph.rs:721,734` — not raw). No `mnestic` change, but it is new Datalog, not plumbing; it earns its keep only when traverse needs true in-engine recursion or becomes the bridge to R0b custom algebras. §9 picks **A** for R0.
+
+(The worked max-prob example still holds: A→B→D / A→C→D, link probs 0.9/0.8/0.5/0.8 → `reach(A,D)=0.64` via A→C→D beating 0.45 — under Option A it's the Rust fold; under Option B the engine's `max`-as-⊕ with `p0*p1` as body-⊗.)
+
+### R0b — register a custom absorptive semiring (small, contained `mnestic` change). Mechanism verified this session.
+
+The lifetime worry is a **non-issue** (see §2): `parse_aggr`'s `&'static` is cloned to an owned `Aggregation` at `parse/query.rs:835` and stored by value. The change mirrors the existing `fixed_rules` runtime registry end-to-end:
+
+1. **`data/aggr.rs`** — add a const-`None` factory field to `Aggregation`: `meet_factory: Option<Arc<dyn Fn() -> Box<dyn MeetAggrObj> + Send + Sync>>` (the builtin `define_aggr!` const path stays byte-identical). Carry it through `Clone` (`aggr.rs:24-33`); in `meet_init` (`aggr.rs:1190`) prepend `if let Some(f) = &self.meet_factory { self.meet_op = Some(f()); return Ok(()); }` *before* the builtin name-match. Custom names: intern via `Box::leak` once per registration (bounded by registry size) to keep `name: &'static str`; a `Cow<'static, str>` migration is the cleaner-but-wider alternative.
+2. **`runtime/db.rs`** — add `custom_aggrs: Arc<ShardedLock<BTreeMap<String, RegisteredAggr>>>` to `Db` (`db.rs:97-124`), init alongside `fixed_rules` (`db.rs:301`), and add `register_custom_aggr`/`unregister_custom_aggr` cloned verbatim from `register_fixed_rule` (`db.rs:807-832`). `RegisteredAggr = { is_meet: bool, meet_factory: Arc<…> }`.
+3. **Parser threading** — add a `custom_aggrs: &BTreeMap<…>` param to `parse_script` (`parse/mod.rs:306`) → `parse_query` → `parse_rule_head_arg` (`query.rs:817-844`), exactly paralleling the `fixed_rules` param already threaded there; pass `&self.custom_aggrs.read().unwrap()` at the `db.rs:376` call site. At `query.rs:835`, try `parse_aggr` first (built-in fast path, untouched); on `None`, construct an owned `Aggregation { name: interned, is_meet: entry.is_meet, meet_op: None, meet_factory: Some(entry.factory.clone()), .. }`.
+
+**The recursion guard is then a free law-check.** The stratifier (`stratify.rs:53-59`, `:86-92`) and `aggr_kind` (`compile.rs:60-72`) read *only* the owned `is_meet` bool — a registered `is_meet=true` is indistinguishable from a builtin meet aggregate, so it rides `AggrKind::Meet` + the recursion guard with **zero** stratifier change, and `meet_put`/`merge_in` (`temp_store.rs:131/203`) call the factory-built op transparently. A user *asserts* `is_meet=true`; add a debug-mode idempotence probe (sample `update(a,a)` is a no-op) so a non-absorptive ⊕ registered as meet fails loudly rather than silently non-terminating. Registry is in-memory / `Db`-scoped — no tag or registry persistence (that is R2).
+
+**NOT in scope for R0:** top-k / any non-idempotent algebra; tag persistence; retraction; a surface-language syntax for declaring ⊗ (R0 keeps ⊗ as ordinary body arithmetic, exactly as `min_cost` does today); differentiable provenance (Scallop's neurosymbolic use case, not ours).
+
+---
+
+## 6. Hard subproblems (pressure-test)
+
+- **The `changed`-bit is only a *saturation* check, not a stop guarantee for non-idempotent tags.** It works for R0 because absorptive ⊕ monotonically converges. R1 top-k is non-idempotent (a better proof *displaces* a worse one; the tuple set stabilizes while the tag keeps improving) — it needs the engine to (a) truncate to k after every ⊕/⊗ and (b) use a real `○=` equivalence predicate, not "value changed." This is a new aggregate category, not a flag flip. **Verified hook points (so the estimate is credible):** the truncate-to-k lives inside the new aggregate's `MeetAggrObj::update` body — invoked at `meet_put` (`temp_store.rs:131`) and `merge_in` (`temp_store.rs:203`): merge `right` into `left`, sort/dedup by proof score, truncate to k, return the saturation-predicate bool. But it must **not** be `is_meet=true`: the existing meet path assumes an idempotent semilattice (`temp_store.rs:122` — "use the idempotency!") and the stratifier permit presumes monotone convergence. So add a third category — an `is_bounded_meet` flag + `AggrKind::BoundedMeet` (`compile.rs:60-72`), gated separately in `stratify.rs:57/90` — that reuses the `meet_put`/`merge_in`/`has_delta` plumbing (`eval.rs:291-300`) verbatim for efficiency but carries its own convergence guard (a Scallop-style saturation bound or a max-iteration cap). That trio — the truncating `update`, the delta→`has_delta` saturation route, and the `BoundedMeet` gate — is the entire new-aggregate-category build. Budget R1 as genuinely-new engine work.
+- **⊗ at the join vs. in the body.** R0 leaves ⊗ as body arithmetic. A "thread the tag as a column and apply ⊗ at the join itself" change (the note's option) is *optional* for cost/prob but *necessary* for top-k (so the engine owns truncation). Don't do the join-threading refactor until R1 forces it.
+- **Persistence (R2) touches the memcomparable encoding.** Tags-in-rows is a storage-format change that shares the bitemporal key's memcomparable row format and the same care bar. It builds on the same timeline as that key (now), sequenced after it lands.
+- **Retraction (R3) is the real engineering and it is coupled to bitemporality.** Deleting a base fact must update every derived annotation. This is the truth-maintenance-system problem; it shares the storage-versioning axis with the `Reverse<i64>` bitemporal key. Sequencing R3 before bitemporality would mean building the versioning substrate twice.
+- **Floating-point ⊕ associativity.** max-prob/min-plus over floats are associative enough for ranking but not bit-exact under reordering; semi-naive evaluation reorders. Fine for scoring, must be documented; matters if anyone treats the confidence as a calibrated probability (it is an *approximation*, per Scallop's own caveat about max-min-prob).
+
+---
+
+## 7. Out of scope / v1 limitations
+
+- Not a general provenance-of-results system (we are not reimplementing ProvSQL); the scope is *recursive aggregation annotations*, the thing our graph leg already does.
+- No differentiable/gradient provenance (Scallop's neurosymbolic training use case) — no current MindGraph pull.
+- No surface-language DDL for semirings in R0 (registration is a host-API call; a query-language syntax is a later, separate decision).
+- The confidence score is an *approximation* for ranking/triage, not a calibrated posterior. Say so wherever it surfaces.
+
+---
+
+## 8. Sequencing
+
+Semirings build now (2026-06-30). The order is pure technical sequencing, each step gated only by the one before it (or by a real storage dependency), not by adoption:
+
+- **R0a first** — product plumbing in `mindgraph-rs` / `mindgraph-server`, no engine change. Smallest first cut.
+- **R0b next** — the small, contained `parse_aggr` registry change in `mnestic/cozo-core`. Follows R0a.
+- **R1 after R0** — top-k proofs, the genuinely-new engine work (a new bounded/approximate-meet aggregate category). Follows R0 because it builds on the registration slot R0b lands.
+- **R2/R3 after the bitemporal storage key** — R2 (tag persistence) shares the bitemporal key's memcomparable row format, and R3 (retraction under MVCC/time-travel) shares the `Reverse<i64>` storage-versioning axis (`ROADMAP.md` Phase 2C #7 platform half + the Phase 2 engine storage-versioning half). That key is being built now on a parallel track; R2/R3 follow it so they compose with the versioning substrate rather than duplicating it.
+
+## 9. Resolved decisions (2026-06-30 — recommended, pending owner + Matthias review)
+
+Mirrors the engine spec's §13. Each adopts the spec's lean; the rationale is recorded so the call is auditable.
+
+1. **R0a surface → ship `/retrieve` exposure (free) + `/traverse` via Option A (Rust semiring fold).** Retrieve already returns relevance + node confidence; traverse gets a Rust min-plus / max-product fold over the BFS parent chain (no new Datalog, no `mnestic` change). Option B (faithful CozoScript over the engine's meet aggregates) is the principled path but **deferred** until traverse needs true in-engine recursion or becomes the bridge to R0b custom algebras.
+2. **`parse_aggr` `'static` lifetime → non-issue.** The ref is cloned to an owned `Aggregation` at parse time; R0b is a `meet_factory` field + a `Db.custom_aggrs` registry (mirroring `fixed_rules`), not a lifetime refactor. Custom names interned via `Box::leak` for R0; `Cow<'static, str>` migration deferred.
+3. **Registration API → host-API call, in-memory, `Db`-scoped.** `register_custom_aggr(name, is_meet=true, factory)` on `Db`/`MindGraph`; **no query-language DDL** for declaring semirings in R0 (a surface syntax is a later, separate decision). ⊗ stays ordinary body arithmetic in R0 (as `min_cost` does today) — no join-threading until R1 forces engine-owned truncation.
+4. **R1 top-k → a new `AggrKind::BoundedMeet` category, not `is_meet`.** Non-idempotent; gets its own convergence guard; do not shoehorn into the meet path. This is the single genuinely-new engine subsystem in the feature **and** the finance/audit differentiator Matthias most cares about — budget it as such, not as a flag flip.
+5. **Persistence/retraction (R2/R3) → after the bitemporal storage key.** A real storage-format / MVCC dependency (they share the `Reverse<i64>` memcomparable row format), not an adoption gate; that key is building now on the parallel bitemporality track (`mnestic/docs/specs/bitemporality.md`, §13.4).
+
+## SDK / wire ripple & definition of done (per phase)
+
+- **R0a:** server scoring option + response field; TS + Python retrieve/traverse types gain the optional score; MCP tool description note; cloud redeploy. Dashboard: optional surfacing of the score.
+- **R0b:** `mnestic` crate change (registry + `parse_aggr` fallback) → version bump + CHANGELOG-FORK entry; `mindgraph-rs` consumes it; no wire change unless exposed to SDK.
+- **Each phase, definition of done** (per `feedback_versioning`, `feedback_changelog_artifact_parity`): cargo test + clippy green; new tests + one live-corpus run; crate version bump + CHANGELOG; SDK/MCP/dashboard ripple shipped; cloud redeployed; registry/changelog parity verified.
+
+## Prior art
+
+- Green, Karvounarakis, Tannen — *Provenance Semirings* — PODS 2007 — the universal polynomial + homomorphism factoring.
+- Dannert, Grädel, Naaf, Tannen — *Semiring Provenance for Fixed-Point Logic* — CSL 2021 — the absorptive-⊕/fully-continuous conditions for recursion (the formal version of `is_meet`).
+- Li, Huang, Naik — *Scallop: A Language for Neurosymbolic Programming* — PLDI 2023 — pluggable provenance interface, generalized saturation check, top-k-proofs instance.
+- Senellart et al. — *ProvSQL* — VLDB 2018 — semiring provenance in a persistent DBMS (Postgres).
