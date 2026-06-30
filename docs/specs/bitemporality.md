@@ -1,6 +1,6 @@
 # Spec — Bitemporality
 
-_Status: **Design spec — proposed, not yet implemented** (2026-06-28). Companion to [`../../ROADMAP.md`](../../ROADMAP.md). Grounded in the current valid-time code (citations are `file:line` in `cozo-core/src/`)._
+_Status: **Design spec — build-now** (decisions resolved 2026-06-30; the build freeze was removed 2026-06-30, so this is active engine work, not deferred). Companion to [`../../ROADMAP.md`](../../ROADMAP.md) and the platform-side valid-time spec [`mindgraph/docs/plans/bitemporal-valid-time.md`]. Grounded in the current valid-time code (citations are `file:line` in `cozo-core/src/`). The five §11 open decisions are now resolved (recommended, pending owner sign-off) in §13; step 2 (the commit clock) has no §11 dependency and can start immediately._
 
 > **One-line goal.** Add an **engine-assigned transaction-time axis** alongside Cozo's existing valid-time axis, so a relation can answer **"what did the database *believe* at transaction-time T about valid-time V"** — opt-in per relation, zero cost for relations that don't use it, and degenerating to today's exact fast path at "now / now".
 
@@ -145,3 +145,20 @@ Each step is its own PR with a failing test first, CHANGELOG-FORK entry, and `ca
 - **SQL:2011 interval-column rewrites / interval-tree indexes** — wrong shape for a memcmp-keyed LSM store; reintroduce range-overlap complexity the skip-scan avoids. ❌
 - **Default-on bitemporality** — SQL Server measures 10–20% high-write overhead; opt-in keeps non-temporal relations at exactly zero. ❌
 - **Temporal path algebra / tri-temporal** — scope explosion; not pulled by any real need. ❌
+
+## 13. Resolutions (2026-06-30 — recommended, pending owner sign-off)
+
+The build freeze was removed 2026-06-30; this is now active engine work. The five §11 open decisions are resolved as below. Each adopts the spec's recommendation; the rationale and the rejected alternative are recorded so the decision is auditable. **Step 2 (the commit clock) depends on none of these** and can begin immediately; these gate **step 3** (schema opt-in) onward.
+
+1. **Opt-in surface → a named `TxTime` column type.** A relation becomes bitemporal by declaring a trailing `tt: TxTime` key column immediately after the `Validity` column (e.g. `:create belief {entity, v: Validity, tt: TxTime => value}`). The column is **engine-assigned**: supplying a value for it on `:put` is an error (mirrors a computed column). Reuses the existing `ColType`/index machinery (`data/relation.rs:84-103`). The user **names** the column (not engine-hidden) so `::history` can project it and binder errors can reference it.
+   _Rejected:_ a relation-level `bitemporal` flag (new grammar, less explicit, no natural `::history` projection name); reusing `Validity` with a second mode (overloads a stable, fast-path-critical type and risks the `@ "NOW"` single-seek encoding).
+
+2. **Transaction-time selector syntax → `@! <expr>`.** Optional, after `@`. `@! "NOW"` (default), `@! "END"` (earliest belief), numeric µs, or ISO-8601. Reads as "and-also-at"; the `!`-prefixed forms are unused in relation-access position → low grammar-collision risk.
+   _Rejected:_ `@@` (visually ambiguous against `@`); `@tx` (consumes an identifier that can collide with a column/var name).
+
+3. **Bulk path (`import_relations`/`batch_put`) → stamp one tt per batch.** A bulk import is treated as a single belief event: all rows in the batch share one engine-assigned tt (captured once at batch commit). The bulk path still **rejects any user-supplied tt** and must document that it bypasses per-row vt defaulting. If a high-contention bitemporal bulk-write path ever appears, batch the high-water-mark persist (heed the 0.8.4 `avgdl` shared-hot-key lesson, §5).
+   _Rejected:_ hard-rejecting bitemporal relations from the bulk path (too limiting for backfills/restores, which are exactly belief-bulk events).
+
+4. **Relationship to MindGraph's tombstones/supersession → compose, do not collapse (for now).** The engine ships the **mechanism** (bitemporal tt). MindGraph continues to use its own **app-level tombstones + valid-time-oriented `Supersedes`** (the platform-side work specced in `mindgraph/docs/plans/bitemporal-valid-time.md`) and does **not** adopt engine tt as its supersession mechanism in this round. The two are **orthogonal axes**, not a stack: platform supersession/valid-time is *assertion-level cognitive lineage* ("when was the fact true in the world / which assertion wins"); engine tt is *storage-level versioning* ("what did the store believe at commit-time T"). A later unification — MindGraph's `node`/`edge` relations becoming engine-bitemporal so retraction + time-travel ride tt — is possible but **deferred**; the first concrete consumer that would pull it is **provenance-semirings R3** (retraction/TMS shares this storage axis). **Not a blocker** for engine steps 2–6.
+
+5. **Event-time → confirmed out of scope.** Two axes only (vt = true-in-world, tt = known-to-DB). "When the real-world event occurred" stays a domain column (MindGraph's `Claim.event_date`, entity birth/death/founded dates), never a third temporal axis. No tri-temporal (consistent with the "default-on versioning rejected" discipline, §4).
