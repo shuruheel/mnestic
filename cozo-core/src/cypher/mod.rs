@@ -13,9 +13,10 @@
 //! native, full-power language; this is a read-only on-ramp (no write clauses).
 //! Design, scope, and the settled decisions are in `docs/specs/cypher-read.md`.
 //!
-//! Status: **step 2 — schema types + grammar + parser**. The translator
-//! (Cypher AST -> CozoScript string) and the `run_cypher` entry point land in
-//! later steps; the parser is exercised by its own unit tests for now.
+//! Status: **shipped (0.9.0, alpha)** behind the off-by-default `cypher`
+//! feature — parser, translator, and the `DbInstance::run_cypher` /
+//! `cypher_to_script` entry points (in `src/lib.rs`) are all live. See the
+//! spec's §10 step log; flip-default-on criteria are in §10 step 6.
 
 mod ast;
 mod parse;

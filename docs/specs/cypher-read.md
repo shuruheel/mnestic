@@ -4,6 +4,43 @@ _Status: **Shipped in 0.9.0 — alpha, behind the off-by-default `cypher` Cargo 
 
 > **One-line goal.** Let a developer query mnestic with a **read-only subset of openCypher** that the engine translates to CozoScript and runs — so the engine is easy to *evaluate and adopt* without first learning Datalog. Datalog stays the native, full-power language; Cypher is an on-ramp. **No write clauses** (CREATE/MERGE/SET/DELETE) — read interop only; write support is explicitly out of scope.
 
+## Quick start (alpha — build with the `cypher` feature)
+
+```toml
+# Cargo.toml — the published crate ships the feature off by default
+cozo = { package = "mnestic", version = "0.9", features = ["cypher"] }
+```
+
+```rust
+use cozo::{DbInstance, CypherGraphSchema, NodeMap, EdgeMap, DataValue};
+use std::collections::BTreeMap;
+
+let db = DbInstance::new("mem", "", Default::default())?;
+// :create person {id => name, age}; :create knows {fr, to} — then:
+let schema = CypherGraphSchema {
+    nodes: vec![NodeMap { label: "Person".into(), relation: "person".into(),
+                          id_col: "id".into(), label_col: None, label_value: None, filter: None }],
+    edges: vec![EdgeMap { rel_type: "KNOWS".into(), relation: "knows".into(),
+                          from_col: "fr".into(), to_col: "to".into(),
+                          type_col: None, type_value: None, eid_col: None, filter: None }],
+};
+let rows = db.run_cypher(
+    "MATCH (a:Person)-[:KNOWS]->(b:Person) WHERE a.age > $min RETURN b.name AS name",
+    &schema,
+    BTreeMap::from([("min".to_string(), DataValue::from(30))]),
+)?;
+// inspect the generated CozoScript instead of running it:
+let cs = db.cypher_to_script("MATCH (a:Person) RETURN a.name", &schema)?;
+```
+
+Python (wheel must be built with the feature — the default published wheel omits it): `maturin build --features cypher,compact`, then `db.run_cypher(query, schema_dict, params)` with `schema_dict` shaped like the struct above (`{"nodes": [{"label": …, "relation": …, "id_col": …}], "edges": [...]}`).
+
+### Error surface (which layer rejects what)
+
+- **Parse errors** — everything outside the v1 grammar fails in `parse.rs` before any schema is consulted: `WITH`, `OPTIONAL MATCH`, `CALL`, variable-length paths `[*m..n]`, `shortestPath`, and every write clause (`CREATE`/`MERGE`/`SET`/`DELETE`) are parse errors by omission.
+- **Translate errors** — grammatical Cypher the v1 translator refuses, each with a targeted message: undirected relationships (`translate.rs:647`); a schema `filter` set on any map (`reserved and not yet implemented in v1`, `translate.rs:1083-1086`); unknown labels/relationship types; unlabeled nodes without a shared/default relation (`label required`); Cypher variables or user params colliding with the reserved `cy_`/`cyp_`/`cphr_` namespaces.
+- **Run errors** — whatever the engine raises against the generated script; these can mention generated names (`cy_match`, `cyp_3`) — use `cypher_to_script` to see the script they refer to.
+
 ## 1. Goals & non-goals
 
 **Goals:** remove the "it only speaks Datalog" evaluation objection; occupy the "embedded + Cypher-readable + agent-memory-native" position vacated by Kùzu's archival; ship the high-value 80/20 read subset with correct `count(*)`/`LIMIT` and injection safety.
@@ -15,16 +52,16 @@ _Status: **Shipped in 0.9.0 — alpha, behind the off-by-default `cypher` Cargo 
 The proven pattern in this codebase (`runtime/hybrid.rs`, the `HybridSearch` builder) is: **a typed request → assemble a CozoScript *string* → pass literal values as query params (never string-interpolated) → validate every interpolated identifier → run via the normal query path, and expose the generated script for inspection.** The Cypher surface is the same shape:
 
 - **Translate Cypher AST → a CozoScript source string**, not to the engine's internal AST. Rationale: the string path is fully inspectable/testable, and it decouples the Cypher layer from internal compiler types that are deliberately not `Clone`/stable, so the surface avoids coupling to them. The translated script then runs through the existing, optimized query pipeline for free.
-- **Run via `run_script_read_only`** (`runtime/db.rs:470`). Because the surface is read-only, routing through the read-only entry means *the engine itself rejects any mutation* even if a translation bug emitted one — defense in depth, and it picks up the snapshot read path (0.8.5) automatically.
-- **Injection safety (non-negotiable, copy `hybrid.rs`'s discipline):** every Cypher *literal* becomes a CozoScript **param** (`$p0`, `$p1`, … in the `params` map `run_script` already accepts); every *identifier* that gets interpolated (relation/column names from the property-graph schema, fusion-style tags) is **validated as a bare identifier** via `miette::ensure` before it touches the string. No user value is ever concatenated into the script.
-- **Module:** new `cozo-core/src/cypher/` — `mod.rs` (schema types + public `run_cypher` / `cypher_to_script`), `parse.rs` (pest → Cypher AST), `translate.rs` (AST → CozoScript string). Behind a **`cypher` cargo feature** (see §11, decision 5).
+- **Run read-only.** `run_cypher` executes via `run_script(.., ScriptMutability::Immutable)` (`lib.rs:270`) — the same read-only path as `run_script_read_only` (`runtime/db.rs:470`). Because the surface is read-only, the engine itself rejects any mutation even if a translation bug emitted one — defense in depth, and it picks up the snapshot read path (0.8.5) automatically.
+- **Injection safety (non-negotiable, copy `hybrid.rs`'s discipline):** every Cypher *literal* becomes a CozoScript **param** (`$cphr_0`, `$cphr_1`, … — a reserved namespace — in the `params` map `run_script` already accepts); every *identifier* that gets interpolated (relation/column names from the property-graph schema, fusion-style tags) is **validated as a bare identifier** via `miette::ensure` before it touches the string. No user value is ever concatenated into the script.
+- **Module:** `cozo-core/src/cypher/` — `mod.rs` (glue: `build_cypher_script`, re-exports), `schema.rs` (schema types, re-exported at crate root: `cozo::{CypherGraphSchema, NodeMap, EdgeMap}`, `lib.rs:71`), `ast.rs`, `cypher.pest`, `parse.rs` (pest → Cypher AST), `translate.rs` (AST → CozoScript string; tests in `translate/tests.rs`). The public `run_cypher` / `cypher_to_script` are `impl DbInstance` in `cozo-core/src/lib.rs:255/:282`. Behind the **`cypher` cargo feature** (see §11, decision 5).
 
 ```text
 run_cypher(query, schema, params)
   └─ parse.rs:  Cypher text ──pest──▶ Cypher AST
   └─ translate.rs: AST + schema ──▶ CozoScript string  (+ params map, validated idents)
-  └─ db.rs:    run_script_read_only(script, params) ──▶ NamedRows
-  └─ mod.rs:   column-projection adapter ──▶ user-visible NamedRows
+  └─ lib.rs:   run_script(script, params, Immutable) ──▶ NamedRows
+  └─ lib.rs:   truncate rows to the RETURN columns ──▶ user-visible NamedRows
 ```
 
 ## 3. The property-graph schema (decision 1 — the crux)
@@ -46,7 +83,8 @@ pub struct NodeMap {
     pub label_value: Option<DataValue>, // value to match in label_col (default: the label string)
     pub filter: Option<String>,   // optional always-ANDed CozoScript predicate over this relation's
                                   // columns (e.g. a soft-delete guard) — a general mechanism, no
-                                  // cognitive vocabulary; lets shared relations exclude dead rows
+                                  // cognitive vocabulary; lets shared relations exclude dead rows.
+                                  // v1: RESERVED — the translator errors if set (§10 step 3, §12)
     // remaining columns are addressable as properties (a.name → the `name` column)
 }
 pub struct EdgeMap {
@@ -58,6 +96,7 @@ pub struct EdgeMap {
     pub type_value: Option<DataValue>,// value to match in type_col (default: the rel_type string)
     pub eid_col: Option<String>,  // explicit edge identity (e.g. a reified edge "uid"); see §6
     pub filter: Option<String>,   // optional always-ANDed predicate (soft-delete guard, etc.)
+                                  // v1: RESERVED — the translator errors if set (§10 step 3, §12)
 }
 ```
 
@@ -77,11 +116,11 @@ For node label `L` → `NodeMap{relation, id_col}` and relationship type `T` →
 | Cypher | CozoScript | Notes |
 |---|---|---|
 | `(a:Person)` — relation-per-label | `*person{id: a}` | label → relation; binds the id var. Named-relation access (`relation_named_apply`, grammar :88). |
-| `(a:Person)` — shared relation | `*node{uid: a, node_type: $pL}` | label → discriminator param (`$pL = "Person"`); hits `node:type_idx` + #1. |
+| `(a:Person)` — shared relation | `*node{uid: a, node_type: $cphr_0}` | label → discriminator param (`$cphr_0 = "Person"`); hits `node:type_idx` + #1. |
 | `(a:Person)-[r:KNOWS]->(b:Person)` | `*person{id: a}, *knows{fr: a, to: b}, *person{id: b}` | each label/type = one atom; relationship binds endpoints. `r` binds to the edge identity (see §6). |
 | `a.age` (property) | bind the column: `*person{id: a, age: a_age}` → use `a_age` | property access = column binding, **not** the `->` op (that's Json access). |
 | `WHERE a.age > 30` | `a_age > 30` (filter atom) | comparison/boolean/`IN`/`IS NULL`/`STARTS WITH`/`CONTAINS` → expr atoms. |
-| `WHERE a.name = 'Bob'` | `*person{id: a, name: $p0}` (param) | constant equality pushed into the relation access → **indexed lookup via #1**. Literal `'Bob'` → param `$p0`. |
+| `WHERE a.name = 'Bob'` | `*person{id: a, name: $cphr_0}` (param) | constant equality pushed into the relation access → **indexed lookup via #1**. Literal `'Bob'` → param `$cphr_0`. |
 | `RETURN e1, e2` | head of the final `?[…]` rule | projection (see §5 for bag vs DISTINCT). |
 | `RETURN DISTINCT …` | set-semantics head (no binding key) | Datalog set dedup = DISTINCT. |
 | `count(*)`, `collect(x)`, `sum`/`avg`/`min`/`max` | head aggregate `?[k, count(a)]` (grammar `aggr_arg` :75) | implicit group-by = the non-aggregating RETURN columns. **`count` counts rows with multiplicity** (`aggr.rs:423-434`, *not* `count_unique`) → bag-correct given a per-binding input. |
@@ -100,43 +139,45 @@ LIMIT 10
 with schema `Person→person{id => name, age}`, `KNOWS→knows{fr, to}` translates to:
 
 ```
-_match[a, b, b_name] := *person{id: a, age: a_age}, a_age > 30,
-                        *knows{fr: a, to: b},
-                        *person{id: b, name: b_name}
-counted[b_name, count(a)] := _match[a, b, b_name]
-?[name, c] := counted[name, c]
+cy_match[a, b, b_name] := *person{id: a, age: a_age}, a_age > 30,
+                          *knows{fr: a, to: b},
+                          *person{id: b, name: b_name}
+cy_agg[b_name, count(a)] := cy_match[a, b, b_name]
+?[name, c] := cy_agg[name, c]
 :order -c
 :limit 10
 ```
 
-The aggregation rule (`counted`) feeds `count` a per-binding relation (`_match` is a *set* of distinct `(a, b, b_name)` bindings, so `count(a)` per `b_name`-group = the true Cypher row count); a final projection rule binds plain vars so `:order`/`:limit` can name them.
+The aggregation rule (`cy_agg`) feeds `count` a per-binding relation (`cy_match` is a *set* of distinct `(a, b, b_name)` bindings, so `count(a)` per `b_name`-group = the true Cypher row count); a final projection rule binds plain vars so `:order`/`:limit` can name them.
+
+> Worked examples are lightly simplified for readability: the shipped translator's property vars are opaque injective `cyp_N` (a step-5 hardening fix — not `a_age`-style names), ORDER-BY aliases are `cy_ret_N`, and every literal is a `$cphr_N` param. Inspect real output with `cypher_to_script`.
 
 ### Same query against a shared-relation (MindGraph) schema
 
 With `Person → node{uid => node_type, name, age}` (`label_col="node_type"`) and `KNOWS → edge{uid => from_uid, to_uid, edge_type}` (`type_col="edge_type"`, `eid_col="uid"`), the *same* Cypher translates to:
 
 ```
-_match[a, r, b, b_name] := *node{uid: a, node_type: $p0, age: a_age}, a_age > 30,
-                           *edge{uid: r, from_uid: a, to_uid: b, edge_type: $p1},
-                           *node{uid: b, node_type: $p0, name: b_name}
-counted[b_name, count(a)] := _match[a, r, b, b_name]
-?[name, c] := counted[name, c]
+cy_match[a, r, b, b_name] := *node{uid: a, node_type: $cphr_0, age: a_age}, a_age > 30,
+                             *edge{uid: r, from_uid: a, to_uid: b, edge_type: $cphr_1},
+                             *node{uid: b, node_type: $cphr_0, name: b_name}
+cy_agg[b_name, count(a)] := cy_match[a, r, b, b_name]
+?[name, c] := cy_agg[name, c]
 :order -c
 :limit 10
 ```
 
-with params `$p0 = "Person"`, `$p1 = "KNOWS"`. Discriminators are params (indexed via `node:type_idx`/`edge:type_idx` + #1); the reified edge's identity is `r` (its `uid`), so edge-isomorphism disequalities are over `r`. Only `label_col`/`type_col`/`eid_col` differ from the relation-per-label example — same translator, same bag/aggregation handling. (A real MindGraph schema would also set `filter: "tombstone_at == 0.0"` to exclude soft-deleted rows — a general predicate the engine ANDs in without knowing what a "tombstone" is.)
+with params `$cphr_0 = "Person"`, `$cphr_1 = "KNOWS"`. Discriminators are params (indexed via `node:type_idx`/`edge:type_idx` + #1); the reified edge's identity is `r` (its `uid`), so edge-isomorphism disequalities are over `r`. Only `label_col`/`type_col`/`eid_col` differ from the relation-per-label example — same translator, same bag/aggregation handling. (A real MindGraph schema will also want `filter: "tombstone_at == 0.0"` to exclude soft-deleted rows — but the `filter` field is **reserved and unimplemented in v1**: the translator errors if it is set, and soft-deleted rows are returned until it lands (§12 v1.x). The predicate stays a general mechanism — the engine will AND it in without knowing what a "tombstone" is.)
 
 ## 5. Bag-vs-set semantics (decision 3)
 
-Cypher tables are **multisets** (duplicates accumulate; removed only by `DISTINCT`/`UNION`); Datalog is set-semantics. A naïve translation silently drops duplicates and corrupts `count(*)`/`LIMIT`. **Recommendation: preserve true bag semantics** via the binding tuple as row identity:
+Cypher tables are **multisets** (duplicates accumulate; removed only by `DISTINCT`/`UNION`); Datalog is set-semantics. A naïve translation silently drops duplicates and corrupts `count(*)`/`LIMIT`. **v1 preserves true bag semantics** via the binding tuple as row identity:
 
 - The intermediate `_match` rule carries **all bound variables** (every node id, every relationship identity, every returned property var). Because `_match` is a *set* of distinct full bindings, its cardinality equals the Cypher bag size.
 - **Non-DISTINCT `RETURN`** (no aggregation): the final `?[…]` head includes the RETURN expressions **plus the binding key** (hidden columns), so per-binding multiplicity survives; `:order`/`:limit` operate over the correctly-multiplied rows; the **NamedRows adapter projects to just the user-visible columns**. (Ordering ties broken by the hidden key — fine; Cypher leaves ties unspecified.)
 - **`RETURN DISTINCT`**: head = RETURN columns only → Datalog set dedup = DISTINCT.
 - **Aggregation**: feed the aggregate the per-binding `_match` (so `count` — which doesn't dedup — is correct); group-by = non-aggregating RETURN columns.
 
-Simpler documented fallback (decision 3): **default everything to `RETURN DISTINCT` set semantics** (Raqlet's pragmatic choice). Cheaper, but `count(*)`/`LIMIT` then differ from real Cypher — which is exactly what evaluators check, so the recommendation is to do the binding-key approach.
+The simpler fallback — defaulting everything to `RETURN DISTINCT` set semantics (Raqlet's pragmatic choice) — was rejected (decision 3): `count(*)`/`LIMIT` would then differ from real Cypher, which is exactly what evaluators check.
 
 ## 6. Edge-isomorphism, null / 3-valued logic
 
@@ -159,17 +200,18 @@ impl DbInstance {
 ```
 
 - **Python binding** (`cozo-lib-python`): expose `run_cypher(query, schema_dict, params)` so the wheel + `langchain-mnestic` can use it (same way `hybrid_search` gained `graph_legs`) (behind the `cypher` feature; the default published wheel does not include it — build with `--features cypher`).
+- **Reserved namespaces (step-5 hardening, user-visible):** user `params` keys starting with `cphr_` are rejected (`lib.rs:261-265`, `translate.rs:783`), and Cypher variable names colliding with the generated namespace (`cy_match`, `cy_agg`, `cy_ret_N`, `cyp_N`) are rejected with a clear error.
 - **Schema delivery (decision 2):** per-call `CypherGraphSchema` in v1 (simplest). A *registered/persisted* graph view (define once, query by name) is a v2 convenience.
 
 ## 8. Grammar choice (decision 4)
 
-**Recommendation: a hand-written `cypher.pest`** (a new pest grammar for the v1 subset), parsed with the engine's existing pest infrastructure. Rationale: the whole engine is `pest`-based (`cozoscript.pest`); the v1 subset grammar is small; no new heavy dependency or build step. Use **Kùzu's MIT `Cypher.g4`** and the **openCypher Apache-2.0 grammar** as *reference* for getting productions right, and the **openCypher TCK** as the conformance gate.
+**Shipped: a hand-written `cypher.pest`** (the v1 subset grammar), parsed with the engine's existing pest infrastructure. Rationale: the whole engine is `pest`-based (`cozoscript.pest`); the v1 subset grammar is small; no new heavy dependency or build step. Use **Kùzu's MIT `Cypher.g4`** and the **openCypher Apache-2.0 grammar** as *reference* for getting productions right, and the **openCypher TCK** as the conformance gate.
 
 **Rejected:** vendoring an ANTLR grammar + `antlr-rust` runtime — pulls a Java codegen build step and a less-mature runtime into a lean embedded engine; the generated openCypher `.g4` also has known correctness bugs. (See research doc §1.)
 
 ## 9. Testing
 
-- **Backend: SQLite + `tempfile::tempdir()`** for execution tests (the stored/scan path differs from the `mem` backend).
+- **Backend — policy vs shipped reality:** the policy is SQLite + `tempfile::tempdir()` for execution tests (the stored/scan path differs from the `mem` backend — the repo's own gotcha), but the shipped execution tests run on `mem`. Translated scripts are single-block, non-recursive reads, so the divergence risk is low — still, add SQLite-backed execution tests before default-on (§12 v1.x).
 - **Golden translation tests** on `cypher_to_script` — assert exact CozoScript output for each subset feature (the core correctness surface; fast, no execution).
 - **openCypher TCK subset** — vendor the Apache-2.0 `.feature` files for `clauses/match`, `clauses/return` (and `clauses/with` when WITH lands), with attribution; gate CI on the shippable subset. (Real engines do this — ArcadeDB self-reports 97.8%.)
 - **Correctness traps**: bag fidelity (`count(*)` and `LIMIT` match Cypher on a graph with duplicate paths); edge-isomorphism (a triangle doesn't match the same edge twice); null/3VL (`WHERE` excludes null); injection (literals are params, hostile relation/column names rejected).
@@ -181,7 +223,7 @@ impl DbInstance {
 3. **Translator `cypher_to_script`** (AST + schema → CozoScript string + params). — ✅ done (2026-06-27). `translate.rs`: both schema conventions, WHERE/RETURN/DISTINCT/aggregates, inline-prop filters → keyed lookups, edge-isomorphism (eid or best-effort), bag fidelity via hidden binding-key, ORDER/SKIP/LIMIT → native epilogue. 8 tests incl. **end-to-end execution** against an in-memory DB (relation-per-label, MindGraph shared-relation, count, bag-vs-distinct) — the generated CozoScript runs and returns correct rows. Returns `CypherScript { script, params, out_columns }`. Deferred with clear errors: undirected rels, the schema `filter` field. *(Total cypher tests: 15 green; clippy clean.)*
 4. **`run_cypher`** → run read-only + NamedRows column-projection adapter. — ✅ done (2026-06-27). `DbInstance::run_cypher(query, schema, params)` and `DbInstance::cypher_to_script(query, schema)` (mirrors `hybrid_search`/`hybrid_search_script`): parse → translate → merge user `$params` with generated literal params → `run_script(.., Immutable)` → truncate each row to the RETURN columns and set headers. 3 entry tests (projection + column naming, user-param passthrough, script inspection). *(21 cypher tests green; clippy clean default + `--features cypher`.)*
 5. **Adversarial review + conformance hardening.** — ✅ done (2026-06-28). An internal hardening review landed the must-fix and should-fix items: **null-aware WHERE (3VL)** so a null operand drops the row instead of aborting the query; **injective `cyp_N` prop vars**; **aggregate null-skipping** (sum/avg no longer abort); **no duplicate `id_col` binding** (RETURN/WHERE on the id column works); **structural bag-key**; **type-discriminator in edge-iso**; **binding validation** with clear errors; **reserved generated-namespace** rejection; **param-collision** rejection; **unicode/control escapes**; recursive `expr_eq`. 26 conformance-derived tests encoded (34 cypher tests total green; clippy clean both gates). *Known divergence:* `sum` over an integer column returns a float (engine accumulator is f64). *(TCK Gherkin vendoring deferred — the conformance cases are encoded directly as Rust tests.)*
-6. **Python binding + docs.** — ✅ done (2026-06-28). `cozo-lib-python`: a `cypher = ["cozo/cypher"]` feature + a gated `run_cypher(query, schema_dict, params)` pymethod (`py_to_cypher_schema` mirrors `py_to_hybrid_search`); compiles under `--features cypher,compact`. README "Status" section points to this spec; the spec is the design doc. **Flip default-on: deferred** — the feature is alpha (just review-hardened, no production soak, no real users). Keep it feature-gated (core + wheel) until it has real usage; the criteria to flip default-on: ≥1 real consumer exercising it + a clean soak, at which point it earns a CHANGELOG-FORK entry + README highlight in the release that turns it on.
+6. **Python binding + docs.** — ✅ done (2026-06-28). `cozo-lib-python`: a `cypher = ["cozo/cypher"]` feature + a gated `run_cypher(query, schema_dict, params)` pymethod (`py_to_cypher_schema` mirrors `py_to_hybrid_search`); compiles under `--features cypher,compact`. README "Status" section points to this spec; the spec is the design doc. **Flip default-on: deferred** — the feature is alpha (just review-hardened, no production soak, no real users). Keep it feature-gated (core + wheel) until it has real usage. **Flip criteria (supersedes decision 5's TCK-gate wording — TCK vendoring was deferred in step 5):** ≥1 real consumer (mindgraph-rs or external) running `run_cypher` in CI or production for ≥4 weeks with zero correctness bugs, **and** the §12 v1.x items landed (schema `filter`, SQLite execution tests). The flipping release gets the CHANGELOG-FORK entry + README highlight.
 
 Each step: failing test first, CHANGELOG-FORK entry, `cargo test -p mnestic --lib` green. Steps 3–4 are the substance.
 
@@ -191,14 +233,18 @@ Each step: failing test first, CHANGELOG-FORK entry, `cargo test -p mnestic --li
 2. **Schema delivery — per-call `CypherGraphSchema` in v1.** A registered/named persisted graph view is an additive v2 convenience (more motivated now that a MindGraph schema is large); auto-derivation from relation metadata is a later ergonomic. API designed so a named view is additive (no breaking change).
 3. **Bag vs set — preserve true bag semantics** (binding-key row identity; `count` verified non-deduping). `RETURN DISTINCT` → set dedup. Correct `count(*)`/`LIMIT` is what evaluators check, so the cost is justified.
 4. **Grammar — hand-written `cypher.pest` subset**, reusing cozo's existing pest + operator-precedence (Pratt) machinery for WHERE expressions (lowers divergence risk). Kùzu MIT `.g4` + openCypher grammar as reference; openCypher TCK as the CI gate. `antlr-rust` rejected (heavy/immature dep + Java codegen step in a lean engine).
-5. **Feature gating — `cypher` cargo feature, off by default during alpha**, flipped default-on once the v1 subset passes the TCK gate; revisit removing the gate entirely (always-on, no new deps) at 1.0.
+5. **Feature gating — `cypher` cargo feature, off by default during alpha.** *(The original "flip once the TCK gate passes" clause is superseded — TCK vendoring was deferred in step 5; the operative flip criteria live in §10 step 6.)* Revisit removing the gate entirely (always-on, no new deps) at 1.0.
 6. **Edge identity — `eid_col` when provided** (e.g. MindGraph's reified edge `uid`), else `(from_col, to_col)` + `type_col` for shared relations (= the edge relation's key tuple). Parallel-edge relations must set `eid_col` (documented limitation). Auto-deriving identity from relation key metadata is a v2 robustness improvement (kept out of v1 to keep `cypher_to_script` pure/tx-free).
 
-## 12. v1 scope (ship / defer) — from the research 80/20
+## 12. v1 scope — shipped / deferred (the post-ship authoritative list)
 
-**Ship:** `MATCH` single node + fixed-length pattern `(a:A)-[:R]->(b:B)` with labels + inline property maps; `WHERE` (comparison, boolean, `IN`, `IS NULL`/`IS NOT NULL`, `STARTS WITH`/`CONTAINS`); `RETURN` with projection, aliases, `DISTINCT`; `ORDER BY`/`SKIP`/`LIMIT`; multi-hop fixed-length chains; basic aggregation (`count`/`collect`/`sum`/`avg`/`min`/`max`) with implicit grouping.
+**Shipped:** `MATCH` single node + fixed-length pattern `(a:A)-[:R]->(b:B)` (directed patterns only) with labels + inline property maps; `WHERE` (comparison, boolean, `IN`, `IS NULL`/`IS NOT NULL`, `STARTS WITH`/`CONTAINS`); `RETURN` with projection, aliases, `DISTINCT`; `ORDER BY`/`SKIP`/`LIMIT`; multi-hop fixed-length chains; basic aggregation (`count`/`collect`/`sum`/`avg`/`min`/`max`) with implicit grouping.
 
-**Defer:** variable-length/recursive paths `[*m..n]`, `shortestPath` (where Datalog *wins* — a later differentiator showcase, not an on-ramp gap); `OPTIONAL MATCH`; complex multi-stage `WITH`; `CALL`/procedures; all write clauses.
+**Deferred:** variable-length/recursive paths `[*m..n]`, `shortestPath` (where Datalog *wins* — a later differentiator showcase, not an on-ramp gap); `OPTIONAL MATCH`; complex multi-stage `WITH`; `CALL`/procedures; all write clauses; **undirected relationships** (parsed, rejected by the translator, `translate.rs:647`); **the schema `filter` field** (reserved, errors if set).
+
+**v1.x — required before default-on:** the schema `filter` field (MindGraph, the primary consumer, needs a soft-delete guard on every query — today tombstoned rows are returned); SQLite-backed execution tests (§9).
+
+**Known divergences (shipped as-is, documented):** `sum` over an integer column returns a float (engine accumulator is f64); parallel edges are indistinguishable unless the `EdgeMap` sets `eid_col` (§6).
 
 **Two non-negotiables even in v1:** enforce edge-isomorphism (§6); decide and document the bag-vs-set policy (§5).
 
