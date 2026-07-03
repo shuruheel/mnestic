@@ -7,6 +7,7 @@
  */
 
 pub(crate) mod aggr;
+pub(crate) mod bitemporal;
 pub(crate) mod expr;
 pub mod functions;
 pub(crate) mod json;

@@ -146,7 +146,7 @@ impl<'a> SessionTx<'a> {
             )
         {
             #[derive(Debug, Error, Diagnostic)]
-            #[error("{0:?} is not yet supported on TxTime relation {1}: it requires the as-of read path (bitemporality step 4)")]
+            #[error("{0:?} is not yet supported on TxTime relation {1}: existence-checking writes land as bitemporality step 4c")]
             #[diagnostic(
                 code(eval::txtime_op_needs_reads),
                 help("use :put (corrections are new rows) or :rm")
@@ -1022,7 +1022,7 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         if is_insert {
             #[derive(Debug, Error, Diagnostic)]
-            #[error(":insert on TxTime relation {0} requires the as-of read path (bitemporality step 4)")]
+            #[error(":insert on TxTime relation {0} lands as bitemporality step 4c")]
             #[diagnostic(code(eval::txtime_op_needs_reads), help("use :put"))]
             struct TxTimeInsert(String);
             bail!(TxTimeInsert(relation_store.name.to_string()));
@@ -1140,7 +1140,7 @@ impl<'a> SessionTx<'a> {
             #[error(":rm on bitemporal relation {0}: removal is a valid-time statement there")]
             #[diagnostic(
                 code(eval::txtime_rm_bitemporal),
-                help("record a cessation with `:put` and vt = \"RETRACT\" (a retraction row); the :rm remap lands with the read path (step 4)")
+                help("record a cessation with `:put` and vt = \"RETRACT\" (a retraction row); the :rm remap lands as bitemporality step 4c")
             )]
             struct TxTimeRmBitemporal(String);
             bail!(TxTimeRmBitemporal(relation_store.name.to_string()));

@@ -91,9 +91,17 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
                 })?;
                 Box::new(store.all_iter().map(|t| Ok(t.into_tuple())))
             }
-            MagicFixedRuleRuleArg::Stored { name, valid_at, .. } => {
+            MagicFixedRuleRuleArg::Stored {
+                name,
+                valid_at,
+                tx_valid_at,
+                ..
+            } => {
                 let relation = self.tx.get_relation(name, false)?;
-                if let Some(valid_at) = valid_at {
+                if let Some(tt) = tx_valid_at {
+                    // bitemporal input (mnestic fork, 4b): two-level scan
+                    Box::new(relation.bitemporal_scan_all(self.tx, *valid_at, *tt))
+                } else if let Some(valid_at) = valid_at {
                     Box::new(relation.skip_scan_all(self.tx, *valid_at))
                 } else {
                     Box::new(relation.scan_all(self.tx))
@@ -111,10 +119,18 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
                 let t = vec![prefix.clone()];
                 Box::new(store.prefix_iter(&t).map(|t| Ok(t.into_tuple())))
             }
-            MagicFixedRuleRuleArg::Stored { name, valid_at, .. } => {
+            MagicFixedRuleRuleArg::Stored {
+                name,
+                valid_at,
+                tx_valid_at,
+                ..
+            } => {
                 let relation = self.tx.get_relation(name, false)?;
                 let t = vec![prefix.clone()];
-                if let Some(valid_at) = valid_at {
+                if let Some(tt) = tx_valid_at {
+                    // bitemporal input (mnestic fork, 4b): two-level scan
+                    Box::new(relation.bitemporal_scan_prefix(self.tx, &t, *valid_at, *tt))
+                } else if let Some(valid_at) = valid_at {
                     Box::new(relation.skip_scan_prefix(self.tx, &t, *valid_at))
                 } else {
                     Box::new(relation.scan_prefix(self.tx, &t))

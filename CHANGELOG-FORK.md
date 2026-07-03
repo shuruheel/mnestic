@@ -5,6 +5,42 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — bitemporal reads complete: the two-level (vt, tt) resolution (bitemporality step 4b)
+- **Bitemporal relations are now fully readable.** The §3 resolution algorithm
+  is live: per key, vt-groups are walked newest-first from the selected valid
+  time, each group resolved to its greatest `tt ≤ T` belief **across both
+  is_assert runs** (a later-recorded cessation at the same vt is never
+  shadowed by the assert run); assertions answer, retractions mean
+  believed-deleted (no shine-through), empty-at-T groups fall through; equal
+  `(vt, tt)` ties resolve to the assertion. All four §4 selector forms work:
+  bare scan = every vt record at current belief (retract rows included — the
+  migration invariant: a vt relation's results are unchanged by adding
+  `tt: TxTime`, pinned comparatively); `@ V` = the belief now about V;
+  `@ (tt: T)` = the whole relation as it stood at T; `@ (vt: V, tt: T)` = the
+  full quadrant. Implemented as a probe-driven scan (`data/bitemporal.rs`)
+  with a generic default over every backend; per-backend seek-loop overrides
+  are step-6 work (measured ~5x a plain scan on sqlite for correction-heavy
+  data — acceptable until then).
+- **`:as_of <t>`** — one query option pinning the default transaction time for
+  every tt-stamped relation atom in the block that lacks an explicit
+  selector (explicit wins; plain/vt relations untouched; using it in a query
+  that references no tt-stamped relation is an error). The spec's #1 use case:
+  re-run a report exactly as it would have answered at T.
+- **Fixed: joins binding temporal columns silently truncated resolution** —
+  a prefix join whose join columns reached into the trailing temporal key
+  columns clamped the scan to one version: superseded/ceased values were
+  resurrected on sqlite and mem panicked (`BTreeMap::range` inversion).
+  Dispatch now falls back to a materialized join over the resolved scan
+  whenever the join prefix leaves the plain key columns — **including the
+  pre-existing upstream variant on vt-only relations** (`@`-selected joins
+  binding the Validity column had the same wrong answers/panic since before
+  the fork). Defensively, the bitemporal probe treats out-of-range bounds as
+  exhausted. Pinned on mem and sqlite.
+- Recorded deferrals: the unquoted-date parse lint (no warning channel in the
+  engine yet) and the §6 write ops owed by step 3 (`:insert`/`:update`/
+  `:ensure`/`:ensure_not`/bitemporal `:rm` remap) move to **step 4c**, now
+  unblocked by the read path; error messages updated to say so.
+
 ### New — system-versioned relations complete: tt-only reads (bitemporality step 4a)
 - **The labeled temporal selector** `@ (vt: …)` / `@ (tt: …)` / order-free
   `@ (vt: …, tt: …)` parses on every relation-access form; bare `@ E` still
@@ -18,8 +54,8 @@ provenance and licensing.
   invariant: adding `tt: TxTime` to a relation changes no existing query's
   results. `@ (tt: T)` reads the state as of any past commit time. Rides the
   existing single-axis skip-scan; fixed-rule inputs resolve the same way.
-  Bitemporal (vt+tt) relations keep raw bare scans and error on any selector
-  until step 4b — don't migrate vt relations to vt+tt yet.
+  (Bitemporal relations gained their reads in step 4b below — migrating vt
+  relations to vt+tt is now supported.)
 - **Fixed: negation against versioned scans panicked** (`unreachable!()` in
   `NegJoin`) — with the current-state default this would have made every
   `not *audit{…}` against a tt-only relation a crash that poisons the Db

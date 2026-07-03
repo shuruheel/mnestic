@@ -25,6 +25,27 @@ use crate::parse::SourceSpan;
 use crate::query::logical::NamedFieldNotFound;
 use crate::runtime::transact::SessionTx;
 
+/// Encode a resolved temporal read into the (valid_at, tx_valid_at) pair a
+/// `MagicFixedRuleRuleArg` carries (mnestic fork, bitemporality): fixed-rule
+/// dispatch reads them back — `tx_valid_at` present ⇒ two-level bitemporal
+/// scan; else `valid_at` present ⇒ single-axis skip scan; else plain scan.
+fn encode_temporal_for_fixed_rule(
+    relation: &crate::runtime::relation::RelationHandle,
+    vt: Option<crate::data::value::ValidityTs>,
+    tt: Option<crate::data::value::ValidityTs>,
+    span: SourceSpan,
+) -> Result<(
+    Option<crate::data::value::ValidityTs>,
+    Option<crate::data::value::ValidityTs>,
+)> {
+    use crate::runtime::relation::TemporalRead;
+    Ok(match relation.resolve_temporal_read(vt, tt, span)? {
+        TemporalRead::Plain => (None, None),
+        TemporalRead::AsOf(t) => (Some(t), None),
+        TemporalRead::Bitemporal { vt, tt } => (vt, Some(tt)),
+    })
+}
+
 impl NormalFormProgram {
     pub(crate) fn exempt_aggr_rules_for_magic_sets(&self, exempt_rules: &mut BTreeSet<Symbol>) {
         for (name, rule_set) in self.prog.iter() {
@@ -352,17 +373,19 @@ impl NormalFormProgram {
                                                 tx_valid_at,
                                             } => {
                                                 let relation = tx.get_relation(name, false)?;
-                                                let effective = relation.resolve_temporal_read(
-                                                    *valid_at,
-                                                    *tx_valid_at,
-                                                    *span,
-                                                )?;
+                                                let (eff_vt, eff_tt) =
+                                                    encode_temporal_for_fixed_rule(
+                                                        &relation,
+                                                        *valid_at,
+                                                        *tx_valid_at,
+                                                        *span,
+                                                    )?;
 
                                                 MagicFixedRuleRuleArg::Stored {
                                                     name: name.clone(),
                                                     bindings: bindings.clone(),
-                                                    valid_at: effective,
-                                                    tx_valid_at: None,
+                                                    valid_at: eff_vt,
+                                                    tx_valid_at: eff_tt,
                                                     span: *span,
                                                 }
                                             }
@@ -374,14 +397,15 @@ impl NormalFormProgram {
                                                 span,
                                             } => {
                                                 let relation = tx.get_relation(name, false)?;
-                                                let valid_at = &relation.resolve_temporal_read(
-                                                    *valid_at,
-                                                    *tx_valid_at,
-                                                    *span,
-                                                )?;
-                                                let tx_valid_at: &Option<
-                                                    crate::data::value::ValidityTs,
-                                                > = &None;
+                                                let (eff_vt, eff_tt) =
+                                                    encode_temporal_for_fixed_rule(
+                                                        &relation,
+                                                        *valid_at,
+                                                        *tx_valid_at,
+                                                        *span,
+                                                    )?;
+                                                let valid_at = &eff_vt;
+                                                let tx_valid_at = &eff_tt;
                                                 let fields: BTreeSet<_> = relation
                                                     .metadata
                                                     .keys

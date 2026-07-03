@@ -54,6 +54,11 @@ pub struct QueryOutOptions {
     pub timeout: Option<f64>,
     /// Sleep after performing the query for this number of seconds. Ignored in WASM.
     pub sleep: Option<f64>,
+    /// Default transaction-time for every tt-stamped relation atom in this
+    /// query that lacks an explicit `tt:` selector (mnestic fork,
+    /// bitemporality §4 `:as_of`). Explicit per-atom selectors win; plain and
+    /// vt-only relations are unaffected.
+    pub as_of: Option<ValidityTs>,
     pub sorters: Vec<(Symbol, SortDir)>,
     pub store_relation: Option<(InputRelationHandle, RelationOp, ReturnMutation)>,
     pub assertion: Option<QueryAssertion>,
@@ -641,9 +646,25 @@ impl InputProgram {
         Err(NoEntryError.into())
     }
     pub(crate) fn into_normalized_program(
-        self,
+        mut self,
         tx: &SessionTx<'_>,
     ) -> Result<(NormalFormProgram, QueryOutOptions)> {
+        // `:as_of` (mnestic fork, bitemporality §4): inject the query-level
+        // default tt into every tt-stamped relation atom lacking an explicit
+        // selector. Kind-aware — plain and vt-only relations are untouched,
+        // so mixed queries keep working (with only their tt-stamped atoms
+        // pinned; the docs call out the partial-reproducibility caveat).
+        if let Some(t) = self.out_opts.as_of {
+            let mut applied = false;
+            for rules_or_fixed in self.prog.values_mut() {
+                apply_as_of_default(rules_or_fixed, t, tx, &mut applied)?;
+            }
+            if !applied {
+                bail!(
+                    "`:as_of` given, but the query references no transaction-time-stamped relation"
+                );
+            }
+        }
         let mut prog: BTreeMap<Symbol, _> = Default::default();
         for (k, rules_or_fixed) in self.prog {
             match rules_or_fixed {
@@ -934,6 +955,82 @@ impl MagicInlineRule {
         }
         coll
     }
+}
+
+/// Apply the `:as_of` default tt to every tt-stamped relation atom lacking an
+/// explicit selector (mnestic fork, bitemporality §4). Kind-aware via `tx`;
+/// sets `applied` when at least one atom is (or already was) pinned.
+fn apply_as_of_default(
+    rules_or_fixed: &mut InputInlineRulesOrFixed,
+    t: ValidityTs,
+    tx: &SessionTx<'_>,
+    applied: &mut bool,
+) -> Result<()> {
+    fn is_tt_stamped(name: &Symbol, tx: &SessionTx<'_>) -> bool {
+        tx.get_relation(name, false)
+            .map(|h| h.has_txtime())
+            .unwrap_or(false)
+    }
+    fn walk(atom: &mut InputAtom, t: ValidityTs, tx: &SessionTx<'_>, applied: &mut bool) {
+        match atom {
+            InputAtom::Relation { inner } => {
+                if is_tt_stamped(&inner.name, tx) {
+                    *applied = true;
+                    if inner.tx_valid_at.is_none() {
+                        inner.tx_valid_at = Some(t);
+                    }
+                }
+            }
+            InputAtom::NamedFieldRelation { inner } => {
+                if is_tt_stamped(&inner.name, tx) {
+                    *applied = true;
+                    if inner.tx_valid_at.is_none() {
+                        inner.tx_valid_at = Some(t);
+                    }
+                }
+            }
+            InputAtom::Negation { inner, .. } => walk(inner, t, tx, applied),
+            InputAtom::Conjunction { inner, .. } | InputAtom::Disjunction { inner, .. } => {
+                for a in inner {
+                    walk(a, t, tx, applied);
+                }
+            }
+            InputAtom::Rule { .. }
+            | InputAtom::Predicate { .. }
+            | InputAtom::Unification { .. }
+            | InputAtom::Search { .. } => {}
+        }
+    }
+    match rules_or_fixed {
+        InputInlineRulesOrFixed::Rules { rules } => {
+            for rule in rules {
+                for atom in rule.body.iter_mut() {
+                    walk(atom, t, tx, applied);
+                }
+            }
+        }
+        InputInlineRulesOrFixed::Fixed { fixed } => {
+            for arg in fixed.rule_args.iter_mut() {
+                match arg {
+                    FixedRuleArg::Stored {
+                        name, tx_valid_at, ..
+                    }
+                    | FixedRuleArg::NamedStored {
+                        name, tx_valid_at, ..
+                    } => {
+                        if is_tt_stamped(name, tx) {
+                            *applied = true;
+                            if tx_valid_at.is_none() {
+                                *tx_valid_at = Some(t);
+                            }
+                        }
+                    }
+                    FixedRuleArg::InMem { .. } => {}
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]

@@ -1272,6 +1272,18 @@ impl<'s, S: Storage<'s>> Db<S> {
                                         json!(null),
                                         json!(filters.iter().map(|f| f.to_string()).collect_vec()),
                                     ),
+                                    RelAlgebra::StoredBitemporal(
+                                        crate::query::ra::StoredBitemporalRA {
+                                            storage,
+                                            filters,
+                                            ..
+                                        },
+                                    ) => (
+                                        "load_stored_bitemporal",
+                                        json!(format!(":{}", storage.name)),
+                                        json!(null),
+                                        json!(filters.iter().map(|f| f.to_string()).collect_vec()),
+                                    ),
                                     RelAlgebra::Join(inner) => {
                                         if inner.left.is_unit() {
                                             rel_stack.push(&inner.right);

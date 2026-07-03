@@ -49,7 +49,7 @@ pub fn decode_tuple_from_key(key: &[u8], size_hint: usize) -> Tuple {
     ret
 }
 
-const DEFAULT_SIZE_HINT: usize = 16;
+pub(crate) const DEFAULT_SIZE_HINT: usize = 16;
 
 /// Check if the tuple key passed in should be a valid return for a validity query.
 ///

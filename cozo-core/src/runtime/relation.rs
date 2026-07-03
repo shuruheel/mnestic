@@ -443,6 +443,21 @@ fn validate_temporal_axes(input_meta: &InputRelationHandle) -> Result<()> {
     Ok(())
 }
 
+/// How a read resolves against a relation's temporal axes (mnestic fork).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TemporalRead {
+    /// no temporal machinery: plain scan
+    Plain,
+    /// single trailing-axis skip-scan at the point (vt relations with `@`,
+    /// and tt-only relations — where the point is on the tt axis)
+    AsOf(ValidityTs),
+    /// two-level (vt, tt) resolution on a bitemporal relation
+    Bitemporal {
+        vt: Option<ValidityTs>,
+        tt: ValidityTs,
+    },
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(crate) struct InputRelationHandle {
     pub(crate) name: Symbol,
@@ -491,18 +506,20 @@ impl RelationHandle {
     }
 
     /// Resolve a read's temporal selectors against this relation's axes
-    /// (mnestic fork, bitemporality step 4a; spec §4 semantics table).
-    /// Returns the effective as-of point for the trailing-axis skip-scan
-    /// (`None` = plain scan). On tt-only relations the tt axis DEFAULTS to
-    /// end-of-tt-time — the default read is the current state, so adding a
-    /// `tt: TxTime` column changes no existing query's results (the migration
-    /// invariant); only an explicit `@ (tt: …)` reaches history.
+    /// (mnestic fork, bitemporality steps 4a/4b; spec §4 semantics table).
+    /// On tt-only relations the tt axis DEFAULTS to end-of-tt-time — the
+    /// default read is the current state, so adding a `tt: TxTime` column
+    /// changes no existing query's results (the migration invariant); only an
+    /// explicit `@ (tt: …)` reaches history. On bitemporal relations the vt
+    /// axis keeps its shipped semantics (no selector = every vt record,
+    /// resolved to the belief at T) and the tt axis defaults to current
+    /// belief — the same invariant, two axes.
     pub(crate) fn resolve_temporal_read(
         &self,
         vt: Option<ValidityTs>,
         tt: Option<ValidityTs>,
         span: SourceSpan,
-    ) -> Result<Option<ValidityTs>> {
+    ) -> Result<TemporalRead> {
         use crate::data::functions::MAX_VALIDITY_TS;
         if self.has_txtime() {
             if self.is_tt_only() {
@@ -516,20 +533,16 @@ impl RelationHandle {
                     struct NoVtAxis(String, #[label] SourceSpan);
                     bail!(NoVtAxis(self.name.to_string(), span));
                 }
-                Ok(Some(tt.unwrap_or(MAX_VALIDITY_TS)))
+                Ok(TemporalRead::AsOf(tt.unwrap_or(MAX_VALIDITY_TS)))
             } else {
-                // Bitemporal: the two-level scan lands in step 4b.
-                if vt.is_some() || tt.is_some() {
-                    #[derive(Debug, Error, Diagnostic)]
-                    #[error("as-of reads on bitemporal relation {0} are not available yet")]
-                    #[diagnostic(
-                        code(eval::txtime_asof_pending),
-                        help("the two-level (vt, tt) resolution lands with bitemporality step 4b; a bare scan returns all raw rows")
-                    )]
-                    struct TxTimeAsOfPending(String, #[label] SourceSpan);
-                    bail!(TxTimeAsOfPending(self.name.to_string(), span));
-                }
-                Ok(None)
+                // Bitemporal (step 4b): the two-level resolution. No vt
+                // selector = every vt record (resolve-groups); a vt selector
+                // = the single belief per key (resolve-key). tt defaults to
+                // current belief.
+                Ok(TemporalRead::Bitemporal {
+                    vt,
+                    tt: tt.unwrap_or(MAX_VALIDITY_TS),
+                })
             }
         } else {
             if tt.is_some() {
@@ -543,7 +556,7 @@ impl RelationHandle {
                 bail!(NoTtAxis(self.name.to_string(), span));
             }
             match vt {
-                None => Ok(None),
+                None => Ok(TemporalRead::Plain),
                 Some(v) => {
                     if self.metadata.keys.last().map(|c| &c.typing.coltype)
                         != Some(&crate::data::relation::ColType::Validity)
@@ -554,7 +567,7 @@ impl RelationHandle {
                             span
                         ));
                     }
-                    Ok(Some(v))
+                    Ok(TemporalRead::AsOf(v))
                 }
             }
         }
@@ -683,6 +696,37 @@ impl RelationHandle {
             tx.store_tx
                 .range_scan_tuple(&prefix_encoded, &upper_encoded)
         }
+    }
+
+    /// Two-level bitemporal scans (mnestic fork, step 4b): whole relation.
+    pub(crate) fn bitemporal_scan_all<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+        vt_at: Option<ValidityTs>,
+        tt_at: ValidityTs,
+    ) -> impl Iterator<Item = Result<Tuple>> + 'a {
+        let lower = Tuple::default().encode_as_key(self.id);
+        let upper = Tuple::default().encode_as_key(self.id.next());
+        tx.store_tx
+            .range_bitemporal_scan_tuple(&lower, &upper, vt_at, tt_at)
+    }
+
+    /// Two-level bitemporal scan narrowed to a key prefix (step 4b).
+    pub(crate) fn bitemporal_scan_prefix<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+        prefix: &Tuple,
+        vt_at: Option<ValidityTs>,
+        tt_at: ValidityTs,
+    ) -> impl Iterator<Item = Result<Tuple>> + 'a {
+        let mut lower = prefix.clone();
+        lower.truncate(self.metadata.keys.len());
+        let mut upper = lower.clone();
+        upper.push(DataValue::Bot);
+        let prefix_encoded = lower.encode_as_key(self.id);
+        let upper_encoded = upper.encode_as_key(self.id);
+        tx.store_tx
+            .range_bitemporal_scan_tuple(&prefix_encoded, &upper_encoded, vt_at, tt_at)
     }
 
     pub(crate) fn skip_scan_prefix<'a>(

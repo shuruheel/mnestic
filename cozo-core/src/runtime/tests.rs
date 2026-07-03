@@ -2110,13 +2110,11 @@ fn txtime_axis_selector_errors() {
     db.run_default("?[k, x] := *vt_r[k, v, x @ (vt: 'NOW')]")
         .unwrap();
 
-    // bitemporal: any selector is still pending (step 4b); bare scan works
+    // bitemporal: selectors resolve via the two-level scan (step 4b)
     db.run_default(":create bi_r {k, v: Validity, tt: TxTime => x: Int}")
         .unwrap();
-    let err = db
-        .run_default("?[k, x] := *bi_r[k, v, tt, x @ (tt: 'NOW')]")
-        .expect_err("bitemporal as-of pending 4b");
-    assert!(format!("{err:?}").contains("not available yet"), "{err:?}");
+    db.run_default("?[k, x] := *bi_r[k, v, tt, x @ (tt: 'NOW')]")
+        .unwrap();
     db.run_default("?[k, x] := *bi_r[k, v, tt, x]").unwrap();
 
     // duplicate axis label is a parse error
@@ -2473,17 +2471,389 @@ fn txtime_reads_on_sqlite_and_selector_forms() {
         .into_json();
     assert_eq!(res["rows"].as_array().unwrap().len(), 0);
 
-    // order-free pair on a BITEMPORAL relation still errors as pending 4b
+    // order-free pair on a BITEMPORAL relation resolves (step 4b)
     db.run_default(":create bi_f {k, v: Validity, tt: TxTime => x: Int}")
         .unwrap();
-    let err = db
-        .run_default("?[k, x] := *bi_f[k, v, tt, x @ (tt: 'NOW', vt: 'NOW')]")
-        .expect_err("bitemporal pair pending 4b");
-    assert!(format!("{err:?}").contains("not available yet"), "{err:?}");
+    db.run_default("?[k, x] := *bi_f[k, v, tt, x @ (tt: 'NOW', vt: 'NOW')]")
+        .unwrap();
 
     // nullable vt with TxTime is rejected at :create (the 8th shape)
     let err = db
         .run_default(":create bad_null_vt {k, v: Validity?, tt: TxTime => x: Int}")
         .expect_err("nullable vt with tt must be rejected");
     assert!(format!("{err:?}").contains("cannot be nullable"), "{err:?}");
+}
+
+// ==== mnestic fork: two-level bitemporal reads (step 4b) ====
+
+/// A worked bitemporal history. Timeline (vt in abstract µs, tt per commit):
+///   tt0: assert (vt=100, x=1)   — "1 from day 100"
+///   tt1: assert (vt=200, x=2)   — "changed to 2 on day 200"
+///   tt2: assert (vt=200, x=3)   — "correction: it was 3, not 2"
+///   tt3: retract (vt=300)       — "ceased on day 300"
+fn bitemporal_fixture(engine: &str, path: &str) -> (DbInstance, [i64; 4]) {
+    let db = DbInstance::new(engine, path, "").unwrap();
+    db.run_default(":create hist {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    fn peek(db: &DbInstance) -> i64 {
+        match db {
+            DbInstance::Mem(i) => i.tt_clock().peek(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(i) => i.tt_clock().peek(),
+            _ => panic!("unsupported engine in fixture"),
+        }
+    }
+    let mut tts = [0i64; 4];
+    db.run_default("?[k, v, x] <- [[1, [100, true], 1]] :put hist {k, v => x}")
+        .unwrap();
+    tts[0] = peek(&db);
+    db.run_default("?[k, v, x] <- [[1, [200, true], 2]] :put hist {k, v => x}")
+        .unwrap();
+    tts[1] = peek(&db);
+    db.run_default("?[k, v, x] <- [[1, [200, true], 3]] :put hist {k, v => x}")
+        .unwrap();
+    tts[2] = peek(&db);
+    db.run_default("?[k, v, x] <- [[1, [300, false], 0]] :put hist {k, v => x}")
+        .unwrap();
+    tts[3] = peek(&db);
+    (db, tts)
+}
+
+#[test]
+fn bitemporal_four_quadrants() {
+    for engine in ["mem", "sqlite"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quad.db");
+        let (db, tts) = bitemporal_fixture(engine, path.to_str().unwrap());
+        let q = |vt: i64, tt: i64| -> serde_json::Value {
+            db.run_default(&format!("?[x] := *hist[k, v, t, x @ (vt: {vt}, tt: {tt})]"))
+                .unwrap()
+                .into_json()["rows"]
+                .clone()
+        };
+        assert_eq!(q(250, tts[3]), serde_json::json!([[3]]), "{engine}");
+        assert_eq!(q(150, tts[3]), serde_json::json!([[1]]), "{engine}");
+        assert_eq!(q(250, tts[1]), serde_json::json!([[2]]), "{engine}");
+        assert_eq!(q(250, tts[0]), serde_json::json!([[1]]), "{engine}");
+        assert_eq!(q(350, tts[3]).as_array().unwrap().len(), 0, "{engine}");
+        assert_eq!(q(350, tts[2]), serde_json::json!([[3]]), "{engine}");
+        assert_eq!(q(50, tts[3]).as_array().unwrap().len(), 0, "{engine}");
+    }
+}
+
+#[test]
+fn bitemporal_bare_scan_is_current_belief_per_group() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bare.db");
+    let (db, tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    let res = db
+        .run_default("?[v, x] := *hist[k, v, t, x]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0][0][0], 300);
+    assert_eq!(rows[0][0][1], serde_json::json!(false));
+    assert_eq!(rows[1][0][0], 200);
+    assert_eq!(rows[1][1], 3, "correction wins in the bare scan: {rows:?}");
+    assert_eq!(rows[2][0][0], 100);
+    assert_eq!(rows[2][1], 1);
+
+    let res = db
+        .run_default(&format!("?[v, x] := *hist[k, v, t, x @ (tt: {})]", tts[1]))
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][1], 2);
+
+    let res = db
+        .run_default("?[x] := *hist[k, v, t, x @ 250]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[3]]));
+}
+
+#[test]
+fn bitemporal_cessation_across_runs_and_ties() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create hr {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, true], 7]] :put hr {k, v => x}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, false], 0]] :put hr {k, v => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *hr[k, v, t, x @ (vt: 100)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"].as_array().unwrap().len(),
+        0,
+        "the later cessation must win across the is_assert-run boundary"
+    );
+
+    let db2 = DbInstance::new("mem", "", "").unwrap();
+    db2.run_default(":create hr2 {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db2.run_default("?[k, v, x] <- [[1, [100, false], 0]] :put hr2 {k, v => x}")
+        .unwrap();
+    db2.run_default("?[k, v, x] <- [[1, [100, true], 9]] :put hr2 {k, v => x}")
+        .unwrap();
+    let res = db2
+        .run_default("?[x] := *hr2[k, v, t, x @ (vt: 100)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[9]]));
+}
+
+#[test]
+fn bitemporal_repudiation_by_copy_and_chained_staleness() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create rep {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, true], 100]] :put rep {k, v => x}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [300, true], 120]] :put rep {k, v => x}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [300, true], 100]] :put rep {k, v => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *rep[k, v, t, x @ (vt: 350)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[100]]));
+
+    db.run_default("?[k, v, x] <- [[1, [100, true], 95]] :put rep {k, v => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *rep[k, v, t, x @ (vt: 350)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[100]]),
+        "copy is a snapshot"
+    );
+    let res = db
+        .run_default("?[x] := *rep[k, v, t, x @ (vt: 150)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[95]]));
+}
+
+#[test]
+fn bitemporal_negation_and_joins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("neg4b.db");
+    let (db, _tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    let res = db
+        .run_default("r[k] <- [[1], [2]] ?[k] := r[k], not *hist{k @ (vt: 250)}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[2]]));
+    let res = db
+        .run_default("r[k] <- [[1]] ?[k, x] := r[k], *hist{k, x @ (vt: 250)}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 3]]));
+}
+
+#[test]
+fn as_of_pins_the_whole_query() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("asof.db");
+    let (db, tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    // also a tt-only relation in the same query
+    db.run_default(":create audit_a {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10]] :put audit_a {k => v}")
+        .unwrap();
+    let after_audit = match &db {
+        DbInstance::Sqlite(i) => i.tt_clock().peek(),
+        _ => panic!(),
+    };
+    db.run_default("?[k, v] <- [[1, 20]] :put audit_a {k => v}")
+        .unwrap();
+
+    // :as_of pins BOTH tt-stamped atoms; the plain relation is untouched
+    db.run_default(":create plain_a {k => v: Int}").unwrap();
+    db.run_default("?[k, v] <- [[1, 5]] :put plain_a {k => v}")
+        .unwrap();
+    let res = db
+        .run_default(&format!(
+            "?[x, w, p] := *hist[k, v, t, x @ (vt: 250)], *audit_a[k2, t2, w], *plain_a[k3, p] \
+             :as_of {}",
+            tts[1].max(after_audit)
+        ))
+        .unwrap()
+        .into_json();
+    // hist's group-200 belief at that point (post-correction): 3;
+    // audit_a as of then: 10; plain untouched: 5
+    assert_eq!(res["rows"], serde_json::json!([[3, 10, 5]]));
+
+    // explicit per-atom selector wins over :as_of
+    let res = db
+        .run_default(&format!(
+            "?[w] := *audit_a[k, t, w @ (tt: 'NOW')] :as_of {after_audit}"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[20]]));
+
+    // :as_of with no tt-stamped relation in the query is an error
+    let err = db
+        .run_default("?[p] := *plain_a[k, p] :as_of 'NOW'")
+        .expect_err(":as_of without tt relations must fail");
+    let msg = format!("{err:?}")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(msg.contains("no transaction-time-stamped"), "{msg}");
+}
+
+#[test]
+fn as_of_minimal_probe() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit_p2 {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10]] :put audit_p2 {k => v}")
+        .unwrap();
+    // no selector
+    db.run_default("?[w] := *audit_p2[k, t, w] :as_of 'NOW'")
+        .unwrap();
+    // with explicit selector
+    db.run_default("?[w] := *audit_p2[k, t, w @ (tt: 'NOW')] :as_of 'NOW'")
+        .unwrap();
+}
+
+#[test]
+fn temporal_join_columns_use_materialized_join() {
+    // Regression: a join binding a temporal column used to clamp the prefix
+    // scan to one vt-group — superseded/ceased values resurrected on sqlite,
+    // BTreeMap::range panic on mem. The dispatch now falls back to a
+    // materialized join over the RESOLVED scan.
+    for engine in ["mem", "sqlite"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tj.db");
+        let (db, _tts) = bitemporal_fixture(engine, path.to_str().unwrap());
+        // join on (k, v): the belief at vt=120 (group 100) does not exist at
+        // vt=250 (group 200 wins there) -> empty result
+        let res = db
+            .run_default(
+                "l[k, v] := *hist[k, v, t, x @ (vt: 120)] \
+                 ?[k, x2] := l[k, v], *hist[k, v, t2, x2 @ (vt: 250)]",
+            )
+            .unwrap()
+            .into_json();
+        assert_eq!(res["rows"].as_array().unwrap().len(), 0, "{engine}");
+
+        // negation twin: nothing at vt=250 carries group-100's vt value
+        let res = db
+            .run_default(
+                "l[k, v] := *hist[k, v, t, x @ (vt: 120)] \
+                 ?[k] := l[k, v], not *hist{k, v @ (vt: 250)}",
+            )
+            .unwrap()
+            .into_json();
+        assert_eq!(res["rows"], serde_json::json!([[1]]), "{engine}");
+
+        // full-binding self-join with a value mismatch must be empty
+        let res = db
+            .run_default(
+                "l[k, v, t, x] := *hist[k, v, t, x0 @ (vt: 250)], x = x0 - 1 \
+                 ?[k, x] := l[k, v, t, x], *hist[k, v, t, x @ (vt: 250)]",
+            )
+            .unwrap()
+            .into_json();
+        assert_eq!(res["rows"].as_array().unwrap().len(), 0, "{engine}");
+    }
+}
+
+#[test]
+fn vt_only_temporal_join_columns_fixed_too() {
+    // The same defect class pre-existed upstream on the single-axis path.
+    for engine in ["mem", "sqlite"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vtj.db");
+        let db = DbInstance::new(engine, path.to_str().unwrap(), "").unwrap();
+        db.run_default(":create vtx {k, v: Validity => x: Int}")
+            .unwrap();
+        db.run_default("?[k, v, x] <- [[1, [100, true], 7]] :put vtx {k, v => x}")
+            .unwrap();
+        db.run_default("?[k, v, x] <- [[1, [150, false], 0]] :put vtx {k, v => x}")
+            .unwrap();
+        // the belief at vt=120 (group 100) is retracted by vt=250: join empty
+        let res = db
+            .run_default("l[k, v] := *vtx[k, v, x @ 120] ?[k, x2] := l[k, v], *vtx[k, v, x2 @ 250]")
+            .unwrap()
+            .into_json();
+        assert_eq!(res["rows"].as_array().unwrap().len(), 0, "{engine}");
+    }
+}
+
+#[test]
+fn bitemporal_migration_invariant_comparative() {
+    // §9: adding `tt: TxTime` to a vt relation changes no existing query's
+    // results (up to corrections) — same puts into a vt twin, diff results.
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create m_vt {k, v: Validity => x: Int}")
+        .unwrap();
+    db.run_default(":create m_bt {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    for rel in ["m_vt", "m_bt"] {
+        db.run_default(&format!(
+            "?[k, v, x] <- [[1, [100, true], 1], [2, [100, true], 5]] :put {rel} {{k, v => x}}"
+        ))
+        .unwrap();
+        db.run_default(&format!(
+            "?[k, v, x] <- [[1, [200, true], 2]] :put {rel} {{k, v => x}}"
+        ))
+        .unwrap();
+        db.run_default(&format!(
+            "?[k, v, x] <- [[2, [300, false], 0]] :put {rel} {{k, v => x}}"
+        ))
+        .unwrap();
+    }
+    // bare scan
+    let a = db
+        .run_default("?[k, v, x] := *m_vt[k, v, x]")
+        .unwrap()
+        .into_json();
+    let b = db
+        .run_default("?[k, v, x] := *m_bt[k, v, t, x]")
+        .unwrap()
+        .into_json();
+    assert_eq!(a["rows"], b["rows"], "bare scan must match the vt twin");
+    // several @V points
+    for vt in [50, 100, 150, 200, 250, 300, 350] {
+        let a = db
+            .run_default(&format!("?[k, x] := *m_vt[k, v, x @ {vt}]"))
+            .unwrap()
+            .into_json();
+        let b = db
+            .run_default(&format!("?[k, x] := *m_bt[k, v, t, x @ {vt}]"))
+            .unwrap()
+            .into_json();
+        assert_eq!(a["rows"], b["rows"], "@{vt} must match the vt twin");
+    }
+}
+
+#[test]
+fn vt_equal_ts_assert_shadows_retract_pinned() {
+    // §9: the previously-unpinned single-axis equal-ts behavior — an assert
+    // and a retract at the SAME vt ts leave the assert visible (assert sorts
+    // first; the skip-scan emits the first qualifying row).
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create eq_vt {k, v: Validity => x: Int}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, true], 7]] :put eq_vt {k, v => x}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, false], 0]] :put eq_vt {k, v => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *eq_vt[k, v, x @ 100]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[7]]));
 }

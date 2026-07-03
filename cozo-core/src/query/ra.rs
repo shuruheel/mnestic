@@ -34,6 +34,8 @@ pub(crate) enum RelAlgebra {
     TempStore(TempStoreRA),
     Stored(StoredRA),
     StoredWithValidity(StoredWithValidityRA),
+    /// two-level bitemporal scan (mnestic fork, bitemporality 4b)
+    StoredBitemporal(StoredBitemporalRA),
     Join(Box<InnerJoin>),
     NegJoin(Box<NegJoin>),
     Reorder(ReorderRA),
@@ -56,6 +58,7 @@ impl RelAlgebra {
             RelAlgebra::Filter(i) => i.span,
             RelAlgebra::Unification(i) => i.span,
             RelAlgebra::StoredWithValidity(i) => i.span,
+            RelAlgebra::StoredBitemporal(i) => i.span,
             RelAlgebra::HnswSearch(i) => i.hnsw_search.span,
             RelAlgebra::FtsSearch(i) => i.fts_search.span,
             RelAlgebra::LshSearch(i) => i.lsh_search.span,
@@ -305,6 +308,14 @@ impl Debug for RelAlgebra {
                 .field(&r.filters)
                 .field(&r.valid_at)
                 .finish(),
+            RelAlgebra::StoredBitemporal(r) => f
+                .debug_tuple("StoredBitemporal")
+                .field(&bindings)
+                .field(&r.storage.name)
+                .field(&r.filters)
+                .field(&r.vt_at)
+                .field(&r.tt_at)
+                .finish(),
             RelAlgebra::Join(r) => {
                 if r.left.is_unit() {
                     r.right.fmt(f)
@@ -376,6 +387,9 @@ impl RelAlgebra {
             RelAlgebra::StoredWithValidity(v) => {
                 v.fill_binding_indices_and_compile()?;
             }
+            RelAlgebra::StoredBitemporal(v) => {
+                v.fill_binding_indices()?;
+            }
             RelAlgebra::Reorder(r) => {
                 r.relation.fill_binding_indices_and_compile()?;
             }
@@ -432,22 +446,32 @@ impl RelAlgebra {
     ) -> Result<Self> {
         // Resolve selectors against the relation's temporal axes (mnestic
         // fork, bitemporality §4): tt-only relations default to current
-        // state; bitemporal as-of reads land in step 4b; plain/vt relations
-        // keep the shipped behavior exactly.
+        // state; bitemporal relations get the two-level resolution (4b);
+        // plain/vt relations keep the shipped behavior exactly.
+        use crate::runtime::relation::TemporalRead;
         match storage.resolve_temporal_read(validity, tx_validity, span)? {
-            None => Ok(Self::Stored(StoredRA {
+            TemporalRead::Plain => Ok(Self::Stored(StoredRA {
                 bindings,
                 storage,
                 filters: vec![],
                 filters_bytecodes: vec![],
                 span,
             })),
-            Some(vld) => Ok(Self::StoredWithValidity(StoredWithValidityRA {
+            TemporalRead::AsOf(vld) => Ok(Self::StoredWithValidity(StoredWithValidityRA {
                 bindings,
                 storage,
                 filters: vec![],
                 filters_bytecodes: vec![],
                 valid_at: vld,
+                span,
+            })),
+            TemporalRead::Bitemporal { vt, tt } => Ok(Self::StoredBitemporal(StoredBitemporalRA {
+                bindings,
+                storage,
+                filters: vec![],
+                filters_bytecodes: vec![],
+                vt_at: vt,
+                tt_at: tt,
                 span,
             })),
         }
@@ -540,6 +564,26 @@ impl RelAlgebra {
                     filters,
                     span,
                     valid_at,
+                    filters_bytecodes: filter_bytecodes,
+                })
+            }
+            RelAlgebra::StoredBitemporal(StoredBitemporalRA {
+                bindings,
+                storage,
+                mut filters,
+                filters_bytecodes: filter_bytecodes,
+                span,
+                vt_at,
+                tt_at,
+            }) => {
+                filters.push(filter);
+                RelAlgebra::StoredBitemporal(StoredBitemporalRA {
+                    bindings,
+                    storage,
+                    filters,
+                    span,
+                    vt_at,
+                    tt_at,
                     filters_bytecodes: filter_bytecodes,
                 })
             }
@@ -840,6 +884,186 @@ fn invert_option_err<T>(v: Result<Option<T>>) -> Option<Result<T>> {
         Err(e) => Some(Err(e)),
         Ok(None) => None,
         Ok(Some(v)) => Some(Ok(v)),
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StoredBitemporalRA {
+    pub(crate) bindings: Vec<Symbol>,
+    pub(crate) storage: RelationHandle,
+    pub(crate) filters: Vec<Expr>,
+    pub(crate) filters_bytecodes: Vec<(Vec<Bytecode>, SourceSpan)>,
+    /// resolve-key vt point; `None` = resolve-groups (all vt records)
+    pub(crate) vt_at: Option<ValidityTs>,
+    pub(crate) tt_at: ValidityTs,
+    pub(crate) span: SourceSpan,
+}
+
+impl StoredBitemporalRA {
+    fn fill_binding_indices(&mut self) -> Result<()> {
+        let bindings: BTreeMap<_, _> = self
+            .bindings
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(a, b)| (b, a))
+            .collect();
+        for e in self.filters.iter_mut() {
+            e.fill_binding_indices(&bindings)?;
+            self.filters_bytecodes.push((e.compile()?, e.span()));
+        }
+        Ok(())
+    }
+    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>) -> Result<TupleIter<'a>> {
+        let it = self.storage.bitemporal_scan_all(tx, self.vt_at, self.tt_at);
+        Ok(if self.filters.is_empty() {
+            Box::new(it)
+        } else {
+            Box::new(filter_iter(self.filters_bytecodes.clone(), Box::new(it)))
+        })
+    }
+    fn prefix_join<'a>(
+        &'a self,
+        tx: &'a SessionTx<'_>,
+        left_iter: TupleIter<'a>,
+        (left_join_indices, right_join_indices): (Vec<usize>, Vec<usize>),
+        eliminate_indices: BTreeSet<usize>,
+    ) -> Result<TupleIter<'a>> {
+        let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
+        right_invert_indices.sort_by_key(|(_, b)| **b);
+        let left_to_prefix_indices = right_invert_indices
+            .into_iter()
+            .map(|(a, _)| left_join_indices[a])
+            .collect_vec();
+        let it = left_iter
+            .map_ok(move |tuple| {
+                let prefix = left_to_prefix_indices
+                    .iter()
+                    .map(|i| tuple[*i].clone())
+                    .collect_vec();
+                let mut stack = vec![];
+                self.storage
+                    .bitemporal_scan_prefix(tx, &prefix, self.vt_at, self.tt_at)
+                    .map(move |res_found| -> Result<Option<Tuple>> {
+                        let found = res_found?;
+                        for (p, span) in self.filters_bytecodes.iter() {
+                            if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
+                                return Ok(None);
+                            }
+                        }
+                        let mut ret = tuple.clone();
+                        ret.extend(found);
+                        Ok(Some(ret))
+                    })
+                    .filter_map(swap_option_result)
+            })
+            .flatten_ok()
+            .map(flatten_err);
+        Ok(if eliminate_indices.is_empty() {
+            Box::new(it)
+        } else {
+            Box::new(it.map_ok(move |t| eliminate_from_tuple(t, &eliminate_indices)))
+        })
+    }
+    fn neg_join<'a>(
+        &'a self,
+        tx: &'a SessionTx<'_>,
+        left_iter: TupleIter<'a>,
+        (left_join_indices, right_join_indices): (Vec<usize>, Vec<usize>),
+        eliminate_indices: BTreeSet<usize>,
+    ) -> Result<TupleIter<'a>> {
+        debug_assert!(!right_join_indices.is_empty());
+        let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
+        right_invert_indices.sort_by_key(|(_, b)| **b);
+        let mut left_to_prefix_indices = vec![];
+        for (ord, (idx, ord_sorted)) in right_invert_indices.iter().enumerate() {
+            if ord != **ord_sorted {
+                break;
+            }
+            left_to_prefix_indices.push(left_join_indices[*idx]);
+        }
+        let plain_len = self.storage.metadata.keys.len().saturating_sub(2);
+        if join_prefix_is_temporally_safe(&right_join_indices, plain_len) {
+            Ok(Box::new(
+                left_iter
+                    .map_ok(move |tuple| -> Result<Option<Tuple>> {
+                        let prefix = left_to_prefix_indices
+                            .iter()
+                            .map(|i| tuple[*i].clone())
+                            .collect_vec();
+                        'outer: for found in self
+                            .storage
+                            .bitemporal_scan_prefix(tx, &prefix, self.vt_at, self.tt_at)
+                        {
+                            let found = found?;
+                            for (left_idx, right_idx) in
+                                left_join_indices.iter().zip(right_join_indices.iter())
+                            {
+                                if tuple[*left_idx] != found[*right_idx] {
+                                    continue 'outer;
+                                }
+                            }
+                            return Ok(None);
+                        }
+                        Ok(Some(if !eliminate_indices.is_empty() {
+                            tuple
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(i, v)| {
+                                    if eliminate_indices.contains(&i) {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }
+                                })
+                                .collect_vec()
+                        } else {
+                            tuple
+                        }))
+                    })
+                    .map(flatten_err)
+                    .filter_map(invert_option_err),
+            ))
+        } else {
+            let mut right_join_vals = BTreeSet::new();
+            for tuple in self.storage.bitemporal_scan_all(tx, self.vt_at, self.tt_at) {
+                let tuple = tuple?;
+                let to_join: Box<[DataValue]> = right_join_indices
+                    .iter()
+                    .map(|i| tuple[*i].clone())
+                    .collect();
+                right_join_vals.insert(to_join);
+            }
+            Ok(Box::new(
+                left_iter
+                    .map_ok(move |tuple| -> Result<Option<Tuple>> {
+                        let left_join_vals: Box<[DataValue]> = left_join_indices
+                            .iter()
+                            .map(|i| tuple[*i].clone())
+                            .collect();
+                        if right_join_vals.contains(&left_join_vals) {
+                            return Ok(None);
+                        }
+                        Ok(Some(if !eliminate_indices.is_empty() {
+                            tuple
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(i, v)| {
+                                    if eliminate_indices.contains(&i) {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }
+                                })
+                                .collect_vec()
+                        } else {
+                            tuple
+                        }))
+                    })
+                    .map(flatten_err)
+                    .filter_map(invert_option_err),
+            ))
+        }
     }
 }
 
@@ -1149,7 +1373,8 @@ impl StoredWithValidityRA {
             left_to_prefix_indices.push(left_join_indices[*idx]);
         }
 
-        if join_is_prefix(&right_join_indices) {
+        let plain_len = self.storage.metadata.keys.len().saturating_sub(1);
+        if join_prefix_is_temporally_safe(&right_join_indices, plain_len) {
             Ok(Box::new(
                 left_iter
                     .map_ok(move |tuple| -> Result<Option<Tuple>> {
@@ -1607,6 +1832,17 @@ impl StoredRA {
     }
 }
 
+/// A prefix join against a temporally-resolved scan is only sound when the
+/// join prefix stays strictly within the PLAIN key columns (mnestic fork,
+/// bitemporality): binding the trailing temporal column(s) would clamp the
+/// scan range to a single version/group, silently truncating the §3
+/// resolution walk (and inverting negations; on mem the overshooting probe
+/// bounds panic BTreeMap::range). When it reaches into them, fall back to a
+/// materialized join over the resolved scan.
+fn join_prefix_is_temporally_safe(right_join_indices: &[usize], plain_len: usize) -> bool {
+    join_is_prefix(right_join_indices) && right_join_indices.iter().all(|i| *i < plain_len)
+}
+
 fn join_is_prefix(right_join_indices: &[usize]) -> bool {
     // We do not consider partial index match to be "prefix", e.g. [a, u => c]
     // with a, c bound and u unbound is not "prefix", as it is not clear that
@@ -1924,6 +2160,7 @@ impl RelAlgebra {
             RelAlgebra::TempStore(_r) => Ok(()),
             RelAlgebra::Stored(_v) => Ok(()),
             RelAlgebra::StoredWithValidity(_v) => Ok(()),
+            RelAlgebra::StoredBitemporal(_v) => Ok(()),
             RelAlgebra::Join(r) => r.do_eliminate_temp_vars(used),
             RelAlgebra::Reorder(r) => r.relation.eliminate_temp_vars(used),
             RelAlgebra::Filter(r) => r.do_eliminate_temp_vars(used),
@@ -1941,6 +2178,7 @@ impl RelAlgebra {
             RelAlgebra::TempStore(_) => None,
             RelAlgebra::Stored(_) => None,
             RelAlgebra::StoredWithValidity(_) => None,
+            RelAlgebra::StoredBitemporal(_) => None,
             RelAlgebra::Join(r) => Some(&r.to_eliminate),
             RelAlgebra::Reorder(_) => None,
             RelAlgebra::Filter(r) => Some(&r.to_eliminate),
@@ -1969,6 +2207,7 @@ impl RelAlgebra {
             RelAlgebra::TempStore(d) => d.bindings.clone(),
             RelAlgebra::Stored(v) => v.bindings.clone(),
             RelAlgebra::StoredWithValidity(v) => v.bindings.clone(),
+            RelAlgebra::StoredBitemporal(v) => v.bindings.clone(),
             RelAlgebra::Join(j) => j.bindings(),
             RelAlgebra::Reorder(r) => r.bindings(),
             RelAlgebra::Filter(r) => r.parent.bindings_after_eliminate(),
@@ -2006,6 +2245,7 @@ impl RelAlgebra {
             RelAlgebra::TempStore(r) => r.iter(delta_rule, stores),
             RelAlgebra::Stored(v) => v.iter(tx),
             RelAlgebra::StoredWithValidity(v) => v.iter(tx),
+            RelAlgebra::StoredBitemporal(v) => v.iter(tx),
             RelAlgebra::Join(j) => j.iter(tx, delta_rule, stores),
             RelAlgebra::Reorder(r) => r.iter(tx, delta_rule, stores),
             RelAlgebra::Filter(r) => r.iter(tx, delta_rule, stores),
@@ -2085,6 +2325,20 @@ impl NegJoin {
                     "stored_vld_neg_mat_join"
                 }
             }
+            RelAlgebra::StoredBitemporal(_) => {
+                let join_indices = self
+                    .joiner
+                    .join_indices(
+                        &self.left.bindings_after_eliminate(),
+                        &self.right.bindings_after_eliminate(),
+                    )
+                    .unwrap();
+                if join_is_prefix(&join_indices.1) {
+                    "stored_bt_neg_prefix_join"
+                } else {
+                    "stored_bt_neg_mat_join"
+                }
+            }
             _ => {
                 unreachable!()
             }
@@ -2131,6 +2385,21 @@ impl NegJoin {
                 )
             }
             RelAlgebra::StoredWithValidity(v) => {
+                let join_indices = self
+                    .joiner
+                    .join_indices(
+                        &self.left.bindings_after_eliminate(),
+                        &self.right.bindings_after_eliminate(),
+                    )
+                    .unwrap();
+                v.neg_join(
+                    tx,
+                    self.left.iter(tx, delta_rule, stores)?,
+                    join_indices,
+                    eliminate_indices,
+                )
+            }
+            RelAlgebra::StoredBitemporal(v) => {
                 let join_indices = self
                     .joiner
                     .join_indices(
@@ -2239,6 +2508,20 @@ impl InnerJoin {
                     "stored_mat_join"
                 }
             }
+            RelAlgebra::StoredBitemporal(_) => {
+                let join_indices = self
+                    .joiner
+                    .join_indices(
+                        &self.left.bindings_after_eliminate(),
+                        &self.right.bindings_after_eliminate(),
+                    )
+                    .unwrap();
+                if join_is_prefix(&join_indices.1) {
+                    "stored_bt_prefix_join"
+                } else {
+                    "stored_bt_mat_join"
+                }
+            }
             RelAlgebra::Join(_) | RelAlgebra::Filter(_) | RelAlgebra::Unification(_) => {
                 "generic_mat_join"
             }
@@ -2320,7 +2603,28 @@ impl InnerJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_is_prefix(&join_indices.1) {
+                let plain_len = r.storage.metadata.keys.len().saturating_sub(1);
+                if join_prefix_is_temporally_safe(&join_indices.1, plain_len) {
+                    r.prefix_join(
+                        tx,
+                        self.left.iter(tx, delta_rule, stores)?,
+                        join_indices,
+                        eliminate_indices,
+                    )
+                } else {
+                    self.materialized_join(tx, eliminate_indices, delta_rule, stores)
+                }
+            }
+            RelAlgebra::StoredBitemporal(r) => {
+                let join_indices = self
+                    .joiner
+                    .join_indices(
+                        &self.left.bindings_after_eliminate(),
+                        &self.right.bindings_after_eliminate(),
+                    )
+                    .unwrap();
+                let plain_len = r.storage.metadata.keys.len().saturating_sub(2);
+                if join_prefix_is_temporally_safe(&join_indices.1, plain_len) {
                     r.prefix_join(
                         tx,
                         self.left.iter(tx, delta_rule, stores)?,

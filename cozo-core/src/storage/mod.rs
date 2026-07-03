@@ -182,6 +182,38 @@ pub trait StoreTx<'s>: Sync {
         valid_at: ValidityTs,
     ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>;
 
+    /// Two-level bitemporal scan (mnestic fork, bitemporality step 4b; see
+    /// `data/bitemporal.rs`). The default implementation drives the generic
+    /// probe loop over `range_scan` — one fresh range per probe. Correct on
+    /// every backend; hot backends may override with a pinned-iterator seek
+    /// loop (step 6 measures before optimizing).
+    fn range_bitemporal_scan_tuple<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        vt_at: Option<ValidityTs>,
+        tt_at: ValidityTs,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        let upper = upper.to_vec();
+        Box::new(crate::data::bitemporal::BitemporalIter::new(
+            move |bound: &[u8]| -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+                // A probe bound past the range end means the walk is done —
+                // never hand an inverted range to the backend (mem's
+                // BTreeMap::range panics on start > end).
+                if bound >= upper.as_slice() {
+                    return Ok(None);
+                }
+                match self.range_scan(bound, &upper).next() {
+                    None => Ok(None),
+                    Some(kv) => Ok(Some(kv?)),
+                }
+            },
+            lower.to_vec(),
+            vt_at,
+            tt_at,
+        ))
+    }
+
     /// Scan on a range and return the raw results.
     /// `lower` is inclusive whereas `upper` is exclusive.
     fn range_scan<'a>(

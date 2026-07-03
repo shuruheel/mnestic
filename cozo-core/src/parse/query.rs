@@ -260,6 +260,15 @@ pub(crate) fn parse_query(
                     },
                 );
             }
+            Rule::as_of_option => {
+                // mnestic fork, bitemporality §4: default tt for every
+                // tt-stamped relation atom in this query lacking an explicit
+                // selector. Parsed with the tt token rules (NOW/END = current
+                // belief; numeric µs; ISO-8601).
+                let pair = pair.into_inner().next().unwrap();
+                let expr = build_expr(pair, param_pool)?;
+                out_opts.as_of = Some(expr2tt_spec(expr)?);
+            }
             Rule::timeout_option => {
                 let pair = pair.into_inner().next().unwrap();
                 let span = pair.extract_span();
