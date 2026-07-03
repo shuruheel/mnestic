@@ -1721,18 +1721,41 @@ fn txtime_put_stamps_at_commit() {
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
 
-    // A correction is a new version at a higher tt: two rows, newest first.
+    // Capture a tt point between the two versions, then correct.
+    let DbInstance::Mem(inner) = &db else {
+        panic!()
+    };
+    let between = inner.tt_clock().peek() + 1;
     db.run_default("?[k, v] <- [[1, 20]] :put audit_w {k => v}")
         .unwrap();
+
+    // Bare read = CURRENT STATE (the correction only) — §4 migration invariant.
     let res = db
-        .run_default("?[tt, v] := *audit_w[k, tt, v], k == 1")
+        .run_default("?[k, v] := *audit_w[k, tt, v]")
         .unwrap()
         .into_json();
-    let rows = res["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    // trailing-Validity sort: newest tt first
-    assert_eq!(rows[0][1], 20);
-    assert_eq!(rows[1][1], 10);
+    assert_eq!(res["rows"], serde_json::json!([[1, 20]]));
+
+    // As-of the point between the versions: the original belief.
+    let res = db
+        .run_default(&format!("?[k, v] := *audit_w[k, tt, v @ (tt: {between})]"))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
+
+    // As-of before the first write: nothing was known.
+    let res = db
+        .run_default("?[k, v] := *audit_w[k, tt, v @ (tt: 1)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0);
+
+    // @ (tt: 'NOW') is the explicit spelling of the current-state default.
+    let res = db
+        .run_default("?[k, v] := *audit_w[k, tt, v @ (tt: 'NOW')]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 20]]));
 }
 
 #[test]
@@ -1757,28 +1780,32 @@ fn txtime_rm_appends_retraction() {
         .unwrap();
     db.run_default("?[k, v] <- [[1, 10]] :put audit_rm {k => v}")
         .unwrap();
+    let DbInstance::Mem(inner) = &db else {
+        panic!()
+    };
+    let before_rm = inner.tt_clock().peek() + 1;
     db.run_default("?[k] <- [[1]] :rm audit_rm {k}").unwrap();
 
-    // Two physical rows: the retraction (newest) then the assert.
+    // Current state: the key is believed-deleted -> absent.
     let res = db
-        .run_default("?[tt, v] := *audit_rm[k, tt, v]")
+        .run_default("?[k] := *audit_rm[k, tt, v]")
         .unwrap()
         .into_json();
-    let rows = res["rows"].as_array().unwrap();
-    assert_eq!(rows.len(), 2, "{rows:?}");
-    // rendered Validity is [ts, is_assert]: newest first is the retraction
-    assert_eq!(rows[0][0][1], serde_json::json!(false), "{rows:?}");
-    assert_eq!(rows[1][0][1], serde_json::json!(true), "{rows:?}");
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0);
 
-    // rm again: already believed-deleted, no third row
+    // As-of before the removal: still there — nothing was physically deleted.
+    let res = db
+        .run_default(&format!(
+            "?[k, v] := *audit_rm[k, tt, v @ (tt: {before_rm})]"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
+
+    // rm again: already believed-deleted, a no-op.
     db.run_default("?[k] <- [[1]] :rm audit_rm {k}").unwrap();
-    let res = db
-        .run_default("?[tt] := *audit_rm[k, tt, v]")
-        .unwrap()
-        .into_json();
-    assert_eq!(res["rows"].as_array().unwrap().len(), 2);
 
-    // rm of a missing key: no-op; :delete of a missing key: error
+    // rm of a missing key: no-op; :delete of a missing key: error.
     db.run_default("?[k] <- [[999]] :rm audit_rm {k}").unwrap();
     let err = db
         .run_default("?[k] <- [[999]] :delete audit_rm {k}")
@@ -2042,18 +2069,68 @@ fn txtime_create_with_rows_rejects_tt_header() {
 }
 
 #[test]
-fn txtime_asof_read_gives_pending_error() {
+fn txtime_axis_selector_errors() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default(":create a_asof {k, tt: TxTime => v: Int}")
         .unwrap();
+    // bare @ E means valid time, everywhere: tt-only relations reject it
     let err = db
         .run_default("?[k, v] := *a_asof[k, tt, v @ 'NOW']")
-        .expect_err("@ on tt relation must give the pending error");
+        .expect_err("bare @ on tt-only must error");
     let msg = format!("{err:?}");
     assert!(
-        msg.contains("not available yet") || msg.contains("step 4"),
+        msg.contains("no valid-time axis") || msg.contains("system-versioned"),
         "{msg}"
     );
+    let err = db
+        .run_default("?[k, v] := *a_asof[k, tt, v @ (vt: 'NOW')]")
+        .expect_err("vt label on tt-only must error");
+    assert!(format!("{err:?}").contains("valid-time"), "{err:?}");
+
+    // tt label on a plain relation errors
+    db.run_default(":create plain_r {k => v: Int}").unwrap();
+    let err = db
+        .run_default("?[k, v] := *plain_r[k, v @ (tt: 'NOW')]")
+        .expect_err("tt label on plain must error");
+    assert!(
+        format!("{err:?}").contains("no transaction-time axis"),
+        "{err:?}"
+    );
+
+    // tt label on a vt-only relation errors; vt label still works
+    db.run_default(":create vt_r {k, v: Validity => x: Int}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, x] := *vt_r[k, v, x @ (tt: 'NOW')]")
+        .expect_err("tt label on vt-only must error");
+    assert!(
+        format!("{err:?}").contains("no transaction-time axis"),
+        "{err:?}"
+    );
+    db.run_default("?[k, x] := *vt_r[k, v, x @ (vt: 'NOW')]")
+        .unwrap();
+
+    // bitemporal: any selector is still pending (step 4b); bare scan works
+    db.run_default(":create bi_r {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, x] := *bi_r[k, v, tt, x @ (tt: 'NOW')]")
+        .expect_err("bitemporal as-of pending 4b");
+    assert!(format!("{err:?}").contains("not available yet"), "{err:?}");
+    db.run_default("?[k, x] := *bi_r[k, v, tt, x]").unwrap();
+
+    // duplicate axis label is a parse error
+    let err = db
+        .run_default("?[k, v] := *a_asof[k, tt, v @ (tt: 1, tt: 2)]")
+        .expect_err("duplicate label must fail");
+    assert!(
+        format!("{err:?}").contains("duplicate temporal axis"),
+        "{err:?}"
+    );
+
+    // labeled vt form works on vt relations, order-free pair parses
+    db.run_default("?[k, x] := *vt_r[k, v, x @ (vt: 'NOW')]")
+        .unwrap();
 }
 
 #[test]
@@ -2305,4 +2382,108 @@ fn meet_and_or_report_change_not_stability() {
     assert!(or.update(&mut v, &DataValue::from(true)).unwrap());
     assert!(!or.update(&mut v, &DataValue::from(true)).unwrap());
     assert!(!or.update(&mut v, &DataValue::from(false)).unwrap());
+}
+
+#[test]
+fn txtime_negation_sees_current_state() {
+    // Regression: negated atoms against tt-only relations hit NegJoin's
+    // unreachable!() before StoredWithValidity gained a neg_join (the
+    // current-state default made that the DEFAULT path for `not *audit{…}`).
+    for engine in ["mem", "sqlite"] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("neg.db");
+        let db = DbInstance::new(engine, path.to_str().unwrap(), "").unwrap();
+        db.run_default(":create audit_n {k, tt: TxTime => v: Int}")
+            .unwrap();
+        db.run_default("?[k, v] <- [[1, 10], [2, 20]] :put audit_n {k => v}")
+            .unwrap();
+        db.run_default("?[k] <- [[2]] :rm audit_n {k}").unwrap();
+
+        // bare negation: key 1 exists (excluded), key 2 believed-deleted and
+        // key 3 never existed (both included)
+        let res = db
+            .run_default("r[k] <- [[1], [2], [3]] ?[k] := r[k], not *audit_n{k}")
+            .unwrap()
+            .into_json();
+        assert_eq!(res["rows"], serde_json::json!([[2], [3]]), "{engine}");
+
+        // explicit selector on the negated atom
+        let res = db
+            .run_default("r[k] <- [[1], [2]] ?[k] := r[k], not *audit_n{k @ (tt: 'NOW')}")
+            .unwrap()
+            .into_json();
+        assert_eq!(res["rows"], serde_json::json!([[2]]), "{engine}");
+
+        // ::explain must not panic either (join_type)
+        db.run_default("::explain { r[k] <- [[1]] ?[k] := r[k], not *audit_n{k} }")
+            .unwrap();
+    }
+}
+
+#[test]
+fn vt_negation_with_selector_no_longer_panics() {
+    // Pre-existing upstream panic, fixed by the same StoredWithValidity
+    // neg_join: a negated vt atom with an @ selector.
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create vt_n {k, v: Validity => x: Int}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, 'ASSERT', 5]] :put vt_n {k, v => x}")
+        .unwrap();
+    let res = db
+        .run_default("r[k] <- [[1], [2]] ?[k] := r[k], not *vt_n{k @ 'NOW'}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[2]]));
+}
+
+#[test]
+fn txtime_reads_on_sqlite_and_selector_forms() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("forms.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create audit_f {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10]] :put audit_f {k => v}")
+        .unwrap();
+    let DbInstance::Sqlite(inner) = &db else {
+        panic!()
+    };
+    let between = inner.tt_clock().peek() + 1;
+    db.run_default("?[k, v] <- [[1, 20]] :put audit_f {k => v}")
+        .unwrap();
+
+    // named-field form with selector
+    let res = db
+        .run_default(&format!("?[k, w] := *audit_f{{k, v: w @ (tt: {between})}}"))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
+
+    // 'END' synonym = current state
+    let res = db
+        .run_default("?[k, w] := *audit_f{k, v: w @ (tt: 'END')}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 20]]));
+
+    // date-only ISO string now parses (midnight UTC) — far past -> empty
+    let res = db
+        .run_default("?[k, w] := *audit_f{k, v: w @ (tt: '2001-01-01')}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0);
+
+    // order-free pair on a BITEMPORAL relation still errors as pending 4b
+    db.run_default(":create bi_f {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, x] := *bi_f[k, v, tt, x @ (tt: 'NOW', vt: 'NOW')]")
+        .expect_err("bitemporal pair pending 4b");
+    assert!(format!("{err:?}").contains("not available yet"), "{err:?}");
+
+    // nullable vt with TxTime is rejected at :create (the 8th shape)
+    let err = db
+        .run_default(":create bad_null_vt {k, v: Validity?, tt: TxTime => x: Int}")
+        .expect_err("nullable vt with tt must be rejected");
+    assert!(format!("{err:?}").contains("cannot be nullable"), "{err:?}");
 }

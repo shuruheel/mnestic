@@ -140,6 +140,7 @@ impl InputAtom {
             name,
             mut args,
             valid_at,
+            tx_valid_at,
             span,
         }: InputNamedFieldRelationApplyAtom,
         gen: &mut TempSymbGen,
@@ -177,6 +178,7 @@ impl InputAtom {
             args: new_args,
             span,
             valid_at,
+            tx_valid_at,
         })
     }
 
@@ -342,6 +344,7 @@ impl InputRelationApplyAtom {
                 name: self.name,
                 args,
                 valid_at: self.valid_at,
+                tx_valid_at: self.tx_valid_at,
                 span: self.span,
             })
         } else {
@@ -349,6 +352,7 @@ impl InputRelationApplyAtom {
                 name: self.name,
                 args,
                 valid_at: self.valid_at,
+                tx_valid_at: self.tx_valid_at,
                 span: self.span,
             })
         });

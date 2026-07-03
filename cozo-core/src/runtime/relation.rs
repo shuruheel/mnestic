@@ -426,6 +426,11 @@ fn validate_temporal_axes(input_meta: &InputRelationHandle) -> Result<()> {
             "at most one Validity column is allowed when TxTime is declared"
         ));
     }
+    if keys.iter().any(|c| is_vt(&&c.clone()) && c.typing.nullable) {
+        bail!(err(
+            "the Validity axis cannot be nullable when TxTime is declared (the two-level resolution has no semantics for a null vt)"
+        ));
+    }
     let n = keys.len();
     if !matches!(keys[n - 1].typing.coltype, ColType::TxTime) {
         bail!(err("TxTime must be the last key column"));
@@ -471,6 +476,88 @@ impl RelationHandle {
             self.metadata.keys.last().map(|c| &c.typing.coltype),
             Some(crate::data::relation::ColType::TxTime)
         )
+    }
+
+    /// tt-only (system-versioned): tt-stamped with no vt axis.
+    pub(crate) fn is_tt_only(&self) -> bool {
+        self.has_txtime() && {
+            let n = self.metadata.keys.len();
+            n < 2
+                || !matches!(
+                    self.metadata.keys[n - 2].typing.coltype,
+                    crate::data::relation::ColType::Validity
+                )
+        }
+    }
+
+    /// Resolve a read's temporal selectors against this relation's axes
+    /// (mnestic fork, bitemporality step 4a; spec §4 semantics table).
+    /// Returns the effective as-of point for the trailing-axis skip-scan
+    /// (`None` = plain scan). On tt-only relations the tt axis DEFAULTS to
+    /// end-of-tt-time — the default read is the current state, so adding a
+    /// `tt: TxTime` column changes no existing query's results (the migration
+    /// invariant); only an explicit `@ (tt: …)` reaches history.
+    pub(crate) fn resolve_temporal_read(
+        &self,
+        vt: Option<ValidityTs>,
+        tt: Option<ValidityTs>,
+        span: SourceSpan,
+    ) -> Result<Option<ValidityTs>> {
+        use crate::data::functions::MAX_VALIDITY_TS;
+        if self.has_txtime() {
+            if self.is_tt_only() {
+                if vt.is_some() {
+                    #[derive(Debug, Error, Diagnostic)]
+                    #[error("relation {0} is system-versioned: it has no valid-time axis")]
+                    #[diagnostic(
+                        code(eval::txtime_no_vt_axis),
+                        help("select transaction time with `@ (tt: …)`; bare `@ E` always means valid time")
+                    )]
+                    struct NoVtAxis(String, #[label] SourceSpan);
+                    bail!(NoVtAxis(self.name.to_string(), span));
+                }
+                Ok(Some(tt.unwrap_or(MAX_VALIDITY_TS)))
+            } else {
+                // Bitemporal: the two-level scan lands in step 4b.
+                if vt.is_some() || tt.is_some() {
+                    #[derive(Debug, Error, Diagnostic)]
+                    #[error("as-of reads on bitemporal relation {0} are not available yet")]
+                    #[diagnostic(
+                        code(eval::txtime_asof_pending),
+                        help("the two-level (vt, tt) resolution lands with bitemporality step 4b; a bare scan returns all raw rows")
+                    )]
+                    struct TxTimeAsOfPending(String, #[label] SourceSpan);
+                    bail!(TxTimeAsOfPending(self.name.to_string(), span));
+                }
+                Ok(None)
+            }
+        } else {
+            if tt.is_some() {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("relation {0} has no transaction-time axis")]
+                #[diagnostic(
+                    code(eval::txtime_no_tt_axis),
+                    help("declare a trailing `tt: TxTime` key column to make the relation transaction-time-stamped")
+                )]
+                struct NoTtAxis(String, #[label] SourceSpan);
+                bail!(NoTtAxis(self.name.to_string(), span));
+            }
+            match vt {
+                None => Ok(None),
+                Some(v) => {
+                    if self.metadata.keys.last().map(|c| &c.typing.coltype)
+                        != Some(&crate::data::relation::ColType::Validity)
+                        || self.metadata.keys.last().unwrap().typing.nullable
+                    {
+                        bail!(crate::query::ra::InvalidTimeTravelScanning(
+                            self.name.to_string(),
+                            span
+                        ));
+                    }
+                    Ok(Some(v))
+                }
+            }
+        }
     }
 
     pub(crate) fn arity(&self) -> usize {

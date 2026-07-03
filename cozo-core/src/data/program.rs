@@ -379,12 +379,16 @@ pub enum FixedRuleArg {
         name: Symbol,
         bindings: Vec<Symbol>,
         valid_at: Option<ValidityTs>,
+        /// transaction-time selector (mnestic fork, bitemporality)
+        tx_valid_at: Option<ValidityTs>,
         span: SourceSpan,
     },
     NamedStored {
         name: Symbol,
         bindings: BTreeMap<SmartString<LazyCompact>, Symbol>,
         valid_at: Option<ValidityTs>,
+        /// transaction-time selector (mnestic fork, bitemporality)
+        tx_valid_at: Option<ValidityTs>,
         span: SourceSpan,
     },
 }
@@ -430,6 +434,8 @@ pub(crate) enum MagicFixedRuleRuleArg {
         name: Symbol,
         bindings: Vec<Symbol>,
         valid_at: Option<ValidityTs>,
+        /// transaction-time selector (mnestic fork, bitemporality)
+        tx_valid_at: Option<ValidityTs>,
         span: SourceSpan,
     },
 }
@@ -1794,6 +1800,8 @@ pub struct InputNamedFieldRelationApplyAtom {
     pub name: Symbol,
     pub args: BTreeMap<SmartString<LazyCompact>, Expr>,
     pub valid_at: Option<ValidityTs>,
+    /// transaction-time selector (mnestic fork, bitemporality)
+    pub tx_valid_at: Option<ValidityTs>,
     pub span: SourceSpan,
 }
 
@@ -1802,6 +1810,8 @@ pub struct InputRelationApplyAtom {
     pub name: Symbol,
     pub args: Vec<Expr>,
     pub valid_at: Option<ValidityTs>,
+    /// transaction-time selector (mnestic fork, bitemporality)
+    pub tx_valid_at: Option<ValidityTs>,
     pub span: SourceSpan,
 }
 
@@ -1817,6 +1827,8 @@ pub(crate) struct NormalFormRelationApplyAtom {
     pub(crate) name: Symbol,
     pub(crate) args: Vec<Symbol>,
     pub(crate) valid_at: Option<ValidityTs>,
+    /// transaction-time selector (mnestic fork, bitemporality)
+    pub(crate) tx_valid_at: Option<ValidityTs>,
     pub(crate) span: SourceSpan,
 }
 
@@ -1832,6 +1844,8 @@ pub(crate) struct MagicRelationApplyAtom {
     pub(crate) name: Symbol,
     pub(crate) args: Vec<Symbol>,
     pub(crate) valid_at: Option<ValidityTs>,
+    /// transaction-time selector (mnestic fork, bitemporality)
+    pub(crate) tx_valid_at: Option<ValidityTs>,
     pub(crate) span: SourceSpan,
 }
 

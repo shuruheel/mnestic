@@ -692,18 +692,16 @@ fn parse_atom(
                 .into_inner()
                 .map(|v| build_expr(v, param_pool))
                 .try_collect()?;
-            let valid_at = match src.next() {
-                None => None,
-                Some(vld_clause) => {
-                    let vld_expr = build_expr(vld_clause.into_inner().next().unwrap(), param_pool)?;
-                    Some(expr2vld_spec(vld_expr, cur_vld)?)
-                }
+            let (valid_at, tx_valid_at) = match src.next() {
+                None => (None, None),
+                Some(vld_clause) => parse_temporal_clause(vld_clause, param_pool, cur_vld)?,
             };
             InputAtom::Relation {
                 inner: InputRelationApplyAtom {
                     name: Symbol::new(&name.as_str()[1..], name.extract_span()),
                     args,
                     valid_at,
+                    tx_valid_at,
                     span,
                 },
             }
@@ -756,12 +754,9 @@ fn parse_atom(
                 .into_inner()
                 .map(|arg| extract_named_apply_arg(arg, param_pool))
                 .try_collect()?;
-            let valid_at = match src.next() {
-                None => None,
-                Some(vld_clause) => {
-                    let vld_expr = build_expr(vld_clause.into_inner().next().unwrap(), param_pool)?;
-                    Some(expr2vld_spec(vld_expr, cur_vld)?)
-                }
+            let (valid_at, tx_valid_at) = match src.next() {
+                None => (None, None),
+                Some(vld_clause) => parse_temporal_clause(vld_clause, param_pool, cur_vld)?,
             };
             InputAtom::NamedFieldRelation {
                 inner: InputNamedFieldRelationApplyAtom {
@@ -769,6 +764,7 @@ fn parse_atom(
                     args,
                     span,
                     valid_at,
+                    tx_valid_at,
                 },
             }
         }
@@ -940,6 +936,7 @@ fn parse_fixed_rule(
                         let name = els.next().unwrap();
                         let mut bindings = vec![];
                         let mut valid_at = None;
+                        let mut tx_valid_at = None;
                         for v in els {
                             match v.as_rule() {
                                 Rule::var => {
@@ -959,9 +956,9 @@ fn parse_fixed_rule(
                                     }
                                 }
                                 Rule::validity_clause => {
-                                    let vld_inner = v.into_inner().next().unwrap();
-                                    let vld_expr = build_expr(vld_inner, param_pool)?;
-                                    valid_at = Some(expr2vld_spec(vld_expr, cur_vld)?)
+                                    let (vt, tt) = parse_temporal_clause(v, param_pool, cur_vld)?;
+                                    valid_at = vt;
+                                    tx_valid_at = tt;
                                 }
                                 _ => unreachable!(),
                             }
@@ -973,6 +970,7 @@ fn parse_fixed_rule(
                             ),
                             bindings,
                             valid_at,
+                            tx_valid_at,
                             span,
                         })
                     }
@@ -981,6 +979,7 @@ fn parse_fixed_rule(
                         let name = els.next().unwrap();
                         let mut bindings = BTreeMap::new();
                         let mut valid_at = None;
+                        let mut tx_valid_at = None;
                         for p in els {
                             match p.as_rule() {
                                 Rule::fixed_named_relation_arg_pair => {
@@ -1004,9 +1003,9 @@ fn parse_fixed_rule(
                                     bindings.insert(k, v);
                                 }
                                 Rule::validity_clause => {
-                                    let vld_inner = p.into_inner().next().unwrap();
-                                    let vld_expr = build_expr(vld_inner, param_pool)?;
-                                    valid_at = Some(expr2vld_spec(vld_expr, cur_vld)?)
+                                    let (vt, tt) = parse_temporal_clause(p, param_pool, cur_vld)?;
+                                    valid_at = vt;
+                                    tx_valid_at = tt;
                                 }
                                 _ => unreachable!(),
                             }
@@ -1019,6 +1018,7 @@ fn parse_fixed_rule(
                             ),
                             bindings,
                             valid_at,
+                            tx_valid_at,
                             span,
                         })
                     }
@@ -1100,6 +1100,75 @@ fn make_empty_const_rule(prog: &mut InputProgram, bindings: &[Symbol]) {
             },
         },
     );
+}
+
+/// Parse a transaction-time selector expr (mnestic fork, bitemporality §4).
+/// "NOW" and "END" both resolve to end-of-tt-time (`MAX_VALIDITY_TS`):
+/// "current belief" means all committed beliefs, and tt is engine-stamped so
+/// it can never be future-dated — resolving against the wall clock instead
+/// would silently hide the newest beliefs after a backward clock step.
+fn expr2tt_spec(expr: Expr) -> Result<ValidityTs> {
+    let vld_span = expr.span();
+    match expr.eval_to_const()? {
+        DataValue::Num(n) => {
+            let microseconds = n.get_int().ok_or(BadValiditySpecification(vld_span))?;
+            Ok(ValidityTs(Reverse(microseconds)))
+        }
+        DataValue::Str(s) => match &s as &str {
+            "NOW" | "END" => Ok(MAX_VALIDITY_TS),
+            s => Ok(str2vld(s).map_err(|_| BadValiditySpecification(vld_span))?),
+        },
+        _ => {
+            bail!(BadValiditySpecification(vld_span))
+        }
+    }
+}
+
+/// Parse the interior of a validity clause (mnestic fork, bitemporality §4):
+/// either the shipped bare expr (valid time, unchanged) or the labeled
+/// order-free axis form `(vt: E)` / `(tt: E)` / `(vt: E1, tt: E2)`.
+/// Returns `(vt_spec, tt_spec)`.
+fn parse_temporal_clause(
+    vld_clause: Pair<'_>,
+    param_pool: &BTreeMap<String, DataValue>,
+    cur_vld: ValidityTs,
+) -> Result<(Option<ValidityTs>, Option<ValidityTs>)> {
+    let inner = vld_clause.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::temporal_axes => {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error("duplicate temporal axis label in @ clause")]
+            #[diagnostic(code(parser::duplicate_temporal_axis))]
+            struct DupAxis(#[label] SourceSpan);
+
+            let mut vt = None;
+            let mut tt = None;
+            for pair_p in inner.into_inner() {
+                let span = pair_p.extract_span();
+                let mut ps = pair_p.into_inner();
+                let label = ps.next().unwrap().as_str().to_string();
+                let expr = build_expr(ps.next().unwrap(), param_pool)?;
+                match label.as_str() {
+                    "vt" => {
+                        if vt.replace(expr2vld_spec(expr, cur_vld)?).is_some() {
+                            bail!(DupAxis(span));
+                        }
+                    }
+                    "tt" => {
+                        if tt.replace(expr2tt_spec(expr)?).is_some() {
+                            bail!(DupAxis(span));
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            Ok((vt, tt))
+        }
+        _ => {
+            let vld_expr = build_expr(inner, param_pool)?;
+            Ok((Some(expr2vld_spec(vld_expr, cur_vld)?), None))
+        }
+    }
 }
 
 fn expr2vld_spec(expr: Expr, cur_vld: ValidityTs) -> Result<ValidityTs> {

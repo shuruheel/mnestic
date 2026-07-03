@@ -81,7 +81,10 @@ fixed_relation_rel = {relation_ident ~ "[" ~ (var ~ ",")* ~ var? ~ validity_clau
 fixed_named_relation_rel = {relation_ident ~ "{" ~ (fixed_named_relation_arg_pair ~ ",")* ~ fixed_named_relation_arg_pair? ~ validity_clause? ~ "}"}
 fixed_named_relation_arg_pair = {ident ~ (":" ~ ident)?}
 
-validity_clause = {"@" ~ expr}
+validity_clause = {"@" ~ (temporal_axes | expr)}
+temporal_axes = {"(" ~ axis_pair ~ ("," ~ axis_pair)? ~ ")"}
+axis_pair = {axis_label ~ ":" ~ expr}
+axis_label = {"vt" | "tt"}
 
 rule_body = {(disjunction ~ ",")* ~ disjunction?}
 rule_apply = {underscore_ident ~ "[" ~ apply_args ~ "]"}

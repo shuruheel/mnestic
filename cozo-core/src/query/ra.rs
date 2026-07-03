@@ -19,7 +19,6 @@ use thiserror::Error;
 
 use crate::data::expr::{compute_bounds, eval_bytecode, eval_bytecode_pred, Bytecode, Expr};
 use crate::data::program::{FtsSearch, HnswSearch, MagicSymbol};
-use crate::data::relation::{ColType, NullableColType};
 use crate::data::symb::Symbol;
 use crate::data::tuple::{Tuple, TupleIter};
 use crate::data::value::{DataValue, ValidityTs};
@@ -429,8 +428,13 @@ impl RelAlgebra {
         storage: RelationHandle,
         span: SourceSpan,
         validity: Option<ValidityTs>,
+        tx_validity: Option<ValidityTs>,
     ) -> Result<Self> {
-        match validity {
+        // Resolve selectors against the relation's temporal axes (mnestic
+        // fork, bitemporality §4): tt-only relations default to current
+        // state; bitemporal as-of reads land in step 4b; plain/vt relations
+        // keep the shipped behavior exactly.
+        match storage.resolve_temporal_read(validity, tx_validity, span)? {
             None => Ok(Self::Stored(StoredRA {
                 bindings,
                 storage,
@@ -438,39 +442,17 @@ impl RelAlgebra {
                 filters_bytecodes: vec![],
                 span,
             })),
-            Some(vld) => {
-                if storage.has_txtime() {
-                    // mnestic fork, bitemporality: as-of reads on TxTime
-                    // relations (labeled @ (vt:/tt:) selectors) land in step 4;
-                    // until then bare scans return all versions.
-                    #[derive(Debug, Error, Diagnostic)]
-                    #[error("as-of reads on TxTime relation {0} are not available yet")]
-                    #[diagnostic(
-                        code(eval::txtime_asof_pending),
-                        help("the labeled selector `@ (vt: …, tt: …)` lands with bitemporality step 4; a bare scan (no `@`) returns all versions, newest transaction time first")
-                    )]
-                    struct TxTimeAsOfPending(String, #[label] SourceSpan);
-                    bail!(TxTimeAsOfPending(storage.name.to_string(), span));
-                }
-                if storage.metadata.keys.last().unwrap().typing
-                    != (NullableColType {
-                        coltype: ColType::Validity,
-                        nullable: false,
-                    })
-                {
-                    bail!(InvalidTimeTravelScanning(storage.name.to_string(), span));
-                };
-                Ok(Self::StoredWithValidity(StoredWithValidityRA {
-                    bindings,
-                    storage,
-                    filters: vec![],
-                    filters_bytecodes: vec![],
-                    valid_at: vld,
-                    span,
-                }))
-            }
+            Some(vld) => Ok(Self::StoredWithValidity(StoredWithValidityRA {
+                bindings,
+                storage,
+                filters: vec![],
+                filters_bytecodes: vec![],
+                valid_at: vld,
+                span,
+            })),
         }
     }
+
     pub(crate) fn reorder(self, new_order: Vec<Symbol>) -> Self {
         Self::Reorder(ReorderRA {
             relation: Box::new(self),
@@ -1145,6 +1127,114 @@ pub(crate) struct StoredWithValidityRA {
 }
 
 impl StoredWithValidityRA {
+    /// Negation against a versioned scan (mnestic fork, bitemporality 4a):
+    /// mirrors `StoredRA::neg_join` with the validity skip-scans, so negated
+    /// atoms against tt-only relations (whose reads now default to the
+    /// current state) and `@`-selected vt atoms work instead of panicking.
+    fn neg_join<'a>(
+        &'a self,
+        tx: &'a SessionTx<'_>,
+        left_iter: TupleIter<'a>,
+        (left_join_indices, right_join_indices): (Vec<usize>, Vec<usize>),
+        eliminate_indices: BTreeSet<usize>,
+    ) -> Result<TupleIter<'a>> {
+        debug_assert!(!right_join_indices.is_empty());
+        let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
+        right_invert_indices.sort_by_key(|(_, b)| **b);
+        let mut left_to_prefix_indices = vec![];
+        for (ord, (idx, ord_sorted)) in right_invert_indices.iter().enumerate() {
+            if ord != **ord_sorted {
+                break;
+            }
+            left_to_prefix_indices.push(left_join_indices[*idx]);
+        }
+
+        if join_is_prefix(&right_join_indices) {
+            Ok(Box::new(
+                left_iter
+                    .map_ok(move |tuple| -> Result<Option<Tuple>> {
+                        let prefix = left_to_prefix_indices
+                            .iter()
+                            .map(|i| tuple[*i].clone())
+                            .collect_vec();
+
+                        'outer: for found in
+                            self.storage.skip_scan_prefix(tx, &prefix, self.valid_at)
+                        {
+                            let found = found?;
+                            for (left_idx, right_idx) in
+                                left_join_indices.iter().zip(right_join_indices.iter())
+                            {
+                                if tuple[*left_idx] != found[*right_idx] {
+                                    continue 'outer;
+                                }
+                            }
+                            return Ok(None);
+                        }
+
+                        Ok(Some(if !eliminate_indices.is_empty() {
+                            tuple
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(i, v)| {
+                                    if eliminate_indices.contains(&i) {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }
+                                })
+                                .collect_vec()
+                        } else {
+                            tuple
+                        }))
+                    })
+                    .map(flatten_err)
+                    .filter_map(invert_option_err),
+            ))
+        } else {
+            let mut right_join_vals = BTreeSet::new();
+
+            for tuple in self.storage.skip_scan_all(tx, self.valid_at) {
+                let tuple = tuple?;
+                let to_join: Box<[DataValue]> = right_join_indices
+                    .iter()
+                    .map(|i| tuple[*i].clone())
+                    .collect();
+                right_join_vals.insert(to_join);
+            }
+            Ok(Box::new(
+                left_iter
+                    .map_ok(move |tuple| -> Result<Option<Tuple>> {
+                        let left_join_vals: Box<[DataValue]> = left_join_indices
+                            .iter()
+                            .map(|i| tuple[*i].clone())
+                            .collect();
+                        if right_join_vals.contains(&left_join_vals) {
+                            return Ok(None);
+                        }
+
+                        Ok(Some(if !eliminate_indices.is_empty() {
+                            tuple
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(i, v)| {
+                                    if eliminate_indices.contains(&i) {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    }
+                                })
+                                .collect_vec()
+                        } else {
+                            tuple
+                        }))
+                    })
+                    .map(flatten_err)
+                    .filter_map(invert_option_err),
+            ))
+        }
+    }
+
     fn fill_binding_indices_and_compile(&mut self) -> Result<()> {
         let bindings: BTreeMap<_, _> = self
             .bindings
@@ -1981,6 +2071,20 @@ impl NegJoin {
                     "stored_neg_mat_join"
                 }
             }
+            RelAlgebra::StoredWithValidity(_) => {
+                let join_indices = self
+                    .joiner
+                    .join_indices(
+                        &self.left.bindings_after_eliminate(),
+                        &self.right.bindings_after_eliminate(),
+                    )
+                    .unwrap();
+                if join_is_prefix(&join_indices.1) {
+                    "stored_vld_neg_prefix_join"
+                } else {
+                    "stored_vld_neg_mat_join"
+                }
+            }
             _ => {
                 unreachable!()
             }
@@ -2012,6 +2116,21 @@ impl NegJoin {
                 )
             }
             RelAlgebra::Stored(v) => {
+                let join_indices = self
+                    .joiner
+                    .join_indices(
+                        &self.left.bindings_after_eliminate(),
+                        &self.right.bindings_after_eliminate(),
+                    )
+                    .unwrap();
+                v.neg_join(
+                    tx,
+                    self.left.iter(tx, delta_rule, stores)?,
+                    join_indices,
+                    eliminate_indices,
+                )
+            }
+            RelAlgebra::StoredWithValidity(v) => {
                 let join_indices = self
                     .joiner
                     .join_indices(

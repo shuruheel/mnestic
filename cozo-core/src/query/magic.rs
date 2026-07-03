@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 use std::mem;
 
 use itertools::Itertools;
-use miette::{bail, ensure, Result};
+use miette::{ensure, Result};
 use smallvec::SmallVec;
 use smartstring::SmartString;
 
@@ -20,11 +20,9 @@ use crate::data::program::{
     NormalFormAtom, NormalFormInlineRule, NormalFormProgram, NormalFormRulesOrFixed,
     StratifiedMagicProgram, StratifiedNormalFormProgram,
 };
-use crate::data::relation::{ColType, NullableColType};
 use crate::data::symb::{Symbol, PROG_ENTRY};
 use crate::parse::SourceSpan;
 use crate::query::logical::NamedFieldNotFound;
-use crate::query::ra::InvalidTimeTravelScanning;
 use crate::runtime::transact::SessionTx;
 
 impl NormalFormProgram {
@@ -351,32 +349,20 @@ impl NormalFormProgram {
                                                 bindings,
                                                 span,
                                                 valid_at,
+                                                tx_valid_at,
                                             } => {
-                                                if valid_at.is_some() {
-                                                    let relation = tx.get_relation(name, false)?;
-                                                    let last_col_type = &relation
-                                                        .metadata
-                                                        .keys
-                                                        .last()
-                                                        .unwrap()
-                                                        .typing;
-                                                    if *last_col_type
-                                                        != (NullableColType {
-                                                            coltype: ColType::Validity,
-                                                            nullable: false,
-                                                        })
-                                                    {
-                                                        bail!(InvalidTimeTravelScanning(
-                                                            name.to_string(),
-                                                            *span
-                                                        ));
-                                                    }
-                                                }
+                                                let relation = tx.get_relation(name, false)?;
+                                                let effective = relation.resolve_temporal_read(
+                                                    *valid_at,
+                                                    *tx_valid_at,
+                                                    *span,
+                                                )?;
 
                                                 MagicFixedRuleRuleArg::Stored {
                                                     name: name.clone(),
                                                     bindings: bindings.clone(),
-                                                    valid_at: *valid_at,
+                                                    valid_at: effective,
+                                                    tx_valid_at: None,
                                                     span: *span,
                                                 }
                                             }
@@ -384,28 +370,18 @@ impl NormalFormProgram {
                                                 name,
                                                 bindings,
                                                 valid_at,
+                                                tx_valid_at,
                                                 span,
                                             } => {
                                                 let relation = tx.get_relation(name, false)?;
-                                                if valid_at.is_some() {
-                                                    let last_col_type = &relation
-                                                        .metadata
-                                                        .keys
-                                                        .last()
-                                                        .unwrap()
-                                                        .typing;
-                                                    if *last_col_type
-                                                        != (NullableColType {
-                                                            coltype: ColType::Validity,
-                                                            nullable: false,
-                                                        })
-                                                    {
-                                                        bail!(InvalidTimeTravelScanning(
-                                                            name.to_string(),
-                                                            *span
-                                                        ));
-                                                    }
-                                                }
+                                                let valid_at = &relation.resolve_temporal_read(
+                                                    *valid_at,
+                                                    *tx_valid_at,
+                                                    *span,
+                                                )?;
+                                                let tx_valid_at: &Option<
+                                                    crate::data::value::ValidityTs,
+                                                > = &None;
                                                 let fields: BTreeSet<_> = relation
                                                     .metadata
                                                     .keys
@@ -441,6 +417,7 @@ impl NormalFormProgram {
                                                     name: name.clone(),
                                                     bindings: new_bindings,
                                                     valid_at: *valid_at,
+                                                    tx_valid_at: *tx_valid_at,
                                                     span: *span,
                                                 }
                                             }
@@ -522,6 +499,7 @@ impl NormalFormAtom {
                     name: v.name.clone(),
                     args: v.args.clone(),
                     valid_at: v.valid_at,
+                    tx_valid_at: v.tx_valid_at,
                     span: v.span,
                 };
                 for arg in v.args.iter() {
@@ -602,6 +580,7 @@ impl NormalFormAtom {
                     name: nv.name.clone(),
                     args: nv.args.clone(),
                     valid_at: nv.valid_at,
+                    tx_valid_at: nv.tx_valid_at,
                     span: nv.span,
                 })
             }

@@ -2518,8 +2518,17 @@ pub(crate) fn op_parse_timestamp(args: &[DataValue]) -> Result<DataValue> {
 }
 
 pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
-    let dt = DateTime::parse_from_rfc3339(s).map_err(|_| miette!("bad datetime: {}", s))?;
-    let st: SystemTime = dt.into();
+    // mnestic fork: also accept a bare date (midnight UTC) — the docs' own
+    // examples use `@ "2026-01-01"`, which strict RFC3339 rejects.
+    let st: SystemTime = match DateTime::parse_from_rfc3339(s) {
+        Ok(dt) => dt.into(),
+        Err(_) => {
+            let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| miette!("bad datetime: {}", s))?;
+            let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            dt.into()
+        }
+    };
     let microseconds = st.duration_since(UNIX_EPOCH).unwrap().as_micros();
     Ok(ValidityTs(Reverse(microseconds as i64)))
 }

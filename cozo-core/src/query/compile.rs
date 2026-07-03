@@ -267,8 +267,14 @@ impl<'a> SessionTx<'a> {
                         }
                     }
 
-                    let chosen_index =
-                        store.choose_index(&join_indices, rel_app.valid_at.is_some());
+                    let chosen_index = store.choose_index(
+                        &join_indices,
+                        // tt-stamped reads are validity-style even with no
+                        // explicit selector (implicit current-state MAX);
+                        // indexes cannot exist on tt relations until step 5,
+                        // but keep the flag honest for when they do.
+                        rel_app.valid_at.is_some() || store.has_txtime(),
+                    );
 
                     match chosen_index {
                         None => {
@@ -278,6 +284,7 @@ impl<'a> SessionTx<'a> {
                                 store,
                                 rel_app.span,
                                 rel_app.valid_at,
+                                rel_app.tx_valid_at,
                             )?;
                             debug_assert_eq!(prev_joiner_vars.len(), right_joiner_vars.len());
                             ret =
@@ -294,6 +301,7 @@ impl<'a> SessionTx<'a> {
                                 chosen_index,
                                 rel_app.span,
                                 rel_app.valid_at,
+                                rel_app.tx_valid_at,
                             )?;
                             debug_assert_eq!(prev_joiner_vars.len(), right_joiner_vars.len());
                             ret =
@@ -326,6 +334,7 @@ impl<'a> SessionTx<'a> {
                                     chosen_index,
                                     rel_app.span,
                                     rel_app.valid_at,
+                                    rel_app.tx_valid_at,
                                 )?;
                                 ret = ret.join(index, left_keys, right_keys, rel_app.span);
                             }
@@ -346,6 +355,7 @@ impl<'a> SessionTx<'a> {
                                     store,
                                     rel_app.span,
                                     rel_app.valid_at,
+                                    rel_app.tx_valid_at,
                                 )?;
                                 ret = ret.join(relation, left_keys, right_keys, rel_app.span);
                             }
@@ -452,8 +462,14 @@ impl<'a> SessionTx<'a> {
                         }
                     }
 
-                    let chosen_index =
-                        store.choose_index(&join_indices, rel_app.valid_at.is_some());
+                    let chosen_index = store.choose_index(
+                        &join_indices,
+                        // tt-stamped reads are validity-style even with no
+                        // explicit selector (implicit current-state MAX);
+                        // indexes cannot exist on tt relations until step 5,
+                        // but keep the flag honest for when they do.
+                        rel_app.valid_at.is_some() || store.has_txtime(),
+                    );
 
                     match chosen_index {
                         None | Some((_, _, true)) => {
@@ -462,6 +478,7 @@ impl<'a> SessionTx<'a> {
                                 store,
                                 rel_app.span,
                                 rel_app.valid_at,
+                                rel_app.tx_valid_at,
                             )?;
                             debug_assert_eq!(prev_joiner_vars.len(), right_joiner_vars.len());
                             ret = ret.neg_join(
@@ -482,6 +499,7 @@ impl<'a> SessionTx<'a> {
                                 chosen_index,
                                 rel_app.span,
                                 rel_app.valid_at,
+                                rel_app.tx_valid_at,
                             )?;
                             debug_assert_eq!(prev_joiner_vars.len(), right_joiner_vars.len());
                             ret = ret.neg_join(

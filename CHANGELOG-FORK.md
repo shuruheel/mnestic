@@ -5,6 +5,33 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — system-versioned relations complete: tt-only reads (bitemporality step 4a)
+- **The labeled temporal selector** `@ (vt: …)` / `@ (tt: …)` / order-free
+  `@ (vt: …, tt: …)` parses on every relation-access form; bare `@ E` still
+  means valid time, everywhere, forever. tt tokens: `"NOW"`/`"END"` =
+  end-of-tt-time (current belief — deliberately not the wall clock), numeric
+  µs, ISO-8601 (bare dates now accepted as midnight UTC — on the vt axis too;
+  strict RFC3339 previously rejected the docs' own `@ "2026-01-01"` examples).
+- **tt-only relations are now fully readable**: the default read is the
+  CURRENT STATE (one seek per key; believed-deleted keys absent) — replacing
+  step 3's all-versions interim scan and completing the §4 migration
+  invariant: adding `tt: TxTime` to a relation changes no existing query's
+  results. `@ (tt: T)` reads the state as of any past commit time. Rides the
+  existing single-axis skip-scan; fixed-rule inputs resolve the same way.
+  Bitemporal (vt+tt) relations keep raw bare scans and error on any selector
+  until step 4b — don't migrate vt relations to vt+tt yet.
+- **Fixed: negation against versioned scans panicked** (`unreachable!()` in
+  `NegJoin`) — with the current-state default this would have made every
+  `not *audit{…}` against a tt-only relation a crash that poisons the Db
+  handle; `StoredWithValidityRA` gained `neg_join` (skip-scan mirror of the
+  stored one). This also fixes the **pre-existing upstream panic** on negated
+  vt atoms with `@` selectors (`not *rel{k @ 'NOW'}`).
+- Also: nullable `Validity` is rejected when `TxTime` is declared (the 4b
+  resolution has no semantics for a null vt); `choose_index`'s validity flag
+  is honest for tt-stamped reads (inert until step 5 legalizes indexes on tt
+  relations); a projected tt column currently renders as a `[ts, flag]` pair —
+  timestamp-only rendering arrives with `::history` (step 5).
+
 ### New — custom aggregate registration (provenance semirings R0b)
 - **`Db::register_custom_aggr(name, is_meet, factory)` / `unregister_custom_aggr`**
   (+ `DbInstance` dispatchers): register a user-supplied ⊕ operator
