@@ -319,6 +319,115 @@ impl RelationHandle {
     }
 }
 
+/// Enforce the temporal-axis rule at `:create` time (mnestic fork,
+/// bitemporality step 3; `docs/specs/bitemporality.md` §4/§13.1): temporal
+/// axes are the trailing key columns in the fixed order vt-then-tt, at most
+/// one of each. `TxTime` is new (no shipped uses), so malformed declarations
+/// fail HERE, loudly, with the corrected declaration in the message —
+/// deliberately stricter than `Validity`'s shipped query-time-only check.
+fn validate_temporal_axes(input_meta: &InputRelationHandle) -> Result<()> {
+    use crate::data::relation::{ColType, ColumnDef};
+
+    let keys = &input_meta.metadata.keys;
+    let non_keys = &input_meta.metadata.non_keys;
+    let is_tt = |c: &&ColumnDef| matches!(c.typing.coltype, ColType::TxTime);
+    let is_vt = |c: &&ColumnDef| matches!(c.typing.coltype, ColType::Validity);
+
+    let tt_in_keys = keys.iter().filter(is_tt).count();
+    let tt_in_vals = non_keys.iter().filter(is_tt).count();
+    if tt_in_keys == 0 && tt_in_vals == 0 {
+        return Ok(());
+    }
+
+    // The copy-pasteable corrected declaration: non-temporal keys in declared
+    // order, then the (single) Validity, then the (single) TxTime, then the
+    // non-temporal value columns. Defaults are omitted from the rendering.
+    let corrected = {
+        let plain_keys = keys
+            .iter()
+            .filter(|c| !is_tt(c) && !is_vt(c))
+            .map(|c| format!("{}: {}", c.name, c.typing))
+            .collect::<Vec<_>>();
+        let vt = keys
+            .iter()
+            .chain(non_keys.iter())
+            .find(|c| is_vt(c))
+            .map(|c| format!("{}: {}", c.name, c.typing));
+        let tt = keys
+            .iter()
+            .chain(non_keys.iter())
+            .find(|c| is_tt(c))
+            .map(|c| format!("{}: TxTime", c.name));
+        let mut key_parts = plain_keys;
+        key_parts.extend(vt);
+        key_parts.extend(tt);
+        let val_parts = non_keys
+            .iter()
+            .filter(|c| !is_tt(c))
+            .map(|c| format!("{}: {}", c.name, c.typing))
+            .collect::<Vec<_>>();
+        if val_parts.is_empty() {
+            format!(":create {} {{{}}}", input_meta.name.name, key_parts.join(", "))
+        } else {
+            format!(
+                ":create {} {{{} => {}}}",
+                input_meta.name.name,
+                key_parts.join(", "),
+                val_parts.join(", ")
+            )
+        }
+    };
+
+    #[derive(Debug, Error, Diagnostic)]
+    #[error("invalid temporal-axis declaration: {reason}")]
+    #[diagnostic(
+        code(eval::invalid_temporal_axes),
+        help("temporal axes must be the trailing key columns, in the order vt (Validity) then tt (TxTime), at most one of each; corrected declaration: `{corrected}`")
+    )]
+    struct InvalidTemporalAxes {
+        reason: String,
+        corrected: String,
+        #[label]
+        span: SourceSpan,
+    }
+    let err = |reason: &str| InvalidTemporalAxes {
+        reason: reason.to_string(),
+        corrected: corrected.clone(),
+        span: input_meta.span,
+    };
+
+    if input_meta.name.is_temp_store_name() {
+        bail!(err("TxTime is not supported on transaction-temp (`_`-prefixed) relations — temp stores have no commit clock"));
+    }
+    if tt_in_vals > 0 {
+        bail!(err("TxTime must be a key column, not a value column"));
+    }
+    if tt_in_keys > 1 {
+        bail!(err("at most one TxTime column is allowed"));
+    }
+    if keys
+        .iter()
+        .find(is_tt)
+        .expect("tt_in_keys == 1")
+        .typing
+        .nullable
+    {
+        bail!(err("TxTime cannot be nullable (it is engine-assigned at every commit)"));
+    }
+    let vt_in_keys = keys.iter().filter(is_vt).count();
+    if vt_in_keys > 1 {
+        bail!(err("at most one Validity column is allowed when TxTime is declared"));
+    }
+    let n = keys.len();
+    if !matches!(keys[n - 1].typing.coltype, ColType::TxTime) {
+        bail!(err("TxTime must be the last key column"));
+    }
+    if vt_in_keys == 1 && (n < 2 || !matches!(keys[n - 2].typing.coltype, ColType::Validity)) {
+        bail!(err("Validity must immediately precede TxTime (the vt-then-tt trailing pair)"));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Eq, PartialEq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(crate) struct InputRelationHandle {
     pub(crate) name: Symbol,
@@ -611,6 +720,7 @@ impl<'a> SessionTx<'a> {
         &mut self,
         input_meta: InputRelationHandle,
     ) -> Result<RelationHandle> {
+        validate_temporal_axes(&input_meta)?;
         let key = DataValue::Str(input_meta.name.name.clone());
         let encoded = vec![key].encode_as_key(RelationId::SYSTEM);
 

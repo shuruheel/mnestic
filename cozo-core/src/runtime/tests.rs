@@ -1612,3 +1612,78 @@ fn fts_drop() {
     )
     .unwrap();
 }
+
+// ==== mnestic fork: temporal-axis rule at :create (bitemporality step 3) ====
+
+#[test]
+fn txtime_create_validation() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    let expect_axis_err = |script: &str, needle: &str| {
+        let err = db.run_default(script).expect_err(script);
+        // collapse miette's line-wrapping so needles match across breaks
+        let msg = format!("{err:?}").split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            msg.contains("invalid temporal-axis declaration"),
+            "{script}: {msg}"
+        );
+        assert!(msg.contains(needle), "{script}: expected `{needle}` in: {msg}");
+        // the copy-pasteable corrected declaration is in the help text
+        assert!(msg.contains(":create"), "{script}: no corrected form in: {msg}");
+    };
+
+    expect_axis_err(
+        ":create r_val {k => v: Int, tt: TxTime}",
+        "key column, not a value column",
+    );
+    expect_axis_err(":create r_pos {tt: TxTime, k => v: Int}", "last key column");
+    expect_axis_err(
+        ":create r_ord {k, tt: TxTime, v: Validity => x: Int}",
+        "last key column",
+    );
+    expect_axis_err(
+        ":create r_two {k, t1: TxTime, t2: TxTime => v: Int}",
+        "at most one TxTime",
+    );
+    expect_axis_err(
+        ":create r_2vt {v1: Validity, v2: Validity, tt: TxTime}",
+        "at most one Validity",
+    );
+    expect_axis_err(
+        ":create r_null {k, tt: TxTime? => v: Int}",
+        "cannot be nullable",
+    );
+    expect_axis_err(
+        ":create r_gap {v: Validity, k, tt: TxTime}",
+        "immediately precede",
+    );
+
+    // Valid shapes: tt-only (system-versioned) and bitemporal.
+    db.run_default(":create audit {k, tt: TxTime => v: Int}").unwrap();
+    db.run_default(":create belief {e, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    let cols = db.run_default("::columns audit").unwrap().into_json();
+    let rendered = cols["rows"].to_string();
+    assert!(rendered.contains("TxTime"), "{rendered}");
+}
+
+#[test]
+fn txtime_create_rejected_on_temp_relations() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // inside a multi-statement script, `_`-relations are legitimate temps
+    let err = db
+        .run_default("{:create _tmp {k, tt: TxTime => v: Int}} {?[k] <- [[1]]}")
+        .expect_err("temp TxTime must be rejected");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("transaction-temp"), "{msg}");
+}
+
+#[test]
+fn txtime_user_supplied_value_rejected() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit2 {k, tt: TxTime => v: Int}").unwrap();
+    let err = db
+        .run_default("?[k, tt, v] <- [[1, 123, 2]] :put audit2 {k, tt => v}")
+        .expect_err("user-supplied tt must be rejected");
+    let msg = format!("{err:?}");
+    assert!(msg.contains("engine-assigned"), "{msg}");
+}

@@ -222,7 +222,7 @@ table_cols = {(table_col ~ ",")* ~ table_col?}
 table_col = {ident ~ (":" ~ col_type)? ~ (("default" ~ expr) | ("=" ~ out_arg))?}
 col_type = {(
     any_type | bool_type | int_type | float_type | string_type |
-    bytes_type | uuid_type | validity_type | vec_type |
+    bytes_type | uuid_type | validity_type | txtime_type | vec_type |
     json_type | list_type | tuple_type) ~ "?"?}
 col_type_with_term = {SOI ~ col_type ~ EOI}
 any_type = {"Any"}
@@ -234,6 +234,7 @@ uuid_type = {"Uuid"}
 bool_type = {"Bool"}
 json_type = {"Json"}
 validity_type = {"Validity"}
+txtime_type = {"TxTime"}
 list_type = {"[" ~ col_type ~ (";" ~ expr)? ~ "]"}
 tuple_type = {"(" ~ (col_type ~ ",")* ~ col_type? ~ ")"}
 vec_type = {"<" ~ vec_el_type ~ ";" ~ pos_int ~ ">"}

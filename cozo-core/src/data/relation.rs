@@ -41,6 +41,7 @@ impl Display for NullableColType {
             ColType::Bytes => f.write_str("Bytes")?,
             ColType::Uuid => f.write_str("Uuid")?,
             ColType::Validity => f.write_str("Validity")?,
+            ColType::TxTime => f.write_str("TxTime")?,
             ColType::List { eltype, len } => {
                 f.write_str("[")?;
                 write!(f, "{eltype}")?;
@@ -99,6 +100,13 @@ pub enum ColType {
     },
     Tuple(Vec<NullableColType>),
     Validity,
+    /// Transaction time (mnestic fork, bitemporality): an engine-assigned
+    /// commit timestamp — never user-settable. Must be the last key column;
+    /// see the temporal-axis rule in `docs/specs/bitemporality.md` §4. The
+    /// runtime value is carried as `DataValue::Validity` (same encoding; the
+    /// flag byte is the retract bit on tt-only relations and must be 0 on
+    /// bitemporal ones, where retract rides the vt axis).
+    TxTime,
     Json,
 }
 
@@ -329,6 +337,16 @@ impl NullableColType {
                 } else {
                     bail!(make_err())
                 }
+            }
+            ColType::TxTime => {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("TxTime is engine-assigned at commit and cannot be supplied: got {0:?}")]
+                #[diagnostic(
+                    code(eval::txtime_user_supplied),
+                    help("omit the TxTime column from writes; the engine stamps it with the transaction's commit time")
+                )]
+                struct TxTimeUserSupplied(DataValue);
+                bail!(TxTimeUserSupplied(data))
             }
             ColType::Validity => {
                 #[derive(Debug, Error, Diagnostic)]

@@ -113,6 +113,7 @@ fn parse_type_inner(pair: Pair<'_>) -> Result<ColType> {
         Rule::uuid_type => ColType::Uuid,
         Rule::json_type => ColType::Json,
         Rule::validity_type => ColType::Validity,
+        Rule::txtime_type => ColType::TxTime,
         Rule::list_type => {
             let mut inner = pair.into_inner();
             let eltype = parse_nullable_type(inner.next().unwrap())?;
