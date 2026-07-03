@@ -3,6 +3,41 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased
+
+### New — transaction-time commit clock (bitemporality step 2; internal, no user surface)
+- The engine-assigned transaction-time (tt) allocator for the bitemporality
+  work (`docs/specs/bitemporality.md` §5, decisions §13.10): a wall-clock-floored
+  strictly monotonic commit counter `tt = max(now_µs, last_tt + 1)` held as an
+  `AtomicI64` high-water mark on `Db` (`runtime/tt_clock.rs`), seeded at open
+  from `max(persisted mark, wall clock)` and persisted as a system key
+  (`[Null, "TT_HWM"]` under `RelationId::SYSTEM`, the `STORAGE_VERSION` idiom)
+  **inside the committing transaction** — no crash window between advancing and
+  persisting. `SessionTx::commit_tx_with_tt` allocates under a per-`Db`
+  critical section so tt order == commit order == visibility order; values
+  advanced by transactions that abort are burned, preserving monotonicity.
+  Hardened by adversarial review: the HWM put goes through a new
+  `StoreTx::put_externally_serialized` (RocksDB override clears the
+  pessimistic transaction's begin-snapshot for this one key — otherwise any
+  two temporally-overlapping tt commits would make the later one abort with
+  `Resource busy`, the 0.8.4 `avgdl` hot-key failure mode; default impl is a
+  plain put for sqlite/mem, whose storage-level write locks preclude
+  overlapping write transactions). Seeding is monotone (`fetch_max`, so
+  re-`initialize` and the step-3 restore re-seed can never regress the
+  authority); a malformed persisted mark refuses to open (loud, mirroring the
+  version-mismatch bail) instead of silently degrading to wall-clock seeding;
+  the commit section recovers from mutex poisoning (sound: a mid-section
+  panic only burns a never-committed value); the wall-clock read is
+  cfg-guarded for wasm32 like `current_validity`. Nothing in the write path
+  calls the clock yet — step 3 (schema opt-in + buffered stamping) routes
+  tt-stamped commits through it, and **owes**: the restore/import re-seed
+  (`max(persisted, max restored tt, wall clock)` after `restore_backup`) and
+  the HWM+data-rows same-tx atomicity test. Pinned by tests: same-µs strict
+  monotonicity, backward-clock step, concurrent per-caller monotonicity +
+  global uniqueness, restart re-seeding from the persisted mark (sqlite),
+  corrupt-mark open refusal, abort-doesn't-persist, mem-backend operation,
+  and overlapping-commit non-conflict on RocksDB.
+
 ## 0.9.0 — 2026-06-28
 
 Adds the **read-only Cypher query surface** (the headline feature) and bundles

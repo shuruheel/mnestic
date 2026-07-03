@@ -96,6 +96,19 @@ pub trait StoreTx<'s>: Sync {
     /// the storage engine needs to overwrite the old value.
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()>;
 
+    /// Put a key whose writes are serialized by a higher-level authority
+    /// (mnestic fork; sole current user: the tt commit clock's high-water
+    /// mark, `runtime/tt_clock.rs`). Backends whose write transactions
+    /// snapshot-validate first-locks (RocksDB pessimistic transactions) must
+    /// skip that validation for this key — otherwise any two temporally
+    /// overlapping transactions writing it make the later committer abort
+    /// spuriously (`Resource busy`; the 0.8.4 `avgdl` hot-key failure mode).
+    /// Default: a plain `put` (sqlite/mem take storage-level write locks, so
+    /// overlapping write transactions cannot exist there).
+    fn put_externally_serialized(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        self.put(key, val)
+    }
+
     /// Should return true if the engine supports parallel put, false otherwise.
     fn supports_par_put(&self) -> bool;
 

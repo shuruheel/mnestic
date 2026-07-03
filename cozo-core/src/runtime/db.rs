@@ -55,6 +55,7 @@ use crate::runtime::relation::{
     extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
 };
 use crate::runtime::transact::SessionTx;
+use crate::runtime::tt_clock::TtClock;
 use crate::storage::temp::TempStorage;
 use crate::storage::{Storage, StoreTx};
 use crate::{decode_tuple_from_kv, FixedRule, Symbol};
@@ -98,6 +99,12 @@ pub struct Db<S> {
     pub(crate) db: S,
     temp_db: TempStorage,
     relation_store_id: Arc<AtomicU64>,
+    /// Transaction-time commit clock high-water mark (mnestic fork,
+    /// bitemporality step 2; `runtime/tt_clock.rs`). Seeded at open from
+    /// `max(persisted TT_HWM system key, wall clock)`.
+    tt_clock: Arc<TtClock>,
+    /// Critical section for tt allocation + persist + commit (spec §13.10).
+    tt_commit_lock: Arc<Mutex<()>>,
     pub(crate) queries_count: Arc<AtomicU64>,
     pub(crate) running_queries: Arc<Mutex<BTreeMap<u64, RunningQueryHandle>>>,
     pub(crate) fixed_rules: Arc<ShardedLock<BTreeMap<String, Arc<Box<dyn FixedRule>>>>>,
@@ -296,6 +303,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             db: storage,
             temp_db: Default::default(),
             relation_store_id: Default::default(),
+            tt_clock: Default::default(),
+            tt_commit_lock: Default::default(),
             queries_count: Default::default(),
             running_queries: Default::default(),
             fixed_rules: Arc::new(ShardedLock::new(DEFAULT_FIXED_RULES.clone())),
@@ -914,8 +923,18 @@ impl<'s, S: Storage<'s>> Db<S> {
         let mut tx = self.transact_write()?;
         self.relation_store_id
             .store(tx.init_storage()?.0, Ordering::Release);
+        // Seed the tt commit clock (mnestic fork, bitemporality step 2):
+        // max(persisted high-water mark, wall clock).
+        self.tt_clock.seed(tx.read_persisted_tt_hwm()?);
         tx.commit_tx()?;
         Ok(())
+    }
+
+    /// The transaction-time commit clock (mnestic fork; test/introspection
+    /// access — production allocation goes through `commit_tx_with_tt`).
+    #[allow(dead_code)]
+    pub(crate) fn tt_clock(&self) -> &TtClock {
+        &self.tt_clock
     }
     pub(crate) fn transact(&'s self) -> Result<SessionTx<'s>> {
         let ret = SessionTx {
@@ -925,6 +944,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
             fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
+            tt_clock: self.tt_clock.clone(),
+            tt_commit_lock: self.tt_commit_lock.clone(),
         };
         Ok(ret)
     }
@@ -936,6 +957,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
             fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
+            tt_clock: self.tt_clock.clone(),
+            tt_commit_lock: self.tt_commit_lock.clone(),
         };
         Ok(ret)
     }

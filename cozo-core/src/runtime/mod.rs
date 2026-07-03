@@ -12,6 +12,7 @@ pub(crate) mod imperative;
 pub(crate) mod relation;
 pub(crate) mod temp_store;
 pub(crate) mod transact;
+pub(crate) mod tt_clock;
 pub(crate) mod hnsw;
 pub(crate) mod hnsw_build;
 pub(crate) mod hybrid;

@@ -20,6 +20,7 @@ use crate::fts::TokenizerCache;
 use crate::{CallbackOp, NamedRows};
 use crate::runtime::callback::CallbackCollector;
 use crate::runtime::relation::RelationId;
+use crate::runtime::tt_clock::{tt_hwm_key, TtClock};
 use crate::storage::temp::TempTx;
 use crate::storage::StoreTx;
 
@@ -32,6 +33,13 @@ pub struct SessionTx<'a> {
     /// Cross-query cache of FTS corpus stats for legacy indexes (mnestic fork);
     /// see `Db::fts_doc_stats_cache`. Shared `Arc` cloned per transaction.
     pub(crate) fts_doc_stats_cache: Arc<Mutex<BTreeMap<SmartString<LazyCompact>, (u64, u64)>>>,
+    /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
+    /// shared handle to the `Db`'s high-water mark. See `runtime/tt_clock.rs`.
+    pub(crate) tt_clock: Arc<TtClock>,
+    /// Per-`Db` critical section serialising tt allocation + HWM persist +
+    /// commit for tt-stamped transactions (`docs/specs/bitemporality.md`
+    /// §13.10). Held only inside `commit_tx_with_tt`.
+    pub(crate) tt_commit_lock: Arc<Mutex<()>>,
 }
 
 pub const CURRENT_STORAGE_VERSION: [u8; 1] = [0x00];
@@ -137,5 +145,68 @@ impl<'a> SessionTx<'a> {
     pub fn commit_tx(&mut self) -> Result<()> {
         self.store_tx.commit()?;
         Ok(())
+    }
+
+    /// Read the persisted tt high-water mark, if any (mnestic fork,
+    /// bitemporality step 2). Called at `Db` open to seed the clock. A
+    /// malformed value is a **loud** error (mirrors `init_storage`'s
+    /// version-mismatch bail): silently falling back to the wall clock would
+    /// re-issue committed tts after a backward clock step — the exact
+    /// failure the persisted mark exists to prevent. Future values are
+    /// accepted (forward clock skew on a previous host is legitimate;
+    /// monotonicity is the invariant, not plausibility).
+    pub(crate) fn read_persisted_tt_hwm(&self) -> Result<Option<i64>> {
+        match self.store_tx.get(&tt_hwm_key(), false)? {
+            None => Ok(None),
+            Some(v) => {
+                let bytes: [u8; 8] = v.as_slice().try_into().map_err(|_| {
+                    miette::miette!(
+                        "tt high-water mark is corrupt: expected 8 bytes, got {} — \
+                         refusing to open with a possibly non-monotonic transaction clock",
+                        v.len()
+                    )
+                })?;
+                let val = i64::from_be_bytes(bytes);
+                if val < 0 {
+                    bail!(
+                        "tt high-water mark is corrupt (negative: {val}) — \
+                         refusing to open with a possibly non-monotonic transaction clock"
+                    );
+                }
+                Ok(Some(val))
+            }
+        }
+    }
+
+    /// Commit this transaction with an engine-assigned transaction time
+    /// (mnestic fork, bitemporality step 2; spec §5/§13.10). Under the
+    /// per-`Db` critical section: allocate the tt, persist the high-water
+    /// mark **inside this same storage transaction** (so a crash can never
+    /// leave the persisted mark behind a committed tt), then commit. Returns
+    /// the allocated tt. tt order == commit order == visibility order by
+    /// construction.
+    ///
+    /// Nothing calls this in production yet — step 3 (schema opt-in +
+    /// buffered stamping) will route commits of transactions that touched
+    /// tt-stamped relations through here, stamping the buffered rows with
+    /// the returned tt before `store_tx.commit()`.
+    #[allow(dead_code)]
+    pub(crate) fn commit_tx_with_tt(&mut self) -> Result<i64> {
+        let lock = self.tt_commit_lock.clone();
+        // Poison recovery is sound here: a panic inside the section can only
+        // have advanced the atomic (a burned, never-committed value) — the
+        // invariant "atomic HWM >= persisted HWM >= every committed tt"
+        // survives, so later committers may proceed rather than fail-stop.
+        let _guard = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tt = self.tt_clock.advance();
+        // put_externally_serialized: the mutex above is the serialization
+        // authority for this key; RocksDB must not snapshot-validate it (two
+        // overlapping tt commits would otherwise abort the later one).
+        self.store_tx
+            .put_externally_serialized(&tt_hwm_key(), &tt.to_be_bytes())?;
+        self.store_tx.commit()?;
+        Ok(tt)
     }
 }

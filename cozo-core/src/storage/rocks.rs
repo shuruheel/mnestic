@@ -283,6 +283,22 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         }
     }
 
+    fn put_externally_serialized(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
+        match &mut self.inner {
+            RocksTxInner::Txn(tx) => {
+                // Drop the begin-snapshot so this put validates against the
+                // latest state instead of conflicting with a concurrent
+                // committer of the same key (see StoreTx doc). Safe: this is
+                // the transaction's final write before commit, all user keys
+                // were locked (and validated) earlier, and the caller holds
+                // the process-wide serialization lock for this key.
+                tx.clear_snapshot();
+                Ok(tx.put(key, val)?)
+            }
+            RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
+        }
+    }
+
     fn supports_par_put(&self) -> bool {
         matches!(self.inner, RocksTxInner::Txn(_))
     }
