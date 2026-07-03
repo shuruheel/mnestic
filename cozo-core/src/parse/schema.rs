@@ -9,14 +9,16 @@
 use std::collections::BTreeSet;
 
 use itertools::Itertools;
-use miette::{bail, ensure, Diagnostic, Result, IntoDiagnostic};
+use miette::{bail, ensure, Diagnostic, IntoDiagnostic, Result};
 use smartstring::SmartString;
 use thiserror::Error;
 
-use crate::data::relation::{VecElementType, ColType, ColumnDef, NullableColType, StoredRelationMetadata};
+use crate::data::relation::{
+    ColType, ColumnDef, NullableColType, StoredRelationMetadata, VecElementType,
+};
 use crate::data::symb::Symbol;
 use crate::data::value::DataValue;
-use crate::parse::expr::{build_expr};
+use crate::parse::expr::build_expr;
 use crate::parse::{ExtractSpan, Pair, Rule, SourceSpan};
 
 pub(crate) fn parse_schema(
@@ -144,14 +146,15 @@ fn parse_type_inner(pair: Pair<'_>) -> Result<ColType> {
             let eltype = match inner.next().unwrap().as_str() {
                 "F32" | "Float" => VecElementType::F32,
                 "F64" | "Double" => VecElementType::F64,
-                _ => unreachable!()
+                _ => unreachable!(),
             };
             let len = inner.next().unwrap();
-            let len = len.as_str().replace('_', "").parse::<usize>().into_diagnostic()?;
-            ColType::Vec {
-                eltype,
-                len,
-            }
+            let len = len
+                .as_str()
+                .replace('_', "")
+                .parse::<usize>()
+                .into_diagnostic()?;
+            ColType::Vec { eltype, len }
         }
         Rule::tuple_type => {
             ColType::Tuple(pair.into_inner().map(parse_nullable_type).try_collect()?)

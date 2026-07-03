@@ -1621,14 +1621,23 @@ fn txtime_create_validation() {
     let expect_axis_err = |script: &str, needle: &str| {
         let err = db.run_default(script).expect_err(script);
         // collapse miette's line-wrapping so needles match across breaks
-        let msg = format!("{err:?}").split_whitespace().collect::<Vec<_>>().join(" ");
+        let msg = format!("{err:?}")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
         assert!(
             msg.contains("invalid temporal-axis declaration"),
             "{script}: {msg}"
         );
-        assert!(msg.contains(needle), "{script}: expected `{needle}` in: {msg}");
+        assert!(
+            msg.contains(needle),
+            "{script}: expected `{needle}` in: {msg}"
+        );
         // the copy-pasteable corrected declaration is in the help text
-        assert!(msg.contains(":create"), "{script}: no corrected form in: {msg}");
+        assert!(
+            msg.contains(":create"),
+            "{script}: no corrected form in: {msg}"
+        );
     };
 
     expect_axis_err(
@@ -1658,7 +1667,8 @@ fn txtime_create_validation() {
     );
 
     // Valid shapes: tt-only (system-versioned) and bitemporal.
-    db.run_default(":create audit {k, tt: TxTime => v: Int}").unwrap();
+    db.run_default(":create audit {k, tt: TxTime => v: Int}")
+        .unwrap();
     db.run_default(":create belief {e, v: Validity, tt: TxTime => x: Int}")
         .unwrap();
     let cols = db.run_default("::columns audit").unwrap().into_json();
@@ -1680,10 +1690,440 @@ fn txtime_create_rejected_on_temp_relations() {
 #[test]
 fn txtime_user_supplied_value_rejected() {
     let db = DbInstance::new("mem", "", "").unwrap();
-    db.run_default(":create audit2 {k, tt: TxTime => v: Int}").unwrap();
+    db.run_default(":create audit2 {k, tt: TxTime => v: Int}")
+        .unwrap();
     let err = db
         .run_default("?[k, tt, v] <- [[1, 123, 2]] :put audit2 {k, tt => v}")
         .expect_err("user-supplied tt must be rejected");
     let msg = format!("{err:?}");
     assert!(msg.contains("engine-assigned"), "{msg}");
+}
+
+// ==== mnestic fork: tt write path (bitemporality step 3b) ====
+
+#[test]
+fn txtime_put_stamps_at_commit() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit_w {k, tt: TxTime => v: Int}")
+        .unwrap();
+
+    // Deferred read-your-writes: the same script does NOT see its own write.
+    let res = db
+        .run_default("{?[k, v] <- [[1, 10]] :put audit_w {k => v}} {?[k] := *audit_w[k, tt, v]}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0);
+
+    // The next script does.
+    let res = db
+        .run_default("?[k, v] := *audit_w[k, tt, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
+
+    // A correction is a new version at a higher tt: two rows, newest first.
+    db.run_default("?[k, v] <- [[1, 20]] :put audit_w {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[tt, v] := *audit_w[k, tt, v], k == 1")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // trailing-Validity sort: newest tt first
+    assert_eq!(rows[0][1], 20);
+    assert_eq!(rows[1][1], 10);
+}
+
+#[test]
+fn txtime_same_tx_double_put_is_last_write_wins() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit_lww {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10], [1, 20]] :put audit_lww {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[v] := *audit_lww[k, tt, v]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1, "same (key, tt) collapses: {rows:?}");
+}
+
+#[test]
+fn txtime_rm_appends_retraction() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit_rm {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10]] :put audit_rm {k => v}")
+        .unwrap();
+    db.run_default("?[k] <- [[1]] :rm audit_rm {k}").unwrap();
+
+    // Two physical rows: the retraction (newest) then the assert.
+    let res = db
+        .run_default("?[tt, v] := *audit_rm[k, tt, v]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // rendered Validity is [ts, is_assert]: newest first is the retraction
+    assert_eq!(rows[0][0][1], serde_json::json!(false), "{rows:?}");
+    assert_eq!(rows[1][0][1], serde_json::json!(true), "{rows:?}");
+
+    // rm again: already believed-deleted, no third row
+    db.run_default("?[k] <- [[1]] :rm audit_rm {k}").unwrap();
+    let res = db
+        .run_default("?[tt] := *audit_rm[k, tt, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 2);
+
+    // rm of a missing key: no-op; :delete of a missing key: error
+    db.run_default("?[k] <- [[999]] :rm audit_rm {k}").unwrap();
+    let err = db
+        .run_default("?[k] <- [[999]] :delete audit_rm {k}")
+        .expect_err(":delete missing must fail");
+    assert!(format!("{err:?}").contains("does not exist"), "{err:?}");
+}
+
+#[test]
+fn txtime_bitemporal_puts_and_conflicts() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create belief_w {e, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    // assert + later cessation on the vt axis — two separate transactions
+    db.run_default("?[e, v, x] <- [[1, 'ASSERT', 10]] :put belief_w {e, v => x}")
+        .unwrap();
+    db.run_default("?[e, v, x] <- [[1, 'RETRACT', 10]] :put belief_w {e, v => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[v, x] := *belief_w[e, v, tt, x]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 2);
+
+    // assert AND retract of one (key, vt) in ONE tx: unbreakable tie -> error
+    let err = db
+        .run_default(
+            "?[e, v, x] <- [[2, [123, true], 1], [2, [123, false], 1]] :put belief_w {e, v => x}",
+        )
+        .expect_err("assert+retract same (key, vt) in one tx must fail");
+    assert!(
+        format!("{err:?}").contains("asserts AND retracts"),
+        "{err:?}"
+    );
+
+    // :rm on bitemporal directs to :put RETRACT
+    let err = db
+        .run_default("?[e, v] <- [[1, 'RETRACT']] :rm belief_w {e, v}")
+        .expect_err(":rm on bitemporal must direct to :put RETRACT");
+    assert!(
+        format!("{err:?}").contains("valid-time statement"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn txtime_unsupported_ops_error() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit_ops {k, tt: TxTime => v: Int}")
+        .unwrap();
+    for script in [
+        "?[k, v] <- [[1, 1]] :insert audit_ops {k => v}",
+        "?[k, v] <- [[1, 1]] :update audit_ops {k => v}",
+        "?[k, v] <- [[1, 1]] :ensure audit_ops {k => v}",
+        "?[k, v] <- [[1, 1]] :ensure_not audit_ops {k => v}",
+    ] {
+        let err = db.run_default(script).expect_err(script);
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("read path") || msg.contains("step 4"),
+            "{script}: {msg}"
+        );
+    }
+    let err = db
+        .run_default("?[k, v] <- [[1, 1]] :replace audit_ops {k => v}")
+        .expect_err("replace must fail");
+    assert!(format!("{err:?}").contains("history"), "{err:?}");
+
+    let err = db
+        .run_default(r#"::set_triggers audit_ops on put { ?[k] <- [[1]] }"#)
+        .expect_err("triggers must fail");
+    assert!(format!("{err:?}").contains("not yet supported"), "{err:?}");
+
+    let err = db
+        .run_default("::index create audit_ops:by_v {v}")
+        .expect_err("index create must fail");
+    assert!(format!("{err:?}").contains("not yet supported"), "{err:?}");
+}
+
+#[test]
+fn txtime_rows_persist_across_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tt_rows.db");
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let db = DbInstance::new("sqlite", &path_str, "").unwrap();
+        db.run_default(":create audit_p {k, tt: TxTime => v: Int}")
+            .unwrap();
+        db.run_default("?[k, v] <- [[1, 10]] :put audit_p {k => v}")
+            .unwrap();
+    }
+    let db = DbInstance::new("sqlite", &path_str, "").unwrap();
+    let res = db
+        .run_default("?[k, v] := *audit_p[k, tt, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
+}
+
+#[test]
+fn txtime_import_relations_one_tt_per_batch() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create audit_imp {k, tt: TxTime => v: Int}")
+        .unwrap();
+
+    // import two rows in one batch: both get the SAME tt (one belief event)
+    let payload = serde_json::json!({
+        "audit_imp": {"headers": ["k", "v"], "rows": [[1, 10], [2, 20]]}
+    });
+    db.import_relations_str_with_err(&payload.to_string())
+        .unwrap();
+    let res = db
+        .run_default("?[k, tt, v] := *audit_imp[k, tt, v]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][1], rows[1][1], "one tt per import batch: {rows:?}");
+
+    // importing a tt column is rejected
+    let bad = serde_json::json!({
+        "audit_imp": {"headers": ["k", "tt", "v"], "rows": [[3, 1, 30]]}
+    });
+    let err = db
+        .import_relations_str_with_err(&bad.to_string())
+        .expect_err("tt header must be rejected");
+    assert!(format!("{err:?}").contains("engine-assigned"), "{err:?}");
+
+    // delete-imports are rejected
+    let del = serde_json::json!({
+        "-audit_imp": {"headers": ["k"], "rows": [[1]]}
+    });
+    let err = db
+        .import_relations_str_with_err(&del.to_string())
+        .expect_err("delete-import must be rejected");
+    assert!(format!("{err:?}").contains("use :rm"), "{err:?}");
+}
+
+#[test]
+fn txtime_restore_backup_reseeds_clock() {
+    // Build a source store whose clock is far in the future, back it up,
+    // restore into a fresh store: the fresh clock must jump past the mark.
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src.db");
+    let backup_path = dir.path().join("backup.db");
+    let dst_path = dir.path().join("dst.db");
+
+    let far_future;
+    {
+        let db = DbInstance::new("sqlite", src_path.to_str().unwrap(), "").unwrap();
+        db.run_default(":create audit_b {k, tt: TxTime => v: Int}")
+            .unwrap();
+        let DbInstance::Sqlite(inner) = &db else {
+            panic!()
+        };
+        far_future = inner
+            .tt_clock()
+            .advance_with_now(crate::runtime::tt_clock::wall_clock_micros() + 3_600_000_000);
+        db.run_default("?[k, v] <- [[1, 10]] :put audit_b {k => v}")
+            .unwrap();
+        db.backup_db(backup_path.to_str().unwrap()).unwrap();
+    }
+
+    let db = DbInstance::new("sqlite", dst_path.to_str().unwrap(), "").unwrap();
+    db.restore_backup(backup_path.to_str().unwrap()).unwrap();
+    let DbInstance::Sqlite(inner) = &db else {
+        panic!()
+    };
+    assert!(
+        inner.tt_clock().peek() > far_future,
+        "restore must re-seed the clock past the restored mark"
+    );
+    // and the restored row is readable
+    let res = db
+        .run_default("?[k, v] := *audit_b[k, tt, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]));
+
+    // import_from_backup of a tt relation is rejected
+    let err = db
+        .import_from_backup(backup_path.to_str().unwrap(), &["audit_b".to_string()])
+        .expect_err("import_from_backup of tt relation must be rejected");
+    assert!(format!("{err:?}").contains("restore_backup"), "{err:?}");
+}
+
+#[test]
+fn txtime_cross_statement_conflicts_rejected() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create belief_ms {e, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    // assert + retract of one (key, vt) across TWO statements of one script
+    let err = db
+        .run_default(
+            "{?[e, v, x] <- [[9, [123, true], 1]] :put belief_ms {e, v => x}} \
+             {?[e, v, x] <- [[9, [123, false], 1]] :put belief_ms {e, v => x}}",
+        )
+        .expect_err("cross-statement assert+retract must fail");
+    assert!(
+        format!("{err:?}").contains("asserts AND retracts"),
+        "{err:?}"
+    );
+
+    // tt-only: :rm then :put of the same PRE-EXISTING key in one script
+    db.run_default(":create a_ms {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10]] :put a_ms {k => v}")
+        .unwrap();
+    let err = db
+        .run_default("{?[k] <- [[1]] :rm a_ms {k}} {?[k, v] <- [[1, 99]] :put a_ms {k => v}}")
+        .expect_err("rm-then-put same key one tx must fail");
+    assert!(
+        format!("{err:?}").contains("asserts AND retracts"),
+        "{err:?}"
+    );
+
+    // tt-only: :put then :rm of a key NOT in the store — clearer message
+    let err = db
+        .run_default("{?[k, v] <- [[5, 50]] :put a_ms {k => v}} {?[k] <- [[5]] :rm a_ms {k}}")
+        .expect_err("put-then-rm same key one tx must fail");
+    assert!(
+        format!("{err:?}").contains("written in the same transaction"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn txtime_delete_believed_deleted_errors() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create a_bd {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10]] :put a_bd {k => v}")
+        .unwrap();
+    db.run_default("?[k] <- [[1]] :rm a_bd {k}").unwrap();
+    let err = db
+        .run_default("?[k] <- [[1]] :delete a_bd {k}")
+        .expect_err(":delete of believed-deleted key must fail");
+    assert!(format!("{err:?}").contains("believed-deleted"), "{err:?}");
+}
+
+#[test]
+fn txtime_remove_relation_with_pending_writes_rejected() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create zomb {k, tt: TxTime => v: Int}")
+        .unwrap();
+    let err = db
+        .run_default("{?[k, v] <- [[9, 9]] :put zomb {k => v}} {::remove zomb}")
+        .expect_err("::remove with pending tt writes must fail");
+    assert!(
+        format!("{err:?}").contains("pending transaction-time writes"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn txtime_create_with_rows_rejects_tt_header() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    let err = db
+        .run_default("?[k, tt, v] <- [[1, 123, 2]] :create cw2 {k, tt: TxTime => v: Int}")
+        .expect_err("tt header on :create-with-rows must fail");
+    assert!(format!("{err:?}").contains("engine-assigned"), "{err:?}");
+}
+
+#[test]
+fn txtime_asof_read_gives_pending_error() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create a_asof {k, tt: TxTime => v: Int}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, v] := *a_asof[k, tt, v @ 'NOW']")
+        .expect_err("@ on tt relation must give the pending error");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("not available yet") || msg.contains("step 4"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn txtime_bitemporal_double_assert_lww() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create belief_lww {e, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db.run_default(
+        "?[e, v, x] <- [[1, [50, true], 10], [1, [50, true], 20]] :put belief_lww {e, v => x}",
+    )
+    .unwrap();
+    let res = db
+        .run_default("?[x] := *belief_lww[e, v, tt, x]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn txtime_trigger_on_plain_relation_writes_into_tt_relation() {
+    // The one currently-working trigger/tt interaction: a put-trigger on a
+    // PLAIN relation whose body writes into a tt relation — rows buffer and
+    // stamp at the outer commit.
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create plain_src {k => v: Int}").unwrap();
+    db.run_default(":create audit_trail {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default(
+        "::set_triggers plain_src on put { ?[k, v] := _new[k, v] :put audit_trail {k => v} }",
+    )
+    .unwrap();
+    db.run_default("?[k, v] <- [[7, 70]] :put plain_src {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[k, v] := *audit_trail[k, tt, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[7, 70]]));
+}
+
+#[test]
+fn txtime_abort_drops_rows_and_hwm_atomically() {
+    // The HWM+rows same-tx atomicity obligation from step 2: a transaction
+    // whose later statement fails must leave neither rows nor an advanced
+    // persisted mark.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tt_atomic.db");
+    let path_str = path.to_str().unwrap().to_string();
+    let db = DbInstance::new("sqlite", &path_str, "").unwrap();
+    db.run_default(":create a_at {k, tt: TxTime => v: Int}")
+        .unwrap();
+
+    // script: a valid buffered put, then a failing statement -> whole tx aborts
+    let err = db
+        .run_default("{?[k, v] <- [[1, 10]] :put a_at {k => v}} {?[k] <- [[1]] :delete a_at {k}}");
+    assert!(
+        err.is_err(),
+        "the :delete of a not-yet-committed key must fail the tx"
+    );
+
+    // no rows visible...
+    let res = db
+        .run_default("?[k] := *a_at[k, tt, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0);
+    // ...and no persisted mark (nothing tt-stamped has ever committed here)
+    let DbInstance::Sqlite(inner) = &db else {
+        panic!()
+    };
+    let tx = inner.transact().unwrap();
+    assert_eq!(tx.read_persisted_tt_hwm().unwrap(), None);
 }

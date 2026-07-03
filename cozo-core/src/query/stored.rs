@@ -31,7 +31,7 @@ use crate::runtime::minhash_lsh::HashPermutations;
 use crate::runtime::relation::{
     extend_tuple_from_v, AccessLevel, InputRelationHandle, InsufficientAccessLevel, RelationHandle,
 };
-use crate::runtime::transact::SessionTx;
+use crate::runtime::transact::{PendingTtWrite, SessionTx};
 use crate::storage::Storage;
 use crate::{Db, NamedRows, SourceSpan, StoreTx};
 
@@ -65,6 +65,16 @@ impl<'a> SessionTx<'a> {
                 bail!(ReplaceInTrigger(meta.name.to_string()))
             }
             if let Ok(old_handle) = self.get_relation(&meta.name, true) {
+                if old_handle.has_txtime() {
+                    #[derive(Debug, Error, Diagnostic)]
+                    #[error("cannot replace TxTime relation {0}: replace would silently destroy its history")]
+                    #[diagnostic(
+                        code(eval::txtime_replace_forbidden),
+                        help("append corrections with :put, delete keys with :rm (tt-only), or ::remove the relation explicitly")
+                    )]
+                    struct TxTimeReplaceForbidden(String);
+                    bail!(TxTimeReplaceForbidden(meta.name.to_string()));
+                }
                 if !old_handle.indices.is_empty() {
                     #[derive(Debug, Error, Diagnostic)]
                     #[error("cannot replace relation {0} since it has indices")]
@@ -123,6 +133,25 @@ impl<'a> SessionTx<'a> {
         if let Some((old_put, old_retract)) = replaced_old_triggers {
             relation_store.put_triggers = old_put;
             relation_store.rm_triggers = old_retract;
+        }
+        // tt-stamped relations (mnestic fork, bitemporality step 3): ops that
+        // must read current state (existence checks, read-modify-write) need
+        // the as-of read path, which lands in step 4. Only :put/:rm (and
+        // :create with rows, which routes through put) are supported now.
+        if relation_store.has_txtime()
+            && matches!(
+                op,
+                RelationOp::Update | RelationOp::Ensure | RelationOp::EnsureNot
+            )
+        {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error("{0:?} is not yet supported on TxTime relation {1}: it requires the as-of read path (bitemporality step 4)")]
+            #[diagnostic(
+                code(eval::txtime_op_needs_reads),
+                help("use :put (corrections are new rows) or :rm")
+            )]
+            struct TxTimeOpNeedsReads(RelationOp, String);
+            bail!(TxTimeOpNeedsReads(op, relation_store.name.to_string()));
         }
         let InputRelationHandle {
             metadata,
@@ -197,6 +226,7 @@ impl<'a> SessionTx<'a> {
                     key_bindings,
                     dep_bindings,
                     op == RelationOp::Insert,
+                    matches!(op, RelationOp::Create | RelationOp::Replace),
                     force_collect,
                     *span,
                 )?,
@@ -220,11 +250,12 @@ impl<'a> SessionTx<'a> {
         key_bindings: &[Symbol],
         dep_bindings: &[Symbol],
         is_insert: bool,
+        is_create: bool,
         force_collect: &str,
         span: SourceSpan,
     ) -> Result<()> {
-        let is_callback_target = callback_targets.contains(&relation_store.name)
-            || force_collect == relation_store.name;
+        let is_callback_target =
+            callback_targets.contains(&relation_store.name) || force_collect == relation_store.name;
 
         if relation_store.access_level < AccessLevel::Protected {
             bail!(InsufficientAccessLevel(
@@ -232,6 +263,22 @@ impl<'a> SessionTx<'a> {
                 "row insertion".to_string(),
                 relation_store.access_level
             ));
+        }
+
+        if relation_store.has_txtime() {
+            return self.buffer_tt_puts(
+                res_iter,
+                headers,
+                cur_vld,
+                relation_store,
+                metadata,
+                key_bindings,
+                dep_bindings,
+                is_insert,
+                is_create,
+                is_callback_target,
+                span,
+            );
         }
 
         let mut key_extractors = make_extractors(
@@ -533,8 +580,8 @@ impl<'a> SessionTx<'a> {
         force_collect: &str,
         span: SourceSpan,
     ) -> Result<()> {
-        let is_callback_target = callback_targets.contains(&relation_store.name)
-            || force_collect == relation_store.name;
+        let is_callback_target =
+            callback_targets.contains(&relation_store.name) || force_collect == relation_store.name;
 
         if relation_store.access_level < AccessLevel::Protected {
             bail!(InsufficientAccessLevel(
@@ -911,6 +958,289 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
+    /// Reject writes that name the engine-assigned TxTime column, and writes
+    /// that need machinery a tt-stamped relation doesn't support yet
+    /// (mnestic fork, bitemporality step 3).
+    fn check_tt_write_shape(
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        is_callback_target: bool,
+        what: &str,
+    ) -> Result<()> {
+        let tt_name = &relation_store
+            .metadata
+            .keys
+            .last()
+            .expect("tt relation has keys")
+            .name;
+        if metadata
+            .keys
+            .iter()
+            .chain(metadata.non_keys.iter())
+            .any(|c| &c.name == tt_name)
+        {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error("column {0} is engine-assigned at commit and cannot be supplied")]
+            #[diagnostic(
+                code(eval::txtime_user_supplied_col),
+                help("omit the TxTime column from the {1} spec; the engine stamps it with the transaction's commit time")
+            )]
+            struct TxTimeColSupplied(String, String);
+            bail!(TxTimeColSupplied(tt_name.to_string(), what.to_string()));
+        }
+        if is_callback_target {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error(":returning and event callbacks are not yet supported on TxTime relation {0}")]
+            #[diagnostic(code(eval::txtime_callbacks_unsupported))]
+            struct TxTimeCallbacks(String);
+            bail!(TxTimeCallbacks(relation_store.name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Buffer `:put`s into a tt-stamped relation (mnestic fork, bitemporality
+    /// step 3): rows are extracted now but stamped and written at commit
+    /// (`SessionTx::stamp_pending_tt_writes`), so the whole transaction
+    /// shares one engine-assigned tt. Not visible to later reads in the same
+    /// script (spec §5 — one belief event per transaction).
+    #[allow(clippy::too_many_arguments)]
+    fn buffer_tt_puts(
+        &mut self,
+        res_iter: impl Iterator<Item = Tuple>,
+        headers: &[Symbol],
+        cur_vld: ValidityTs,
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        key_bindings: &[Symbol],
+        dep_bindings: &[Symbol],
+        is_insert: bool,
+        is_create: bool,
+        is_callback_target: bool,
+        span: SourceSpan,
+    ) -> Result<()> {
+        if is_insert {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error(":insert on TxTime relation {0} requires the as-of read path (bitemporality step 4)")]
+            #[diagnostic(code(eval::txtime_op_needs_reads), help("use :put"))]
+            struct TxTimeInsert(String);
+            bail!(TxTimeInsert(relation_store.name.to_string()));
+        }
+        // On :create the input metadata IS the declared schema (tt included,
+        // legitimately); the supplied-column check applies to put specs only —
+        // but the query HEADERS must still not smuggle a tt value in.
+        if !is_create {
+            Self::check_tt_write_shape(relation_store, metadata, is_callback_target, ":put")?;
+        } else {
+            if is_callback_target {
+                Self::check_tt_write_shape(
+                    relation_store,
+                    &StoredRelationMetadata {
+                        keys: vec![],
+                        non_keys: vec![],
+                    },
+                    is_callback_target,
+                    ":create",
+                )?;
+            }
+        }
+
+        let kpos = relation_store.metadata.keys.len() - 1;
+        let mut extractors = make_extractors(
+            &relation_store.metadata.keys[..kpos],
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+        let val_extractors = if metadata.non_keys.is_empty() {
+            make_extractors(
+                &relation_store.metadata.non_keys,
+                &metadata.keys,
+                key_bindings,
+                headers,
+            )?
+        } else {
+            make_extractors(
+                &relation_store.metadata.non_keys,
+                &metadata.non_keys,
+                dep_bindings,
+                headers,
+            )?
+        };
+        extractors.extend(val_extractors);
+
+        let tt_name = &relation_store
+            .metadata
+            .keys
+            .last()
+            .expect("tt relation has keys")
+            .name;
+        // On a bare :create the headers legitimately include the declared tt
+        // column but there are no rows; :create-with-rows supplying tt data
+        // must NOT silently drop it.
+        let headers_have_tt = is_create && headers.iter().any(|h| &h.name == tt_name);
+
+        let mut rows = Vec::new();
+        for tuple in res_iter {
+            if headers_have_tt {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("column {0} is engine-assigned at commit and cannot be supplied")]
+                #[diagnostic(
+                    code(eval::txtime_user_supplied_col),
+                    help("remove the TxTime column from the :create input rows; the engine stamps it")
+                )]
+                struct TxTimeHeaderSupplied(String);
+                bail!(TxTimeHeaderSupplied(tt_name.to_string()));
+            }
+            let extracted: Vec<DataValue> = extractors
+                .iter()
+                .map(|ex| ex.extract_data(&tuple, cur_vld))
+                .try_collect()?;
+            rows.push(extracted);
+        }
+        if !rows.is_empty() {
+            self.pending_tt_writes.push(PendingTtWrite {
+                handle: relation_store.clone(),
+                rows,
+                is_retract: false,
+                span,
+            });
+        }
+        Ok(())
+    }
+
+    /// Buffer `:rm`/`:delete` on a tt-stamped relation (mnestic fork,
+    /// bitemporality step 3). On tt-only relations this appends a retraction
+    /// at commit-tt — never a physical delete; values are taken from the
+    /// key's current (latest-tt) row. On bitemporal relations removal is
+    /// expressed on the vt axis instead (`:put` with `"RETRACT"`), so `:rm`
+    /// directs there until the read path lands.
+    #[allow(clippy::too_many_arguments)]
+    fn buffer_tt_removals(
+        &mut self,
+        res_iter: impl Iterator<Item = Tuple>,
+        headers: &[Symbol],
+        cur_vld: ValidityTs,
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        key_bindings: &[Symbol],
+        check_exists: bool,
+        is_callback_target: bool,
+        span: SourceSpan,
+    ) -> Result<()> {
+        let kpos = relation_store.metadata.keys.len() - 1;
+        let is_bitemporal = kpos >= 1
+            && matches!(
+                relation_store.metadata.keys[kpos - 1].typing.coltype,
+                crate::data::relation::ColType::Validity
+            );
+        if is_bitemporal {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error(":rm on bitemporal relation {0}: removal is a valid-time statement there")]
+            #[diagnostic(
+                code(eval::txtime_rm_bitemporal),
+                help("record a cessation with `:put` and vt = \"RETRACT\" (a retraction row); the :rm remap lands with the read path (step 4)")
+            )]
+            struct TxTimeRmBitemporal(String);
+            bail!(TxTimeRmBitemporal(relation_store.name.to_string()));
+        }
+        Self::check_tt_write_shape(relation_store, metadata, is_callback_target, ":rm")?;
+
+        let extractors = make_extractors(
+            &relation_store.metadata.keys[..kpos],
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+
+        let mut prefixes = Vec::new();
+        for tuple in res_iter {
+            let extracted: Vec<DataValue> = extractors
+                .iter()
+                .map(|ex| ex.extract_data(&tuple, cur_vld))
+                .try_collect()?;
+            prefixes.push(extracted);
+        }
+
+        // A key written earlier in this same transaction cannot also be
+        // removed by it — one belief event per transaction (the stamp-time
+        // cross-check covers the reverse order; this catches rm-after-put
+        // with a clearer message).
+        for prefix in &prefixes {
+            let clashes = self.pending_tt_writes.iter().any(|w| {
+                !w.is_retract
+                    && w.handle.id == relation_store.id
+                    && w.rows
+                        .iter()
+                        .any(|r| &r[0..prefix.len()] == prefix.as_slice())
+            });
+            if clashes {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error(
+                    "cannot remove a key written in the same transaction from TxTime relation {0}"
+                )]
+                #[diagnostic(
+                    code(eval::txtime_rm_pending_put),
+                    help("one belief event per transaction: both rows would carry the same transaction time; split into two transactions")
+                )]
+                struct TtRmPendingPut(String);
+                bail!(TtRmPendingPut(relation_store.name.to_string()));
+            }
+        }
+
+        // Values for the retraction rows come from each key's current
+        // (latest-tt) row — collected before mutating self to satisfy the
+        // borrow on the scan iterator.
+        let mut rows = Vec::new();
+        for prefix in prefixes {
+            let existing: Option<Tuple> = {
+                let mut it = relation_store.scan_prefix(self, &prefix.to_vec());
+                match it.next() {
+                    None => None,
+                    Some(t) => Some(t?),
+                }
+            };
+            match existing {
+                None => {
+                    if check_exists {
+                        bail!(TransactAssertionFailure {
+                            relation: relation_store.name.to_string(),
+                            key: prefix,
+                            notice: "key does not exist in database".to_string()
+                        });
+                    }
+                    // :rm of a missing key is a no-op, as on plain relations.
+                }
+                Some(full) => {
+                    // Already believed-deleted? (latest row is a retraction)
+                    if let Some(DataValue::Validity(v)) = full.get(kpos) {
+                        if !v.is_assert.0 {
+                            if check_exists {
+                                bail!(TransactAssertionFailure {
+                                    relation: relation_store.name.to_string(),
+                                    key: prefix,
+                                    notice: "key is believed-deleted".to_string()
+                                });
+                            }
+                            continue;
+                        }
+                    }
+                    let mut row = prefix;
+                    row.extend_from_slice(&full[kpos + 1..]);
+                    rows.push(row);
+                }
+            }
+        }
+        if !rows.is_empty() {
+            self.pending_tt_writes.push(PendingTtWrite {
+                handle: relation_store.clone(),
+                rows,
+                is_retract: true,
+                span,
+            });
+        }
+        Ok(())
+    }
+
     fn remove_from_relation<'s, S: Storage<'s>>(
         &mut self,
         db: &Db<S>,
@@ -938,6 +1268,21 @@ impl<'a> SessionTx<'a> {
                 relation_store.access_level
             ));
         }
+
+        if relation_store.has_txtime() {
+            return self.buffer_tt_removals(
+                res_iter,
+                headers,
+                cur_vld,
+                relation_store,
+                metadata,
+                key_bindings,
+                check_exists,
+                is_callback_target,
+                span,
+            );
+        }
+
         let key_extractors = make_extractors(
             &relation_store.metadata.keys,
             &metadata.keys,
@@ -978,7 +1323,12 @@ impl<'a> SessionTx<'a> {
                     });
                 }
             }
-            if need_to_collect || has_indices || has_hnsw_indices || has_fts_indices || has_lsh_indices {
+            if need_to_collect
+                || has_indices
+                || has_hnsw_indices
+                || has_fts_indices
+                || has_lsh_indices
+            {
                 if let Some(existing) = self.store_tx.get(&key, false)? {
                     let mut tup = extracted.clone();
                     extend_tuple_from_v(&mut tup, &existing);

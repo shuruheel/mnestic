@@ -138,6 +138,11 @@ impl StoredRelationMetadata {
                 return Ok(());
             }
         }
+        // TxTime is engine-assigned at commit (mnestic fork, bitemporality):
+        // a write spec not only may but MUST omit it.
+        if matches!(col.typing.coltype, ColType::TxTime) {
+            return Ok(());
+        }
         if col.default_gen.is_none() {
             #[derive(Debug, Error, Diagnostic)]
             #[error("required column {0} not provided by input")]

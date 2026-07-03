@@ -240,7 +240,11 @@ mod tests {
             .get(&tt_hwm_key(), false)
             .unwrap()
             .map(|v| i64::from_be_bytes(v.as_slice().try_into().unwrap()));
-        assert_ne!(persisted, Some(burned), "aborted tx must not persist its tt");
+        assert_ne!(
+            persisted,
+            Some(burned),
+            "aborted tx must not persist its tt"
+        );
 
         // ...but the in-memory clock stays monotone past the burned value.
         let next = inner.tt_clock().advance();

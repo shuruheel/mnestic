@@ -367,7 +367,11 @@ fn validate_temporal_axes(input_meta: &InputRelationHandle) -> Result<()> {
             .map(|c| format!("{}: {}", c.name, c.typing))
             .collect::<Vec<_>>();
         if val_parts.is_empty() {
-            format!(":create {} {{{}}}", input_meta.name.name, key_parts.join(", "))
+            format!(
+                ":create {} {{{}}}",
+                input_meta.name.name,
+                key_parts.join(", ")
+            )
         } else {
             format!(
                 ":create {} {{{} => {}}}",
@@ -412,18 +416,24 @@ fn validate_temporal_axes(input_meta: &InputRelationHandle) -> Result<()> {
         .typing
         .nullable
     {
-        bail!(err("TxTime cannot be nullable (it is engine-assigned at every commit)"));
+        bail!(err(
+            "TxTime cannot be nullable (it is engine-assigned at every commit)"
+        ));
     }
     let vt_in_keys = keys.iter().filter(is_vt).count();
     if vt_in_keys > 1 {
-        bail!(err("at most one Validity column is allowed when TxTime is declared"));
+        bail!(err(
+            "at most one Validity column is allowed when TxTime is declared"
+        ));
     }
     let n = keys.len();
     if !matches!(keys[n - 1].typing.coltype, ColType::TxTime) {
         bail!(err("TxTime must be the last key column"));
     }
     if vt_in_keys == 1 && (n < 2 || !matches!(keys[n - 2].typing.coltype, ColType::Validity)) {
-        bail!(err("Validity must immediately precede TxTime (the vt-then-tt trailing pair)"));
+        bail!(err(
+            "Validity must immediately precede TxTime (the vt-then-tt trailing pair)"
+        ));
     }
     Ok(())
 }
@@ -453,6 +463,16 @@ Consider file a bug report."
 pub(crate) struct RelationDeserError;
 
 impl RelationHandle {
+    /// Whether this relation is tt-stamped (its last key column is `TxTime`;
+    /// mnestic fork, bitemporality). Guaranteed by `validate_temporal_axes`
+    /// to be the only possible TxTime position.
+    pub(crate) fn has_txtime(&self) -> bool {
+        matches!(
+            self.metadata.keys.last().map(|c| &c.typing.coltype),
+            Some(crate::data::relation::ColType::TxTime)
+        )
+    }
+
     pub(crate) fn arity(&self) -> usize {
         self.metadata.non_keys.len() + self.metadata.keys.len()
     }
@@ -683,6 +703,22 @@ impl<'a> SessionTx<'a> {
             self.store_tx.exists(&encoded, false)
         }
     }
+    /// Bail if `rel` is tt-stamped: triggers and secondary/search indexes are
+    /// not yet supported on TxTime relations (mnestic fork, bitemporality
+    /// step 3 — buffered commit-time stamping is incompatible with
+    /// statement-time trigger/index maintenance; B-tree index support is
+    /// step 5, `docs/specs/bitemporality.md` §8).
+    fn reject_txtime_relation(rel: &RelationHandle, what: &str) -> Result<()> {
+        if rel.has_txtime() {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error("{0} is not yet supported on TxTime (transaction-time) relations: {1}")]
+            #[diagnostic(code(eval::txtime_unsupported_op))]
+            struct TxTimeUnsupported(String, String);
+            bail!(TxTimeUnsupported(what.to_string(), rel.name.to_string()));
+        }
+        Ok(())
+    }
+
     pub(crate) fn set_relation_triggers(
         &mut self,
         name: &Symbol,
@@ -694,6 +730,7 @@ impl<'a> SessionTx<'a> {
             bail!("Cannot set triggers for temp store")
         }
         let mut original = self.get_relation(name, true)?;
+        Self::reject_txtime_relation(&original, "::set_triggers")?;
         if original.access_level < AccessLevel::Protected {
             bail!(InsufficientAccessLevel(
                 original.name.to_string(),
@@ -813,6 +850,17 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
     pub(crate) fn destroy_relation(&mut self, name: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        if self
+            .pending_tt_writes
+            .iter()
+            .any(|w| w.handle.name.as_str() == name as &str)
+        {
+            bail!(
+                "relation {} has pending transaction-time writes in this transaction; \
+                 commit them in their own transaction before removing the relation",
+                name
+            );
+        }
         let is_temp = name.starts_with('_');
         let mut to_clean = vec![];
 
@@ -873,6 +921,7 @@ impl<'a> SessionTx<'a> {
     pub(crate) fn create_minhash_lsh_index(&mut self, config: &MinHashLshConfig) -> Result<()> {
         // Get relation handle
         let mut rel_handle = self.get_relation(&config.base_relation, true)?;
+        Self::reject_txtime_relation(&rel_handle, "::lsh create")?;
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1003,6 +1052,7 @@ impl<'a> SessionTx<'a> {
     pub(crate) fn create_fts_index(&mut self, config: &FtsIndexConfig) -> Result<()> {
         // Get relation handle
         let mut rel_handle = self.get_relation(&config.base_relation, true)?;
+        Self::reject_txtime_relation(&rel_handle, "::fts create")?;
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1150,8 +1200,7 @@ impl<'a> SessionTx<'a> {
                             let mut n_docs: u64 = 0;
                             for tuple in chunk {
                                 let (tuple_rows, count) = encode_fts_rows_for_tuple(
-                                    tuple, extractor, &mut stack, tokenizer, rel_handle,
-                                    idx_handle,
+                                    tuple, extractor, &mut stack, tokenizer, rel_handle, idx_handle,
                                 )?;
                                 if count > 0 {
                                     total_tokens += count as u64;
@@ -1207,9 +1256,15 @@ impl<'a> SessionTx<'a> {
     pub(crate) fn prepare_hnsw_index(
         &mut self,
         config: &HnswIndexConfig,
-    ) -> Result<(RelationHandle, RelationHandle, HnswIndexManifest, Vec<Bytecode>)> {
+    ) -> Result<(
+        RelationHandle,
+        RelationHandle,
+        HnswIndexManifest,
+        Vec<Bytecode>,
+    )> {
         // Get relation handle
         let rel_handle = self.get_relation(&config.base_relation, true)?;
+        Self::reject_txtime_relation(&rel_handle, "::hnsw create")?;
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1443,9 +1498,7 @@ impl<'a> SessionTx<'a> {
             let k = orig_table.encode_key_for_store(&t[0..nkeys], Default::default())?;
             snap.insert(k, t);
         }
-        let current: Vec<Tuple> = orig_table
-            .scan_all(self)
-            .collect::<Result<Vec<_>>>()?;
+        let current: Vec<Tuple> = orig_table.scan_all(self).collect::<Result<Vec<_>>>()?;
         let mut stack = vec![];
         for cur in &current {
             let k = orig_table.encode_key_for_store(&cur[0..nkeys], Default::default())?;
@@ -1525,6 +1578,7 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         // Get relation handle
         let mut rel_handle = self.get_relation(rel_name, true)?;
+        Self::reject_txtime_relation(&rel_handle, "::index create")?;
 
         // Check if index already exists
         if rel_handle.has_index(&idx_name.name) {

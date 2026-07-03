@@ -10,19 +10,23 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 
-use miette::{bail, Result};
-use smartstring::{LazyCompact, SmartString};
 use crate::data::program::ReturnMutation;
+use miette::{bail, Diagnostic, Result};
+use smartstring::{LazyCompact, SmartString};
+use thiserror::Error;
 
 use crate::data::tuple::TupleT;
 use crate::data::value::DataValue;
+use crate::data::value::{Validity, ValidityTs};
 use crate::fts::TokenizerCache;
-use crate::{CallbackOp, NamedRows};
+use crate::parse::SourceSpan;
 use crate::runtime::callback::CallbackCollector;
-use crate::runtime::relation::RelationId;
+use crate::runtime::relation::{RelationHandle, RelationId};
 use crate::runtime::tt_clock::{tt_hwm_key, TtClock};
 use crate::storage::temp::TempTx;
 use crate::storage::StoreTx;
+use crate::{CallbackOp, NamedRows};
+use std::cmp::Reverse;
 
 pub struct SessionTx<'a> {
     pub(crate) store_tx: Box<dyn StoreTx<'a> + 'a>,
@@ -40,6 +44,26 @@ pub struct SessionTx<'a> {
     /// commit for tt-stamped transactions (`docs/specs/bitemporality.md`
     /// §13.10). Held only inside `commit_tx_with_tt`.
     pub(crate) tt_commit_lock: Arc<Mutex<()>>,
+    /// Buffered writes to tt-stamped relations (mnestic fork, bitemporality
+    /// step 3): rows are collected at statement time and stamped + written at
+    /// commit inside `commit_tx_with_tt`, so every row of the transaction
+    /// carries the same engine-assigned tt and tt order == commit order.
+    /// Consequence (spec §5): writes are NOT visible to later reads in the
+    /// same script — a transaction is one belief event.
+    pub(crate) pending_tt_writes: Vec<PendingTtWrite>,
+}
+
+/// One statement's worth of buffered writes to a tt-stamped relation.
+pub(crate) struct PendingTtWrite {
+    pub(crate) handle: RelationHandle,
+    /// Full extracted tuples WITHOUT the trailing TxTime key column
+    /// (plain keys [+ vt], then value columns).
+    pub(crate) rows: Vec<Vec<DataValue>>,
+    /// tt-only deletion (`:rm`): stamp with `is_assert = false`. On
+    /// bitemporal relations retraction rides the vt axis instead and this is
+    /// always false.
+    pub(crate) is_retract: bool,
+    pub(crate) span: SourceSpan,
 }
 
 pub const CURRENT_STORAGE_VERSION: [u8; 1] = [0x00];
@@ -53,15 +77,18 @@ const STATUS_STR: &str = "status";
 const OK_STR: &str = "OK";
 
 impl<'a> SessionTx<'a> {
-    pub(crate) fn get_returning_rows(&self, callback_collector: &mut CallbackCollector, rel: &str, returning: &ReturnMutation) -> Result<NamedRows> {
+    pub(crate) fn get_returning_rows(
+        &self,
+        callback_collector: &mut CallbackCollector,
+        rel: &str,
+        returning: &ReturnMutation,
+    ) -> Result<NamedRows> {
         let returned_rows = {
             match returning {
-                ReturnMutation::NotReturning => {
-                    NamedRows::new(
-                        vec![STATUS_STR.to_string()],
-                        vec![vec![DataValue::from(OK_STR)]],
-                    )
-                }
+                ReturnMutation::NotReturning => NamedRows::new(
+                    vec![STATUS_STR.to_string()],
+                    vec![vec![DataValue::from(OK_STR)]],
+                ),
                 ReturnMutation::Returning => {
                     let meta = self.get_relation(rel, false)?;
                     let target_len = meta.metadata.keys.len() + meta.metadata.non_keys.len();
@@ -69,8 +96,8 @@ impl<'a> SessionTx<'a> {
                     if let Some(collected) = callback_collector.get(&meta.name) {
                         for (kind, insertions, deletions) in collected {
                             let (pos_key, neg_key) = match kind {
-                                CallbackOp::Put => { ("inserted", "replaced") }
-                                CallbackOp::Rm => { ("requested", "deleted") }
+                                CallbackOp::Put => ("inserted", "replaced"),
+                                CallbackOp::Rm => ("requested", "deleted"),
                             };
                             for row in &insertions.rows {
                                 let mut v = Vec::with_capacity(target_len + 1);
@@ -93,14 +120,14 @@ impl<'a> SessionTx<'a> {
                         }
                     }
                     let mut header = vec!["_kind".to_string()];
-                    header.extend(meta.metadata.keys
-                        .iter()
-                        .chain(meta.metadata.non_keys.iter())
-                        .map(|s| s.name.to_string()));
-                    NamedRows::new(
-                        header,
-                        returned_rows,
-                    )
+                    header.extend(
+                        meta.metadata
+                            .keys
+                            .iter()
+                            .chain(meta.metadata.non_keys.iter())
+                            .map(|s| s.name.to_string()),
+                    );
+                    NamedRows::new(header, returned_rows)
                 }
             }
         };
@@ -143,6 +170,13 @@ impl<'a> SessionTx<'a> {
     }
 
     pub fn commit_tx(&mut self) -> Result<()> {
+        if !self.pending_tt_writes.is_empty() {
+            // Route through the tt commit path (mnestic fork): stamp the
+            // buffered rows, persist the HWM, commit — all under the per-Db
+            // critical section. Every call site inherits this automatically.
+            self.commit_tx_with_tt()?;
+            return Ok(());
+        }
         self.store_tx.commit()?;
         Ok(())
     }
@@ -190,7 +224,6 @@ impl<'a> SessionTx<'a> {
     /// buffered stamping) will route commits of transactions that touched
     /// tt-stamped relations through here, stamping the buffered rows with
     /// the returned tt before `store_tx.commit()`.
-    #[allow(dead_code)]
     pub(crate) fn commit_tx_with_tt(&mut self) -> Result<i64> {
         let lock = self.tt_commit_lock.clone();
         // Poison recovery is sound here: a panic inside the section can only
@@ -201,6 +234,7 @@ impl<'a> SessionTx<'a> {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tt = self.tt_clock.advance();
+        self.stamp_pending_tt_writes(tt)?;
         // put_externally_serialized: the mutex above is the serialization
         // authority for this key; RocksDB must not snapshot-validate it (two
         // overlapping tt commits would otherwise abort the later one).
@@ -208,5 +242,87 @@ impl<'a> SessionTx<'a> {
             .put_externally_serialized(&tt_hwm_key(), &tt.to_be_bytes())?;
         self.store_tx.commit()?;
         Ok(tt)
+    }
+
+    /// Drain the buffered tt writes: append the allocated tt as the trailing
+    /// key component of every row and write it. Same-(key, vt) double-puts in
+    /// one transaction collapse to last-write-wins naturally (identical full
+    /// key); an assert AND a retract of one (key, vt) in one transaction is
+    /// an error (both rows would carry the same tt — an unbreakable
+    /// resolution tie, spec §3/§6).
+    fn stamp_pending_tt_writes(&mut self, tt: i64) -> Result<()> {
+        use std::collections::BTreeMap;
+        let writes = std::mem::take(&mut self.pending_tt_writes);
+
+        // One belief event may not both assert and retract the same logical
+        // key at its single tt (an unbreakable resolution tie, spec §3/§6).
+        // Checked across ALL buffered statements of the transaction, keyed by
+        // (relation id, flag-normalized key-prefix bytes); the flag is the vt
+        // is_assert on bitemporal relations and !is_retract on tt-only ones.
+        {
+            let mut seen: BTreeMap<(u64, Vec<u8>), bool> = BTreeMap::new();
+            for w in &writes {
+                let kpos = w.handle.metadata.keys.len() - 1;
+                let is_bitemporal = kpos >= 1
+                    && matches!(
+                        w.handle.metadata.keys[kpos - 1].typing.coltype,
+                        crate::data::relation::ColType::Validity
+                    );
+                for row in &w.rows {
+                    let (norm_key, flag) = if is_bitemporal {
+                        let (vt_ts, vt_flag) = match &row[kpos - 1] {
+                            DataValue::Validity(v) => (v.timestamp, v.is_assert.0),
+                            _ => continue,
+                        };
+                        let mut norm = row[0..kpos].to_vec();
+                        norm[kpos - 1] = DataValue::Validity(Validity {
+                            timestamp: vt_ts,
+                            is_assert: Reverse(true),
+                        });
+                        (w.handle.encode_partial_key_for_store(&norm), vt_flag)
+                    } else {
+                        (
+                            w.handle.encode_partial_key_for_store(&row[0..kpos]),
+                            !w.is_retract,
+                        )
+                    };
+                    if let Some(prev) = seen.insert((w.handle.id.0, norm_key), flag) {
+                        if prev != flag {
+                            #[derive(Debug, Error, Diagnostic)]
+                            #[error("transaction asserts AND retracts one key in relation {0}")]
+                            #[diagnostic(
+                                code(eval::txtime_assert_retract_conflict),
+                                help("both rows would carry the same transaction time — an unbreakable resolution tie; split into two transactions")
+                            )]
+                            struct TtAssertRetractConflict(String);
+                            bail!(TtAssertRetractConflict(w.handle.name.to_string()));
+                        }
+                    }
+                }
+            }
+        }
+
+        for w in writes {
+            let kpos = w.handle.metadata.keys.len() - 1;
+            let is_bitemporal = kpos >= 1
+                && matches!(
+                    w.handle.metadata.keys[kpos - 1].typing.coltype,
+                    crate::data::relation::ColType::Validity
+                );
+            let tt_value = DataValue::Validity(Validity {
+                timestamp: ValidityTs(Reverse(tt)),
+                // tt-only relations carry the retract bit on the tt axis;
+                // bitemporal ones must keep the reserved flag byte at 0
+                // (assert), retraction riding the vt axis (spec §4).
+                is_assert: Reverse(!w.is_retract || is_bitemporal),
+            });
+            for mut row in w.rows {
+                row.insert(kpos, tt_value.clone());
+                let key = w.handle.encode_key_for_store(&row, w.span)?;
+                let val = w.handle.encode_val_for_store(&row, w.span)?;
+                self.store_tx.put(&key, &val)?;
+            }
+        }
+        Ok(())
     }
 }

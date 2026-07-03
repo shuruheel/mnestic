@@ -5,6 +5,57 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — TxTime relations: schema opt-in + write path (bitemporality step 3)
+- **`TxTime` column type** (`docs/specs/bitemporality.md` §4): a relation whose
+  last key column is `tt: TxTime` is transaction-time-stamped — tt-only
+  (`{k, tt: TxTime => v}`, system-versioned) or bitemporal
+  (`{k, v: Validity, tt: TxTime => x}`). The engine stamps every write with the
+  commit clock's tt at commit; user-supplied tt values are rejected on every
+  path (put specs, `:create`-with-rows headers, imports). **Relations declaring
+  `TxTime` are unreadable by pre-fork/upstream builds.**
+- **Temporal-axis rule enforced at `:create`** — axes are the trailing key
+  columns, vt-then-tt, at most one of each; seven malformed shapes are
+  `:create`-time errors whose message contains the copy-pasteable corrected
+  declaration (deliberately stricter than `Validity`'s shipped query-time-only
+  check).
+- **Buffered commit-time stamping**: writes to tt-stamped relations buffer on
+  the transaction and are stamped + written inside the commit critical section,
+  so the whole transaction shares one tt (one belief event) and tt order ==
+  commit order. Consequences, all pinned by tests: same-transaction writes are
+  **not visible to later reads in the same script**; a key cannot be both
+  asserted and retracted in one transaction (unbreakable resolution tie —
+  rejected across statements, including tt-only `:put`+`:rm` mixes); double-puts
+  of one (key [, vt]) in one transaction collapse last-write-wins; `::remove` of
+  a relation with pending tt writes in the same script is rejected.
+- **`:rm` on tt-only relations appends a retraction** at commit-tt (never a
+  physical delete); values snapshot the key's latest row at statement time;
+  `:rm` of a missing key is a no-op; `:delete` of a missing or believed-deleted
+  key fails its existence assertion. **Deviations recorded:** on *bitemporal*
+  relations `:rm` is rejected in v1 (removal is a valid-time statement — use
+  `:put` with vt `"RETRACT"`; the spec-§6 remap is deferred to step 4);
+  `:insert`/`:update`/`:ensure`/`:ensure_not` are rejected pending the as-of
+  read path (step 4); `:replace` of an existing TxTime relation is rejected
+  (destroy-and-recreate would silently drop history); triggers, secondary and
+  search indexes, callbacks, and `:returning` are rejected on TxTime relations
+  (indexes: step 5). A put-trigger on a *plain* relation may write into a
+  TxTime relation (buffers and stamps normally; pinned).
+- **Imports**: `import_relations` stamps **one tt per batch** (one belief
+  event; spec §13.3), rejects tt columns in payload headers and delete-imports;
+  `restore_backup` preserves tt bytes verbatim and **re-seeds the commit
+  clock** from the backup's persisted mark; `import_from_backup` is rejected
+  for TxTime relations (its rows would carry a foreign clock's tts — restore
+  the full store or re-ingest). Export→import therefore does not round-trip
+  TxTime relations; use backup/restore.
+- **Interim read behavior**: bare scans work (all versions, newest tt first —
+  the tt column decodes as a Validity value; use `:order` for chronological
+  output); any `@` as-of read on a TxTime relation fails with a distinct
+  "lands in step 4" error, so vt semantics never silently apply to the tt axis.
+- Closes step 2's owed items: the restore re-seed and the HWM+rows same-tx
+  atomicity test (an aborted transaction leaves neither rows nor a persisted
+  mark). 24 txtime/tt_clock tests; hardened against a three-lens adversarial
+  review (cross-statement conflict detection, `::remove`-with-pending-writes
+  orphan bytes, believed-deleted `:delete` consistency were review catches).
+
 ### New — transaction-time commit clock (bitemporality step 2; internal, no user surface)
 - The engine-assigned transaction-time (tt) allocator for the bitemporality
   work (`docs/specs/bitemporality.md` §5, decisions §13.10): a wall-clock-floored

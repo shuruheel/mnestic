@@ -604,6 +604,59 @@ impl<'s, S: Storage<'s>> Db<S> {
                 .map(|(i, k)| -> Result<(&str, usize)> { Ok((k as &str, i)) })
                 .try_collect()?;
 
+            // tt-stamped relations (mnestic fork, bitemporality step 3): the
+            // import must not carry tt (engine-assigned), deletes need :rm,
+            // and rows are buffered so the whole import — one transaction —
+            // is stamped with ONE tt (one belief event, spec §13.3).
+            if handle.has_txtime() {
+                if is_delete {
+                    bail!(
+                        "cannot import deletes into TxTime relation '{}': use :rm",
+                        relation
+                    );
+                }
+                let tt_name = &handle.metadata.keys.last().unwrap().name;
+                if header2idx.contains_key(tt_name as &str) {
+                    bail!(
+                        "column {} of relation '{}' is engine-assigned at commit and cannot be imported",
+                        tt_name,
+                        relation
+                    );
+                }
+                let kpos = handle.metadata.keys.len() - 1;
+                let mut rows = Vec::with_capacity(in_data.rows.len());
+                for row in &in_data.rows {
+                    let mut extracted = Vec::with_capacity(kpos + handle.metadata.non_keys.len());
+                    for col in handle.metadata.keys[..kpos]
+                        .iter()
+                        .chain(handle.metadata.non_keys.iter())
+                    {
+                        let idx = header2idx.get(&col.name as &str).ok_or_else(|| {
+                            miette!(
+                                "required header {} not found for relation {}",
+                                col.name,
+                                relation
+                            )
+                        })?;
+                        let v = row
+                            .get(*idx)
+                            .ok_or_else(|| miette!("row too short: {:?}", row))?;
+                        extracted.push(col.typing.coerce(v.clone(), cur_vld)?);
+                    }
+                    rows.push(extracted);
+                }
+                if !rows.is_empty() {
+                    tx.pending_tt_writes
+                        .push(crate::runtime::transact::PendingTtWrite {
+                            handle: handle.clone(),
+                            rows,
+                            is_retract: false,
+                            span: Default::default(),
+                        });
+                }
+                continue;
+            }
+
             let key_indices: Vec<_> = handle
                 .metadata
                 .keys
@@ -736,6 +789,16 @@ impl<'s, S: Storage<'s>> Db<S> {
             let iter = s_tx.store_tx.total_scan();
             self.db.batch_put(iter)?;
             s_tx.commit_tx()?;
+            // Re-seed the tt commit clock from the restored high-water mark
+            // (mnestic fork, bitemporality): the backup carries the TT_HWM
+            // system key, and "persisted HWM >= every committed tt" holds
+            // inside any consistent backup, so the persisted mark alone
+            // suffices — no row scan. fetch_max seeding cannot regress.
+            {
+                let tx = self.transact()?;
+                let persisted = tx.read_persisted_tt_hwm()?;
+                self.tt_clock.seed(persisted);
+            }
             Ok(())
         }
         #[cfg(not(feature = "storage-sqlite"))]
@@ -773,6 +836,16 @@ impl<'s, S: Storage<'s>> Db<S> {
                 }
                 let src_handle = src_tx.get_relation(relation, false)?;
                 let dst_handle = dst_tx.get_relation(relation, false)?;
+
+                if dst_handle.has_txtime() || src_handle.has_txtime() {
+                    bail!(
+                        "cannot import TxTime relation '{}' from a backup: its rows carry \
+                         transaction times from the source store's clock, which this store's \
+                         high-water mark knows nothing about — restore the full store with \
+                         restore_backup() (which re-seeds the commit clock) or re-ingest",
+                        relation
+                    );
+                }
 
                 if !dst_handle.indices.is_empty() {
                     #[derive(Debug, Error, Diagnostic)]
@@ -946,6 +1019,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
+            pending_tt_writes: Vec::new(),
         };
         Ok(ret)
     }
@@ -959,6 +1033,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
+            pending_tt_writes: Vec::new(),
         };
         Ok(ret)
     }
@@ -1358,7 +1433,13 @@ impl<'s, S: Storage<'s>> Db<S> {
             // The build only *writes* the temp store (is_temp routing) and only
             // *reads* the base relation via this snapshot — so a read transaction
             // is sufficient and holds no relation lock.
-            tx.hnsw_build_index(&manifest, &base_handle, &idx_temp, filter_ref, &snapshot_tuples)?;
+            tx.hnsw_build_index(
+                &manifest,
+                &base_handle,
+                &idx_temp,
+                filter_ref,
+                &snapshot_tuples,
+            )?;
             self.db
                 .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
             snapshot_tuples

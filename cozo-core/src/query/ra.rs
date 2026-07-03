@@ -439,6 +439,19 @@ impl RelAlgebra {
                 span,
             })),
             Some(vld) => {
+                if storage.has_txtime() {
+                    // mnestic fork, bitemporality: as-of reads on TxTime
+                    // relations (labeled @ (vt:/tt:) selectors) land in step 4;
+                    // until then bare scans return all versions.
+                    #[derive(Debug, Error, Diagnostic)]
+                    #[error("as-of reads on TxTime relation {0} are not available yet")]
+                    #[diagnostic(
+                        code(eval::txtime_asof_pending),
+                        help("the labeled selector `@ (vt: …, tt: …)` lands with bitemporality step 4; a bare scan (no `@`) returns all versions, newest transaction time first")
+                    )]
+                    struct TxTimeAsOfPending(String, #[label] SourceSpan);
+                    bail!(TxTimeAsOfPending(storage.name.to_string(), span));
+                }
                 if storage.metadata.keys.last().unwrap().typing
                     != (NullableColType {
                         coltype: ColType::Validity,
@@ -1178,8 +1191,10 @@ impl StoredWithValidityRA {
                     .collect_vec();
 
                 if !skip_range_check && !self.filters.is_empty() {
-                    let other_bindings = &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
-                    let (l_bound, u_bound) = compute_bounds(&self.filters, other_bindings).unwrap_or_default();
+                    let other_bindings =
+                        &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
+                    let (l_bound, u_bound) =
+                        compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
@@ -1338,8 +1353,10 @@ impl StoredRA {
                 let mut stack = vec![];
 
                 if !skip_range_check && !self.filters.is_empty() {
-                    let other_bindings = &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
-                    let (l_bound, u_bound) = compute_bounds(&self.filters, other_bindings).unwrap_or_default();
+                    let other_bindings =
+                        &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
+                    let (l_bound, u_bound) =
+                        compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
@@ -1686,7 +1703,8 @@ impl TempStoreRA {
 
                 if !skip_range_check && !self.filters.is_empty() {
                     let other_bindings = &self.bindings[right_join_indices.len()..];
-                    let (l_bound, u_bound) = compute_bounds(&self.filters, other_bindings).unwrap_or_default();
+                    let (l_bound, u_bound) =
+                        compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
