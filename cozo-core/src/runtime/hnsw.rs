@@ -425,9 +425,13 @@ impl<'a> SessionTx<'a> {
                     }
                     // update degree
                     target_self_val[0] = DataValue::from(target_degree as f64);
-                    let target_self_val_bytes_new =
-                        idx_table.encode_val_only_for_store(&target_self_val, Default::default())?;
-                    self.idx_put(idx_table, &target_self_key_bytes, &target_self_val_bytes_new)?;
+                    let target_self_val_bytes_new = idx_table
+                        .encode_val_only_for_store(&target_self_val, Default::default())?;
+                    self.idx_put(
+                        idx_table,
+                        &target_self_key_bytes,
+                        &target_self_val_bytes_new,
+                    )?;
                 }
             }
         } else {
@@ -769,7 +773,15 @@ impl<'a> SessionTx<'a> {
             cache: FxHashMap::default(),
             distance: manifest.distance,
         };
-        self.hnsw_put_inner(manifest, orig_table, idx_table, filter, stack, tuple, &mut vec_cache)
+        self.hnsw_put_inner(
+            manifest,
+            orig_table,
+            idx_table,
+            filter,
+            stack,
+            tuple,
+            &mut vec_cache,
+        )
     }
 
     /// Bulk-build an HNSW index over `tuples` (mnestic fork). The graph is
@@ -951,14 +963,7 @@ impl<'a> SessionTx<'a> {
         }
         for (vec, idx, sub) in extracted_vectors {
             self.hnsw_put_vector(
-                tuple,
-                vec,
-                idx,
-                sub,
-                manifest,
-                orig_table,
-                idx_table,
-                vec_cache,
+                tuple, vec, idx, sub, manifest, orig_table, idx_table, vec_cache,
             )?;
         }
         Ok(true)
@@ -1055,7 +1060,11 @@ impl<'a> SessionTx<'a> {
                 neighbour_val[0] = DataValue::from(neighbour_val[0].get_float().unwrap() - 1.);
                 let neighbour_val_bytes_new =
                     idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?;
-                self.idx_put(idx_table, &neighbour_self_key_bytes, &neighbour_val_bytes_new)?;
+                self.idx_put(
+                    idx_table,
+                    &neighbour_self_key_bytes,
+                    &neighbour_val_bytes_new,
+                )?;
             }
         }
 
@@ -1138,8 +1147,8 @@ impl<'a> SessionTx<'a> {
                 Some(x) => x as usize,
                 None => {
                     // this occurs if the index is empty
-                    return Ok(vec![])
-                },
+                    return Ok(vec![]);
+                }
             };
             let ep_t_key = ep[1..config.base_handle.metadata.keys.len() + 1].to_vec();
             let ep_subidx = ep[config.base_handle.metadata.keys.len() + 2]

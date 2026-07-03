@@ -2617,8 +2617,8 @@ fn decode_ulid(s: &str) -> Result<u128> {
     );
     let mut value: u128 = first;
     for c in bytes {
-        let d = crockford_decode(c)
-            .ok_or_else(|| miette!("invalid ULID character {:?}", c as char))?;
+        let d =
+            crockford_decode(c).ok_or_else(|| miette!("invalid ULID character {:?}", c as char))?;
         value = (value << 5) | d;
     }
     Ok(value)

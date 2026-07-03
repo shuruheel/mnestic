@@ -1,8 +1,8 @@
 use super::{options::TokenizerOption, stream::CangjieTokenStream};
+use crate::fts::tokenizer::BoxTokenStream;
 use jieba_rs::Jieba;
 use log::trace;
 use std::sync::Arc;
-use crate::fts::tokenizer::BoxTokenStream;
 
 #[derive(Clone, Debug)]
 pub(crate) struct CangJieTokenizer {

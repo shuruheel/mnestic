@@ -71,7 +71,10 @@ fn bench_read_path(c: &mut Criterion) {
     let fixed_rules = db.get_fixed_rules();
 
     let mut params = BTreeMap::new();
-    params.insert("u".to_string(), DataValue::Str(format!("k{}", N / 2).into()));
+    params.insert(
+        "u".to_string(),
+        DataValue::Str(format!("k{}", N / 2).into()),
+    );
     params.insert("t".to_string(), DataValue::from(100i64));
 
     // Two shapes: a single-rule point read, and a multi-rule "retrieval-like"
@@ -88,16 +91,19 @@ fn bench_read_path(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("read_path");
     for (name, query) in queries {
-        group.bench_with_input(
-            BenchmarkId::new("parse_only", name),
-            &query,
-            |b, q| {
-                b.iter(|| {
-                    let ast = parse_script(q, &params, &fixed_rules, current_validity()).unwrap();
-                    criterion::black_box(&ast);
-                })
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("parse_only", name), &query, |b, q| {
+            b.iter(|| {
+                let ast = parse_script(
+                    q,
+                    &params,
+                    &fixed_rules,
+                    &Default::default(),
+                    current_validity(),
+                )
+                .unwrap();
+                criterion::black_box(&ast);
+            })
+        });
         group.bench_with_input(BenchmarkId::new("full_run", name), &query, |b, q| {
             b.iter(|| {
                 let res = db

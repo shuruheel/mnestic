@@ -107,6 +107,7 @@ pub(crate) fn parse_query(
     src: Pairs<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
     cur_vld: ValidityTs,
 ) -> Result<InputProgram> {
     let mut progs: BTreeMap<Symbol, InputInlineRulesOrFixed> = Default::default();
@@ -119,7 +120,7 @@ pub(crate) fn parse_query(
     for pair in src {
         match pair.as_rule() {
             Rule::rule => {
-                let (name, rule) = parse_rule(pair, param_pool, cur_vld)?;
+                let (name, rule) = parse_rule(pair, param_pool, custom_aggrs, cur_vld)?;
 
                 match progs.entry(name) {
                     Entry::Vacant(e) => {
@@ -163,7 +164,8 @@ pub(crate) fn parse_query(
             }
             Rule::fixed_rule => {
                 let rule_span = pair.extract_span();
-                let (name, apply) = parse_fixed_rule(pair, param_pool, fixed_rules, cur_vld)?;
+                let (name, apply) =
+                    parse_fixed_rule(pair, param_pool, fixed_rules, custom_aggrs, cur_vld)?;
 
                 match progs.entry(name) {
                     Entry::Vacant(e) => {
@@ -185,7 +187,8 @@ pub(crate) fn parse_query(
             Rule::const_rule => {
                 let span = pair.extract_span();
                 let mut src = pair.into_inner();
-                let (name, mut head, aggr) = parse_rule_head(src.next().unwrap(), param_pool)?;
+                let (name, mut head, aggr) =
+                    parse_rule_head(src.next().unwrap(), param_pool, custom_aggrs)?;
 
                 if let Some(found) = progs.get(&name) {
                     let mut found_span = match found {
@@ -530,13 +533,14 @@ pub(crate) fn parse_query(
 fn parse_rule(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
     cur_vld: ValidityTs,
 ) -> Result<(Symbol, InputInlineRule)> {
     let span = src.extract_span();
     let mut src = src.into_inner();
     let head = src.next().unwrap();
     let head_span = head.extract_span();
-    let (name, head, aggr) = parse_rule_head(head, param_pool)?;
+    let (name, head, aggr) = parse_rule_head(head, param_pool, custom_aggrs)?;
 
     #[derive(Debug, Error, Diagnostic)]
     #[error("Horn-clause rule cannot have empty rule head")]
@@ -792,6 +796,7 @@ fn extract_named_apply_arg(
 fn parse_rule_head(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
 ) -> Result<(
     Symbol,
     Vec<Symbol>,
@@ -802,7 +807,7 @@ fn parse_rule_head(
     let mut args = vec![];
     let mut aggrs = vec![];
     for p in src {
-        let (arg, aggr) = parse_rule_head_arg(p, param_pool)?;
+        let (arg, aggr) = parse_rule_head_arg(p, param_pool, custom_aggrs)?;
         args.push(arg);
         aggrs.push(aggr);
     }
@@ -817,6 +822,7 @@ struct AggrNotFound(String, #[label] SourceSpan);
 fn parse_rule_head_arg(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
 ) -> Result<(Symbol, Option<(Aggregation, Vec<DataValue>)>)> {
     let src = src.into_inner().next().unwrap();
     Ok(match src.as_rule() {
@@ -829,14 +835,30 @@ fn parse_rule_head_arg(
             let args: Vec<_> = inner
                 .map(|v| -> Result<DataValue> { build_expr(v, param_pool)?.eval_to_const() })
                 .try_collect()?;
+            let aggr = match parse_aggr(aggr_name) {
+                Some(builtin) => builtin.clone(),
+                None => match custom_aggrs.get(aggr_name) {
+                    // A user-registered aggregate (mnestic fork, R0b): an
+                    // owned Aggregation carrying the ⊕ factory. The stratifier
+                    // and aggr_kind read only `is_meet`, so a registered meet
+                    // rides the recursion guard exactly like a builtin.
+                    Some(reg) => Aggregation {
+                        name: crate::data::aggr::intern_aggr_name(aggr_name),
+                        is_meet: reg.is_meet,
+                        meet_op: None,
+                        normal_op: None,
+                        meet_factory: Some(reg.factory.clone()),
+                    },
+                    None => {
+                        return Err(
+                            AggrNotFound(aggr_name.to_string(), aggr_p.extract_span()).into()
+                        )
+                    }
+                },
+            };
             (
                 Symbol::new(var.as_str(), var.extract_span()),
-                Some((
-                    parse_aggr(aggr_name)
-                        .ok_or_else(|| AggrNotFound(aggr_name.to_string(), aggr_p.extract_span()))?
-                        .clone(),
-                    args,
-                )),
+                Some((aggr, args)),
             )
         }
         _ => unreachable!(),
@@ -852,10 +874,11 @@ fn parse_fixed_rule(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
     cur_vld: ValidityTs,
 ) -> Result<(Symbol, FixedRuleApply)> {
     let mut src = src.into_inner();
-    let (out_symbol, head, aggr) = parse_rule_head(src.next().unwrap(), param_pool)?;
+    let (out_symbol, head, aggr) = parse_rule_head(src.next().unwrap(), param_pool, custom_aggrs)?;
 
     #[derive(Debug, Error, Diagnostic)]
     #[error("fixed rule cannot be combined with aggregation")]

@@ -5,6 +5,38 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — custom aggregate registration (provenance semirings R0b)
+- **`Db::register_custom_aggr(name, is_meet, factory)` / `unregister_custom_aggr`**
+  (+ `DbInstance` dispatchers): register a user-supplied ⊕ operator
+  (`MeetAggrObj`, re-exported with `NormalAggrObj`/`RegisteredAggr`) usable in
+  rule heads by name — the registration slot of the provenance-semirings plan
+  (`docs/specs/provenance-semirings.md` §5 R0b). With `is_meet = true` the
+  aggregate is admitted into **recursive rules**, riding the existing
+  stratifier guard and `changed`-bit saturation with zero stratifier change;
+  the ⊕ must then be an absorptive semilattice operation (the registrant's
+  obligation; a **debug-build probe** in the meet path re-applies operands on
+  custom aggregates and panics on observed non-idempotence). Outside recursion
+  a custom aggregate runs through a derived normal-path adapter (state = 0̄,
+  set = ⊕). Registry is in-memory and `Db`-scoped (persistence is R2); builtin
+  names are reserved; duplicates error (unregister to replace — already-parsed
+  programs keep their factory); names must be lowercase identifiers; custom
+  aggregates take no arguments in R0; ⊗ stays ordinary rule-body arithmetic.
+  Factories and operators must not panic (no `catch_unwind` in the engine) and
+  factories must be cheap (called O(rules × epochs) per query).
+- **Custom aggregates are rejected in trigger scripts** at `::set_triggers`
+  time (a trigger is persisted CozoScript re-parsed on every write; a fresh
+  `Db` open would lack the registration — unsupported until R2).
+- **Breaking (fork-internal API):** `parse::parse_script` gains a
+  `custom_aggrs` parameter.
+
+### Fixed — `and`/`or` meet aggregates reported an inverted changed-bit (upstream bug)
+- `MeetAggrAnd`/`MeetAggrOr::update` returned `true` when the value was
+  **stable** and `false` when it **changed** — so in recursive rules a real
+  change never propagated through the semi-naive delta (wrong results) and
+  stable values were re-enqueued. Found by the R0b adversarial review while
+  auditing the new idempotence probe; fixed to report change, pinned by a
+  unit test.
+
 ### New — TxTime relations: schema opt-in + write path (bitemporality step 3)
 - **`TxTime` column type** (`docs/specs/bitemporality.md` §4): a relation whose
   last key column is `tt: TxTime` is transaction-time-stamped — tt-only

@@ -28,6 +28,7 @@ pub(crate) fn parse_imperative_block(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
     cur_vld: ValidityTs,
 ) -> Result<ImperativeProgram> {
     let mut collected = vec![];
@@ -40,6 +41,7 @@ pub(crate) fn parse_imperative_block(
             pair,
             param_pool,
             fixed_rules,
+            custom_aggrs,
             cur_vld,
         )?);
     }
@@ -61,6 +63,7 @@ fn parse_imperative_stmt(
     pair: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
+    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
     cur_vld: ValidityTs,
 ) -> Result<ImperativeStmt> {
     Ok(match pair.as_rule() {
@@ -95,6 +98,7 @@ fn parse_imperative_stmt(
                             src.next().unwrap().into_inner(),
                             param_pool,
                             fixed_rules,
+                            custom_aggrs,
                             cur_vld,
                         )?;
                         let store_as = src.next().map(|p| SmartString::from(p.as_str().trim()));
@@ -117,6 +121,7 @@ fn parse_imperative_stmt(
                         src.next().unwrap().into_inner(),
                         param_pool,
                         fixed_rules,
+                        custom_aggrs,
                         cur_vld,
                     )?;
                     let store_as = src.next().map(|p| SmartString::from(p.as_str().trim()));
@@ -128,13 +133,15 @@ fn parse_imperative_stmt(
                 .next()
                 .unwrap()
                 .into_inner()
-                .map(|p| parse_imperative_stmt(p, param_pool, fixed_rules, cur_vld))
+                .map(|p| parse_imperative_stmt(p, param_pool, fixed_rules, custom_aggrs, cur_vld))
                 .try_collect()?;
             let else_body = match inner.next() {
                 None => vec![],
                 Some(rest) => rest
                     .into_inner()
-                    .map(|p| parse_imperative_stmt(p, param_pool, fixed_rules, cur_vld))
+                    .map(|p| {
+                        parse_imperative_stmt(p, param_pool, fixed_rules, custom_aggrs, cur_vld)
+                    })
                     .try_collect()?,
             };
             ImperativeStmt::If {
@@ -152,7 +159,7 @@ fn parse_imperative_stmt(
                 mark = Some(SmartString::from(nxt.as_str()));
                 nxt = inner.next().unwrap();
             }
-            let body = parse_imperative_block(nxt, param_pool, fixed_rules, cur_vld)?;
+            let body = parse_imperative_block(nxt, param_pool, fixed_rules, custom_aggrs, cur_vld)?;
             ImperativeStmt::Loop { label: mark, body }
         }
         Rule::temp_swap => {
@@ -183,6 +190,7 @@ fn parse_imperative_stmt(
                 src.next().unwrap().into_inner(),
                 param_pool,
                 fixed_rules,
+                custom_aggrs,
                 cur_vld,
             )?;
             let store_as = src.next().map(|p| SmartString::from(p.as_str().trim()));
@@ -196,6 +204,7 @@ fn parse_imperative_stmt(
                 src.next().unwrap().into_inner(),
                 param_pool,
                 fixed_rules,
+                custom_aggrs,
                 cur_vld,
             )?;
             let store_as = src.next().map(|p| SmartString::from(p.as_str().trim()));
@@ -210,6 +219,7 @@ fn parse_imperative_stmt(
                 src.next().unwrap().into_inner(),
                 param_pool,
                 fixed_rules,
+                custom_aggrs,
                 cur_vld,
             )?;
             let store_as = src.next().map(|p| SmartString::from(p.as_str().trim()));

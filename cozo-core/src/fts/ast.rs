@@ -6,8 +6,8 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use ordered_float::OrderedFloat;
 use crate::fts::tokenizer::TextAnalyzer;
+use ordered_float::OrderedFloat;
 use smartstring::{LazyCompact, SmartString};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -67,13 +67,11 @@ impl FtsExpr {
 
     pub(crate) fn is_empty(&self) -> bool {
         match self {
-            FtsExpr::Literal(l) => {
-                l.booster == 0. || l.value.is_empty()
-            },
-            FtsExpr::Near(FtsNear{ literals, .. }) => {literals.is_empty()}
-            FtsExpr::And(v) => {v.is_empty()}
-            FtsExpr::Or(v) => {v.is_empty()}
-            FtsExpr::Not(lhs, _) => {lhs.is_empty()}
+            FtsExpr::Literal(l) => l.booster == 0. || l.value.is_empty(),
+            FtsExpr::Near(FtsNear { literals, .. }) => literals.is_empty(),
+            FtsExpr::And(v) => v.is_empty(),
+            FtsExpr::Or(v) => v.is_empty(),
+            FtsExpr::Not(lhs, _) => lhs.is_empty(),
         }
     }
 
@@ -88,7 +86,7 @@ impl FtsExpr {
                             if !e.is_empty() {
                                 flattened.push(e)
                             }
-                        },
+                        }
                     }
                 }
                 if flattened.len() == 1 {
@@ -106,7 +104,8 @@ impl FtsExpr {
                             if !e.is_empty() {
                                 flattened.push(e)
                             }
-                        },                    }
+                        }
+                    }
                 }
                 if flattened.len() == 1 {
                     flattened.into_iter().next().unwrap()

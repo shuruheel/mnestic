@@ -606,10 +606,12 @@ impl InputProgram {
                             ret.push(Symbol::new(
                                 format!(
                                     "{}({})",
+                                    // custom aggregates (mnestic fork, R0b)
+                                    // carry their raw registered name
                                     aggr.name
                                         .strip_prefix("AGGR_")
-                                        .unwrap()
-                                        .to_ascii_lowercase(),
+                                        .map(|n| n.to_ascii_lowercase())
+                                        .unwrap_or_else(|| aggr.name.to_string()),
                                     symb
                                 ),
                                 symb.span,
@@ -1320,7 +1322,10 @@ impl SearchInput {
                     .eval_to_const()?
                     .get_float()
                     .ok_or_else(|| miette!("`b` for FTS must be a number"))?;
-                ensure!((0.0..=1.0).contains(&b), "`b` for FTS must be in [0, 1], got {b}");
+                ensure!(
+                    (0.0..=1.0).contains(&b),
+                    "`b` for FTS must be in [0, 1], got {b}"
+                );
                 b
             }
         };

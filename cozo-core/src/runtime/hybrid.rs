@@ -252,7 +252,10 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         !q.query_vector.is_empty(),
         "hybrid_search: query_vector is empty"
     );
-    ensure!(q.rrf_k.is_finite() && q.rrf_k >= 0.0, "hybrid_search: rrf_k must be finite and >= 0");
+    ensure!(
+        q.rrf_k.is_finite() && q.rrf_k >= 0.0,
+        "hybrid_search: rrf_k must be finite and >= 0"
+    );
     for l in &q.extra_lists {
         validate_ident(&l.label, "extra_lists.label")?;
     }
@@ -261,12 +264,21 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         validate_ident(&g.edge_relation, "graph_legs.edge_relation")?;
         validate_ident(&g.from_col, "graph_legs.from_col")?;
         validate_ident(&g.to_col, "graph_legs.to_col")?;
-        ensure!(g.max_hops >= 1, "hybrid_search: graph_legs.max_hops must be >= 1");
-        ensure!(!g.seeds.is_empty(), "hybrid_search: graph_legs.seeds is empty");
+        ensure!(
+            g.max_hops >= 1,
+            "hybrid_search: graph_legs.max_hops must be >= 1"
+        );
+        ensure!(
+            !g.seeds.is_empty(),
+            "hybrid_search: graph_legs.seeds is empty"
+        );
     }
     if let Some(m) = &q.mmr {
         validate_ident(&m.embedding_col, "mmr.embedding_col")?;
-        ensure!(m.lambda.is_finite(), "hybrid_search: mmr.lambda must be finite");
+        ensure!(
+            m.lambda.is_finite(),
+            "hybrid_search: mmr.lambda must be finite"
+        );
     }
 
     let rel = &q.relation;
@@ -306,7 +318,12 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
     let mut params = BTreeMap::new();
     params.insert(
         "qv".to_string(),
-        DataValue::List(q.query_vector.iter().map(|f| DataValue::from(*f as f64)).collect()),
+        DataValue::List(
+            q.query_vector
+                .iter()
+                .map(|f| DataValue::from(*f as f64))
+                .collect(),
+        ),
     );
     params.insert("qt".to_string(), DataValue::from(q.query_text.as_str()));
     for (i, g) in q.graph_legs.iter().enumerate() {
@@ -350,8 +367,16 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
     }
 
     // Union all legs into one [list_id, item, score] relation.
-    writeln!(s, "combined[__lid, id, score] := sem[id, score], __lid = 'semantic'").unwrap();
-    writeln!(s, "combined[__lid, id, score] := txt[id, score], __lid = 'text'").unwrap();
+    writeln!(
+        s,
+        "combined[__lid, id, score] := sem[id, score], __lid = 'semantic'"
+    )
+    .unwrap();
+    writeln!(
+        s,
+        "combined[__lid, id, score] := txt[id, score], __lid = 'text'"
+    )
+    .unwrap();
     for l in &q.extra_lists {
         writeln!(
             s,

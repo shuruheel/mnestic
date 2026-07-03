@@ -19,6 +19,11 @@ pub struct Aggregation {
     pub is_meet: bool,
     pub meet_op: Option<Box<dyn MeetAggrObj>>,
     pub normal_op: Option<Box<dyn NormalAggrObj>>,
+    /// Factory for a user-registered aggregate (mnestic fork, provenance
+    /// semirings R0b): builds the ⊕ operator. `None` for every builtin — the
+    /// `define_aggr!` const path is unchanged. Cloned with the Aggregation
+    /// (programs are cloned; the ops boxes are not).
+    pub meet_factory: Option<std::sync::Arc<dyn Fn() -> Box<dyn MeetAggrObj> + Send + Sync>>,
 }
 
 impl Clone for Aggregation {
@@ -28,7 +33,64 @@ impl Clone for Aggregation {
             is_meet: self.is_meet,
             meet_op: None,
             normal_op: None,
+            meet_factory: self.meet_factory.clone(),
         }
+    }
+}
+
+/// A user-registered aggregate (mnestic fork, provenance semirings R0b): a
+/// declared `(⊕, 0̄, is_meet)` — ⊗ stays ordinary rule-body arithmetic, exactly
+/// as `min_cost` uses it. Registered on a `Db` via `register_custom_aggr`;
+/// in-memory and `Db`-scoped (no persistence — that is R2). Contract for the
+/// factory and the produced `MeetAggrObj`: **must not panic** (there is no
+/// `catch_unwind` in the engine — a panic unwinds into the host) and the
+/// factory must be cheap (it runs O(rules × epochs) per query). If
+/// `is_meet` is true the ⊕ MUST be an absorptive semilattice operation
+/// (idempotent, commutative, associative) — the stratifier admits it into
+/// recursion on that assertion; a debug-build probe re-applies operands to
+/// catch violations on encountered values, but the law is the registrant's
+/// obligation.
+#[derive(Clone)]
+pub struct RegisteredAggr {
+    pub is_meet: bool,
+    pub factory: std::sync::Arc<dyn Fn() -> Box<dyn MeetAggrObj> + Send + Sync>,
+}
+
+/// Intern a custom aggregate name to `&'static str`, leaking each DISTINCT
+/// name exactly once per process (a bare per-call leak would grow without
+/// bound under register→unregister→register cycles).
+pub(crate) fn intern_aggr_name(name: &str) -> &'static str {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    static INTERNED: Mutex<Option<HashSet<&'static str>>> = Mutex::new(None);
+    let mut guard = INTERNED.lock().unwrap();
+    let set = guard.get_or_insert_with(HashSet::new);
+    match set.get(name) {
+        Some(s) => s,
+        None => {
+            let leaked: &'static str = Box::leak(name.to_string().into_boxed_str());
+            set.insert(leaked);
+            leaked
+        }
+    }
+}
+
+/// Runs a user-registered meet ⊕ as an ordinary (non-recursive) aggregate:
+/// state = 0̄, `set` = ⊕ — semantically valid for any meet operation and how
+/// the builtin meets already behave. Without this, a custom aggregate in a
+/// non-recursive rule would hit `normal_init`'s unreachable!().
+struct MeetToNormalAdapter {
+    op: Box<dyn MeetAggrObj>,
+    state: DataValue,
+}
+
+impl NormalAggrObj for MeetToNormalAdapter {
+    fn set(&mut self, value: &DataValue) -> Result<()> {
+        self.op.update(&mut self.state, value)?;
+        Ok(())
+    }
+    fn get(&self) -> Result<DataValue> {
+        Ok(self.state.clone())
     }
 }
 
@@ -61,6 +123,7 @@ macro_rules! define_aggr {
             is_meet: $is_meet,
             meet_op: None,
             normal_op: None,
+            meet_factory: None,
         };
     };
 }
@@ -103,7 +166,10 @@ impl MeetAggrObj for MeetAggrAnd {
             (DataValue::Bool(l), DataValue::Bool(r)) => {
                 let old = *l;
                 *l &= *r;
-                Ok(old == *l)
+                // mnestic fork fix: report whether the value CHANGED (was
+                // inverted upstream — a change never propagated through the
+                // semi-naive delta, and stable values were kept in it)
+                Ok(old != *l)
             }
             (u, v) => bail!("cannot compute 'and' for {:?} and {:?}", u, v),
         }
@@ -143,7 +209,8 @@ impl MeetAggrObj for MeetAggrOr {
             (DataValue::Bool(l), DataValue::Bool(r)) => {
                 let old = *l;
                 *l |= *r;
-                Ok(old == *l)
+                // mnestic fork fix: report change, not stability (see 'and')
+                Ok(old != *l)
             }
             (u, v) => bail!("cannot compute 'or' for {:?} and {:?}", u, v),
         }
@@ -1188,6 +1255,13 @@ pub(crate) fn parse_aggr(name: &str) -> Option<&'static Aggregation> {
 
 impl Aggregation {
     pub(crate) fn meet_init(&mut self, _args: &[DataValue]) -> Result<()> {
+        if let Some(f) = &self.meet_factory {
+            if !_args.is_empty() {
+                bail!("custom aggregate {} takes no arguments", self.name);
+            }
+            self.meet_op = Some(f());
+            return Ok(());
+        }
         self.meet_op.replace(match self.name {
             name if name == AGGR_AND.name => Box::new(MeetAggrAnd),
             name if name == AGGR_OR.name => Box::new(MeetAggrOr),
@@ -1205,6 +1279,15 @@ impl Aggregation {
         Ok(())
     }
     pub(crate) fn normal_init(&mut self, args: &[DataValue]) -> Result<()> {
+        if let Some(f) = &self.meet_factory {
+            if !args.is_empty() {
+                bail!("custom aggregate {} takes no arguments", self.name);
+            }
+            let op = f();
+            let state = op.init_val();
+            self.normal_op = Some(Box::new(MeetToNormalAdapter { op, state }));
+            return Ok(());
+        }
         #[allow(clippy::box_default)]
         self.normal_op.replace(match self.name {
             name if name == AGGR_AND.name => Box::new(AggrAnd::default()),

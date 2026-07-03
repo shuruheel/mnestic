@@ -105,6 +105,13 @@ pub struct Db<S> {
     tt_clock: Arc<TtClock>,
     /// Critical section for tt allocation + persist + commit (spec §13.10).
     tt_commit_lock: Arc<Mutex<()>>,
+    /// User-registered aggregates (mnestic fork, provenance semirings R0b) —
+    /// mirrors `fixed_rules`. In-memory, `Db`-scoped; consulted by the parser
+    /// when a head aggregate is not a builtin. NOT consulted when parsing
+    /// trigger scripts (custom aggregates in triggers are unsupported until
+    /// R2 — a trigger is persisted CozoScript re-parsed on every write, and a
+    /// fresh `Db` open would not have the registration).
+    custom_aggrs: Arc<ShardedLock<BTreeMap<String, crate::data::aggr::RegisteredAggr>>>,
     pub(crate) queries_count: Arc<AtomicU64>,
     pub(crate) running_queries: Arc<Mutex<BTreeMap<u64, RunningQueryHandle>>>,
     pub(crate) fixed_rules: Arc<ShardedLock<BTreeMap<String, Arc<Box<dyn FixedRule>>>>>,
@@ -305,6 +312,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             relation_store_id: Default::default(),
             tt_clock: Default::default(),
             tt_commit_lock: Default::default(),
+            custom_aggrs: Default::default(),
             queries_count: Default::default(),
             running_queries: Default::default(),
             fixed_rules: Arc::new(ShardedLock::new(DEFAULT_FIXED_RULES.clone())),
@@ -381,18 +389,22 @@ impl<'s, S: Storage<'s>> Db<S> {
                     break;
                 }
                 TransactionPayload::Query((script, params)) => {
-                    let p =
-                        match parse_script(&script, &params, &self.fixed_rules.read().unwrap(), ts)
-                        {
-                            Ok(p) => p,
-                            Err(err) => {
-                                if results.send(Err(err)).is_err() {
-                                    break;
-                                } else {
-                                    continue;
-                                }
+                    let p = match parse_script(
+                        &script,
+                        &params,
+                        &self.fixed_rules.read().unwrap(),
+                        &self.custom_aggrs.read().unwrap(),
+                        ts,
+                    ) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            if results.send(Err(err)).is_err() {
+                                break;
+                            } else {
+                                continue;
                             }
-                        };
+                        }
+                    };
 
                     let p = match p.get_single_program() {
                         Ok(p) => p,
@@ -438,6 +450,11 @@ impl<'s, S: Storage<'s>> Db<S> {
         return self.fixed_rules.read().unwrap().clone();
     }
 
+    /// Snapshot of the registered custom aggregates (mnestic fork, R0b).
+    pub fn get_custom_aggrs(&'s self) -> BTreeMap<String, crate::data::aggr::RegisteredAggr> {
+        self.custom_aggrs.read().unwrap().clone()
+    }
+
     /// Run the CozoScript passed in. The `params` argument is a map of parameters.
     pub fn run_script(
         &'s self,
@@ -450,6 +467,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 payload,
                 &params,
                 &self.get_fixed_rules(),
+                &self.get_custom_aggrs(),
                 current_validity(),
             )?,
             current_validity(),
@@ -911,6 +929,56 @@ impl<'s, S: Storage<'s>> Db<S> {
             bail!("Cannot unregister builtin fixed rule {}", name);
         }
         Ok(self.fixed_rules.write().unwrap().remove(name).is_some())
+    }
+
+    /// Register a custom aggregate — a user-supplied ⊕ operator usable in
+    /// rule heads by `name` (mnestic fork, provenance semirings R0b; see
+    /// `RegisteredAggr` for the registrant's contract). With
+    /// `is_meet = true` the aggregate is admitted into recursive rules — the
+    /// ⊕ MUST then be an absorptive semilattice operation. Builtin names are
+    /// reserved (the parser tries builtins first, so shadowing would be
+    /// silent); duplicate registrations error — unregister first to replace
+    /// (programs already parsed keep their factory `Arc`).
+    pub fn register_custom_aggr<F>(&self, name: String, is_meet: bool, factory: F) -> Result<()>
+    where
+        F: Fn() -> Box<dyn crate::data::aggr::MeetAggrObj> + Send + Sync + 'static,
+    {
+        if crate::data::aggr::parse_aggr(&name).is_some() {
+            bail!(
+                "Cannot register custom aggregate {}: builtin names are reserved",
+                name
+            );
+        }
+        let name_ok = !name.is_empty()
+            && name.chars().next().unwrap().is_ascii_lowercase()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !name_ok {
+            bail!(
+                "Cannot register custom aggregate {}: the name must be a lowercase identifier, or the grammar can never reach it",
+                name
+            );
+        }
+        match self.custom_aggrs.write().unwrap().entry(name) {
+            Entry::Vacant(ent) => {
+                ent.insert(crate::data::aggr::RegisteredAggr {
+                    is_meet,
+                    factory: Arc::new(factory),
+                });
+                Ok(())
+            }
+            Entry::Occupied(ent) => {
+                bail!(
+                    "A custom aggregate with the name {} is already registered",
+                    ent.key()
+                )
+            }
+        }
+    }
+
+    /// Unregister a custom aggregate. Programs already parsed keep working
+    /// (they hold the factory `Arc`); future parses no longer resolve it.
+    pub fn unregister_custom_aggr(&self, name: &str) -> Result<bool> {
+        Ok(self.custom_aggrs.write().unwrap().remove(name).is_some())
     }
 
     /// Register callback channel to receive changes when the requested relation are successfully committed.

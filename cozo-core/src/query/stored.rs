@@ -97,6 +97,7 @@ impl<'a> SessionTx<'a> {
                         trigger,
                         &Default::default(),
                         &db.fixed_rules.read().unwrap(),
+                        &Default::default(), // triggers: custom aggregates unsupported (R0)
                         cur_vld,
                     )?
                     .get_single_program()?;
@@ -746,6 +747,7 @@ impl<'a> SessionTx<'a> {
                     trigger,
                     &Default::default(),
                     &db.fixed_rules.read().unwrap(),
+                    &Default::default(), // triggers: custom aggregates unsupported (R0)
                     cur_vld,
                 )?
                 .get_single_program()?;
@@ -1386,6 +1388,7 @@ impl<'a> SessionTx<'a> {
                         trigger,
                         &Default::default(),
                         &db.fixed_rules.read().unwrap(),
+                        &Default::default(), // triggers: custom aggregates unsupported (R0)
                         cur_vld,
                     )?
                     .get_single_program()?;

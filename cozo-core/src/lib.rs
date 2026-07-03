@@ -62,20 +62,21 @@ use parse::parse_script;
 use parse::CozoScript;
 use serde_json::json;
 
+#[cfg(feature = "cypher")]
+pub use cypher::{CypherGraphSchema, EdgeMap, NodeMap};
+pub use data::aggr::{MeetAggrObj, NormalAggrObj, RegisteredAggr};
 pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs};
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 pub use runtime::db::Db;
 pub use runtime::db::NamedRows;
 pub use runtime::hybrid::{build_hybrid_query, GraphLeg, HybridList, HybridSearch, MmrParams};
-#[cfg(feature = "cypher")]
-pub use cypher::{CypherGraphSchema, EdgeMap, NodeMap};
 pub use runtime::relation::decode_tuple_from_kv;
 pub use runtime::temp_store::RegularTempStore;
 pub use storage::mem::{new_cozo_mem, MemStorage};
-#[cfg(feature = "storage-rocksdb")]
-pub use storage::rocks::{new_cozo_rocksdb, RocksDbStorage};
 #[cfg(feature = "storage-new-rocksdb")]
 pub use storage::newrocks::{new_cozo_newrocksdb, NewRocksDbStorage};
+#[cfg(feature = "storage-rocksdb")]
+pub use storage::rocks::{new_cozo_rocksdb, RocksDbStorage};
 #[cfg(feature = "storage-sled")]
 pub use storage::sled::{new_cozo_sled, SledStorage};
 #[cfg(feature = "storage-sqlite")]
@@ -215,6 +216,22 @@ impl DbInstance {
             DbInstance::TiKv(db) => db.get_fixed_rules(),
         }
     }
+    /// Snapshot of the registered custom aggregates (mnestic fork, R0b).
+    pub fn get_custom_aggrs(&self) -> BTreeMap<String, RegisteredAggr> {
+        match self {
+            DbInstance::Mem(db) => db.get_custom_aggrs(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.get_custom_aggrs(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.get_custom_aggrs(),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.get_custom_aggrs(),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.get_custom_aggrs(),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.get_custom_aggrs(),
+        }
+    }
     /// Dispatcher method. See [crate::Db::run_script].
     pub fn run_script(
         &self,
@@ -224,7 +241,13 @@ impl DbInstance {
     ) -> Result<NamedRows> {
         let cur_vld = current_validity();
         self.run_script_ast(
-            parse_script(payload, &params, &self.get_fixed_rules(), cur_vld)?,
+            parse_script(
+                payload,
+                &params,
+                &self.get_fixed_rules(),
+                &self.get_custom_aggrs(),
+                cur_vld,
+            )?,
             cur_vld,
             mutability,
         )
@@ -595,6 +618,41 @@ impl DbInstance {
             DbInstance::Sled(db) => db.register_fixed_rule(name, rule_impl),
             #[cfg(feature = "storage-tikv")]
             DbInstance::TiKv(db) => db.register_fixed_rule(name, rule_impl),
+        }
+    }
+    /// Dispatcher method. See [crate::Db::register_custom_aggr].
+    pub fn register_custom_aggr<F>(&self, name: String, is_meet: bool, factory: F) -> Result<()>
+    where
+        F: Fn() -> Box<dyn MeetAggrObj> + Send + Sync + 'static,
+    {
+        match self {
+            DbInstance::Mem(db) => db.register_custom_aggr(name, is_meet, factory),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.register_custom_aggr(name, is_meet, factory),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.register_custom_aggr(name, is_meet, factory),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.register_custom_aggr(name, is_meet, factory),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.register_custom_aggr(name, is_meet, factory),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.register_custom_aggr(name, is_meet, factory),
+        }
+    }
+    /// Dispatcher method. See [crate::Db::unregister_custom_aggr].
+    pub fn unregister_custom_aggr(&self, name: &str) -> Result<bool> {
+        match self {
+            DbInstance::Mem(db) => db.unregister_custom_aggr(name),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.unregister_custom_aggr(name),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.unregister_custom_aggr(name),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.unregister_custom_aggr(name),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.unregister_custom_aggr(name),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.unregister_custom_aggr(name),
         }
     }
     /// Dispatcher method. See [crate::Db::unregister_fixed_rule]

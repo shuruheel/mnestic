@@ -109,7 +109,11 @@ impl FixedRule for ReciprocalRankFusion {
             for (item, score) in entries {
                 match best.get_mut(&item) {
                     Some(cur) => {
-                        let better = if descending { score > *cur } else { score < *cur };
+                        let better = if descending {
+                            score > *cur
+                        } else {
+                            score < *cur
+                        };
                         if better {
                             *cur = score;
                         }

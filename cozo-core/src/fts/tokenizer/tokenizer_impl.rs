@@ -1,10 +1,10 @@
+use rustc_hash::FxHashSet;
 use smartstring::{LazyCompact, SmartString};
 /// The tokenizer module contains all of the tools used to process
 /// text in `tantivy`.
 use std::borrow::{Borrow, BorrowMut};
 use std::iter;
 use std::ops::{Deref, DerefMut};
-use rustc_hash::FxHashSet;
 
 use crate::fts::tokenizer::empty_tokenizer::EmptyTokenizer;
 
@@ -102,7 +102,11 @@ impl TextAnalyzer {
         }
         token_stream
     }
-    pub(crate) fn unique_ngrams(&self, text: &str, n: usize) -> FxHashSet<Vec<SmartString<LazyCompact>>> {
+    pub(crate) fn unique_ngrams(
+        &self,
+        text: &str,
+        n: usize,
+    ) -> FxHashSet<Vec<SmartString<LazyCompact>>> {
         let mut token_steam = self.token_stream(text);
         let mut coll: Vec<SmartString<LazyCompact>> = vec![];
         while let Some(token) = token_steam.next() {

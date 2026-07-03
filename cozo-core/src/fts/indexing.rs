@@ -248,12 +248,7 @@ impl<'a> SessionTx<'a> {
             }
             FtsExpr::And(ls) => {
                 let mut l_iter = ls.iter();
-                let mut res = self.fts_search_impl(
-                    l_iter.next().unwrap(),
-                    config,
-                    n,
-                    avgdl,
-                )?;
+                let mut res = self.fts_search_impl(l_iter.next().unwrap(), config, n, avgdl)?;
                 for nxt in l_iter {
                     let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     res = res
@@ -272,7 +267,11 @@ impl<'a> SessionTx<'a> {
                     let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     for (k, v) in nxt_res {
                         if let Some(old_v) = res.get_mut(&k) {
-                            *old_v = if sum_terms { *old_v + v } else { (*old_v).max(v) };
+                            *old_v = if sum_terms {
+                                *old_v + v
+                            } else {
+                                (*old_v).max(v)
+                            };
                         } else {
                             res.insert(k, v);
                         }
@@ -349,10 +348,7 @@ impl<'a> SessionTx<'a> {
             }
             FtsExpr::Not(fst, snd) => {
                 let mut res = self.fts_search_impl(fst, config, n, avgdl)?;
-                for el in self
-                    .fts_search_impl(snd, config, n, avgdl)?
-                    .keys()
-                {
+                for el in self.fts_search_impl(snd, config, n, avgdl)?.keys() {
                     res.remove(el);
                 }
                 res

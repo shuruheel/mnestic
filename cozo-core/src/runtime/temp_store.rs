@@ -128,7 +128,12 @@ impl MeetAggrStore {
                 let mut changed = false;
                 for (i, (aggr_op, _)) in self.aggregations.iter().enumerate() {
                     let op = aggr_op.meet_op.as_ref().unwrap();
-                    changed |= op.update(&mut prev_aggr[i], &val_part[i])?;
+                    let this_changed = op.update(&mut prev_aggr[i], &val_part[i])?;
+                    #[cfg(debug_assertions)]
+                    if this_changed && aggr_op.meet_factory.is_some() {
+                        probe_meet_idempotence(op.as_ref(), &prev_aggr[i], &val_part[i])?;
+                    }
+                    changed |= this_changed;
                 }
                 Ok(changed)
             }
@@ -200,7 +205,12 @@ impl MeetAggrStore {
                         let target = ent.get_mut();
                         for (i, (aggr_op, _)) in self.aggregations.iter().enumerate() {
                             let op = aggr_op.meet_op.as_ref().unwrap();
-                            changed |= op.update(&mut target[i], &v[i])?;
+                            let this_changed = op.update(&mut target[i], &v[i])?;
+                            #[cfg(debug_assertions)]
+                            if this_changed && aggr_op.meet_factory.is_some() {
+                                probe_meet_idempotence(op.as_ref(), &target[i], &v[i])?;
+                            }
+                            changed |= this_changed;
                         }
                     }
                     if changed {
@@ -413,4 +423,30 @@ impl<'a> Iterator for TupleInIterIterator<'a> {
         self.idx += 1;
         Some(ret)
     }
+}
+
+/// Debug-build probe (mnestic fork, semirings R0b), CUSTOM aggregates only
+/// (several builtins are convergence-safe but not probe-stable — bit_and/
+/// bit_or report true unconditionally; intersection normalizes List→Set on
+/// re-entry): after a ⊕ that reported a
+/// change, re-applying the same operand must be a no-op — the meet path
+/// presumes an idempotent semilattice ("use the idempotency!"). Catches a
+/// non-absorptive ⊕ registered with `is_meet = true` loudly on encountered
+/// values instead of silently non-terminating; the law itself remains the
+/// registrant's obligation.
+#[cfg(debug_assertions)]
+fn probe_meet_idempotence(
+    op: &dyn crate::data::aggr::MeetAggrObj,
+    current: &crate::data::value::DataValue,
+    operand: &crate::data::value::DataValue,
+) -> miette::Result<()> {
+    let mut again = current.clone();
+    let changed_again = op.update(&mut again, operand)?;
+    debug_assert!(
+        !changed_again && &again == current,
+        "non-idempotent meet aggregate: re-applying an operand changed the value again \
+         (a custom aggregate registered with is_meet=true must be an absorptive \
+         semilattice operation)"
+    );
+    Ok(())
 }

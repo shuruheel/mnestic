@@ -57,7 +57,11 @@ const DEFAULT_SIZE_HINT: usize = 16;
 /// in the return set and `None` otherwise,
 /// the second element gives the next binary key for the seek to be used as an inclusive
 /// lower bound.
-pub fn check_key_for_validity(key: &[u8], valid_at: ValidityTs, size_hint: Option<usize>) -> (Option<Tuple>, Vec<u8>) {
+pub fn check_key_for_validity(
+    key: &[u8],
+    valid_at: ValidityTs,
+    size_hint: Option<usize>,
+) -> (Option<Tuple>, Vec<u8>) {
     let mut decoded = decode_tuple_from_key(key, size_hint.unwrap_or(DEFAULT_SIZE_HINT));
     let rel_id = RelationId::raw_decode(key);
     let vld = match decoded.last().unwrap() {

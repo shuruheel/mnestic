@@ -178,11 +178,7 @@ impl Storage<'_> for RocksDbStorage {
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| PathBuf::from(&data_dir));
         let seq = SST_SEQ.fetch_add(1, Ordering::Relaxed);
-        let sst_path = staging_dir.join(format!(
-            "idx_build_{}_{}.sst",
-            std::process::id(),
-            seq
-        ));
+        let sst_path = staging_dir.join(format!("idx_build_{}_{}.sst", std::process::id(), seq));
         let sst_path_str = sst_path
             .to_str()
             .ok_or_else(|| miette!("bad SST staging path"))?;

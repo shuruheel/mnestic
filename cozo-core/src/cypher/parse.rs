@@ -63,11 +63,7 @@ fn parse_reading(pair: Pair<'_>) -> Result<ReadingClause> {
 
 fn parse_pattern(pair: Pair<'_>) -> Result<Pattern> {
     let mut inner = pair.into_inner();
-    let start = parse_node(
-        inner
-            .next()
-            .ok_or_else(|| miette!("empty pattern"))?,
-    )?;
+    let start = parse_node(inner.next().ok_or_else(|| miette!("empty pattern"))?)?;
     let mut rels = Vec::new();
     while let Some(rel_p) = inner.next() {
         let rel = parse_rel(rel_p)?;
@@ -143,10 +139,7 @@ fn parse_prop_map(pair: Pair<'_>) -> Result<Vec<(String, CExpr)>> {
                 .ok_or_else(|| miette!("property key missing"))?
                 .as_str()
                 .to_string();
-            let val = parse_expr(
-                it.next()
-                    .ok_or_else(|| miette!("property value missing"))?,
-            )?;
+            let val = parse_expr(it.next().ok_or_else(|| miette!("property value missing"))?)?;
             out.push((key, val));
         }
     }
@@ -328,7 +321,11 @@ fn parse_comp_rhs(lhs: CExpr, pair: Pair<'_>) -> Result<CExpr> {
         Rule::null_tail => {
             let is_not = tail.into_inner().any(|x| x.as_rule() == Rule::isnot_null);
             Ok(CExpr::Unary {
-                op: if is_not { UnOp::IsNotNull } else { UnOp::IsNull },
+                op: if is_not {
+                    UnOp::IsNotNull
+                } else {
+                    UnOp::IsNull
+                },
                 operand: Box::new(lhs),
             })
         }
@@ -596,7 +593,11 @@ mod tests {
     #[test]
     fn parses_relationship_directions() {
         assert_eq!(
-            parse_cypher("MATCH (a)<-[:R]-(b) RETURN a").unwrap().reading[0].patterns[0].rels[0]
+            parse_cypher("MATCH (a)<-[:R]-(b) RETURN a")
+                .unwrap()
+                .reading[0]
+                .patterns[0]
+                .rels[0]
                 .0
                 .dir,
             Direction::RtoL

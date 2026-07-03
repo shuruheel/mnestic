@@ -279,7 +279,12 @@ impl<'s> Translator<'s> {
         let mut eqs: Vec<String> = Vec::new();
         for col in &cols {
             let is_ref = referenced.contains(col);
-            let inline: Vec<&CExpr> = n.props.iter().filter(|(k, _)| k == col).map(|(_, v)| v).collect();
+            let inline: Vec<&CExpr> = n
+                .props
+                .iter()
+                .filter(|(k, _)| k == col)
+                .map(|(_, v)| v)
+                .collect();
             if *col == nm.id_col {
                 // The id column is already bound to the node var; never re-bind it.
                 if is_ref {
@@ -394,7 +399,12 @@ impl<'s> Translator<'s> {
         let mut eqs: Vec<String> = Vec::new();
         for col in &cols {
             let is_ref = rel_var.is_some() && referenced.contains(col);
-            let inline: Vec<&CExpr> = r.props.iter().filter(|(k, _)| k == col).map(|(_, v)| v).collect();
+            let inline: Vec<&CExpr> = r
+                .props
+                .iter()
+                .filter(|(k, _)| k == col)
+                .map(|(_, v)| v)
+                .collect();
             if is_ref {
                 let pv = self.pvar(rel_var.unwrap(), col);
                 args.push(format!("{col}: {pv}"));
@@ -501,7 +511,13 @@ impl<'s> Translator<'s> {
         let cols: Vec<String> = (0..query.ret.items.len())
             .map(|i| item_head_var(&query.ret, i, true))
             .collect();
-        writeln!(script, "?[{}] := cy_agg[{}]", cols.join(", "), cols.join(", ")).unwrap();
+        writeln!(
+            script,
+            "?[{}] := cy_agg[{}]",
+            cols.join(", "),
+            cols.join(", ")
+        )
+        .unwrap();
         Ok(())
     }
 
@@ -553,7 +569,11 @@ impl<'s> Translator<'s> {
             .iter()
             .any(|it| matches!(&it.expr, CExpr::Func { name, .. } if is_aggregate(name)));
         if let CExpr::Var(name) = e {
-            if let Some(i) = ret.items.iter().position(|it| it.alias.as_deref() == Some(name)) {
+            if let Some(i) = ret
+                .items
+                .iter()
+                .position(|it| it.alias.as_deref() == Some(name))
+            {
                 return Ok(item_head_var(ret, i, has_aggr));
             }
         }
@@ -573,11 +593,10 @@ impl<'s> Translator<'s> {
                 .cloned()
                 .ok_or_else(|| miette::miette!("no schema mapping for node label `{l}`")),
             None => {
-                let first = self
-                    .schema
-                    .nodes
-                    .first()
-                    .ok_or_else(|| miette::miette!("node pattern needs a label (empty schema)"))?;
+                let first =
+                    self.schema.nodes.first().ok_or_else(|| {
+                        miette::miette!("node pattern needs a label (empty schema)")
+                    })?;
                 let shared = self
                     .schema
                     .nodes
@@ -606,12 +625,15 @@ impl<'s> Translator<'s> {
                 .cloned()
                 .ok_or_else(|| miette::miette!("no schema mapping for relationship type `{t}`")),
             None => {
-                let first = self
+                let first =
+                    self.schema.edges.first().ok_or_else(|| {
+                        miette::miette!("relationship needs a type (empty schema)")
+                    })?;
+                let shared = self
                     .schema
                     .edges
-                    .first()
-                    .ok_or_else(|| miette::miette!("relationship needs a type (empty schema)"))?;
-                let shared = self.schema.edges.iter().all(|m| m.relation == first.relation);
+                    .iter()
+                    .all(|m| m.relation == first.relation);
                 if !shared {
                     bail!("untyped relationship requires a single shared edge relation");
                 }
@@ -670,7 +692,10 @@ impl<'s> Translator<'s> {
         // A name cannot be both a node and a relationship variable.
         for n in &nodes {
             if rel_var_names.contains(&n.var) {
-                bail!("`{}` is used as both a node and a relationship variable", n.var);
+                bail!(
+                    "`{}` is used as both a node and a relationship variable",
+                    n.var
+                );
             }
         }
         Ok((nodes, rels))
@@ -708,12 +733,7 @@ impl<'s> Translator<'s> {
 
     /// Reject references to variables that aren't bound by a pattern, so callers
     /// get a clear error instead of an opaque engine "unbound variable".
-    fn validate_bindings(
-        &self,
-        query: &CypherQuery,
-        nodes: &[NodeB],
-        rels: &[RelB],
-    ) -> Result<()> {
+    fn validate_bindings(&self, query: &CypherQuery, nodes: &[NodeB], rels: &[RelB]) -> Result<()> {
         let node_vars: BTreeSet<String> = nodes.iter().map(|n| n.var.clone()).collect();
         let mut rel_eid: BTreeMap<String, bool> = BTreeMap::new();
         for r in rels {
@@ -834,7 +854,10 @@ impl<'s> Translator<'s> {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                     let l = self.expr(lhs)?;
                     let r = self.expr(rhs)?;
-                    format!("(!is_null({l}) && !is_null({r}) && ({l} {} {r}))", infix(op))
+                    format!(
+                        "(!is_null({l}) && !is_null({r}) && ({l} {} {r}))",
+                        infix(op)
+                    )
                 }
                 BinOp::StartsWith | BinOp::EndsWith | BinOp::Contains => {
                     let l = self.expr(lhs)?;
@@ -877,7 +900,10 @@ impl<'s> Translator<'s> {
                 BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Gt | BinOp::Le | BinOp::Ge => {
                     let l = self.expr(lhs)?;
                     let r = self.expr(rhs)?;
-                    format!("(!is_null({l}) && !is_null({r}) && !({l} {} {r}))", infix(op))
+                    format!(
+                        "(!is_null({l}) && !is_null({r}) && !({l} {} {r}))",
+                        infix(op)
+                    )
                 }
                 BinOp::StartsWith | BinOp::EndsWith | BinOp::Contains => {
                     let l = self.expr(lhs)?;
@@ -1109,16 +1135,35 @@ fn push_unique_pair(v: &mut Vec<(String, String)>, item: (String, String)) {
 fn expr_eq(a: &CExpr, b: &CExpr) -> bool {
     match (a, b) {
         (CExpr::Var(x), CExpr::Var(y)) => x == y,
-        (CExpr::Prop { var: v1, key: k1 }, CExpr::Prop { var: v2, key: k2 }) => v1 == v2 && k1 == k2,
+        (CExpr::Prop { var: v1, key: k1 }, CExpr::Prop { var: v2, key: k2 }) => {
+            v1 == v2 && k1 == k2
+        }
         (CExpr::Lit(x), CExpr::Lit(y)) => x == y,
         (CExpr::Param(x), CExpr::Param(y)) => x == y,
-        (CExpr::List(x), CExpr::List(y)) => x.len() == y.len() && x.iter().zip(y).all(|(a, b)| expr_eq(a, b)),
-        (CExpr::Unary { op: o1, operand: e1 }, CExpr::Unary { op: o2, operand: e2 }) => {
-            o1 == o2 && expr_eq(e1, e2)
+        (CExpr::List(x), CExpr::List(y)) => {
+            x.len() == y.len() && x.iter().zip(y).all(|(a, b)| expr_eq(a, b))
         }
         (
-            CExpr::Binary { op: o1, lhs: l1, rhs: r1 },
-            CExpr::Binary { op: o2, lhs: l2, rhs: r2 },
+            CExpr::Unary {
+                op: o1,
+                operand: e1,
+            },
+            CExpr::Unary {
+                op: o2,
+                operand: e2,
+            },
+        ) => o1 == o2 && expr_eq(e1, e2),
+        (
+            CExpr::Binary {
+                op: o1,
+                lhs: l1,
+                rhs: r1,
+            },
+            CExpr::Binary {
+                op: o2,
+                lhs: l2,
+                rhs: r2,
+            },
         ) => o1 == o2 && expr_eq(l1, l2) && expr_eq(r1, r2),
         (CExpr::Func { name: n1, args: a1 }, CExpr::Func { name: n2, args: a2 }) => {
             n1.eq_ignore_ascii_case(n2)

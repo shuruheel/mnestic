@@ -73,7 +73,8 @@ fn push_equality_filters_to_bindings(body: Vec<NormalFormAtom>) -> Vec<NormalFor
     let mut rest = vec![];
     for atom in body {
         match atom {
-            NormalFormAtom::Predicate(expr) => match eq_predicate_as_unification(&expr, &generated) {
+            NormalFormAtom::Predicate(expr) => match eq_predicate_as_unification(&expr, &generated)
+            {
                 Some(unif) => front.push(NormalFormAtom::Unification(unif)),
                 None => rest.push(NormalFormAtom::Predicate(expr)),
             },
@@ -109,8 +110,13 @@ fn eq_predicate_as_unification(expr: &Expr, generated: &BTreeSet<Symbol>) -> Opt
             // values (str/uuid/bytes/bool/null) compare identically under `op_eq` and
             // the index. Parameters are already substituted to `Expr::Const` by this
             // stage, so this also covers `k == $numeric_param`.
-            let numeric_const =
-                matches!(maybe_ground, Expr::Const { val: DataValue::Num(_), .. });
+            let numeric_const = matches!(
+                maybe_ground,
+                Expr::Const {
+                    val: DataValue::Num(_),
+                    ..
+                }
+            );
             if ground && !numeric_const && generated.contains(var) {
                 return Some(Unification {
                     binding: var.clone(),

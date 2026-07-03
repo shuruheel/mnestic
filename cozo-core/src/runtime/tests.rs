@@ -2127,3 +2127,182 @@ fn txtime_abort_drops_rows_and_hwm_atomically() {
     let tx = inner.transact().unwrap();
     assert_eq!(tx.read_persisted_tt_hwm().unwrap(), None);
 }
+
+// ==== mnestic fork: custom aggregate registration (semirings R0b) ====
+
+/// A user ⊕ keeping the numeric maximum — a legitimate absorptive meet.
+struct TestMaxi;
+impl crate::data::aggr::MeetAggrObj for TestMaxi {
+    fn init_val(&self) -> DataValue {
+        DataValue::Null
+    }
+    fn update(&self, left: &mut DataValue, right: &DataValue) -> miette::Result<bool> {
+        if *left == DataValue::Null || right > left {
+            *left = right.clone();
+            return Ok(*left != DataValue::Null);
+        }
+        Ok(false)
+    }
+}
+
+/// A non-absorptive ⊕ (numeric addition) — illegal as a meet.
+struct TestAdder;
+impl crate::data::aggr::MeetAggrObj for TestAdder {
+    fn init_val(&self) -> DataValue {
+        DataValue::from(0)
+    }
+    fn update(&self, left: &mut DataValue, right: &DataValue) -> miette::Result<bool> {
+        let l = left.get_float().unwrap_or(0.);
+        let r = right.get_float().unwrap_or(0.);
+        *left = DataValue::from(l + r);
+        Ok(true)
+    }
+}
+
+#[test]
+fn custom_aggr_meet_in_recursion_converges() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.register_custom_aggr("maxi".to_string(), true, || Box::new(TestMaxi))
+        .unwrap();
+    // longest-reachable-value: recursive SCC using the custom meet
+    let res = db
+        .run_default(
+            r#"
+        edges[f, t, w] <- [[1, 2, 10.0], [2, 3, 5.0], [1, 3, 2.0], [3, 4, 30.0]]
+        reach[t, maxi(w)] := edges[1, t, w]
+        reach[t, maxi(w2)] := reach[m, w], edges[m, t, w1], w2 = max(w, w1)
+        ?[t, w] := reach[t, w]
+        "#,
+        )
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    // node 4 reachable with max edge weight 30 along the path
+    assert!(rows.iter().any(|r| r[0] == 4 && r[1] == 30.0), "{rows:?}");
+}
+
+#[test]
+fn custom_aggr_non_meet_rejected_in_recursion() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.register_custom_aggr("summy".to_string(), false, || Box::new(TestAdder))
+        .unwrap();
+    // non-meet custom in a recursive SCC: stratifier must reject like a builtin
+    let err = db
+        .run_default(
+            r#"
+        edges[f, t] <- [[1, 2], [2, 3]]
+        reach[t, summy(x)] := edges[1, t], x = 1
+        reach[t, summy(x)] := reach[m, x], edges[m, t]
+        ?[t, x] := reach[t, x]
+        "#,
+        )
+        .expect_err("non-meet custom aggregate in recursion must be rejected");
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("stratif") || msg.contains("aggregation") || msg.contains("recursion"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn custom_aggr_non_recursive_uses_normal_adapter() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // is_meet=true in an all-meet head rides the meet path...
+    db.register_custom_aggr("maxi2".to_string(), true, || Box::new(TestMaxi))
+        .unwrap();
+    let res = db
+        .run_default("?[maxi2(x)] := x in [3, 9, 4]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[9]]));
+    // ...while is_meet=false forces AggrKind::Normal — the MeetToNormalAdapter
+    db.register_custom_aggr("maxinm".to_string(), false, || Box::new(TestMaxi))
+        .unwrap();
+    let res = db
+        .run_default("?[maxinm(x)] := x in [3, 9, 4]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[9]]));
+    // custom aggregates take no args in R0
+    let err = db
+        .run_default("?[maxinm(x, 5)] := x in [3, 9, 4]")
+        .expect_err("args must be rejected");
+    assert!(format!("{err:?}").contains("takes no arguments"), "{err:?}");
+}
+
+#[test]
+fn custom_aggr_registry_policy() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // builtin names reserved
+    let err = db
+        .register_custom_aggr("min".to_string(), true, || Box::new(TestMaxi))
+        .expect_err("builtin name must be reserved");
+    assert!(format!("{err:?}").contains("reserved"), "{err:?}");
+    // duplicates rejected; unregister-then-register works
+    db.register_custom_aggr("dup".to_string(), true, || Box::new(TestMaxi))
+        .unwrap();
+    let err = db
+        .register_custom_aggr("dup".to_string(), true, || Box::new(TestMaxi))
+        .expect_err("duplicate must be rejected");
+    assert!(format!("{err:?}").contains("already registered"), "{err:?}");
+    assert!(db.unregister_custom_aggr("dup").unwrap());
+    db.register_custom_aggr("dup".to_string(), true, || Box::new(TestMaxi))
+        .unwrap();
+    // unknown aggregate still errors cleanly
+    let err = db
+        .run_default("?[nosuch(x)] := x in [1]")
+        .expect_err("unknown aggregate must fail");
+    assert!(format!("{err:?}").contains("nosuch"), "{err:?}");
+}
+
+#[test]
+fn custom_aggr_rejected_in_trigger_scripts() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.register_custom_aggr("maxi3".to_string(), true, || Box::new(TestMaxi))
+        .unwrap();
+    db.run_default(":create t_src {k => v: Int}").unwrap();
+    db.run_default(":create t_dst {k => v}").unwrap();
+    // trigger validation parses with an empty custom registry (R0 policy)
+    let err = db
+        .run_default(
+            "::set_triggers t_src on put { ?[k, maxi3(v)] := _new[k, v] :put t_dst {k => v} }",
+        )
+        .expect_err("custom aggregate in trigger script must be rejected");
+    assert!(format!("{err:?}").contains("maxi3"), "{err:?}");
+}
+
+#[test]
+#[should_panic(expected = "non-idempotent meet aggregate")]
+fn custom_aggr_debug_probe_catches_non_absorptive_meet() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // registered as meet, but ⊕ is addition: the debug probe must fire
+    db.register_custom_aggr("badsum".to_string(), true, || Box::new(TestAdder))
+        .unwrap();
+    let _ = db.run_default(
+        r#"
+        edges[f, t] <- [[1, 2], [1, 3]]
+        reach[f, badsum(x)] := edges[f, t], x = 1.0
+        ?[f, x] := reach[f, x]
+        "#,
+    );
+}
+
+#[test]
+fn meet_and_or_report_change_not_stability() {
+    // mnestic fork fix: upstream returned the INVERTED changed-bit from the
+    // and/or meet aggregates (true when stable), so a real change never
+    // propagated through the semi-naive delta and stable values were kept in
+    // it. Pin the corrected contract: true iff the value changed.
+    use crate::data::aggr::{MeetAggrAnd, MeetAggrObj, MeetAggrOr};
+    let and = MeetAggrAnd;
+    let mut v = DataValue::from(true);
+    assert!(and.update(&mut v, &DataValue::from(false)).unwrap());
+    assert!(!and.update(&mut v, &DataValue::from(false)).unwrap());
+    assert!(!and.update(&mut v, &DataValue::from(true)).unwrap());
+    let or = MeetAggrOr;
+    let mut v = DataValue::from(false);
+    assert!(or.update(&mut v, &DataValue::from(true)).unwrap());
+    assert!(!or.update(&mut v, &DataValue::from(true)).unwrap());
+    assert!(!or.update(&mut v, &DataValue::from(false)).unwrap());
+}

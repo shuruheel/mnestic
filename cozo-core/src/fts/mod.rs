@@ -81,7 +81,8 @@ impl TokenizerConfig {
             "Whitespace" => Box::new(WhitespaceTokenizer),
             "NGram" => {
                 let min_gram = self
-                    .args.first()
+                    .args
+                    .first()
                     .unwrap_or(&DataValue::from(1))
                     .get_int()
                     .ok_or_else(|| miette!("First argument `min_gram` must be an integer"))?;
@@ -141,7 +142,8 @@ impl TokenizerConfig {
             "AsciiFolding" => AsciiFoldingFilter.into(),
             "LowerCase" | "Lowercase" => LowerCaser.into(),
             "RemoveLong" => RemoveLongFilter::limit(
-                self.args.first()
+                self.args
+                    .first()
                     .ok_or_else(|| miette!("Missing first argument `min_length`"))?
                     .get_int()
                     .ok_or_else(|| miette!("First argument `min_length` must be an integer"))?
@@ -151,7 +153,8 @@ impl TokenizerConfig {
             "SplitCompoundWords" => {
                 let mut list_values = Vec::new();
                 match self
-                    .args.first()
+                    .args
+                    .first()
                     .ok_or_else(|| miette!("Missing first argument `compound_words_list`"))?
                 {
                     DataValue::List(l) => {
@@ -172,7 +175,8 @@ impl TokenizerConfig {
             }
             "Stemmer" => {
                 let language = match self
-                    .args.first()
+                    .args
+                    .first()
                     .ok_or_else(|| miette!("Missing first argument `language` to Stemmer"))?
                     .get_str()
                     .ok_or_else(|| {

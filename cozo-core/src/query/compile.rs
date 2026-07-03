@@ -254,7 +254,7 @@ impl<'a> SessionTx<'a> {
                             right_vars.push(rk.clone());
                             right_joiner_vars.push(rk);
                             right_joiner_vars_pos.push(i);
-                            right_joiner_vars_pos_rev[i] = Some(right_joiner_vars.len()-1);
+                            right_joiner_vars_pos_rev[i] = Some(right_joiner_vars.len() - 1);
                             join_indices.push(IndexPositionUse::Join)
                         } else {
                             seen_variables.insert(var.clone());
@@ -327,12 +327,7 @@ impl<'a> SessionTx<'a> {
                                     rel_app.span,
                                     rel_app.valid_at,
                                 )?;
-                                ret = ret.join(
-                                    index,
-                                    left_keys,
-                                    right_keys,
-                                    rel_app.span,
-                                );
+                                ret = ret.join(index, left_keys, right_keys, rel_app.span);
                             }
                             // Join the index with the original relation
                             {
@@ -352,21 +347,25 @@ impl<'a> SessionTx<'a> {
                                     rel_app.span,
                                     rel_app.valid_at,
                                 )?;
-                                ret = ret.join(
-                                    relation,
-                                    left_keys,
-                                    right_keys,
-                                    rel_app.span,
-                                );
+                                ret = ret.join(relation, left_keys, right_keys, rel_app.span);
                             }
                             // Use the binds that were not used in the join
                             for (i, nb) in not_bound.into_iter().enumerate() {
-                                if !nb { continue };
-                                let (left, right) = (prev_joiner_vars[i].clone(), right_joiner_vars[i].clone());
+                                if !nb {
+                                    continue;
+                                };
+                                let (left, right) =
+                                    (prev_joiner_vars[i].clone(), right_joiner_vars[i].clone());
                                 ret = ret.filter(Expr::build_equate(
                                     vec![
-                                        Expr::Binding { var: left, tuple_pos: None },
-                                        Expr::Binding { var: right, tuple_pos: None },
+                                        Expr::Binding {
+                                            var: left,
+                                            tuple_pos: None,
+                                        },
+                                        Expr::Binding {
+                                            var: right,
+                                            tuple_pos: None,
+                                        },
                                     ],
                                     rel_app.span,
                                 ))?;

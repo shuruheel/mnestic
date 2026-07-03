@@ -125,7 +125,10 @@ impl FixedRule for MaximalMarginalRelevance {
         }
 
         for (rank, &ci) in selected.iter().enumerate() {
-            out.put(vec![cands[ci].0.clone(), DataValue::from((rank + 1) as i64)]);
+            out.put(vec![
+                cands[ci].0.clone(),
+                DataValue::from((rank + 1) as i64),
+            ]);
         }
         Ok(())
     }

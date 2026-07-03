@@ -9,7 +9,7 @@
 use std::collections::BTreeSet;
 
 use itertools::Itertools;
-use miette::{bail, ensure, Diagnostic, Result, miette};
+use miette::{bail, ensure, miette, Diagnostic, Result};
 use thiserror::Error;
 
 use crate::data::expr::Expr;
@@ -201,9 +201,7 @@ impl InputAtom {
                 let mut args = args
                     .into_iter()
                     .map(|a| a.do_disjunctive_normal_form(gen, tx));
-                let mut result = args
-                    .next()
-                    .ok_or_else(|| miette!("empty conjunction"))??;
+                let mut result = args.next().ok_or_else(|| miette!("empty conjunction"))??;
                 for a in args {
                     result = result.conjunctive_to_disjunctive_de_morgen(a?)
                 }
