@@ -12,7 +12,7 @@ use std::fmt::{Debug, Formatter};
 use miette::{bail, ensure, miette, Result};
 use rand::prelude::*;
 
-use crate::data::value::DataValue;
+use crate::data::value::{DataValue, Num};
 
 pub struct Aggregation {
     pub name: &'static str,
@@ -507,6 +507,55 @@ impl NormalAggrObj for AggrCollect {
 
     fn get(&self) -> Result<DataValue> {
         Ok(DataValue::List(self.accum.clone()))
+    }
+}
+
+define_aggr!(AGGR_INTERVAL_COALESCE, false);
+
+/// mnestic fork (spec: docs/specs/cozoscript-extensions.md §3.4): merge the
+/// group's half-open `[start, end)` interval spans into maximal intervals.
+/// Adjacent (touching) spans merge, since `[0, 5)` + `[5, 10)` = `[0, 10)`.
+/// Ordinary (non-meet) aggregate: equal-valued grouping happens via the rule
+/// head's other columns, exactly like `collect`.
+#[derive(Default)]
+pub(crate) struct AggrIntervalCoalesce {
+    accum: Vec<(Num, Num)>,
+}
+
+impl NormalAggrObj for AggrIntervalCoalesce {
+    fn set(&mut self, value: &DataValue) -> Result<()> {
+        // Shared bound validation + NUMERIC comparison (not Num's storage Ord,
+        // under which Int(5) and Float(5.0) are never equal) — see functions.rs.
+        let (s, e) = crate::data::functions::to_interval(value, "'interval_coalesce'")?;
+        self.accum.push((s, e));
+        Ok(())
+    }
+
+    fn get(&self) -> Result<DataValue> {
+        use crate::data::functions::interval_num_cmp;
+        use std::cmp::Ordering::Greater;
+        let mut spans = self.accum.clone();
+        spans.sort_by(|(s1, e1), (s2, e2)| {
+            interval_num_cmp(*s1, *s2).then(interval_num_cmp(*e1, *e2))
+        });
+        let mut merged: Vec<(Num, Num)> = Vec::with_capacity(spans.len());
+        for (s, e) in spans {
+            match merged.last_mut() {
+                // Overlapping or numerically adjacent: extend the open span.
+                Some((_, cur_end)) if interval_num_cmp(s, *cur_end) != Greater => {
+                    if interval_num_cmp(e, *cur_end) == Greater {
+                        *cur_end = e;
+                    }
+                }
+                _ => merged.push((s, e)),
+            }
+        }
+        Ok(DataValue::List(
+            merged
+                .into_iter()
+                .map(|(s, e)| DataValue::List(vec![DataValue::Num(s), DataValue::Num(e)]))
+                .collect(),
+        ))
     }
 }
 
@@ -1299,6 +1348,7 @@ pub(crate) fn parse_aggr(name: &str) -> Option<&'static Aggregation> {
         "mean" => &AGGR_MEAN,
         "choice" => &AGGR_CHOICE,
         "collect" => &AGGR_COLLECT,
+        "interval_coalesce" => &AGGR_INTERVAL_COALESCE,
         "shortest" => &AGGR_SHORTEST,
         "min_cost" => &AGGR_MIN_COST,
         "bit_and" => &AGGR_BIT_AND,
@@ -1400,6 +1450,9 @@ impl Aggregation {
             name if name == AGGR_LATEST_BY.name => Box::new(AggrLatestBy::default()),
             name if name == AGGR_SMALLEST_BY.name => Box::new(AggrSmallestBy::default()),
             name if name == AGGR_CHOICE_RAND.name => Box::new(AggrChoiceRand::default()),
+            name if name == AGGR_INTERVAL_COALESCE.name => {
+                Box::new(AggrIntervalCoalesce::default())
+            }
             name if name == AGGR_COLLECT.name => Box::new({
                 if args.is_empty() {
                     AggrCollect::default()

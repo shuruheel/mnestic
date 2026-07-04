@@ -273,4 +273,91 @@ fn spec_listings_run_as_documented() {
         2,
         "v/w overlap symmetric; x overlaps nothing"
     );
+
+    // ---------- §3.4 v1 primitives: interval_overlaps + interval_coalesce ----------
+    // A.4's formerly-PROPOSED overlap block, now shipped: builtin agrees with the predicate.
+    let res = run_ok(
+        r#"
+        conflict[a, b] := *fact_spans{entity: e, span_start: s1, span_end: e1, value: a},
+                          *fact_spans{entity: e, span_start: s2, span_end: e2, value: b},
+                          a != b, interval_overlaps([s1, e1], [s2, e2])
+        ?[a, b] := conflict[a, b]
+        "#,
+        no_params(),
+    );
+    assert_eq!(res.rows.len(), 2, "builtin agrees with the plain predicate");
+
+    // Half-open semantics: touching intervals do not overlap; mixed int/float bounds compare.
+    let res = run_ok(
+        "?[x] := x = interval_overlaps([0, 5], [5, 10])",
+        no_params(),
+    );
+    assert_eq!(res.rows[0][0], DataValue::from(false));
+    let res = run_ok(
+        "?[x] := x = interval_overlaps([0, 5.5], [5, 10])",
+        no_params(),
+    );
+    assert_eq!(res.rows[0][0], DataValue::from(true));
+    // Mixed int/float at the exact boundary: bounds compare NUMERICALLY, not by
+    // storage order (under Num's Ord, Int(5) < Float(5.0) — which would have
+    // made this touching pair "overlap" depending on which side held the int).
+    let res = run_ok(
+        "?[x] := x = interval_overlaps([0, 5.0], [5, 10])",
+        no_params(),
+    );
+    assert_eq!(res.rows[0][0], DataValue::from(false));
+    let res = run_ok(
+        "?[x] := x = interval_overlaps([0, 5], [5.0, 10])",
+        no_params(),
+    );
+    assert_eq!(res.rows[0][0], DataValue::from(false));
+    // An empty interval [x, x) contains no point: it overlaps nothing, even
+    // when its point lies strictly inside the other span.
+    let res = run_ok(
+        "?[x] := x = interval_overlaps([5, 5], [0, 10])",
+        no_params(),
+    );
+    assert_eq!(res.rows[0][0], DataValue::from(false));
+    // Malformed spans are loud errors, not silent falses.
+    assert!(run(
+        "?[x] := x = interval_overlaps([5, 0], [0, 10])",
+        no_params()
+    )
+    .is_err());
+    assert!(run("?[x] := x = interval_overlaps(3, [0, 10])", no_params()).is_err());
+
+    // A.4's formerly-PROPOSED coalesce block: fragmented equal-valued spans merge
+    // into maximal intervals (adjacent half-open spans fuse; gaps stay separate).
+    run_ok(
+        r#"?[entity, span_start, span_end, value] <- [
+             ["e2", 0, 5, "y"], ["e2", 5, 10, "y"], ["e2", 12, 20, "y"]
+           ] :put fact_spans {entity, span_start, span_end => value}"#,
+        no_params(),
+    );
+    let res = run_ok(
+        r#"
+        held[e, v, interval_coalesce(span)] :=
+            *fact_spans{entity: e, span_start: s, span_end: t, value: v},
+            span = [s, t]
+        ?[e, v, spans] := held[e, v, spans], e = "e2"
+        "#,
+        no_params(),
+    );
+    assert_eq!(res.rows.len(), 1);
+    let expected = DataValue::List(vec![
+        DataValue::List(vec![DataValue::from(0i64), DataValue::from(10i64)]),
+        DataValue::List(vec![DataValue::from(12i64), DataValue::from(20i64)]),
+    ]);
+    assert_eq!(res.rows[0][2], expected, "[0,5)+[5,10) fuse; [12,20) stays");
+
+    // Malformed spans error loudly in the aggregate too.
+    assert!(run(
+        r#"
+        bad[e, interval_coalesce(span)] :=
+            *fact_spans{entity: e, span_start: s, span_end: t}, span = [t, s]
+        ?[e, x] := bad[e, x]
+        "#,
+        no_params(),
+    )
+    .is_err());
 }

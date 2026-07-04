@@ -916,6 +916,7 @@ pub(crate) fn get_op(name: &str) -> Option<&'static Op> {
         "rand_choose" => &OP_RAND_CHOOSE,
         "assert" => &OP_ASSERT,
         "union" => &OP_UNION,
+        "interval_overlaps" => &OP_INTERVAL_OVERLAPS,
         "intersection" => &OP_INTERSECTION,
         "difference" => &OP_DIFFERENCE,
         "to_uuid" => &OP_TO_UUID,

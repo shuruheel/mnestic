@@ -3,6 +3,22 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased
+
+- **Interval primitives** (spec: `docs/specs/cozoscript-extensions.md` §3.4 v1):
+  `interval_overlaps(a, b)` builtin function and `interval_coalesce(span)`
+  aggregate over half-open `[start, end)` list intervals. Deliberately plain
+  list utilities decoupled from the vt axis (point-event `Validity` storage is
+  unchanged). Touching spans do not overlap but do coalesce
+  (`[0,5)` + `[5,10)` = `[0,10)`); empty spans `[x, x)` overlap nothing;
+  mixed int/float bounds compare numerically (not by `Num`'s storage order);
+  malformed spans (start > end, non-numeric or NaN bounds, non-list operands)
+  are loud errors, never silent falses.
+  `interval_coalesce` is the spec-mandated rename away from the original
+  `coalesce` proposal, which silently collides with the shipped null-coalescing
+  builtin / `~` operator. Pinned by `cozo-core/tests/spec_doc_validation.rs`,
+  which also pins every validated listing in the companion spec.
+
 ## 0.10.0 — 2026-07-04
 The release has two pillars, in order of impact:
 

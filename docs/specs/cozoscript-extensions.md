@@ -150,7 +150,7 @@ The original asked for a reality check before building ("do not build a feature 
 
 **Explicitly out — the σ-view trap (unchanged).** "Auto-filter every relation by `$ctx.viewer` under a visibility preorder" is policy, not engine. The engine's job ends at passing a structured param and projecting fields; the `visible[...]` filter is authored by the consumer as an ordinary predicate (A.3).
 
-### 3.4 Valid-time interval primitives — representation decided; names fixed; MTL stays out.
+### 3.4 Valid-time interval primitives — v1 SHIPPED 2026-07-04; MTL stays out.
 
 **The blocker the original skipped.** Shipped valid time is point-event `Validity`, not intervals (§2). `coalesce(vt)` as originally sketched had no interval input to merge — each bound `vt` is one (timestamp, flag) point. Three candidate representations, now dispositioned:
 
@@ -158,12 +158,12 @@ The original asked for a reality check before building ("do not build a feature 
 2. **A new Interval `DataValue`** — _rejected:_ a storage-type change (memcmp encoding, coercions, ordering) far bigger than "two ordinary functions", and the same shape `bitemporality.md` §12 already rejected for the tt axis (interval-column rewrites / interval trees are the wrong shape for a memcmp-keyed store).
 3. **Deriving spans from Validity assert/retract event pairs** — _deferred with its open questions recorded:_ which rows feed it (a raw no-`@` scan includes retract rows and, on bitemporal relations, superseded tt-correction rows — stale beliefs would pollute spans; an as-of read collapses to one winning row per key — nothing left to merge), and per-key event-pairing is an order-sensitive windowing step, not a value fold. Revisit when a consumer wants engine-derived validity spans rather than app-recorded ones.
 
-**v1 scope — two additions, both small once representation is fixed:**
+**v1 scope — SHIPPED 2026-07-04, both primitives engine-pinned (✓):**
 
-- `interval_overlaps(a, b)` over `[start, end)` lists — a plain builtin (`define_op!` + one `get_op` arm; genuinely trivial), with the rest of Allen's relations as thin skins over one generalized interval-transform if and when pulled (Vadalog's own lesson: the operator surface is ergonomics, not the semantic core).
-- **`interval_coalesce(span)`** — merge adjacent/overlapping equal-valued spans into maximal intervals, as an ordinary list-returning aggregate (precedent exists in both flavors: `collect` normal, `union` meet). **Renamed:** the original's `coalesce` collides with the shipped variadic null-coalescing builtin and its `~` operator (`data/functions.rs:287-295`). The aggregate namespace is technically separate from the function namespace, which makes the collision *silent* rather than impossible — one token, two unrelated semantics by position, and SQL-trained readers will assume null-coalescing. Follow-on hardening: extend `register_custom_aggr`'s name-reservation check (`runtime/db.rs:949-954`) to builtin *function* names too.
+- `interval_overlaps(a, b)` over `[start, end)` lists — shipped as a plain builtin (`op_interval_overlaps`, `data/functions.rs`; half-open semantics — touching intervals do not overlap, and an empty span `[x, x)` overlaps nothing, a case the textbook `s1 < e2 ∧ s2 < e1` test gets wrong; malformed or NaN spans are loud errors, never silent falses; mixed int/float bounds compare **numerically**, not by `Num`'s storage order, under which `Int(5)` and `Float(5.0)` are never equal). The rest of Allen's relations stay unbuilt until pulled, as thin skins over one generalized interval-transform (Vadalog's own lesson: the operator surface is ergonomics, not the semantic core).
+- **`interval_coalesce(span)`** — shipped as an ordinary list-returning aggregate (`AggrIntervalCoalesce`, `data/aggr.rs`; precedent: `collect` normal, `union` meet): merges the group's overlapping **and adjacent** spans into maximal intervals (`[0,5)` + `[5,10)` = `[0,10)`); equal-valued grouping rides the rule head's other columns; malformed spans error. **Renamed from the original's `coalesce`,** which collides with the shipped variadic null-coalescing builtin and its `~` operator (`data/functions.rs:287-295`). The aggregate namespace is technically separate from the function namespace, which makes the collision *silent* rather than impossible — one token, two unrelated semantics by position, and SQL-trained readers will assume null-coalescing. Follow-on hardening (not shipped): extend `register_custom_aggr`'s name-reservation check (`runtime/db.rs:949-954`) to builtin *function* names too.
 
-What works today without either addition (✓ validated — A.4): spans as columns, overlap as a plain predicate. The additions are packaging, which is exactly why they are small.
+The pre-existing zero-build pattern (✓ A.4): spans as columns, overlap as a plain predicate. The primitives are packaging over it, which is exactly why they were small.
 
 **NOT in scope (unchanged):** metric/MTL operators (`since`/`until`/`◆`/`◇`); anything that turns the store into a temporal reasoner. The prior-art split stands verified: `provenance-semirings.md`'s prior-art note flags Temporal Vadalog / DatalogMTL as "Unitemporal — no transaction time" and records the interval-transform + since/until-second-class lessons — that whole line stays the reasoning layer *above* mnestic.
 
@@ -179,7 +179,7 @@ The original ranked §3.1 first on a cost premise ("adds one parameter to an exi
 
 1. **§3.3 — ship now, as documentation.** Zero build; the surface exists (including `->` and `:as_of get($ctx, …)`). Cost ≈ this section + the pinning test.
 2. **§3.2 — ship now, as documentation.** Zero engine change; the validated witness pattern + the reconcile-coexistence rule. Most load-bearing per unit cost of anything here.
-3. **§3.4 v1 — small real work behind a decided representation.** `interval_overlaps` + `interval_coalesce` over `[start, end]` lists; rename settled; no new types.
+3. **§3.4 v1 — SHIPPED 2026-07-04.** `interval_overlaps` + `interval_coalesce` over `[start, end)` lists; rename settled; no new types.
 4. **§3.1 — the genuine engine feature; scope it as its own spec first.** Resolve Q1–Q4 (cap, law/probe, delivery surface, contracts) with the companions' review-and-sign-off cycle. Strong candidate for contributor-owned work; budget like R1, not like a parameter.
 5. **§3.5 — deferred**; revisit on the named trigger.
 
@@ -197,7 +197,7 @@ The corrected through-line: three of the five items generalize shipped machinery
 
 ## Appendix A — worked examples (evidence graph)
 
-A non-TMS running example in the register the semirings note already uses: sources assert claims, claims support claims, everything auditable. Blocks marked **✓** run today and are pinned by `cozo-core/tests/spec_doc_validation.rs`; blocks marked **✳ PROPOSED** use §3.1/§3.4 surface that does not exist yet. One `:create` per script (schema statements don't stack in a single plain script); comments are `#` (CozoScript; `%` is the mod operator).
+A non-TMS running example in the register the semirings note already uses: sources assert claims, claims support claims, everything auditable. Blocks marked **✓** run today and are pinned by `cozo-core/tests/spec_doc_validation.rs`; blocks marked **✳ PROPOSED** use §3.1 surface that does not exist yet. One `:create` per script (schema statements don't stack in a single plain script); comments are `#` (CozoScript; `%` is the mod operator).
 
 Base schema (✓):
 
@@ -242,7 +242,7 @@ visible[s] := *source{src: s, trust}, trust >= 0.7     # the consumer's policy, 
 
 `source` is deliberately tt-stamped: `:as_of` errors, by design, on a block that references no tt-stamped relation (the typo guard, `data/program.rs:660-672`). The engine's contribution ends at Json params + `get()`/`->` + `:as_of`; no access model is baked in.
 
-### A.4 — intervals (§3.4): spans as data today ✓, primitives as packaging ✳
+### A.4 — intervals (§3.4 ✓): spans as data, primitives shipped
 
 ```
 :create fact_spans {entity: String, span_start: Int, span_end: Int => value: String}
@@ -254,7 +254,7 @@ visible[s] := *source{src: s, trust}, trust >= 0.7     # the consumer's policy, 
            *fact_spans{entity: e, span_start: s2, span_end: e2, value: b},
            a != b, s1 < e2, s2 < e1
 
-# ✳ PROPOSED (§3.4 v1): the same, packaged
+# ✓ shipped (§3.4 v1, 2026-07-04): the same, packaged
 conflict[a, b] := *fact_spans{entity: e, span_start: s1, span_end: e1, value: a},
                   *fact_spans{entity: e, span_start: s2, span_end: e2, value: b},
                   a != b, interval_overlaps([s1, e1], [s2, e2])
@@ -291,3 +291,4 @@ Two of the three readings ship today (top-k proofs; as-of reproducibility — va
 |------|--------|
 | 2026-07-04 | First authoring (external design note): re-sorts the "missing from mnestic" review against the 0.10.0 baseline into four residue items + one deferred ergonomic. |
 | 2026-07-04 | **Verification + revision pass** (panel review against shipped code, adversarial refutation, engine-validated listings — `cozo-core/tests/spec_doc_validation.rs`). §3.3 resolved as already-shipped (incl. `->` and `:as_of get($ctx,…)`); §3.2 listings corrected (persistent tt-stamped witness, flat scope columns; underscore + map-destructuring traps documented; reconcile-coexistence rule added; medium cut re-pointed at scoped `:reconcile`); §3.1 re-costed (honest touch-list; Q1 cap confluence, Q2 law/probe, Q3 delivery surface, Q4 contracts; attribution claim removed; needs own spec); §3.4 representation decided (flat `[start,end]` columns v1; `interval_coalesce` rename over the `coalesce` builtin collision; Validity-derived spans deferred with open questions); §1 accounting fixed (row 6 clarification pending, row 7 reworded to convention, §3.4 marked net-new); §4 priority re-derived (inverts); per-atom selector syntax corrected to the in-brace form throughout. A post-revision verification round (coverage / citations+listings / consistency agents) then caught and fixed: A.3 rewritten against a tt-stamped `source` and pinned (the draft would have tripped the `:as_of` typo guard, `data/program.rs:660-672`), A.3/A.4 schemas printed, fence-stacking traps split (§3.2, §3.3 noted), guardrail-box claim rescoped, `:reconcile` row dual-phrased, Q2(v) operand-only-visibility + Q4 non-recursive-path contracts added. |
+| 2026-07-04 | **§3.4 v1 shipped**: `interval_overlaps` builtin (`op_interval_overlaps`) + `interval_coalesce` aggregate (`AggrIntervalCoalesce`) over half-open `[start, end)` list intervals; touching spans don't overlap but do coalesce; malformed spans are loud errors. A.4's proposed blocks flipped to ✓ and engine-pinned (incl. edge semantics + error cases). §4 item 3 closed; only §3.1 (own spec first) and §3.5 (deferred) remain open. |

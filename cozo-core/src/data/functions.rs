@@ -330,6 +330,68 @@ pub(crate) fn op_is_in(args: &[DataValue]) -> Result<DataValue> {
     Ok(DataValue::from(right.contains(left)))
 }
 
+/// mnestic fork (spec: docs/specs/cozoscript-extensions.md §3.4): NUMERIC
+/// comparison of interval bounds. `Num`'s derived `Ord` is the storage total
+/// order, where `Int(5)` and `Float(5.0)` are deliberately never equal — using
+/// it for bounds would make half-open boundary semantics depend on which side
+/// of a mixed int/float pair holds the integer. NaN bounds are rejected before
+/// this is called, so `partial_cmp` cannot fail.
+pub(crate) fn interval_num_cmp(a: Num, b: Num) -> std::cmp::Ordering {
+    match (a, b) {
+        (Num::Int(x), Num::Int(y)) => x.cmp(&y),
+        (Num::Float(x), Num::Float(y)) => x.partial_cmp(&y).unwrap(),
+        (Num::Int(x), Num::Float(y)) => (x as f64).partial_cmp(&y).unwrap(),
+        (Num::Float(x), Num::Int(y)) => x.partial_cmp(&(y as f64)).unwrap(),
+    }
+}
+
+/// mnestic fork (spec: docs/specs/cozoscript-extensions.md §3.4): parse a
+/// `[start, end)` half-open interval with numeric bounds. Malformed spans
+/// (wrong shape, non-numeric or NaN bounds, start > end) are loud errors,
+/// never silently-false comparisons.
+pub(crate) fn to_interval(arg: &DataValue, ctx: &str) -> Result<(Num, Num)> {
+    let l = arg
+        .get_slice()
+        .ok_or_else(|| miette!("{ctx} expects [start, end] interval lists, got {arg:?}"))?;
+    ensure!(
+        l.len() == 2,
+        "{ctx} expects [start, end] interval lists of length 2, got {arg:?}"
+    );
+    match (&l[0], &l[1]) {
+        (DataValue::Num(s), DataValue::Num(e)) => {
+            if let Num::Float(f) = s {
+                ensure!(!f.is_nan(), "{ctx} got a NaN interval bound: {arg:?}");
+            }
+            if let Num::Float(f) = e {
+                ensure!(!f.is_nan(), "{ctx} got a NaN interval bound: {arg:?}");
+            }
+            ensure!(
+                interval_num_cmp(*s, *e) != std::cmp::Ordering::Greater,
+                "{ctx} got a malformed interval (start > end): {arg:?}"
+            );
+            Ok((*s, *e))
+        }
+        _ => bail!("{ctx} expects numeric interval bounds, got {arg:?}"),
+    }
+}
+
+define_op!(OP_INTERVAL_OVERLAPS, 2, false);
+pub(crate) fn op_interval_overlaps(args: &[DataValue]) -> Result<DataValue> {
+    use std::cmp::Ordering::{Equal, Less};
+    let (s1, e1) = to_interval(&args[0], "'interval_overlaps'")?;
+    let (s2, e2) = to_interval(&args[1], "'interval_overlaps'")?;
+    // Half-open [start, end) semantics: touching intervals do not overlap, and
+    // an empty interval [x, x) contains no point, so it overlaps nothing —
+    // the bare s1 < e2 && s2 < e1 test would wrongly report overlap when an
+    // empty interval's point lies strictly inside the other span.
+    if interval_num_cmp(s1, e1) == Equal || interval_num_cmp(s2, e2) == Equal {
+        return Ok(DataValue::from(false));
+    }
+    Ok(DataValue::from(
+        interval_num_cmp(s1, e2) == Less && interval_num_cmp(s2, e1) == Less,
+    ))
+}
+
 define_op!(OP_NEQ, 2, false);
 pub(crate) fn op_neq(args: &[DataValue]) -> Result<DataValue> {
     Ok(DataValue::from(match (&args[0], &args[1]) {
