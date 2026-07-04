@@ -13,7 +13,7 @@ The single most important promise of this fork is that it is **actively maintain
 Make the engine the best **substrate for agentic memory**: in *one embedded engine*, deliver
 
 - **Hybrid retrieval** — vector (HNSW) + keyword (BM25) + graph traversal, fused in a single call;
-- **Temporally-correct knowledge** — query memory as-of any point in time, and (next) bi-temporally ("what did we believe *when*");
+- **Temporally-correct knowledge** — query memory as-of any point in time, and bi-temporally ("what did we believe *when*" — shipped in 0.10.0);
 - **Incremental index maintenance** — upserts that keep vector/FTS indexes current without full rebuilds or long write locks;
 - **Fast point-lookups co-located with semantic search**; and
 - **The operational tooling** to run long-lived graph memory in production.
@@ -86,7 +86,7 @@ Contributions are very welcome — mnestic is meant to serve the whole Cozo/Kùz
 - **Tests:** keep the inherited engine tests green (they encode upstream semantics), and use the **SQLite** backend for any planner/stored-relation test (the in-memory backend uses a different join operator). See [`CONTRIBUTING.md`](./CONTRIBUTING.md) for the test-backend conventions.
 - **Licensing:** mnestic is MPL-2.0. Preserve the original `Copyright … The Cozo Project Authors` headers on any file you modify.
 
-If you're considering a larger feature (especially bi-temporality, or extending the Cypher-read surface), open an issue to discuss the design first.
+If you're considering a larger feature (for example extending the Cypher-read surface, or building on the now-shipped bi-temporality — GC policy, audit tooling, benchmarks), open an issue to discuss the design first.
 
 ## Releases & versioning
 
