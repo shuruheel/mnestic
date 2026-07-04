@@ -1223,6 +1223,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                                     if atom_type == "out" {
                                         atom_type = "meet_aggr_out";
                                     }
+                                } else if a.is_bounded_meet {
+                                    if atom_type == "out" {
+                                        atom_type = "bounded_meet_aggr_out";
+                                    }
                                 } else {
                                     atom_type = "aggr_out";
                                 }

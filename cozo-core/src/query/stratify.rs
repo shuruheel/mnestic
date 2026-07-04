@@ -50,11 +50,15 @@ fn convert_normal_form_program_to_graph(
                 let has_aggr = ruleset
                     .iter()
                     .any(|rule| rule.aggr.iter().any(|a| a.is_some()));
+                // meet OR bounded-meet (provenance semirings R1): both are
+                // admitted into self-recursion; bounded-meet gets its own
+                // convergence guard in the evaluator (epoch cap), and
+                // consumers still stratify AFTER the rule either way.
                 let is_meet = has_aggr
                     && ruleset.iter().all(|rule| {
                         rule.aggr.iter().all(|v| match v {
                             None => true,
-                            Some((v, _)) => v.is_meet,
+                            Some((v, _)) => v.is_meet || v.is_bounded_meet,
                         })
                     });
                 if is_meet {
@@ -87,7 +91,8 @@ fn convert_normal_form_program_to_graph(
                     && ruleset.iter().all(|rule| {
                         rule.aggr.iter().all(|v| match v {
                             None => true,
-                            Some((v, _)) => v.is_meet,
+                            // R1: bounded-meet rides the same permit
+                            Some((v, _)) => v.is_meet || v.is_bounded_meet,
                         })
                     });
                 for rule in ruleset {

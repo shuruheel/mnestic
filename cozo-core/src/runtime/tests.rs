@@ -3372,3 +3372,165 @@ fn step5_review_pins() {
         .expect_err("reserved name");
     assert!(format!("{err:?}").contains("reserved"), "{err:?}");
 }
+
+// ==== mnestic fork: provenance semirings R1 — bounded-meet (top-k proofs) ====
+
+#[test]
+fn bounded_meet_top_k_basics() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // non-recursive: the k lowest-cost packs per group, one row each,
+    // cost-ordered; a group with fewer than k keeps them all
+    let res = db
+        .run_default(
+            r#"
+        data[g, pack] <- [[1, ['a', 3.0]], [1, ['b', 1.0]], [1, ['c', 2.0]],
+                          [1, ['d', 4.0]], [2, ['e', 5.0]]]
+        ?[g, best] := data[g, pack], best = pack
+        "#,
+        )
+        .unwrap();
+    assert_eq!(res.rows.len(), 5, "sanity: data visible");
+    let res = db
+        .run_default(
+            r#"
+        data[g, pack] <- [[1, ['a', 3.0]], [1, ['b', 1.0]], [1, ['c', 2.0]],
+                          [1, ['d', 4.0]], [2, ['e', 5.0]]]
+        ?[g, min_cost_k(pack, 3)] := data[g, pack]
+        "#,
+        )
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([
+            [1, ["b", 1.0]],
+            [1, ["c", 2.0]],
+            [1, ["a", 3.0]],
+            [2, ["e", 5.0]]
+        ]),
+        "{res:?}"
+    );
+    // no grouping columns: one global k-set
+    let res = db
+        .run_default(
+            r#"
+        data[g, pack] <- [[1, ['a', 3.0]], [1, ['b', 1.0]], [2, ['e', 5.0]]]
+        ?[min_cost_k(pack, 2)] := data[g, pack]
+        "#,
+        )
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[["b", 1.0]], [["a", 3.0]]]),
+        "{res:?}"
+    );
+}
+
+#[test]
+fn bounded_meet_k_shortest_paths() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // 1→2→3 (2.0) beats 1→3 (3.0); the 3→1 back-edge creates cycles whose
+    // paths all cost ≥ 4 — the top-2 must converge despite them
+    let res = db
+        .run_default(
+            r#"
+        edge[f, t, w] <- [[1, 2, 1.0], [2, 3, 1.0], [1, 3, 3.0], [3, 1, 1.0]]
+        sp[t, min_cost_k(pack, 2)] := t = 1, pack = [[1], 0.0]
+        sp[t, min_cost_k(pack, 2)] := sp[m, p], edge[m, t, w],
+                                      pack = [concat(first(p), [t]), last(p) + w]
+        ?[pack] := sp[3, pack]
+        "#,
+        )
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[[[1, 2, 3], 2.0]], [[[1, 3], 3.0]]]),
+        "{res:?}"
+    );
+}
+
+#[test]
+fn bounded_meet_divergence_capped() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // a negative-cost cycle improves the k-set forever: the changed-bit
+    // never settles, the epoch cap must convert that into a loud error
+    let err = db
+        .run_default(
+            r#"
+        edge[f, t, w] <- [[1, 2, -1.0], [2, 1, -1.0]]
+        sp[t, min_cost_k(pack, 2)] := t = 1, pack = [[1], 0.0]
+        sp[t, min_cost_k(pack, 2)] := sp[m, p], edge[m, t, w],
+                                      pack = [concat(first(p), [t]), last(p) + w]
+        ?[pack] := sp[2, pack]
+        "#,
+        )
+        .expect_err("negative cycle must hit the epoch cap");
+    assert!(format!("{err:?}").contains("did not converge"), "{err:?}");
+}
+
+#[test]
+fn bounded_meet_validation() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default("?[g, pack] <- [[1, ['a', 1.0]]] :create bm {g, pack}")
+        .unwrap();
+    // missing k
+    let err = db
+        .run_default("?[g, min_cost_k(pack)] := *bm[g, pack]")
+        .expect_err("missing k");
+    assert!(
+        format!("{err:?}").contains("exactly one argument"),
+        "{err:?}"
+    );
+    // non-positive k
+    let err = db
+        .run_default("?[g, min_cost_k(pack, 0)] := *bm[g, pack]")
+        .expect_err("k = 0");
+    assert!(format!("{err:?}").contains("positive integer"), "{err:?}");
+    // mixed with another aggregate
+    let err = db
+        .run_default("?[min_cost_k(pack, 2), count(g)] := *bm[g, pack]")
+        .expect_err("mixed head");
+    assert!(
+        format!("{err:?}").contains("bounded-meet aggregate"),
+        "{err:?}"
+    );
+    // not in the last position
+    let err = db
+        .run_default("?[min_cost_k(pack, 2), g] := *bm[g, pack]")
+        .expect_err("not last");
+    assert!(
+        format!("{err:?}").contains("bounded-meet aggregate"),
+        "{err:?}"
+    );
+    // malformed pack
+    let err = db
+        .run_default("?[g, min_cost_k(g, 2)] := *bm[g, pack]")
+        .expect_err("bad pack");
+    assert!(
+        format!("{err:?}").contains("cannot compute 'min_cost_k'"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn bounded_meet_does_not_cap_costratified_recursion() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // a CONVERGED (here: non-recursive) bounded rule sharing a stratum with
+    // an unrelated recursion needing more epochs than the cap must not kill
+    // it — the guard counts consecutive epochs the k-sets kept changing
+    let res = db
+        .run_default(
+            r#"
+        base[pack] <- [[['a', 1.0]], [['b', 2.0]]]
+        best[min_cost_k(pack, 2)] := base[pack]
+        w[a] := a = 0
+        w[a] := w[b], a = b + 1, a < 4300
+        ?[count(a)] := w[a], best[p]
+        "#,
+        )
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[4300 * 2]]), "{res:?}");
+}

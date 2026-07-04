@@ -17,6 +17,13 @@ use crate::data::value::DataValue;
 pub struct Aggregation {
     pub name: &'static str,
     pub is_meet: bool,
+    /// A *bounded-meet* aggregate (mnestic fork, provenance semirings R1):
+    /// keeps up to k rows per group instead of one — the store owns the
+    /// sort/dedup/truncate, the rows flow through recursion as ordinary
+    /// tuples (⊗ stays body arithmetic), and the evaluator caps epochs
+    /// because displacement makes convergence a bound, not a guarantee.
+    /// Mutually exclusive with `is_meet`.
+    pub is_bounded_meet: bool,
     pub meet_op: Option<Box<dyn MeetAggrObj>>,
     pub normal_op: Option<Box<dyn NormalAggrObj>>,
     /// Factory for a user-registered aggregate (mnestic fork, provenance
@@ -31,10 +38,54 @@ impl Clone for Aggregation {
         Self {
             name: self.name,
             is_meet: self.is_meet,
+            is_bounded_meet: self.is_bounded_meet,
             meet_op: None,
             normal_op: None,
             meet_factory: self.meet_factory.clone(),
         }
+    }
+}
+
+/// The candidate contract of one bounded-meet aggregate (provenance
+/// semirings R1). The store owns the k-set mechanics (insert-sorted, dedup,
+/// truncate); the object owns what a candidate IS: validation and the total
+/// order. `cmp_candidates` must be total and return `Equal` ONLY for
+/// candidates that are duplicates under the aggregate's `○=` equivalence —
+/// `Equal` is how the store deduplicates.
+pub trait BoundedMeetAggrObj: Send + Sync {
+    fn validate(&self, value: &DataValue) -> Result<()>;
+    fn cmp_candidates(&self, a: &DataValue, b: &DataValue) -> std::cmp::Ordering;
+}
+
+/// `min_cost_k([payload, cost], k)` — the k lowest-cost candidates per
+/// group, each kept as its own output row. The direct generalization of
+/// `min_cost` (same `[payload, cost]` pack shape); ties order by the whole
+/// pack for determinism, exact-duplicate packs collapse.
+pub(crate) struct BoundedMinCostK;
+
+impl BoundedMeetAggrObj for BoundedMinCostK {
+    fn validate(&self, value: &DataValue) -> Result<()> {
+        match value {
+            DataValue::List(l) => {
+                ensure!(
+                    l.len() == 2,
+                    "'min_cost_k' requires a list of exactly two items [payload, cost] as argument"
+                );
+                ensure!(
+                    l[1].get_float().is_some(),
+                    "'min_cost_k' cost must be numeric"
+                );
+                Ok(())
+            }
+            v => bail!("cannot compute 'min_cost_k' on {:?}", v),
+        }
+    }
+    fn cmp_candidates(&self, a: &DataValue, b: &DataValue) -> std::cmp::Ordering {
+        let cost = |v: &DataValue| match v {
+            DataValue::List(l) => l[1].get_float().unwrap_or(f64::INFINITY),
+            _ => f64::INFINITY,
+        };
+        cost(a).total_cmp(&cost(b)).then_with(|| a.cmp(b))
     }
 }
 
@@ -118,15 +169,22 @@ impl Debug for Aggregation {
 
 macro_rules! define_aggr {
     ($name:ident, $is_meet:expr) => {
+        define_aggr!($name, $is_meet, false);
+    };
+    ($name:ident, $is_meet:expr, $is_bounded_meet:expr) => {
         const $name: Aggregation = Aggregation {
             name: stringify!($name),
             is_meet: $is_meet,
+            is_bounded_meet: $is_bounded_meet,
             meet_op: None,
             normal_op: None,
             meet_factory: None,
         };
     };
 }
+
+// provenance semirings R1: the bounded-meet category's shipped instance
+define_aggr!(AGGR_MIN_COST_K, false, true);
 
 define_aggr!(AGGR_AND, true);
 
@@ -1249,11 +1307,39 @@ pub(crate) fn parse_aggr(name: &str) -> Option<&'static Aggregation> {
         "latest_by" => &AGGR_LATEST_BY,
         "smallest_by" => &AGGR_SMALLEST_BY,
         "choice_rand" => &AGGR_CHOICE_RAND,
+        "min_cost_k" => &AGGR_MIN_COST_K,
         _ => return None,
     })
 }
 
 impl Aggregation {
+    /// Build the candidate contract of a bounded-meet aggregate (provenance
+    /// semirings R1), returning `(k, op)`. The trailing argument is the
+    /// bound k — a positive integer.
+    pub(crate) fn bounded_meet_init(
+        &self,
+        args: &[DataValue],
+    ) -> Result<(usize, Box<dyn BoundedMeetAggrObj>)> {
+        debug_assert!(self.is_bounded_meet);
+        let k = match args {
+            [k_arg] => k_arg.get_int().filter(|k| *k >= 1).ok_or_else(|| {
+                miette!(
+                    "the bound of '{}' must be a positive integer, got {:?}",
+                    self.name,
+                    k_arg
+                )
+            })?,
+            _ => bail!(
+                "'{}' takes exactly one argument after the value: the bound k",
+                self.name
+            ),
+        };
+        let op: Box<dyn BoundedMeetAggrObj> = match self.name {
+            name if name == AGGR_MIN_COST_K.name => Box::new(BoundedMinCostK),
+            name => unreachable!("{}", name),
+        };
+        Ok((k as usize, op))
+    }
     pub(crate) fn meet_init(&mut self, _args: &[DataValue]) -> Result<()> {
         if let Some(f) = &self.meet_factory {
             if !_args.is_empty() {

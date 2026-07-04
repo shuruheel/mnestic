@@ -38,6 +38,12 @@ pub(crate) enum AggrKind {
     None,
     Normal,
     Meet,
+    /// Bounded-meet (mnestic fork, provenance semirings R1): up to k rows
+    /// per group; the store owns sort/dedup/truncate, the evaluator caps
+    /// epochs. A third category — NOT the meet path: displacement means
+    /// rows can leave the store, which the idempotent-semilattice
+    /// assumptions of `Meet` never allow.
+    BoundedMeet,
 }
 
 impl CompiledRuleSet {
@@ -47,11 +53,15 @@ impl CompiledRuleSet {
             CompiledRuleSet::Fixed(fixed) => fixed.arity,
         }
     }
-    pub(crate) fn aggr_kind(&self) -> AggrKind {
-        match self {
+    pub(crate) fn aggr_kind(&self) -> Result<AggrKind> {
+        Ok(match self {
             CompiledRuleSet::Rules(rules) => {
                 let mut has_non_meet = false;
                 let mut has_aggr = false;
+                let mut bounded_count = 0usize;
+                let mut aggr_count = 0usize;
+                let mut bounded_name = "";
+                let mut bounded_is_last = false;
                 for maybe_aggr in rules[0].aggr.iter() {
                     match maybe_aggr {
                         None => {
@@ -59,12 +69,38 @@ impl CompiledRuleSet {
                             if has_aggr {
                                 has_non_meet = true
                             }
+                            bounded_is_last = false;
                         }
                         Some((aggr, _)) => {
                             has_aggr = true;
-                            has_non_meet = has_non_meet || !aggr.is_meet
+                            has_non_meet = has_non_meet || !(aggr.is_meet || aggr.is_bounded_meet);
+                            aggr_count += 1;
+                            if aggr.is_bounded_meet {
+                                bounded_count += 1;
+                                bounded_name = aggr.name;
+                                bounded_is_last = true;
+                            } else {
+                                bounded_is_last = false;
+                            }
                         }
                     }
+                }
+                if bounded_count > 0 {
+                    // provenance semirings R1, v1 restriction: the k-set is
+                    // over whole value tuples, so it cannot compose
+                    // column-wise with other aggregates.
+                    if aggr_count > 1 || has_non_meet || !bounded_is_last {
+                        let display = bounded_name
+                            .strip_prefix("AGGR_")
+                            .map(|s| s.to_lowercase())
+                            .unwrap_or_else(|| bounded_name.to_string());
+                        bail!(
+                            "a bounded-meet aggregate ('{}') must be the single aggregated \
+                             column, in the last position of the rule head",
+                            display
+                        );
+                    }
+                    return Ok(AggrKind::BoundedMeet);
                 }
                 match (has_aggr, has_non_meet) {
                     (false, _) => AggrKind::None,
@@ -73,7 +109,7 @@ impl CompiledRuleSet {
                 }
             }
             CompiledRuleSet::Fixed(_) => AggrKind::None,
-        }
+        })
     }
 }
 

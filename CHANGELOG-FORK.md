@@ -5,6 +5,47 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — bounded-meet aggregates: `min_cost_k` top-k proofs (provenance semirings R1)
+- **A third aggregate category, `AggrKind::BoundedMeet`** — the genuinely-new
+  engine work of the semirings feature (spec §6/§9.4): a recursive aggregate
+  that keeps **up to k rows per group**, so a query returns the k best whole
+  derivations for each answer instead of one. Rows flow through recursion as
+  ordinary tuples (⊗ stays rule-body arithmetic, exactly like `min_cost`),
+  while the ENGINE owns truncation at every fixpoint step: the new
+  `BoundedMeetStore` insert-sorts each candidate under the aggregate's total
+  order, deduplicates on `Ordering::Equal` (the `○=` equivalence), and
+  truncates to k. NOT the meet path — displacement means rows can leave the
+  store, which the idempotent-semilattice assumptions of `Meet` never allow.
+- **Shipped instance: `min_cost_k([payload, cost], k)`** — the k lowest-cost
+  packs per group, one output row each, cost-ordered (ties break on the whole
+  pack; exact duplicates collapse). K-shortest-paths is the direct idiom:
+  the `min_cost` recursion with `min_cost_k(pack, k)` in the head. The
+  finance/audit shape: "the k most-likely paths plus the exact evidence
+  chains that justify them".
+- **Convergence guard**: the changed-bit is only a saturation check for
+  non-idempotent tags, so the evaluator bails after 4096 CONSECUTIVE epochs
+  in which some bounded k-set changed — catching cost-decreasing cycles
+  loudly instead of hanging (review must-fix: an earlier stratum-wide cap
+  falsely killed converged bounded rules co-stratified with unrelated long
+  recursions; the consecutive-change counter caps only live divergence).
+  Known limit: a legitimate bounded recursion deeper than 4096 epochs also
+  trips the cap (the error says so).
+- Semantics documented: **Scallop-style approximate top-k** — upstream
+  truncation prunes derivations, and candidates already consumed by earlier
+  epochs are not retracted; the k-set at fixpoint = the k best candidates
+  ever surfaced. Cost-order of the k rows is guaranteed only when the
+  bounded aggregate is the entry head (downstream rules re-sort into value
+  order). NaN costs are admitted and deterministically rank worst.
+- v1 restrictions (validated with a loud error): the bounded aggregate must
+  be the single aggregated column, in the last head position; mutual
+  recursion between bounded rules stays unstratifiable; custom registration
+  of bounded-meet operators is deferred (the R0b registry still only takes
+  meet/normal aggregates).
+- Adversarially reviewed: 16-scenario probe battery (relay displacement,
+  DAG-exactness vs brute force, zero-cost cycles converge, equal-cost
+  lexicographic divergence hits the cap, stratification shapes, `::explain`,
+  `:limit`/`:order` post-application) — all sound after the must-fix.
+
 ### Perf — temporal-read budget: pinned-cursor bitemporal scans + the bench gate (bitemporality step 6)
 - **`benches/time_travel.rs` rewritten** from the nightly-only `#![feature(test)]`
   relic into a stable criterion bench (registered `harness = false`;

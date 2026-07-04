@@ -223,10 +223,165 @@ impl MeetAggrStore {
     }
 }
 
+/// The bounded-meet store (mnestic fork, provenance semirings R1): up to k
+/// rows per group, each row one candidate "proof" pack. The store owns the
+/// k-set mechanics — insert-sorted by the aggregate's total order, dedup on
+/// `Ordering::Equal` (the aggregate's `○=`), truncate to k — so the engine
+/// controls truncation at every fixpoint step while ⊗ stays ordinary rule-
+/// body arithmetic over the rows. Displacement makes this NON-monotone: a
+/// row can leave the store, which is why it is a third `AggrKind`, not a
+/// meet, and why the evaluator caps epochs (`BOUNDED_MEET_MAX_EPOCHS`).
+/// v1 shape: exactly ONE bounded aggregate column, in the last position
+/// (validated in `aggr_kind`).
+pub(crate) struct BoundedMeetStore {
+    /// group key → sorted, deduped, ≤k single-column value tuples
+    inner: BTreeMap<Tuple, Vec<Tuple>>,
+    op: std::sync::Arc<dyn crate::data::aggr::BoundedMeetAggrObj>,
+    k: usize,
+    grouping_len: usize,
+    /// `true` for a delta store: keep candidates sorted+deduped but do NOT
+    /// truncate. (In practice each epoch's out store is itself k-truncating,
+    /// so at most k candidates per group reach the delta per epoch — the
+    /// unbounded twin is belt-and-braces for the delta contract, not a
+    /// load-bearing path.)
+    unbounded: bool,
+}
+
+impl std::fmt::Debug for BoundedMeetStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BoundedMeetStore")
+            .field("k", &self.k)
+            .field("grouping_len", &self.grouping_len)
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl BoundedMeetStore {
+    pub(crate) fn wrap(self) -> TempStore {
+        TempStore::BoundedMeet(self)
+    }
+    pub(crate) fn new(aggrs: Vec<Option<(Aggregation, Vec<DataValue>)>>) -> Result<Self> {
+        let total_key_len = aggrs.len();
+        let mut bounded = aggrs.into_iter().flatten().collect_vec();
+        // aggr_kind validated the shape: exactly one, last position
+        debug_assert_eq!(bounded.len(), 1);
+        let (aggr, args) = bounded.pop().unwrap();
+        let (k, op) = aggr.bounded_meet_init(&args)?;
+        Ok(Self {
+            inner: Default::default(),
+            op: std::sync::Arc::from(op),
+            k,
+            grouping_len: total_key_len - 1,
+            unbounded: false,
+        })
+    }
+    /// An empty twin for the delta slot: same contract, no truncation.
+    pub(crate) fn delta_twin(&self) -> Self {
+        Self {
+            inner: Default::default(),
+            op: self.op.clone(),
+            k: self.k,
+            grouping_len: self.grouping_len,
+            unbounded: true,
+        }
+    }
+    pub(crate) fn exists(&self, key: &Tuple) -> bool {
+        let truncated = &key[0..self.grouping_len];
+        self.inner.contains_key(truncated)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    /// Merge one candidate row into its group's k-set. Returns whether the
+    /// k-set changed.
+    pub(crate) fn meet_put(&mut self, tuple: Tuple) -> Result<bool> {
+        let (key_part, val_part) = tuple.split_at(self.grouping_len);
+        self.op.validate(&val_part[0])?;
+        let op = self.op.clone();
+        let (k, unbounded) = (self.k, self.unbounded);
+        let entry = self.inner.entry(key_part.to_vec()).or_default();
+        match entry.binary_search_by(|held| op.cmp_candidates(&held[0], &val_part[0])) {
+            // Equal under the aggregate's order = duplicate under its ○=
+            Ok(_) => Ok(false),
+            Err(pos) => {
+                if !unbounded && pos >= k {
+                    // worse than the group's k-th best: not a change
+                    return Ok(false);
+                }
+                entry.insert(pos, val_part.to_vec());
+                if !unbounded && entry.len() > k {
+                    entry.pop();
+                }
+                Ok(true)
+            }
+        }
+    }
+    fn range_iter(
+        &self,
+        lower: &Tuple,
+        upper: &Tuple,
+        upper_inclusive: bool,
+    ) -> impl Iterator<Item = TupleInIter<'_>> {
+        let lower_key = if lower.len() > self.grouping_len {
+            lower[0..self.grouping_len].to_vec()
+        } else {
+            lower.to_vec()
+        };
+        let upper_key = if upper.len() > self.grouping_len {
+            upper[0..self.grouping_len].to_vec()
+        } else {
+            upper.to_vec()
+        };
+        let lower = lower.to_vec();
+        let upper = upper.to_vec();
+        self.inner
+            .range(lower_key..=upper_key)
+            .flat_map(|(k, vs)| vs.iter().map(move |v| TupleInIter(k, v, false)))
+            .filter(move |ret| {
+                if ret.partial_cmp(&lower as &[DataValue]) == Some(Ordering::Less) {
+                    return false;
+                }
+                match ret.partial_cmp(&upper as &[DataValue]).unwrap() {
+                    Ordering::Less => true,
+                    Ordering::Equal => upper_inclusive,
+                    Ordering::Greater => false,
+                }
+            })
+    }
+    /// Returns true if prev is guaranteed to be the same as self after this
+    /// function call, false if we are not sure. `prev` collects the
+    /// candidates that CHANGED a k-set — the delta for the next epoch.
+    pub(crate) fn merge_in(&mut self, prev: &mut Self, mut new: Self) -> Result<bool> {
+        prev.inner.clear();
+        prev.unbounded = true;
+        if new.inner.is_empty() {
+            return Ok(false);
+        }
+        if self.inner.is_empty() {
+            mem::swap(&mut self.inner, &mut new.inner);
+            return Ok(true);
+        }
+        for (k, vs) in new.inner {
+            for v in vs {
+                let mut row = k.clone();
+                row.extend(v.iter().cloned());
+                if self.meet_put(row)? {
+                    let mut prev_row = k.clone();
+                    prev_row.extend(v);
+                    prev.meet_put(prev_row)?;
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum TempStore {
     Normal(RegularTempStore),
     MeetAggr(MeetAggrStore),
+    BoundedMeet(BoundedMeetStore),
 }
 
 impl TempStore {
@@ -234,6 +389,7 @@ impl TempStore {
         match self {
             TempStore::Normal(n) => n.exists(key),
             TempStore::MeetAggr(m) => m.exists(key),
+            TempStore::BoundedMeet(b) => b.exists(key),
         }
     }
     fn range_iter(
@@ -244,13 +400,15 @@ impl TempStore {
     ) -> impl Iterator<Item = TupleInIter<'_>> {
         match self {
             TempStore::Normal(n) => Left(n.range_iter(lower, upper, upper_inclusive)),
-            TempStore::MeetAggr(m) => Right(m.range_iter(lower, upper, upper_inclusive)),
+            TempStore::MeetAggr(m) => Right(Left(m.range_iter(lower, upper, upper_inclusive))),
+            TempStore::BoundedMeet(b) => Right(Right(b.range_iter(lower, upper, upper_inclusive))),
         }
     }
     fn is_empty(&self) -> bool {
         match self {
             TempStore::Normal(n) => n.inner.is_empty(),
             TempStore::MeetAggr(m) => m.inner.is_empty(),
+            TempStore::BoundedMeet(b) => b.inner.is_empty(),
         }
     }
 }
@@ -283,12 +441,33 @@ impl EpochStore {
             arity: aggrs.len(),
         })
     }
+    /// provenance semirings R1: total is k-bounded; the delta twin is
+    /// sorted/deduped but unbounded (one epoch may surface > k candidates).
+    pub(crate) fn new_bounded_meet(
+        aggrs: &[Option<(Aggregation, Vec<DataValue>)>],
+    ) -> Result<Self> {
+        let total = BoundedMeetStore::new(aggrs.to_vec())?;
+        let delta = total.delta_twin();
+        Ok(Self {
+            total: TempStore::BoundedMeet(total),
+            delta: TempStore::BoundedMeet(delta),
+            use_total_for_delta: true,
+            arity: aggrs.len(),
+        })
+    }
     pub(crate) fn merge_in(&mut self, new: TempStore) -> Result<()> {
         match (&mut self.total, &mut self.delta, new) {
             (TempStore::Normal(total), TempStore::Normal(prev), TempStore::Normal(new)) => {
                 self.use_total_for_delta = total.merge_in(prev, new);
             }
             (TempStore::MeetAggr(total), TempStore::MeetAggr(prev), TempStore::MeetAggr(new)) => {
+                self.use_total_for_delta = total.merge_in(prev, new)?;
+            }
+            (
+                TempStore::BoundedMeet(total),
+                TempStore::BoundedMeet(prev),
+                TempStore::BoundedMeet(new),
+            ) => {
                 self.use_total_for_delta = total.merge_in(prev, new)?;
             }
             _ => unreachable!(),

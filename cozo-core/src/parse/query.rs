@@ -850,6 +850,9 @@ fn parse_rule_head_arg(
                     Some(reg) => Aggregation {
                         name: crate::data::aggr::intern_aggr_name(aggr_name),
                         is_meet: reg.is_meet,
+                        // custom bounded-meet registration is deferred (R1
+                        // ships the category + the min_cost_k builtin)
+                        is_bounded_meet: false,
                         meet_op: None,
                         normal_op: None,
                         meet_factory: Some(reg.factory.clone()),
