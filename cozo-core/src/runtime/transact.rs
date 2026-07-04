@@ -51,6 +51,10 @@ pub struct SessionTx<'a> {
     /// Consequence (spec §5): writes are NOT visible to later reads in the
     /// same script — a transaction is one belief event.
     pub(crate) pending_tt_writes: Vec<PendingTtWrite>,
+    /// Set when the transaction burned a tt outside the buffered-write path
+    /// (`::evict`'s audit stamp): forces `commit_tx` through
+    /// `commit_tx_with_tt` so the persisted HWM covers the burned value.
+    pub(crate) tt_hwm_dirty: bool,
 }
 
 /// One statement's worth of buffered writes to a tt-stamped relation.
@@ -170,10 +174,14 @@ impl<'a> SessionTx<'a> {
     }
 
     pub fn commit_tx(&mut self) -> Result<()> {
-        if !self.pending_tt_writes.is_empty() {
+        if !self.pending_tt_writes.is_empty() || self.tt_hwm_dirty {
             // Route through the tt commit path (mnestic fork): stamp the
             // buffered rows, persist the HWM, commit — all under the per-Db
             // critical section. Every call site inherits this automatically.
+            // `tt_hwm_dirty` covers transactions that burned a tt outside
+            // the buffered-write path (`::evict`'s audit stamp): the HWM put
+            // must happen under the lock held ACROSS the commit, or an
+            // overlapping tt commit could be overwritten by our lower mark.
             self.commit_tx_with_tt()?;
             return Ok(());
         }

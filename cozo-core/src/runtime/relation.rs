@@ -83,6 +83,12 @@ pub(crate) struct RelationHandle {
     pub(crate) replace_triggers: Vec<String>,
     pub(crate) access_level: AccessLevel,
     pub(crate) is_temp: bool,
+    /// mnestic fork, bitemporality step 5: after `::history_gc rel cutoff`,
+    /// as-of reads below the cutoff would silently return a post-hoc
+    /// reconstruction, so they error instead. `None` = never garbage
+    /// collected. Serde default keeps pre-gc catalogs readable.
+    #[serde(default)]
+    pub(crate) tt_gc_floor: Option<i64>,
     pub(crate) indices: BTreeMap<SmartString<LazyCompact>, (RelationHandle, Vec<usize>)>,
     pub(crate) hnsw_indices:
         BTreeMap<SmartString<LazyCompact>, (RelationHandle, HnswIndexManifest)>,
@@ -523,6 +529,25 @@ impl RelationHandle {
         }
     }
 
+    /// After `::history_gc`, an as-of read below the persisted floor would
+    /// silently return a post-hoc reconstruction as if it were the historical
+    /// belief — error instead (mnestic fork, bitemporality step 5).
+    fn check_tt_gc_floor(&self, tt: Option<ValidityTs>, span: SourceSpan) -> Result<()> {
+        if let (Some(t), Some(floor)) = (tt, self.tt_gc_floor) {
+            if t.0 .0 < floor {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("as-of read below the ::history_gc floor of relation {0} ({1} < {2})")]
+                #[diagnostic(
+                    code(eval::txtime_below_gc_floor),
+                    help("records below the floor were garbage-collected; the belief at that time is no longer reconstructible")
+                )]
+                struct BelowGcFloor(String, i64, i64, #[label] SourceSpan);
+                bail!(BelowGcFloor(self.name.to_string(), t.0 .0, floor, span));
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a read's temporal selectors against this relation's axes
     /// (mnestic fork, bitemporality steps 4a/4b; spec §4 semantics table).
     /// On tt-only relations the tt axis DEFAULTS to end-of-tt-time — the
@@ -551,12 +576,14 @@ impl RelationHandle {
                     struct NoVtAxis(String, #[label] SourceSpan);
                     bail!(NoVtAxis(self.name.to_string(), span));
                 }
+                self.check_tt_gc_floor(tt, span)?;
                 Ok(TemporalRead::AsOf(tt.unwrap_or(MAX_VALIDITY_TS)))
             } else {
                 // Bitemporal (step 4b): the two-level resolution. No vt
                 // selector = every vt record (resolve-groups); a vt selector
                 // = the single belief per key (resolve-key). tt defaults to
                 // current belief.
+                self.check_tt_gc_floor(tt, span)?;
                 Ok(TemporalRead::Bitemporal {
                     vt,
                     tt: tt.unwrap_or(MAX_VALIDITY_TS),
@@ -860,7 +887,7 @@ impl<'a> SessionTx<'a> {
     fn reject_txtime_relation(rel: &RelationHandle, what: &str) -> Result<()> {
         if rel.has_txtime() {
             #[derive(Debug, Error, Diagnostic)]
-            #[error("{0} is not yet supported on TxTime (transaction-time) relations: {1}")]
+            #[error("{0} is not supported on TxTime (transaction-time) relations: {1} (statement-time index/trigger maintenance is incompatible with buffered commit-time stamping; revisit on real pull)")]
             #[diagnostic(code(eval::txtime_unsupported_op))]
             struct TxTimeUnsupported(String, String);
             bail!(TxTimeUnsupported(what.to_string(), rel.name.to_string()));
@@ -935,6 +962,7 @@ impl<'a> SessionTx<'a> {
             replace_triggers: vec![],
             access_level: AccessLevel::Normal,
             is_temp,
+            tt_gc_floor: None,
             indices: Default::default(),
             hnsw_indices: Default::default(),
             fts_indices: Default::default(),

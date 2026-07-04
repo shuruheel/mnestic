@@ -51,6 +51,15 @@ pub enum SysOp {
     /// (truncated values from interrupted writes). Surgical alternative to
     /// dropping a database that fails integrity checks.
     RepairCorrupt(Symbol),
+    /// mnestic fork, bitemporality step 5: full belief timeline of the given
+    /// keys of a tt-stamped relation — (relation, keys, limit, offset)
+    TtHistory(Symbol, Vec<Vec<DataValue>>, Option<usize>, Option<usize>),
+    /// (relation, cutoff tt µs): drop superseded records below the cutoff,
+    /// persist the gc floor
+    TtHistoryGc(Symbol, i64),
+    /// (relation, keys, unredacted): hard-delete every record of the keys
+    /// (GDPR); audit row written in the same transaction
+    TtEvict(Symbol, Vec<Vec<DataValue>>, bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -115,6 +124,44 @@ pub(crate) fn parse_sys(
 ) -> Result<SysOp> {
     let inner = src.next().unwrap();
     Ok(match inner.as_rule() {
+        Rule::history_op => {
+            let mut in_inner = inner.into_inner();
+            let rel = in_inner.next().unwrap();
+            let rel_symbol = Symbol::new(rel.as_str(), rel.extract_span());
+            let keys_expr = build_expr(in_inner.next().unwrap(), param_pool)?;
+            let keys = sysop_keys(keys_expr)?;
+            // limit/offset are bare `pos_int` tokens, not exprs: an expr
+            // would greedily parse `2 -1` as the single limit `2 - 1`
+            let mut limit = None;
+            let mut offset = None;
+            if let Some(p) = in_inner.next() {
+                limit = Some(sysop_pos_int(&p, "limit")?);
+            }
+            if let Some(p) = in_inner.next() {
+                offset = Some(sysop_pos_int(&p, "offset")?);
+            }
+            SysOp::TtHistory(rel_symbol, keys, limit, offset)
+        }
+        Rule::history_gc_op => {
+            let mut in_inner = inner.into_inner();
+            let rel = in_inner.next().unwrap();
+            let rel_symbol = Symbol::new(rel.as_str(), rel.extract_span());
+            let cutoff_expr = build_expr(in_inner.next().unwrap(), param_pool)?;
+            let cutoff = cutoff_expr
+                .eval_to_const()?
+                .get_int()
+                .ok_or_else(|| miette!("::history_gc cutoff must be an integer (µs)"))?;
+            SysOp::TtHistoryGc(rel_symbol, cutoff)
+        }
+        Rule::evict_op => {
+            let mut in_inner = inner.into_inner();
+            let rel = in_inner.next().unwrap();
+            let rel_symbol = Symbol::new(rel.as_str(), rel.extract_span());
+            let keys_expr = build_expr(in_inner.next().unwrap(), param_pool)?;
+            let keys = sysop_keys(keys_expr)?;
+            let unredacted = in_inner.next().is_some();
+            SysOp::TtEvict(rel_symbol, keys, unredacted)
+        }
         Rule::compact_op => SysOp::Compact,
         Rule::running_op => SysOp::ListRunning,
         Rule::kill_op => {
@@ -686,4 +733,26 @@ pub(crate) fn parse_sys(
         Rule::list_fixed_rules => SysOp::ListFixedRules,
         r => unreachable!("{:?}", r),
     })
+}
+
+/// Evaluate a sysop key argument: a const list of key-lists (mnestic fork).
+fn sysop_keys(expr: crate::data::expr::Expr) -> Result<Vec<Vec<DataValue>>> {
+    match expr.eval_to_const()? {
+        DataValue::List(keys) => keys
+            .into_iter()
+            .map(|k| match k {
+                DataValue::List(parts) => Ok(parts),
+                v => Ok(vec![v]),
+            })
+            .collect(),
+        _ => bail!("expected a list of keys, e.g. [[1], [2]]"),
+    }
+}
+
+/// Parse a bare `pos_int` sysop token (mnestic fork; `::history` limit/offset).
+fn sysop_pos_int(pair: &pest::iterators::Pair<'_, Rule>, what: &str) -> Result<usize> {
+    pair.as_str()
+        .replace('_', "")
+        .parse::<usize>()
+        .map_err(|_| miette!("{} must be a non-negative integer", what))
 }

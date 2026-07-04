@@ -11,10 +11,10 @@ query_script = {SOI ~ (option | rule | const_rule | fixed_rule)+ ~ EOI}
 query_script_inner = {"{" ~ (option | rule | const_rule | fixed_rule)+ ~ "}"}
 query_script_inner_no_bracket = { (option | rule | const_rule | fixed_rule)+ }
 imperative_script = {SOI ~ imperative_stmt+ ~ EOI}
-sys_script = {SOI ~ "::" ~ (list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | remove_relations_op | trigger_relation_op |
+sys_script = {SOI ~ "::" ~ (history_op | history_gc_op | evict_op | list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | remove_relations_op | trigger_relation_op |
                     trigger_relation_show_op | rename_relations_op | running_op | kill_op | explain_op |
                     access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules) ~ EOI}
-sys_script_inner = {"{" ~ "::" ~ (list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | remove_relations_op | trigger_relation_op |
+sys_script_inner = {"{" ~ "::" ~ (history_op | history_gc_op | evict_op | list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | remove_relations_op | trigger_relation_op |
                     trigger_relation_show_op | rename_relations_op | running_op | kill_op | explain_op |
                     access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules) ~ "}"}
 index_op = {"index" ~ (index_create | index_drop)}
@@ -25,6 +25,10 @@ index_create = {"create" ~ compound_ident ~ ":" ~ ident ~ "{" ~ (ident ~ ",")* ~
 index_create_adv = {"create" ~ compound_ident ~ ":" ~ ident ~ "{" ~ (index_opt_field ~ ",")* ~ index_opt_field? ~ "}"}
 index_drop = {"drop" ~ compound_ident ~ ":" ~ ident }
 compact_op = {"compact"}
+history_op = {"history" ~ compound_ident ~ expr ~ (pos_int ~ pos_int?)?}
+history_gc_op = {"history_gc" ~ compound_ident ~ expr}
+evict_op = {"evict" ~ compound_ident ~ expr ~ evict_unredacted?}
+evict_unredacted = {"unredacted"}
 list_fixed_rules = {"fixed_rules"}
 running_op = {"running"}
 kill_op = {"kill" ~ expr}

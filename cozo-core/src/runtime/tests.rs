@@ -1865,12 +1865,12 @@ fn txtime_unsupported_ops_error() {
     let err = db
         .run_default(r#"::set_triggers audit_ops on put { ?[k] <- [[1]] }"#)
         .expect_err("triggers must fail");
-    assert!(format!("{err:?}").contains("not yet supported"), "{err:?}");
+    assert!(format!("{err:?}").contains("not supported"), "{err:?}");
 
     let err = db
         .run_default("::index create audit_ops:by_v {v}")
         .expect_err("index create must fail");
-    assert!(format!("{err:?}").contains("not yet supported"), "{err:?}");
+    assert!(format!("{err:?}").contains("not supported"), "{err:?}");
 }
 
 #[test]
@@ -3046,4 +3046,289 @@ fn tt_4c_review_pins() {
         .run_default("?[k, x] <- [[1, 11]] :update pin_c {k => x}")
         .expect_err("update after cessation must fail");
     assert!(format!("{err:?}").contains("does not exist"), "{err:?}");
+}
+
+// ==== mnestic fork: step 5 sys ops ====
+
+#[test]
+fn history_sysop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("h5.db");
+    let (db, tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    let res = db.run_default("::history hist [[1]]").unwrap().into_json();
+    let rows = res["rows"].as_array().unwrap();
+    // 4 physical records: retract@300, correction+original@200, assert@100
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(
+        res["headers"],
+        serde_json::json!(["k", "vt_ts", "op", "tt", "x"])
+    );
+    assert_eq!(rows[0][1], 300);
+    assert_eq!(rows[0][2], "retract");
+    assert_eq!(rows[1][1], 200);
+    assert_eq!(rows[1][2], "assert");
+    assert!(rows[1][3].as_i64().unwrap() <= tts[2] && rows[1][3].as_i64().unwrap() > tts[1]);
+    // limit/offset
+    let res = db
+        .run_default("::history hist [[1]] 2 1")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 2);
+    // tt-only shape has no vt_ts column
+    db.run_default(":create a5 {k, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[9, 1]] :put a5 {k => v}")
+        .unwrap();
+    db.run_default("?[k] <- [[9]] :rm a5 {k}").unwrap();
+    let res = db.run_default("::history a5 [[9]]").unwrap().into_json();
+    assert_eq!(res["headers"], serde_json::json!(["k", "op", "tt", "v"]));
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][1], "retract");
+    // non-tt relation errors
+    db.run_default(":create plain5 {k => v: Int}").unwrap();
+    let err = db
+        .run_default("::history plain5 [[1]]")
+        .expect_err("must fail");
+    assert!(
+        format!("{err:?}").contains("requires a TxTime relation"),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn history_gc_sysop_and_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("gc5.db");
+    let (db, tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    // cutoff between the correction (tts[2]) and the retraction (tts[3]):
+    // group 200 keeps only the correction (its belief at cutoff); the
+    // superseded original@200 is dropped; groups 100/300 untouched.
+    let cutoff = tts[2] + 1;
+    let res = db
+        .run_default(&format!("::history_gc hist {cutoff}"))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"][0][0], 1, "exactly the superseded row dropped");
+    let res = db.run_default("::history hist [[1]]").unwrap().into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 3);
+    // as-of at/above the cutoff still answers correctly
+    let res = db
+        .run_default(&format!(
+            "?[x] := *hist[k, v, t, x @ (vt: 250, tt: {cutoff})]"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[3]]));
+    // below the floor errors
+    let err = db
+        .run_default(&format!(
+            "?[x] := *hist[k, v, t, x @ (vt: 250, tt: {})]",
+            tts[0]
+        ))
+        .expect_err("below-floor read must fail");
+    assert!(format!("{err:?}").contains("gc floor"), "{err:?}");
+    // read-only guard
+    let err = db
+        .run_script(
+            &format!("::history_gc hist {cutoff}"),
+            Default::default(),
+            ScriptMutability::Immutable,
+        )
+        .expect_err("gc in read-only must fail");
+    assert!(format!("{err:?}").contains("read-only"), "{err:?}");
+}
+
+#[test]
+fn evict_sysop() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ev5.db");
+    let (db, _tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    let res = db.run_default("::evict hist [[1]]").unwrap().into_json();
+    assert_eq!(res["rows"][0][2], 4, "all four records hard-deleted");
+    // gone from history and reads
+    let res = db.run_default("::history hist [[1]]").unwrap().into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0);
+    // audit row exists with a hash marker (not the key), and an eviction tt
+    let res = db
+        .run_default("?[r, key, n] := *mnestic_evict_audit[r, key, tt, n]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], "hist");
+    assert_eq!(rows[0][2], 4);
+    let marker = rows[0][1].as_str().unwrap();
+    assert!(
+        !marker.contains('1') || marker.len() == 36,
+        "salted uuid marker: {marker}"
+    );
+    // unredacted opts out
+    db.run_default("?[k, v, x] <- [[2, [100, true], 5]] :put hist {k, v => x}")
+        .unwrap();
+    db.run_default("::evict hist [[2]] unredacted").unwrap();
+    let res = db
+        .run_default("?[key] := *mnestic_evict_audit[r, key, tt, n], n == 1")
+        .unwrap()
+        .into_json();
+    assert!(res["rows"][0][0].as_str().unwrap().contains('2'), "{res:?}");
+    // read-only guard
+    let err = db
+        .run_script(
+            "::evict hist [[2]]",
+            Default::default(),
+            ScriptMutability::Immutable,
+        )
+        .expect_err("evict in read-only must fail");
+    assert!(format!("{err:?}").contains("read-only"), "{err:?}");
+}
+
+#[test]
+fn step5_review_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("pins5.db");
+    let (db, tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+
+    // same-tx pending tt writes would be stamped AFTER the eviction's
+    // deletes and resurrect the key: the whole script must fail
+    let err = db
+        .run_default(
+            "{?[k, v, x] <- [[1, [500, true], 9]] :put hist {k, v => x}} {::evict hist [[1]]}",
+        )
+        .expect_err("evict with pending tt writes must fail");
+    assert!(
+        format!("{err:?}").contains("pending transaction-time writes"),
+        "{err:?}"
+    );
+    let res = db.run_default("::history hist [[1]]").unwrap().into_json();
+    assert_eq!(
+        res["rows"].as_array().unwrap().len(),
+        4,
+        "nothing committed"
+    );
+
+    // a no-op gc deletes nothing, so it must not raise the (irreversible)
+    // floor — past reads stay exact
+    let res = db.run_default("::history_gc hist 1").unwrap().into_json();
+    assert_eq!(res["rows"][0][0], 0);
+    assert_eq!(res["rows"][0][1], serde_json::Value::Null);
+    let res = db
+        .run_default(&format!(
+            "?[x] := *hist[k, v, t, x @ (vt: 250, tt: {})]",
+            tts[0]
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1]]));
+
+    // a future cutoff can only be a typo
+    let err = db
+        .run_default("::history_gc hist 99999999999999999")
+        .expect_err("future cutoff must fail");
+    assert!(format!("{err:?}").contains("future"), "{err:?}");
+
+    // the report carries the EFFECTIVE floor: an older-cutoff re-run does
+    // not lower (or echo below) it
+    let cutoff = tts[2] + 1;
+    let res = db
+        .run_default(&format!("::history_gc hist {cutoff}"))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"][0][0], 1);
+    assert_eq!(res["rows"][0][1].as_i64().unwrap(), cutoff);
+    let res = db.run_default("::history_gc hist 5").unwrap().into_json();
+    assert_eq!(res["rows"][0][0], 0);
+    assert_eq!(
+        res["rows"][0][1].as_i64().unwrap(),
+        cutoff,
+        "floor not lowered"
+    );
+
+    // an imperative program containing only a destructive sysop must get a
+    // write transaction (on RocksDB the read-tx bridge rejects writes)
+    db.run_default(&format!("{{::history_gc hist {cutoff}}}"))
+        .unwrap();
+
+    // access levels guard the destructive ops and history reads
+    db.run_default("::access_level read_only hist").unwrap();
+    let err = db
+        .run_default("::evict hist [[1]]")
+        .expect_err("read_only evict");
+    assert!(
+        format!("{err:?}").contains("Insufficient access level"),
+        "{err:?}"
+    );
+    let err = db
+        .run_default(&format!("::history_gc hist {cutoff}"))
+        .expect_err("read_only gc");
+    assert!(
+        format!("{err:?}").contains("Insufficient access level"),
+        "{err:?}"
+    );
+    db.run_default("::access_level hidden hist").unwrap();
+    let err = db
+        .run_default("::history hist [[1]]")
+        .expect_err("hidden history");
+    assert!(
+        format!("{err:?}").contains("Insufficient access level"),
+        "{err:?}"
+    );
+    db.run_default("::access_level normal hist").unwrap();
+
+    // duplicate keys in one ::evict: one audit row with the true count (a
+    // repeat would overwrite it with rows_deleted = 0)
+    let res = db
+        .run_default("::evict hist [[1], [1]]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(res["rows"][0][2], 3);
+    let res = db
+        .run_default("?[n] := *mnestic_evict_audit[r, key, tt, n]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[3]]));
+
+    // keys coerce through the column types: a mistyped ::evict key errors
+    // loudly instead of silently evicting nothing
+    db.run_default(":create typed5 {k: Int, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[7, 1], [8, 2]] :put typed5 {k => v}")
+        .unwrap();
+    assert!(
+        db.run_default("::evict typed5 [['7']]").is_err(),
+        "mistyped key must be loud"
+    );
+
+    // ::history output is key-ascending; limit/offset are strict pos_ints
+    // (`2 -1` must not silently parse as the single limit `2 - 1`)
+    let res = db
+        .run_default("::history typed5 [[8], [7]]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"][0][0], 7, "key-asc order");
+    assert!(
+        db.run_default("::history typed5 [[7]] 2 -1").is_err(),
+        "negative offset must not parse"
+    );
+
+    // synthesized history headers must not shadow user columns
+    db.run_default(":create clash5 {k, tt: TxTime => op: String}")
+        .unwrap();
+    let err = db
+        .run_default("::history clash5 [[1]]")
+        .expect_err("header collision");
+    assert!(format!("{err:?}").contains("collides"), "{err:?}");
+
+    // the audit relation name is reserved: a pre-existing relation with a
+    // divergent schema would be corrupted by the raw audit puts
+    let dir2 = tempfile::tempdir().unwrap();
+    let path2 = dir2.path().join("pins5b.db");
+    let (db2, _) = bitemporal_fixture("sqlite", path2.to_str().unwrap());
+    db2.run_default(":create mnestic_evict_audit {a => b: Float}")
+        .unwrap();
+    let err = db2
+        .run_default("::evict hist [[1]]")
+        .expect_err("reserved name");
+    assert!(format!("{err:?}").contains("reserved"), "{err:?}");
 }

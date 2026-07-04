@@ -55,7 +55,7 @@ use crate::runtime::relation::{
     extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
 };
 use crate::runtime::transact::SessionTx;
-use crate::runtime::tt_clock::TtClock;
+use crate::runtime::tt_clock::{wall_clock_micros, TtClock};
 use crate::storage::temp::TempStorage;
 use crate::storage::{Storage, StoreTx};
 use crate::{decode_tuple_from_kv, FixedRule, Symbol};
@@ -1088,6 +1088,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
+            tt_hwm_dirty: false,
         };
         Ok(ret)
     }
@@ -1102,6 +1103,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
+            tt_hwm_dirty: false,
         };
         Ok(ret)
     }
@@ -1556,6 +1558,54 @@ impl<'s, S: Storage<'s>> Db<S> {
         Ok(())
     }
 
+    /// The reserved eviction-audit relation (mnestic fork, bitemporality
+    /// step 5), created lazily on first `::evict`. Keys: (relation, key
+    /// marker, tt); value: rows_deleted.
+    fn tt_evict_audit_relation(&'s self, tx: &mut SessionTx<'_>) -> Result<RelationHandle> {
+        use crate::data::relation::{ColType, ColumnDef, NullableColType, StoredRelationMetadata};
+        let col = |name: &str, coltype: ColType| ColumnDef {
+            name: SmartString::from(name),
+            typing: NullableColType {
+                coltype,
+                nullable: false,
+            },
+            default_gen: None,
+        };
+        let meta = StoredRelationMetadata {
+            keys: vec![
+                col("relation", ColType::String),
+                col("key", ColType::String),
+                col("tt", ColType::Int),
+            ],
+            non_keys: vec![col("rows_deleted", ColType::Int)],
+        };
+        if let Ok(h) = tx.get_relation("mnestic_evict_audit", false) {
+            // The audit puts are raw store writes: a divergent schema would
+            // corrupt rows, and indices/triggers would silently not be
+            // maintained.
+            if h.metadata != meta
+                || !h.has_no_index()
+                || !h.put_triggers.is_empty()
+                || !h.rm_triggers.is_empty()
+                || !h.replace_triggers.is_empty()
+            {
+                bail!(
+                    "the relation name mnestic_evict_audit is reserved for the eviction \
+                     audit trail; the existing relation must keep the exact reserved \
+                     schema and carry no indices or triggers"
+                );
+            }
+            return Ok(h);
+        }
+        tx.create_relation(crate::runtime::relation::InputRelationHandle {
+            name: Symbol::new("mnestic_evict_audit", Default::default()),
+            metadata: meta,
+            key_bindings: vec![],
+            dep_bindings: vec![],
+            span: Default::default(),
+        })
+    }
+
     pub(crate) fn run_sys_op_with_tx(
         &'s self,
         tx: &mut SessionTx<'_>,
@@ -1591,6 +1641,394 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .map(|k| vec![DataValue::from(k as &str)])
                         .collect_vec(),
                 ))
+            }
+            SysOp::TtHistory(rel, keys, limit, offset) => {
+                // mnestic fork, bitemporality step 5: the introspection
+                // surface — every (vt, tt) record of the given keys.
+                let handle = tx.get_relation(rel, false)?;
+                if !handle.has_txtime() {
+                    bail!("::history requires a TxTime relation, {} is not", rel);
+                }
+                if handle.access_level < AccessLevel::ReadOnly {
+                    bail!(InsufficientAccessLevel(
+                        handle.name.to_string(),
+                        "history introspection".to_string(),
+                        handle.access_level
+                    ))
+                }
+                let kpos = handle.metadata.keys.len() - 1;
+                let is_bitemporal = !handle.is_tt_only();
+                let plain_len = if is_bitemporal { kpos - 1 } else { kpos };
+
+                let mut headers: Vec<String> = handle.metadata.keys[..plain_len]
+                    .iter()
+                    .map(|c| c.name.to_string())
+                    .collect();
+                if is_bitemporal {
+                    headers.push("vt_ts".to_string());
+                }
+                headers.push("op".to_string());
+                headers.push("tt".to_string());
+                headers.extend(handle.metadata.non_keys.iter().map(|c| c.name.to_string()));
+                {
+                    // consumers key rows by header name — a user column named
+                    // `op`/`tt`/`vt_ts` would silently shadow one
+                    let mut seen = std::collections::BTreeSet::new();
+                    for h in &headers {
+                        if !seen.insert(h.as_str()) {
+                            bail!(
+                                "::history synthesizes an output column named {}, which \
+                                 collides with a column of {}; rename the column",
+                                h,
+                                rel
+                            );
+                        }
+                    }
+                }
+
+                // spec §7: output is key-ascending
+                let mut keys = keys.clone();
+                keys.sort();
+                keys.dedup();
+
+                let mut rows: Vec<Vec<DataValue>> = Vec::new();
+                for key in &keys {
+                    if key.len() != plain_len {
+                        bail!(
+                            "::history key arity mismatch for {}: expected {} plain key column(s), got {}",
+                            rel,
+                            plain_len,
+                            key.len()
+                        );
+                    }
+                    let key = key
+                        .iter()
+                        .zip(handle.metadata.keys.iter())
+                        .map(|(v, c)| {
+                            c.typing
+                                .coerce(v.clone(), crate::data::functions::MAX_VALIDITY_TS)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    for found in handle.scan_prefix(tx, &key) {
+                        let t = found?;
+                        let mut row: Vec<DataValue> = t[..plain_len].to_vec();
+                        let (op, tt_us) = if is_bitemporal {
+                            let (vt_ts, vt_flag) = match &t[kpos - 1] {
+                                DataValue::Validity(v) => (v.timestamp.0 .0, v.is_assert.0),
+                                _ => bail!("corrupt vt component in {}", rel),
+                            };
+                            row.push(DataValue::from(vt_ts));
+                            let tt_us = match &t[kpos] {
+                                DataValue::Validity(v) => v.timestamp.0 .0,
+                                _ => bail!("corrupt tt component in {}", rel),
+                            };
+                            (if vt_flag { "assert" } else { "retract" }, tt_us)
+                        } else {
+                            match &t[kpos] {
+                                DataValue::Validity(v) => (
+                                    if v.is_assert.0 { "assert" } else { "retract" },
+                                    v.timestamp.0 .0,
+                                ),
+                                _ => bail!("corrupt tt component in {}", rel),
+                            }
+                        };
+                        row.push(DataValue::from(op));
+                        row.push(DataValue::from(tt_us));
+                        row.extend_from_slice(&t[kpos + 1..]);
+                        rows.push(row);
+                    }
+                }
+                let offset = offset.unwrap_or(0);
+                let rows: Vec<_> = rows
+                    .into_iter()
+                    .skip(offset)
+                    .take(limit.unwrap_or(usize::MAX))
+                    .collect();
+                Ok(NamedRows::new(headers, rows))
+            }
+            SysOp::TtHistoryGc(rel, cutoff) => {
+                if read_only {
+                    bail!("Cannot run ::history_gc in read-only mode");
+                }
+                let locks = if skip_locking {
+                    vec![]
+                } else {
+                    self.obtain_relation_locks([&rel.name].into_iter())
+                };
+                let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
+
+                let mut handle = tx.get_relation(rel, true)?;
+                if !handle.has_txtime() {
+                    bail!("::history_gc requires a TxTime relation, {} is not", rel);
+                }
+                if handle.access_level < AccessLevel::Normal {
+                    bail!(InsufficientAccessLevel(
+                        handle.name.to_string(),
+                        "history garbage collection".to_string(),
+                        handle.access_level
+                    ))
+                }
+                if tx
+                    .pending_tt_writes
+                    .iter()
+                    .any(|w| w.handle.name == handle.name)
+                {
+                    bail!(
+                        "relation {} has pending transaction-time writes in this transaction; \
+                         commit them in their own transaction before running ::history_gc",
+                        rel
+                    );
+                }
+                let kpos = handle.metadata.keys.len() - 1;
+                let is_bitemporal = !handle.is_tt_only();
+                let cutoff = *cutoff;
+                // A future cutoff can only be a typo — it would floor tts
+                // that haven't been allocated yet.
+                let present = wall_clock_micros().max(tx.tt_clock.peek());
+                if cutoff > present {
+                    bail!(
+                        "::history_gc cutoff {} is in the future (present high-water mark: {})",
+                        cutoff,
+                        present
+                    );
+                }
+
+                // Group per (plain key [, vt-ts]); within each group KEEP the
+                // record the resolution would pick at tt = cutoff (greatest
+                // tt <= cutoff, assert-wins on ties) plus everything at or
+                // above the cutoff; delete the rest. NOTE v1 runs in one
+                // transaction — chunked online gc is deferred until real
+                // stores need it (recorded deviation).
+                let mut group: Vec<(Vec<u8>, i64, bool)> = Vec::new(); // (key bytes, tt, is_assert-ish)
+                let mut group_id: Option<Vec<DataValue>> = None;
+                let mut to_delete: Vec<Vec<u8>> = Vec::new();
+                let mut deleted = 0usize;
+                let flush = |group: &mut Vec<(Vec<u8>, i64, bool)>,
+                             to_delete: &mut Vec<Vec<u8>>| {
+                    // keeper = greatest tt <= cutoff; tie -> assert
+                    let keeper = group
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, (_, tt, _))| *tt <= cutoff)
+                        .max_by(|(_, (_, ta, aa)), (_, (_, tb, ab))| {
+                            ta.cmp(tb).then_with(|| aa.cmp(ab))
+                        })
+                        .map(|(i, _)| i);
+                    for (i, (kb, tt, _)) in group.iter().enumerate() {
+                        if *tt < cutoff && Some(i) != keeper {
+                            to_delete.push(kb.clone());
+                        }
+                    }
+                    group.clear();
+                };
+                {
+                    let it = handle.scan_all(tx);
+                    for t in it {
+                        let t = t?;
+                        let id: Vec<DataValue> = if is_bitemporal {
+                            let mut id = t[..kpos - 1].to_vec();
+                            match &t[kpos - 1] {
+                                DataValue::Validity(v) => {
+                                    id.push(DataValue::from(v.timestamp.0 .0))
+                                }
+                                // a silent omission here would merge adjacent
+                                // vt-groups and over-delete
+                                _ => bail!("corrupt vt component in {}", rel),
+                            }
+                            id
+                        } else {
+                            t[..kpos].to_vec()
+                        };
+                        let (tt_us, flag) = match &t[kpos] {
+                            DataValue::Validity(v) => (v.timestamp.0 .0, v.is_assert.0),
+                            _ => bail!("corrupt tt component in {}", rel),
+                        };
+                        // On bitemporal relations the op rides the VT flag
+                        // (the tt flag byte is reserved-0); the tie-break
+                        // below must compare the real assert/retract bit.
+                        let flag = if is_bitemporal {
+                            match &t[kpos - 1] {
+                                DataValue::Validity(v) => v.is_assert.0,
+                                _ => unreachable!("vt component checked above"),
+                            }
+                        } else {
+                            flag
+                        };
+                        let key_bytes = t[..=kpos].to_vec().encode_as_key(handle.id);
+                        if group_id.as_ref() != Some(&id) {
+                            flush(&mut group, &mut to_delete);
+                            group_id = Some(id);
+                        }
+                        group.push((key_bytes, tt_us, flag));
+                    }
+                    flush(&mut group, &mut to_delete);
+                }
+                for kb in to_delete {
+                    tx.store_tx.del(&kb)?;
+                    deleted += 1;
+                }
+                // Persist the gc floor on the relation metadata — but only
+                // when something was deleted: after a no-op run every read
+                // below the cutoff is still exact, and the floor is
+                // irreversible.
+                if deleted > 0 {
+                    handle.tt_gc_floor = Some(handle.tt_gc_floor.unwrap_or(i64::MIN).max(cutoff));
+                    let name_key =
+                        vec![DataValue::Str(handle.name.clone())].encode_as_key(RelationId::SYSTEM);
+                    let mut meta_val = vec![];
+                    serde::Serialize::serialize(
+                        &handle,
+                        &mut rmp_serde::Serializer::new(&mut meta_val).with_struct_map(),
+                    )
+                    .unwrap();
+                    tx.store_tx.put(&name_key, &meta_val)?;
+                }
+
+                Ok(NamedRows::new(
+                    vec!["deleted".to_string(), "gc_floor".to_string()],
+                    vec![vec![
+                        DataValue::from(deleted as i64),
+                        // the EFFECTIVE floor, which an older-cutoff re-run
+                        // does not lower
+                        match handle.tt_gc_floor {
+                            Some(f) => DataValue::from(f),
+                            None => DataValue::Null,
+                        },
+                    ]],
+                ))
+            }
+            SysOp::TtEvict(rel, keys, unredacted) => {
+                if read_only {
+                    bail!("Cannot run ::evict in read-only mode");
+                }
+                let audit_name = SmartString::from("mnestic_evict_audit");
+                let locks = if skip_locking {
+                    vec![]
+                } else {
+                    self.obtain_relation_locks([&rel.name, &audit_name].into_iter())
+                };
+                let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
+
+                let handle = tx.get_relation(rel, true)?;
+                if !handle.has_txtime() {
+                    bail!("::evict requires a TxTime relation, {} is not", rel);
+                }
+                if handle.access_level < AccessLevel::Normal {
+                    bail!(InsufficientAccessLevel(
+                        handle.name.to_string(),
+                        "eviction".to_string(),
+                        handle.access_level
+                    ))
+                }
+                if tx
+                    .pending_tt_writes
+                    .iter()
+                    .any(|w| w.handle.name == handle.name)
+                {
+                    bail!(
+                        "relation {} has pending transaction-time writes in this transaction; \
+                         they would be stamped after the eviction and resurrect the evicted \
+                         keys — commit them in their own transaction first",
+                        rel
+                    );
+                }
+                let kpos = handle.metadata.keys.len() - 1;
+                let is_bitemporal = !handle.is_tt_only();
+                let plain_len = if is_bitemporal { kpos - 1 } else { kpos };
+
+                // salt for the audit key-hash, generated once per store
+                // (locking read: two racing first-evicts must not each mint
+                // a salt, or the loser's audit markers become unlinkable)
+                let salt_key = {
+                    let t = vec![DataValue::Null, DataValue::from("EVICT_SALT")];
+                    t.encode_as_key(RelationId::SYSTEM)
+                };
+                let salt = match tx.store_tx.get(&salt_key, true)? {
+                    Some(s) => s,
+                    None => {
+                        let mut buf = [0u8; 16];
+                        rand::Rng::fill(&mut rand::thread_rng(), &mut buf);
+                        tx.store_tx.put(&salt_key, &buf)?;
+                        buf.to_vec()
+                    }
+                };
+                let ns = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &salt);
+
+                let audit = self.tt_evict_audit_relation(tx)?;
+                let evict_tt = tx.tt_clock.advance();
+                // route this tx's commit through the tt path so the burned
+                // audit tt is covered by the persisted HWM (crash + clock
+                // regression must not re-allocate it)
+                tx.tt_hwm_dirty = true;
+
+                let headers = vec![
+                    "relation".to_string(),
+                    "key".to_string(),
+                    "rows_deleted".to_string(),
+                    "tt".to_string(),
+                ];
+                let mut out_rows = Vec::new();
+                let mut seen_keys = std::collections::BTreeSet::new();
+                for key in keys {
+                    if key.len() != plain_len {
+                        bail!(
+                            "::evict key arity mismatch for {}: expected {} plain key column(s), got {}",
+                            rel,
+                            plain_len,
+                            key.len()
+                        );
+                    }
+                    // coerce through the column types: a mistyped key must
+                    // error loudly, not silently evict nothing
+                    let key = key
+                        .iter()
+                        .zip(handle.metadata.keys.iter())
+                        .map(|(v, c)| {
+                            c.typing
+                                .coerce(v.clone(), crate::data::functions::MAX_VALIDITY_TS)
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    if !seen_keys.insert(key.clone()) {
+                        // a repeated key would overwrite its own audit row
+                        // (same tt) with rows_deleted = 0
+                        continue;
+                    }
+                    let mut kill: Vec<Vec<u8>> = Vec::new();
+                    for found in handle.scan_prefix(tx, &key) {
+                        let t = found?;
+                        kill.push(t[..=kpos].to_vec().encode_as_key(handle.id));
+                    }
+                    let n = kill.len();
+                    for kb in kill {
+                        tx.store_tx.del(&kb)?;
+                    }
+                    // the audit marker: a salted hash by default — storing
+                    // the key itself would re-enshrine the PII the eviction
+                    // removes; `unredacted` opts out.
+                    let key_repr = if *unredacted {
+                        format!("{key:?}")
+                    } else {
+                        let enc = key.to_vec().encode_as_key(handle.id);
+                        uuid::Uuid::new_v5(&ns, &enc).to_string()
+                    };
+                    let audit_row = vec![
+                        DataValue::from(handle.name.to_string().as_str()),
+                        DataValue::from(key_repr.as_str()),
+                        DataValue::from(evict_tt),
+                        DataValue::from(n as i64),
+                    ];
+                    let ak = audit.encode_key_for_store(&audit_row, Default::default())?;
+                    let av = audit.encode_val_for_store(&audit_row, Default::default())?;
+                    tx.store_tx.put(&ak, &av)?;
+
+                    out_rows.push(vec![
+                        DataValue::from(handle.name.to_string().as_str()),
+                        DataValue::from(key_repr.as_str()),
+                        DataValue::from(n as i64),
+                        DataValue::from(evict_tt),
+                    ]);
+                }
+                Ok(NamedRows::new(headers, out_rows))
             }
             SysOp::RemoveRelation(rel_names) => {
                 if read_only {

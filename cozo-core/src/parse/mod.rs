@@ -201,6 +201,19 @@ impl ImperativeStmt {
                 SysOp::RemoveIndex(rel, idx) => {
                     collector.insert(SmartString::from(format!("{}:{}", rel.name, idx.name)));
                 }
+                // mnestic fork, bitemporality step 5: these delete rows, so
+                // an imperative program containing only them must still get
+                // a WRITE transaction and the per-relation locks — without
+                // these arms `{::evict …}` runs on a read tx (an error on
+                // RocksDB, an unlocked mutation elsewhere).
+                SysOp::TtHistoryGc(rel, ..) => {
+                    collector.insert(rel.name.clone());
+                }
+                SysOp::TtEvict(rel, ..) => {
+                    collector.insert(rel.name.clone());
+                    // evict also writes the reserved audit relation
+                    collector.insert(SmartString::from("mnestic_evict_audit"));
+                }
                 _ => {}
             },
         }

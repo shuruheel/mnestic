@@ -5,6 +5,53 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — bitemporal system operations (bitemporality step 5)
+- **`::history rel [[k]…] [limit] [offset]`** — the introspection surface: every
+  (vt, tt) record of the given keys, raw. Columns `keys…, vt_ts, op, tt,
+  values…` (`op` ∈ assert/retract; `vt_ts` absent on tt-only relations; both
+  timestamps as integer µs); ordering key-asc, vt-desc, tt-desc. Errors on
+  non-TxTime relations.
+- **`::history_gc rel <cutoff-tt>`** — drops superseded records below the
+  cutoff while preserving, per (key, vt-group), exactly the record the
+  resolution would pick at tt = cutoff — so as-of reads at or above the
+  cutoff are unchanged. Persists a per-relation **gc floor**: an as-of read
+  below it errors instead of silently returning a post-hoc reconstruction as
+  if it were the historical belief. Read-only-guarded. *(v1 runs in one
+  transaction; chunked online gc is deferred until real store sizes pull it.)*
+- **`::evict rel [[k]…] [unredacted]`** — hard-deletes every record of the
+  given keys (the one deliberate break of append-only, for GDPR), writing an
+  audit row (relation, key marker, eviction tt, rows deleted) to the reserved
+  `mnestic_evict_audit` relation **in the same transaction**. The key marker
+  is a **salted hash** by default — storing the key itself would re-enshrine
+  the PII the eviction removes; `unredacted` opts out. Read-only-guarded.
+- Recorded deviation: **B-tree index legalization on TxTime relations is
+  deferred** (spec §10 step 5 listed it) — statement-time index maintenance is
+  structurally incompatible with buffered commit-time stamping, and there are
+  zero consumers; the rejection message now says so without a step number.
+- Adversarial-review hardening (all empirically confirmed before fixing):
+  `::evict`/`::history_gc` bail when the same transaction holds pending tt
+  writes for the target relation (they'd be stamped after the deletes and
+  resurrect the evicted keys); imperative-only `{::evict}`/`{::history_gc}`
+  programs now get a write transaction + per-relation locks (previously an
+  error on RocksDB, an unlocked mutation elsewhere); all three ops enforce
+  access levels (history ≥ read_only, gc/evict ≥ normal); the
+  `mnestic_evict_audit` name is enforced as reserved (a pre-existing relation
+  with a divergent schema, indices, or triggers is rejected — raw audit puts
+  would corrupt/diverge it); duplicate keys in one `::evict` no longer
+  overwrite the audit row with `rows_deleted = 0`; `::history`/`::evict` keys
+  coerce through the column types (a mistyped key errors instead of silently
+  matching nothing); `::history_gc` reports the *effective* floor, refuses
+  future cutoffs, and no longer raises the floor on a no-op run (nothing
+  deleted ⇒ every read below the cutoff is still exact — and the floor is
+  irreversible); its keeper tie-break now reads the vt flag on bitemporal
+  relations (the tt flag byte is reserved-0 there) and bails on a corrupt vt
+  column instead of silently merging adjacent groups; `::history` output is
+  key-ascending, rejects header collisions with user columns named
+  `op`/`tt`/`vt_ts`, and its limit/offset are strict `pos_int` tokens (`2 -1`
+  no longer silently parses as the single limit `2 - 1`); the burned audit tt
+  is covered by the persisted clock HWM (evict transactions commit through
+  the tt path).
+
 ### New — existence-checking writes on TxTime relations (bitemporality step 4c)
 - The §6 write ops owed by step 3 are live, all evaluated against the
   **resolved current belief** ((vt=NOW, tt=current) on bitemporal relations):
