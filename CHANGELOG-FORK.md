@@ -5,6 +5,28 @@ provenance and licensing.
 
 ## Unreleased
 
+### Resolved — annotation persistence needs no storage-format change (provenance semirings R2)
+- The spec anticipated persisting semiring tags via a row-format change. The
+  tags-as-columns architecture (R0/R1) made that unnecessary: annotation
+  values are ordinary `DataValue`s, so **`:put` of an annotated query output
+  already persists them** in the existing memcomparable row format — the R2
+  acceptance criterion ("an annotated derivation is materialized and
+  queryable without recompute") holds by construction. Pinned by
+  `semiring_tags_persist_in_rows` across a real reopen:
+  - meet-annotated derivations (`min_cost` packs) round-trip;
+  - bounded-meet outputs materialize as k rows per group (pack in the key);
+  - **composition with the tt axis**: materializing an annotated derivation
+    into a `TxTime` relation yields *annotated belief history* — `::history`
+    shows each materialization with its engine-stamped tt, and an as-of read
+    returns the annotation as believed at that time ("what did we believe,
+    and why, as of T" — the persistence half of the R3 story);
+  - custom-aggregate outputs stay readable after reopen with NO
+    re-registration; re-computing without the registration errors loudly.
+- Recorded decisions: a hidden per-row tag slot (Scallop-style) is overbuild
+  — no consumer, contradicts tags-as-columns; custom aggregates in trigger
+  scripts stay rejected **permanently** (factories are process-scoped Rust
+  closures and cannot persist — the doc comment no longer promises R2).
+
 ### New — bounded-meet aggregates: `min_cost_k` top-k proofs (provenance semirings R1)
 - **A third aggregate category, `AggrKind::BoundedMeet`** — the genuinely-new
   engine work of the semirings feature (spec §6/§9.4): a recursive aggregate

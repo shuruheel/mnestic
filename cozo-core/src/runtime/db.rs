@@ -108,9 +108,12 @@ pub struct Db<S> {
     /// User-registered aggregates (mnestic fork, provenance semirings R0b) —
     /// mirrors `fixed_rules`. In-memory, `Db`-scoped; consulted by the parser
     /// when a head aggregate is not a builtin. NOT consulted when parsing
-    /// trigger scripts (custom aggregates in triggers are unsupported until
-    /// R2 — a trigger is persisted CozoScript re-parsed on every write, and a
-    /// fresh `Db` open would not have the registration).
+    /// trigger scripts (custom aggregates in triggers are unsupported: a
+    /// trigger is persisted CozoScript re-parsed on every write, while a
+    /// factory is a process-scoped Rust closure that cannot persist — a
+    /// fresh `Db` open would break every write to the relation. Permanent
+    /// policy, recorded in R2: materialized OUTPUTS of custom aggregates
+    /// persist fine; the operators themselves are registration-scoped).
     custom_aggrs: Arc<ShardedLock<BTreeMap<String, crate::data::aggr::RegisteredAggr>>>,
     pub(crate) queries_count: Arc<AtomicU64>,
     pub(crate) running_queries: Arc<Mutex<BTreeMap<u64, RunningQueryHandle>>>,

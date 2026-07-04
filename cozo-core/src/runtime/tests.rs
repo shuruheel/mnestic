@@ -3534,3 +3534,136 @@ fn bounded_meet_does_not_cap_costratified_recursion() {
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([[4300 * 2]]), "{res:?}");
 }
+
+// ==== mnestic fork: provenance semirings R2 — annotations persist in rows ====
+
+/// R2's acceptance criterion — "an annotated derivation is materialized and
+/// queryable without recompute" — is met by the tags-as-columns architecture
+/// with NO row-format change: annotation values are ordinary DataValues, so
+/// `:put` of an annotated query output persists them in the existing
+/// memcomparable row format. This test pins the four contracts (including
+/// the composition with the bitemporal tt axis) across a real reopen.
+#[test]
+fn semiring_tags_persist_in_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("r2.db");
+    let p = path.to_str().unwrap();
+    {
+        let db = DbInstance::new("sqlite", p, "").unwrap();
+        // (a) meet-annotated derivation → stored relation
+        db.run_default(":create sp_out {dst: Int => pack}").unwrap();
+        let sp_script = |put: &str| {
+            format!(
+                r#"
+            edge[f, t, w] <- [[1, 2, 1.0], [2, 3, 1.0], [1, 3, 3.0]]
+            sp[t, min_cost(pack)] := t = 1, pack = [[1], 0.0]
+            sp[t, min_cost(pack)] := sp[m, p], edge[m, t, w],
+                                     pack = [concat(first(p), [t]), last(p) + w]
+            ?[dst, pack] := sp[dst, pack]
+            {put}
+            "#
+            )
+        };
+        db.run_default(&sp_script(":put sp_out {dst => pack}"))
+            .unwrap();
+        // (b) bounded-meet k rows per group → stored relation (pack in key)
+        db.run_default(":create topk_out {dst: Int, pack => }")
+            .unwrap();
+        db.run_default(
+            r#"
+            edge[f, t, w] <- [[1, 2, 1.0], [2, 3, 1.0], [1, 3, 3.0]]
+            sp[t, min_cost_k(pack, 2)] := t = 1, pack = [[1], 0.0]
+            sp[t, min_cost_k(pack, 2)] := sp[m, p], edge[m, t, w],
+                                          pack = [concat(first(p), [t]), last(p) + w]
+            ?[dst, pack] := sp[dst, pack]
+            :put topk_out {dst, pack}
+            "#,
+        )
+        .unwrap();
+        // (c) annotated + tt: materialized beliefs carry engine-stamped
+        // transaction time — annotated belief HISTORY
+        db.run_default(":create belief {dst: Int, tt: TxTime => pack}")
+            .unwrap();
+        db.run_default(&sp_script(":put belief {dst => pack}"))
+            .unwrap();
+        // a later, cheaper route to 3 changes the belief
+        db.run_default(
+            r#"
+            edge[f, t, w] <- [[1, 2, 1.0], [2, 3, 1.0], [1, 3, 0.5]]
+            sp[t, min_cost(pack)] := t = 1, pack = [[1], 0.0]
+            sp[t, min_cost(pack)] := sp[m, p], edge[m, t, w],
+                                     pack = [concat(first(p), [t]), last(p) + w]
+            ?[dst, pack] := sp[dst, pack]
+            :put belief {dst => pack}
+            "#,
+        )
+        .unwrap();
+        // (d) custom-aggregate annotations materialize; the operator itself
+        // is registration-scoped
+        db.register_custom_aggr("fuse2".to_string(), true, || Box::new(TestMaxi))
+            .unwrap();
+        db.run_default(":create fused {k: Int => v}").unwrap();
+        db.run_default(
+            r#"
+            data[k, v] <- [[1, 0.9], [1, 0.5]]
+            agg[k, fuse2(v)] := data[k, v]
+            ?[k, v] := agg[k, v]
+            :put fused {k => v}
+            "#,
+        )
+        .unwrap();
+    }
+    // reopen: no re-registration, everything readable without recompute
+    let db = DbInstance::new("sqlite", p, "").unwrap();
+    let res = db
+        .run_default("?[dst, pack] := *sp_out[dst, pack]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[1, [[1], 0.0]], [2, [[1, 2], 1.0]], [3, [[1, 2, 3], 2.0]]]),
+        "{res:?}"
+    );
+    let res = db
+        .run_default("?[dst, pack] := *topk_out[dst, pack]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 4, "{res:?}");
+    // current belief = the cheaper corrected route
+    let res = db
+        .run_default("?[pack] := *belief[3, t, pack]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[[[1, 3], 0.5]]]), "{res:?}");
+    // annotated belief HISTORY: both materializations recorded with their tts
+    let res = db
+        .run_default("::history belief [[3]]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    // as-of the FIRST materialization's tt, the old belief answers
+    let first_tt = rows[1][2].as_i64().unwrap();
+    let res = db
+        .run_default(&format!(
+            "?[pack] := *belief[3, t, pack @ (tt: {first_tt})]"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[[[1, 2, 3], 2.0]]]),
+        "{res:?}"
+    );
+    // (d) materialized custom-aggregate output readable with NO registry…
+    let res = db
+        .run_default("?[k, v] := *fused[k, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 0.9]]), "{res:?}");
+    // …while re-computing loudly requires the registration
+    let err = db
+        .run_default("data[k, v] <- [[1, 0.9]] ?[k, fuse2(v)] := data[k, v]")
+        .expect_err("unregistered aggregate must not resolve");
+    assert!(format!("{err:?}").contains("not found"), "{err:?}");
+}
