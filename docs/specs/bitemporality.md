@@ -73,7 +73,7 @@ Repudiation **cannot** be expressed as `(vt=March, retract)` — that means cess
 
 ## 4. Schema & syntax
 
-_This section was revised 2026-07-02 (external contributor review; §13.1/13.2 revised, 13.6–13.9 added)._
+_This section was revised 2026-07-02 (external contributor review; §13.1/13.2 revised, 13.6–13.9 added). Erratum fixed 2026-07-04: the selector examples below originally printed the `@` clause after the closing brace; the shipped grammar attaches it **inside** the closing brace (`*rel{cols @ (tt: T)}`, `cozoscript.pest:95`) — an attachment inherited unchanged from upstream; this spec's grammar change touched only the clause interior (§13.2). Pinned by `cozo-core/tests/spec_doc_validation.rs`._
 
 ### Terminology: axes vs column types
 
@@ -128,11 +128,11 @@ Instead, the **interior** of the existing validity clause is extended with an or
 
 ```
 *rel{…}                      # no clause: vt bare-scan behavior unchanged; tt defaults to current belief
-*rel{…} @ "2026-01-01"       # vt as-of — exactly today's syntax, unchanged
-*rel{…} @ (vt: "2026-01-01")                      # explicit spelling of the same
-*rel{…} @ (tt: "2026-03-01")                      # the relation as it stood on Mar 1 (vt untouched)
-*rel{…} @ (vt: "2026-01-01", tt: "2026-03-01")    # what we believed on Mar 1 was true on Jan 1
-*rel{…} @ (tt: "2026-03-01", vt: "2026-01-01")    # same — labels are order-free
+*rel{… @ "2026-01-01"}       # vt as-of — exactly today's syntax, unchanged
+*rel{… @ (vt: "2026-01-01")}                      # explicit spelling of the same
+*rel{… @ (tt: "2026-03-01")}                      # the relation as it stood on Mar 1 (vt untouched)
+*rel{… @ (vt: "2026-01-01", tt: "2026-03-01")}    # what we believed on Mar 1 was true on Jan 1
+*rel{… @ (tt: "2026-03-01", vt: "2026-01-01")}    # same — labels are order-free
 ```
 
 **Semantics: the axes are independent — each has its own default whether or not the other is specified.** vt keeps its shipped semantics (no selector = the bare scan over all vt records, retracts-as-rows included; a selector = as-of resolution). tt defaults to **current belief**; only an explicit `tt:` selector (or `:as_of`) reaches historical beliefs. This yields the **migration invariant**: adding a `tt: TxTime` column to an existing relation changes no existing query's results (up to corrections actually recorded) — a plain relation's bare scan still returns current rows after becoming tt-only; a vt relation's bare scan still returns its (vt, flag) records, now resolved to current belief per (key, vt); nobody has to add selectors to existing code. Without this default, every count/join would silently multiply by version-count the moment a relation opts in.
