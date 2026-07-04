@@ -299,15 +299,33 @@ impl RelationHandle {
     pub(crate) fn ensure_compatible(
         &self,
         inp: &InputRelationHandle,
-        is_remove_or_update: bool,
+        op: crate::data::program::RelationOp,
     ) -> Result<()> {
+        use crate::data::program::RelationOp;
+        let is_remove_or_update =
+            matches!(op, RelationOp::Rm | RelationOp::Delete | RelationOp::Update);
         let InputRelationHandle { metadata, .. } = inp;
         // check that every given key is found and compatible
         for col in metadata.keys.iter().chain(self.metadata.non_keys.iter()) {
             self.metadata.compatible_with_col(col)?
         }
         // check that every key is provided or has default
-        for col in &self.metadata.keys {
+        let n = self.metadata.keys.len();
+        for (i, col) in self.metadata.keys.iter().enumerate() {
+            // mnestic fork, bitemporality 4c: on a bitemporal relation the
+            // ops that target the CURRENT belief (:update, :ensure,
+            // :ensure_not) must not bind the vt column — the engine resolves
+            // it — so it is not required of their input.
+            if self.has_txtime()
+                && !self.is_tt_only()
+                && i == n - 2
+                && matches!(
+                    op,
+                    RelationOp::Update | RelationOp::Ensure | RelationOp::EnsureNot
+                )
+            {
+                continue;
+            }
             metadata.satisfied_by_required_col(col)?;
         }
         if !is_remove_or_update {

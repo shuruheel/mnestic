@@ -92,7 +92,11 @@ fn parse_imperative_stmt(
                         let rel = SmartString::from(p.as_str());
                         rets.push(Right(rel));
                     }
-                    Rule::query_script_inner => {
+                    Rule::query_script_inner | Rule::imperative_clause => {
+                        // mnestic fork fix: the grammar delivers
+                        // `imperative_clause` for a braced `%return {…}` —
+                        // matching only `query_script_inner` panicked
+                        // (upstream bug; mirrors the if_chain arm).
                         let mut src = p.into_inner();
                         let prog = parse_query(
                             src.next().unwrap().into_inner(),

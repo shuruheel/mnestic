@@ -135,25 +135,6 @@ impl<'a> SessionTx<'a> {
             relation_store.put_triggers = old_put;
             relation_store.rm_triggers = old_retract;
         }
-        // tt-stamped relations (mnestic fork, bitemporality step 3): ops that
-        // must read current state (existence checks, read-modify-write) need
-        // the as-of read path, which lands in step 4. Only :put/:rm (and
-        // :create with rows, which routes through put) are supported now.
-        if relation_store.has_txtime()
-            && matches!(
-                op,
-                RelationOp::Update | RelationOp::Ensure | RelationOp::EnsureNot
-            )
-        {
-            #[derive(Debug, Error, Diagnostic)]
-            #[error("{0:?} is not yet supported on TxTime relation {1}: existence-checking writes land as bitemporality step 4c")]
-            #[diagnostic(
-                code(eval::txtime_op_needs_reads),
-                help("use :put (corrections are new rows) or :rm")
-            )]
-            struct TxTimeOpNeedsReads(RelationOp, String);
-            bail!(TxTimeOpNeedsReads(op, relation_store.name.to_string()));
-        }
         let InputRelationHandle {
             metadata,
             key_bindings,
@@ -592,6 +573,19 @@ impl<'a> SessionTx<'a> {
             ));
         }
 
+        if relation_store.has_txtime() {
+            return self.buffer_tt_update(
+                res_iter,
+                headers,
+                cur_vld,
+                relation_store,
+                metadata,
+                key_bindings,
+                is_callback_target,
+                span,
+            );
+        }
+
         let key_extractors = make_extractors(
             &relation_store.metadata.keys,
             &metadata.keys,
@@ -862,6 +856,19 @@ impl<'a> SessionTx<'a> {
             ));
         }
 
+        if relation_store.has_txtime() {
+            return self.tt_ensure(
+                res_iter,
+                headers,
+                cur_vld,
+                relation_store,
+                metadata,
+                key_bindings,
+                false,
+                span,
+            );
+        }
+
         let key_extractors = make_extractors(
             &relation_store.metadata.keys,
             &metadata.keys,
@@ -907,6 +914,19 @@ impl<'a> SessionTx<'a> {
                 "row check".to_string(),
                 relation_store.access_level
             ));
+        }
+
+        if relation_store.has_txtime() {
+            return self.tt_ensure(
+                res_iter,
+                headers,
+                cur_vld,
+                relation_store,
+                metadata,
+                key_bindings,
+                true,
+                span,
+            );
         }
 
         let mut key_extractors = make_extractors(
@@ -958,6 +978,33 @@ impl<'a> SessionTx<'a> {
             }
         }
         Ok(())
+    }
+
+    /// Resolved current-belief row of a tt-stamped relation for one fully
+    /// bound plain-key prefix (mnestic fork, bitemporality 4c): (vt = NOW,
+    /// tt = current belief) on bitemporal relations; (tt = current belief)
+    /// on tt-only ones.
+    fn tt_current_row(
+        &self,
+        handle: &RelationHandle,
+        plain: &Tuple,
+        cur_vld: ValidityTs,
+    ) -> Result<Option<Tuple>> {
+        use crate::data::functions::MAX_VALIDITY_TS;
+        if handle.is_tt_only() {
+            let mut it = handle.skip_scan_prefix(self, plain, MAX_VALIDITY_TS);
+            it.next().transpose()
+        } else {
+            let mut it = handle.bitemporal_scan_prefix(self, plain, Some(cur_vld), MAX_VALIDITY_TS);
+            it.next().transpose()
+        }
+    }
+
+    /// Does this transaction already hold a buffered write touching the key?
+    fn tt_pending_conflict(&self, handle: &RelationHandle, plain: &[DataValue]) -> bool {
+        self.pending_tt_writes
+            .iter()
+            .any(|w| w.handle.id == handle.id && w.rows.iter().any(|r| &r[..plain.len()] == plain))
     }
 
     /// Reject writes that name the engine-assigned TxTime column, and writes
@@ -1020,13 +1067,6 @@ impl<'a> SessionTx<'a> {
         is_callback_target: bool,
         span: SourceSpan,
     ) -> Result<()> {
-        if is_insert {
-            #[derive(Debug, Error, Diagnostic)]
-            #[error(":insert on TxTime relation {0} lands as bitemporality step 4c")]
-            #[diagnostic(code(eval::txtime_op_needs_reads), help("use :put"))]
-            struct TxTimeInsert(String);
-            bail!(TxTimeInsert(relation_store.name.to_string()));
-        }
         // On :create the input metadata IS the declared schema (tt included,
         // legitimately); the supplied-column check applies to put specs only —
         // but the query HEADERS must still not smuggle a tt value in.
@@ -1081,7 +1121,15 @@ impl<'a> SessionTx<'a> {
         // must NOT silently drop it.
         let headers_have_tt = is_create && headers.iter().any(|h| &h.name == tt_name);
 
+        let is_bitemporal = kpos >= 1
+            && matches!(
+                relation_store.metadata.keys[kpos - 1].typing.coltype,
+                crate::data::relation::ColType::Validity
+            );
+        let plain_len = if is_bitemporal { kpos - 1 } else { kpos };
+
         let mut rows = Vec::new();
+        let mut seen_in_stmt: std::collections::BTreeSet<Vec<u8>> = Default::default();
         for tuple in res_iter {
             if headers_have_tt {
                 #[derive(Debug, Error, Diagnostic)]
@@ -1097,6 +1145,49 @@ impl<'a> SessionTx<'a> {
                 .iter()
                 .map(|ex| ex.extract_data(&tuple, cur_vld))
                 .try_collect()?;
+            if is_insert {
+                // :insert (mnestic fork, 4c): duplicates within one
+                // statement would silently last-write-win — reject them.
+                let plain: Tuple = extracted[..plain_len].to_vec();
+                if !seen_in_stmt.insert(relation_store.encode_partial_key_for_store(&plain)) {
+                    bail!(TransactAssertionFailure {
+                        relation: relation_store.name.to_string(),
+                        key: plain,
+                        notice: "duplicate key in one :insert statement".to_string()
+                    });
+                }
+                if self.tt_pending_conflict(relation_store, &plain) {
+                    bail!(TransactAssertionFailure {
+                        relation: relation_store.name.to_string(),
+                        key: plain,
+                        notice: "key was already written (or removed) in this transaction"
+                            .to_string()
+                    });
+                }
+                // tt-only: no CURRENT belief may exist (re-inserting a
+                // believed-deleted key stays legal). Bitemporal: no records
+                // at ANY valid time — a (vt=NOW)-only gate would let :insert
+                // silently rewrite past/future vt-groups (review-probed).
+                let exists = if is_bitemporal {
+                    let mut it = relation_store.scan_prefix(self, &plain);
+                    it.next().transpose()?.is_some()
+                } else {
+                    self.tt_current_row(relation_store, &plain, cur_vld)?
+                        .is_some()
+                };
+                if exists {
+                    bail!(TransactAssertionFailure {
+                        relation: relation_store.name.to_string(),
+                        key: plain,
+                        notice: if is_bitemporal {
+                            "key has recorded beliefs (use :put for versions/corrections)"
+                                .to_string()
+                        } else {
+                            "key exists in database (current belief)".to_string()
+                        }
+                    });
+                }
+            }
             rows.push(extracted);
         }
         if !rows.is_empty() {
@@ -1135,17 +1226,24 @@ impl<'a> SessionTx<'a> {
                 relation_store.metadata.keys[kpos - 1].typing.coltype,
                 crate::data::relation::ColType::Validity
             );
-        if is_bitemporal {
-            #[derive(Debug, Error, Diagnostic)]
-            #[error(":rm on bitemporal relation {0}: removal is a valid-time statement there")]
-            #[diagnostic(
-                code(eval::txtime_rm_bitemporal),
-                help("record a cessation with `:put` and vt = \"RETRACT\" (a retraction row); the :rm remap lands as bitemporality step 4c")
-            )]
-            struct TxTimeRmBitemporal(String);
-            bail!(TxTimeRmBitemporal(relation_store.name.to_string()));
-        }
         Self::check_tt_write_shape(relation_store, metadata, is_callback_target, ":rm")?;
+        if is_bitemporal {
+            // :rm {k, vt} on a bitemporal relation (mnestic fork, 4c; spec
+            // §6): a cessation — equivalent to `:put` with vt RETRACT at the
+            // supplied valid time, with values taken from the key's belief at
+            // that vt. No belief there → :rm is a no-op (:delete asserts).
+            return self.buffer_bitemporal_rm(
+                res_iter,
+                headers,
+                cur_vld,
+                relation_store,
+                metadata,
+                key_bindings,
+                check_exists,
+                span,
+                kpos,
+            );
+        }
 
         let extractors = make_extractors(
             &relation_store.metadata.keys[..kpos],
@@ -1239,6 +1337,323 @@ impl<'a> SessionTx<'a> {
                 is_retract: true,
                 span,
             });
+        }
+        Ok(())
+    }
+
+    /// Bitemporal `:rm {k, vt}` (mnestic fork, 4c): buffer a vt-retraction
+    /// row at the supplied valid time, values from the key's belief there.
+    #[allow(clippy::too_many_arguments)]
+    fn buffer_bitemporal_rm(
+        &mut self,
+        res_iter: impl Iterator<Item = Tuple>,
+        headers: &[Symbol],
+        cur_vld: ValidityTs,
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        key_bindings: &[Symbol],
+        check_exists: bool,
+        span: SourceSpan,
+        kpos: usize,
+    ) -> Result<()> {
+        use crate::data::functions::MAX_VALIDITY_TS;
+        // keys minus tt: plain keys + the vt column (user-supplied)
+        let extractors = make_extractors(
+            &relation_store.metadata.keys[..kpos],
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+        let mut prefixes = Vec::new();
+        for tuple in res_iter {
+            let extracted: Vec<DataValue> = extractors
+                .iter()
+                .map(|ex| ex.extract_data(&tuple, cur_vld))
+                .try_collect()?;
+            prefixes.push(extracted);
+        }
+
+        for prefix in &prefixes {
+            let plain = &prefix[..kpos - 1];
+            if self.tt_pending_conflict(relation_store, plain) {
+                bail!(TransactAssertionFailure {
+                    relation: relation_store.name.to_string(),
+                    key: prefix.clone(),
+                    notice: "key was already written (or removed) in this transaction".to_string()
+                });
+            }
+        }
+
+        let mut rows = Vec::new();
+        for mut prefix in prefixes {
+            let vt_ts = match &prefix[kpos - 1] {
+                DataValue::Validity(v) => v.timestamp,
+                _ => unreachable!("vt column coerces to Validity"),
+            };
+            let existing: Option<Tuple> = {
+                let plain: Tuple = prefix[..kpos - 1].to_vec();
+                let mut it = relation_store.bitemporal_scan_prefix(
+                    self,
+                    &plain,
+                    Some(vt_ts),
+                    MAX_VALIDITY_TS,
+                );
+                it.next().transpose()?
+            };
+            match existing {
+                None => {
+                    if check_exists {
+                        bail!(TransactAssertionFailure {
+                            relation: relation_store.name.to_string(),
+                            key: prefix,
+                            notice: "no belief exists at that valid time".to_string()
+                        });
+                    }
+                }
+                Some(full) => {
+                    // retraction row: user vt with the retract flag, values
+                    // copied from the ceasing belief
+                    prefix[kpos - 1] = DataValue::Validity(crate::data::value::Validity {
+                        timestamp: vt_ts,
+                        is_assert: std::cmp::Reverse(false),
+                    });
+                    let mut row = prefix;
+                    row.extend_from_slice(&full[kpos + 1..]);
+                    rows.push(row);
+                }
+            }
+        }
+        if !rows.is_empty() {
+            self.pending_tt_writes.push(PendingTtWrite {
+                handle: relation_store.clone(),
+                rows,
+                is_retract: false, // bitemporal: the retract flag rides vt
+                span,
+            });
+        }
+        Ok(())
+    }
+
+    /// `:update` on a tt-stamped relation (mnestic fork, 4c; spec §6):
+    /// read the resolved current belief, merge the provided value columns,
+    /// buffer the merged row as a correction at commit-tt (bitemporal: in
+    /// the current belief's own vt-group).
+    #[allow(clippy::too_many_arguments)]
+    fn buffer_tt_update(
+        &mut self,
+        res_iter: impl Iterator<Item = Tuple>,
+        headers: &[Symbol],
+        cur_vld: ValidityTs,
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        key_bindings: &[Symbol],
+        is_callback_target: bool,
+        span: SourceSpan,
+    ) -> Result<()> {
+        Self::check_tt_write_shape(relation_store, metadata, is_callback_target, ":update")?;
+        let kpos = relation_store.metadata.keys.len() - 1;
+        let is_bitemporal = kpos >= 1
+            && matches!(
+                relation_store.metadata.keys[kpos - 1].typing.coltype,
+                crate::data::relation::ColType::Validity
+            );
+        let plain_len = if is_bitemporal { kpos - 1 } else { kpos };
+        if is_bitemporal
+            && metadata
+                .keys
+                .iter()
+                .any(|c| c.name == relation_store.metadata.keys[kpos - 1].name)
+        {
+            bail!(
+                ":update on bitemporal relation {} targets the current belief; \
+                 to correct a specific valid-time version use :put",
+                relation_store.name
+            );
+        }
+        let key_extractors = make_extractors(
+            &relation_store.metadata.keys[..plain_len],
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+        let val_extractors = make_update_extractors(
+            &relation_store.metadata.non_keys,
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+
+        let mut inputs = Vec::new();
+        for tuple in res_iter {
+            let plain: Vec<DataValue> = key_extractors
+                .iter()
+                .map(|ex| ex.extract_data(&tuple, cur_vld))
+                .try_collect()?;
+            let provided: Vec<Option<DataValue>> = val_extractors
+                .iter()
+                .map(|ex| -> Result<Option<DataValue>> {
+                    Ok(match ex {
+                        Some(e) => Some(e.extract_data(&tuple, cur_vld)?),
+                        None => None,
+                    })
+                })
+                .try_collect()?;
+            inputs.push((plain, provided));
+        }
+
+        let mut rows = Vec::new();
+        for (plain, provided) in inputs {
+            if self.tt_pending_conflict(relation_store, &plain) {
+                bail!(TransactAssertionFailure {
+                    relation: relation_store.name.to_string(),
+                    key: plain,
+                    notice: "key was already written (or removed) in this transaction".to_string()
+                });
+            }
+            let current = self
+                .tt_current_row(relation_store, &plain.to_vec(), cur_vld)?
+                .ok_or_else(|| TransactAssertionFailure {
+                    relation: relation_store.name.to_string(),
+                    key: plain.clone(),
+                    notice: "key does not exist in database (current belief)".to_string(),
+                })?;
+            // resolved row layout: [plain.., (vt,) tt, vals..]
+            let mut row = plain;
+            if is_bitemporal {
+                // correction lands in the current belief's own vt-group
+                row.push(current[kpos - 1].clone());
+            }
+            for (i, p) in provided.into_iter().enumerate() {
+                row.push(match p {
+                    Some(v) => v,
+                    None => current[kpos + 1 + i].clone(),
+                });
+            }
+            rows.push(row);
+        }
+        if !rows.is_empty() {
+            self.pending_tt_writes.push(PendingTtWrite {
+                handle: relation_store.clone(),
+                rows,
+                is_retract: false,
+                span,
+            });
+        }
+        Ok(())
+    }
+
+    /// `:ensure` / `:ensure_not` on a tt-stamped relation (mnestic fork, 4c):
+    /// assertions against the resolved current belief; this transaction's
+    /// own buffered rows count as existing.
+    #[allow(clippy::too_many_arguments)]
+    fn tt_ensure(
+        &mut self,
+        res_iter: impl Iterator<Item = Tuple>,
+        headers: &[Symbol],
+        cur_vld: ValidityTs,
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        key_bindings: &[Symbol],
+        must_exist: bool,
+        span: SourceSpan,
+    ) -> Result<()> {
+        let _ = span;
+        Self::check_tt_write_shape(relation_store, metadata, false, ":ensure")?;
+        let kpos = relation_store.metadata.keys.len() - 1;
+        let is_bitemporal = kpos >= 1
+            && matches!(
+                relation_store.metadata.keys[kpos - 1].typing.coltype,
+                crate::data::relation::ColType::Validity
+            );
+        let plain_len = if is_bitemporal { kpos - 1 } else { kpos };
+        if is_bitemporal
+            && metadata
+                .keys
+                .iter()
+                .chain(metadata.non_keys.iter())
+                .any(|c| c.name == relation_store.metadata.keys[kpos - 1].name)
+        {
+            bail!(
+                ":ensure/:ensure_not on bitemporal relation {} assert about the CURRENT belief; the valid-time column cannot be bound",
+                relation_store.name
+            );
+        }
+        let key_extractors = make_extractors(
+            &relation_store.metadata.keys[..plain_len],
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+        let val_extractors = if must_exist {
+            make_update_extractors(
+                &relation_store.metadata.non_keys,
+                &metadata.keys,
+                key_bindings,
+                headers,
+            )?
+        } else {
+            vec![]
+        };
+        let mut checks = Vec::new();
+        for tuple in res_iter {
+            let plain: Vec<DataValue> = key_extractors
+                .iter()
+                .map(|ex| ex.extract_data(&tuple, cur_vld))
+                .try_collect()?;
+            let provided: Vec<Option<DataValue>> = val_extractors
+                .iter()
+                .map(|ex| -> Result<Option<DataValue>> {
+                    Ok(match ex {
+                        Some(e) => Some(e.extract_data(&tuple, cur_vld)?),
+                        None => None,
+                    })
+                })
+                .try_collect()?;
+            checks.push((plain, provided));
+        }
+        for (plain, provided) in checks {
+            let pending = self.tt_pending_conflict(relation_store, &plain);
+            let current = self.tt_current_row(relation_store, &plain.to_vec(), cur_vld)?;
+            let exists = pending || current.is_some();
+            if must_exist {
+                if pending && current.is_some() {
+                    bail!(TransactAssertionFailure {
+                        relation: relation_store.name.to_string(),
+                        key: plain,
+                        notice: "key is being rewritten in this transaction — ambiguous assertion target; assert in a separate transaction".to_string()
+                    });
+                }
+                let current = current.ok_or_else(|| TransactAssertionFailure {
+                    relation: relation_store.name.to_string(),
+                    key: plain.clone(),
+                    notice: if pending {
+                        "key is only written in this transaction (not yet committed)".to_string()
+                    } else {
+                        "key does not exist in database (current belief)".to_string()
+                    },
+                })?;
+                for (i, p) in provided.into_iter().enumerate() {
+                    if let Some(v) = p {
+                        let cur_v = &current[kpos + 1 + i];
+                        if &v != cur_v {
+                            bail!(TransactAssertionFailure {
+                                relation: relation_store.name.to_string(),
+                                key: plain,
+                                notice: format!(
+                                    "value mismatch: expected {v:?}, current belief {cur_v:?}"
+                                )
+                            });
+                        }
+                    }
+                }
+            } else if exists {
+                bail!(TransactAssertionFailure {
+                    relation: relation_store.name.to_string(),
+                    key: plain,
+                    notice: "key exists (current belief, or written/removed by this transaction)"
+                        .to_string()
+                });
+            }
         }
         Ok(())
     }

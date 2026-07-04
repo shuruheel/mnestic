@@ -1840,14 +1840,15 @@ fn txtime_bitemporal_puts_and_conflicts() {
         "{err:?}"
     );
 
-    // :rm on bitemporal directs to :put RETRACT
-    let err = db
-        .run_default("?[e, v] <- [[1, 'RETRACT']] :rm belief_w {e, v}")
-        .expect_err(":rm on bitemporal must direct to :put RETRACT");
-    assert!(
-        format!("{err:?}").contains("valid-time statement"),
-        "{err:?}"
-    );
+    // :rm on bitemporal (4c): a cessation at the supplied valid time —
+    // 'RETRACT' coerces to (now, retract), i.e. "ceases now"
+    db.run_default("?[e, v] <- [[1, 'RETRACT']] :rm belief_w {e, v}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *belief_w[e, v, tt, x @ 'NOW']")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0, "ceased now");
 }
 
 #[test]
@@ -1855,19 +1856,7 @@ fn txtime_unsupported_ops_error() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default(":create audit_ops {k, tt: TxTime => v: Int}")
         .unwrap();
-    for script in [
-        "?[k, v] <- [[1, 1]] :insert audit_ops {k => v}",
-        "?[k, v] <- [[1, 1]] :update audit_ops {k => v}",
-        "?[k, v] <- [[1, 1]] :ensure audit_ops {k => v}",
-        "?[k, v] <- [[1, 1]] :ensure_not audit_ops {k => v}",
-    ] {
-        let err = db.run_default(script).expect_err(script);
-        let msg = format!("{err:?}");
-        assert!(
-            msg.contains("read path") || msg.contains("step 4"),
-            "{script}: {msg}"
-        );
-    }
+    // 4c: these now work — only :replace stays rejected
     let err = db
         .run_default("?[k, v] <- [[1, 1]] :replace audit_ops {k => v}")
         .expect_err("replace must fail");
@@ -2856,4 +2845,205 @@ fn vt_equal_ts_assert_shadows_retract_pinned() {
         .unwrap()
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([[7]]));
+}
+
+// ==== mnestic fork: 4c existence-checking writes + bitemporal :rm ====
+
+#[test]
+fn tt_insert_update_ensure() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create a4c {k, tt: TxTime => v: Int, w: Int default 0}")
+        .unwrap();
+
+    // insert new key OK
+    db.run_default("?[k, v] <- [[1, 10]] :insert a4c {k => v}")
+        .unwrap();
+    // insert existing key fails
+    let err = db
+        .run_default("?[k, v] <- [[1, 11]] :insert a4c {k => v}")
+        .expect_err("insert existing must fail");
+    assert!(format!("{err:?}").contains("exists"), "{err:?}");
+    // rm, then re-insert of the believed-deleted key succeeds
+    db.run_default("?[k] <- [[1]] :rm a4c {k}").unwrap();
+    db.run_default("?[k, v] <- [[1, 12]] :insert a4c {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[v] := *a4c[k, tt, v, w]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[12]]));
+    // insert + put same key in one tx rejected
+    let err = db
+        .run_default(
+            "{?[k, v] <- [[7, 1]] :put a4c {k => v}} {?[k, v] <- [[7, 2]] :insert a4c {k => v}}",
+        )
+        .expect_err("insert-after-put same tx must fail");
+    assert!(format!("{err:?}").contains("already written"), "{err:?}");
+
+    // update merges provided columns over the current belief
+    db.run_default("?[k, w] <- [[1, 5]] :update a4c {k => w}")
+        .unwrap();
+    let res = db
+        .run_default("?[v, w] := *a4c[k, tt, v, w]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[12, 5]]),
+        "v kept, w updated"
+    );
+    // update of a missing key fails
+    let err = db
+        .run_default("?[k, w] <- [[99, 5]] :update a4c {k => w}")
+        .expect_err("update missing must fail");
+    assert!(format!("{err:?}").contains("does not exist"), "{err:?}");
+
+    // ensure passes on matching current belief, fails on mismatch
+    db.run_default("?[k, v] <- [[1, 12]] :ensure a4c {k => v}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, v] <- [[1, 999]] :ensure a4c {k => v}")
+        .expect_err("ensure mismatch must fail");
+    assert!(format!("{err:?}").contains("mismatch"), "{err:?}");
+    // ensure_not passes on missing, fails on existing
+    db.run_default("?[k, v] <- [[404, 0]] :ensure_not a4c {k => v}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, v] <- [[1, 0]] :ensure_not a4c {k => v}")
+        .expect_err("ensure_not existing must fail");
+    assert!(format!("{err:?}").contains("exists"), "{err:?}");
+}
+
+#[test]
+fn bitemporal_rm_remap_cessation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rm4c.db");
+    let (db, _tts) = bitemporal_fixture("sqlite", path.to_str().unwrap());
+    // cease the key at vt=400 via :rm — values come from the belief at 400
+    db.run_default("?[k, v] <- [[1, [400, true]]] :rm hist {k, v}")
+        .unwrap();
+    // hmm: the fixture already retracted at vt=300, so belief at 400 is
+    // deleted — the rm is a no-op; use vt=250 instead where belief = 3
+    db.run_default("?[k, v] <- [[1, [250, true]]] :rm hist {k, v}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *hist[k, v, t, x @ (vt: 260)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0, "ceased at 250");
+    // belief below 250 unaffected
+    let res = db
+        .run_default("?[x] := *hist[k, v, t, x @ (vt: 240)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[3]]));
+    // :delete at a vt with no belief errors
+    let err = db
+        .run_default("?[k, v] <- [[1, [50, true]]] :delete hist {k, v}")
+        .expect_err("delete with no belief must fail");
+    assert!(format!("{err:?}").contains("no belief"), "{err:?}");
+
+    // bitemporal insert/update on the (vt=NOW) current belief
+    db.run_default(":create bi4c {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, true], 5]] :put bi4c {k, v => x}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, v, x] <- [[1, [200, true], 6]] :insert bi4c {k, v => x}")
+        .expect_err("bitemporal insert on a key with recorded beliefs must fail");
+    assert!(format!("{err:?}").contains("recorded beliefs"), "{err:?}");
+    db.run_default("?[k, x] <- [[1, 9]] :update bi4c {k => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[v, x] := *bi4c[k, v, t, x @ (vt: 150)]")
+        .unwrap()
+        .into_json();
+    // the correction lands in group 100 (the current belief's own group)
+    assert_eq!(res["rows"], serde_json::json!([[[100, true], 9]]));
+}
+
+#[test]
+fn imperative_return_braced_clause_no_panic() {
+    // mnestic fork fix: `%return { <query> }` panicked with unreachable!()
+    // (upstream bug — the match arm expected query_script_inner but the
+    // grammar delivers imperative_clause).
+    let db = DbInstance::new("mem", "", "").unwrap();
+    let res = db
+        .run_default(
+            r#"
+        {:create _t_ret {a}}
+        %return { ?[x] <- [[1]] }
+        "#,
+        )
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1]]));
+}
+
+#[test]
+fn tt_4c_review_pins() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create pin4c {k, tt: TxTime => v: Int}")
+        .unwrap();
+    // duplicate key within ONE :insert statement is rejected (was silent LWW)
+    let err = db
+        .run_default("?[k, v] <- [[7, 1], [7, 2]] :insert pin4c {k => v}")
+        .expect_err("duplicate in-statement insert must fail");
+    assert!(format!("{err:?}").contains("duplicate key"), "{err:?}");
+
+    // ensure with a bound tt column is rejected (was silently ignored)
+    db.run_default("?[k, v] <- [[1, 10]] :put pin4c {k => v}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, tt, v] <- [[1, 5, 10]] :ensure pin4c {k, tt => v}")
+        .expect_err("tt-bound ensure must fail");
+    assert!(format!("{err:?}").contains("engine-assigned"), "{err:?}");
+
+    // ensure of a key rewritten in the same tx is an ambiguous assertion
+    let err = db
+        .run_default(
+            "{?[k, v] <- [[1, 99]] :put pin4c {k => v}} {?[k, v] <- [[1, 99]] :ensure pin4c {k => v}}",
+        )
+        .expect_err("ensure of same-tx rewrite must fail");
+    assert!(format!("{err:?}").contains("ambiguous"), "{err:?}");
+
+    // bitemporal: ensure with a bound vt column is rejected
+    db.run_default(":create pin_bi {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db.run_default("?[k, v, x] <- [[1, [100, true], 5]] :put pin_bi {k, v => x}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, v, x] <- [[1, [100, true], 5]] :ensure pin_bi {k, v => x}")
+        .expect_err("vt-bound ensure must fail");
+    assert!(format!("{err:?}").contains("CURRENT belief"), "{err:?}");
+
+    // update after cessation fails; tt-past read shows pre-update value
+    let db2 = DbInstance::new("mem", "", "").unwrap();
+    db2.run_default(":create pin_c {k, v: Validity, tt: TxTime => x: Int}")
+        .unwrap();
+    db2.run_default("?[k, v, x] <- [[1, [100, true], 5]] :put pin_c {k, v => x}")
+        .unwrap();
+    let DbInstance::Mem(inner) = &db2 else {
+        panic!()
+    };
+    let before = inner.tt_clock().peek() + 1;
+    db2.run_default("?[k, x] <- [[1, 9]] :update pin_c {k => x}")
+        .unwrap();
+    let res = db2
+        .run_default(&format!(
+            "?[x] := *pin_c[k, v, t, x @ (vt: 150, tt: {before})]"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[5]]),
+        "tt-past shows pre-update"
+    );
+    db2.run_default("?[k, v] <- [[1, [200, true]]] :rm pin_c {k, v}")
+        .unwrap();
+    let err = db2
+        .run_default("?[k, x] <- [[1, 11]] :update pin_c {k => x}")
+        .expect_err("update after cessation must fail");
+    assert!(format!("{err:?}").contains("does not exist"), "{err:?}");
 }

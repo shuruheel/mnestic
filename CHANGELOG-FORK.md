@@ -5,6 +5,31 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — existence-checking writes on TxTime relations (bitemporality step 4c)
+- The §6 write ops owed by step 3 are live, all evaluated against the
+  **resolved current belief** ((vt=NOW, tt=current) on bitemporal relations):
+  `:insert` (tt-only: current-belief absence — re-inserting a believed-deleted
+  key is legal; **bitemporal: no records at any valid time** — a NOW-only gate
+  would let an "insert" silently rewrite past or future vt-groups; duplicate
+  keys within one statement rejected); `:update` (merges provided value
+  columns over the current belief; the correction lands in that belief's own
+  vt-group; binding the vt column is rejected — use `:put` to correct a
+  specific version); `:ensure`/`:ensure_not` (assertions about the current
+  belief; binding vt or tt is rejected — a silently retargeted assertion is
+  worse than none; a key rewritten by the same transaction is an ambiguous
+  target and errors; pending writes/removals count as existing for
+  `:ensure_not`); and the **bitemporal `:rm {k, vt}` remap** — a cessation:
+  buffers a vt-retraction with values copied from the belief at that valid
+  time (no belief → no-op; `:delete` asserts one exists). One belief event
+  per transaction throughout: writes and existence-checks of one key cannot
+  mix in one transaction.
+- `:replace` on TxTime relations stays rejected (destroy-and-recreate would
+  drop history); triggers/indexes/callbacks remain step-5 work.
+
+### Fixed — `%return { <query> }` panicked in imperative scripts (upstream bug)
+- The match arm expected `query_script_inner` where the grammar delivers
+  `imperative_clause`; any braced clause in `%return` hit `unreachable!()`.
+
 ### New — bitemporal reads complete: the two-level (vt, tt) resolution (bitemporality step 4b)
 - **Bitemporal relations are now fully readable.** The §3 resolution algorithm
   is live: per key, vt-groups are walked newest-first from the selected valid
