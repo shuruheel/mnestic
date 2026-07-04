@@ -4,313 +4,67 @@ Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
 ## 0.10.0 — 2026-07-04
+The release has two pillars, in order of impact:
 
-### New — `:reconcile`: recompute-based belief revision (provenance semirings R3)
-- **`:reconcile rel {…}`** — declare a query output to BE a TxTime relation's
-  new complete current belief. The engine diffs the output against the
-  resolved current belief and records, as ONE belief event at commit-tt:
-  assertions for new/changed keys; retractions (tt-only) or vt-cessations
-  with values copied (bitemporal) for currently-believed keys absent from
-  the output. Unchanged keys record nothing — an identical re-reconcile is
-  a true no-op (no tt burned, no history bloat). This is the R3
-  truth-maintenance step in its honest recompute form: retract or append
-  base facts, re-derive, `:reconcile` the derived (annotated) relation —
-  derived annotations stay consistent with the revised base, and
-  `::history` + as-of reads answer **"what did we believe, and why, as of
-  T"** across the revision (pinned end-to-end with a `min_cost_k`-annotated
-  path relation surviving a base-edge retraction). **Truth maintenance is
-  user-driven**: no automatic base→derived propagation; incremental
-  (DRed/counting) maintenance is recorded future work.
-- **The declaration is protected transaction-wide** (review must-fix,
-  empirically probed): a reconciled relation admits no other write in the
-  same transaction, before or after the reconcile — including cases where
-  an idempotent reconcile buffers no rows and would otherwise leave no
-  pending trace (`{reconcile} {rm}` would silently empty the relation the
-  reconcile just declared). Witnessed by a transaction-scoped
-  reconciled-relations set, not the pending-write buffer.
-- Documented contracts: TxTime relations only (plain relations keep
-  `:replace`); the revision is invisible to later reads in the same script
-  (§5 one-belief-event); duplicate keys with conflicting values in one
-  output error; bitemporal inputs must carry assert-flagged, explicit vt
-  timestamps (`'NOW'` mints a fresh group per run); value columns with
-  non-constant defaults defeat idempotence if omitted; cost is
-  O(relation) per call.
+1. **Bitemporality** — engine-assigned transaction time alongside Cozo's
+   valid time. System-versioned (`tt: TxTime`) and fully bitemporal
+   (`vld: Validity, tt: TxTime`) relations: a crash-safe monotone commit
+   clock stamps every write; reads default to the current belief and
+   time-travel with `@ (vt: …, tt: …)` or `:as_of`; existence-checking
+   writes target the resolved current belief; `::history` /
+   `::history_gc` (persisted floor) / `::evict` (audited hard deletion)
+   manage the record's lifecycle; and a measured performance gate keeps
+   current-belief reads within ~4–12% of the single-axis baseline.
+   "What did we believe at time T about period Y" — in-engine.
+   Spec: `docs/specs/bitemporality.md`.
+2. **Provenance semirings** — the same recursive rules compute existence,
+   cost, confidence, or evidence: `register_custom_aggr` for user-defined
+   absorptive combines in recursion; `min_cost_k` bounded-meet aggregates
+   returning the k best derivations per answer WITH the evidence chains
+   that justify them; annotation persistence (resolved: no format change
+   needed); and `:reconcile` — recompute-based belief revision that keeps
+   derived annotations consistent under base-fact retraction, composed
+   with the tt axis. Spec: `docs/specs/provenance-semirings.md`.
 
-### Fixed — `::history` output order now matches spec §7 (step-5 follow-up)
-- Rows were emitted in physical scan order, which interleaves a vt-group's
-  assert and retract RUNS — a belief timeline read top-to-bottom misordered
-  cessations against corrections (surfaced by the R3 review). Output is now
-  key-asc, vt-desc, tt-desc as §7 documents.
+Plus **four upstream CozoDB bugs fixed** along the way: the inverted
+changed-bit in `and`/`or` meet aggregates, a panic on negated validity
+atoms, wrong answers from prefix-truncated temporal-column joins, and the
+braced-`%return` imperative parse panic.
 
-### Resolved — annotation persistence needs no storage-format change (provenance semirings R2)
-- The spec anticipated persisting semiring tags via a row-format change. The
-  tags-as-columns architecture (R0/R1) made that unnecessary: annotation
-  values are ordinary `DataValue`s, so **`:put` of an annotated query output
-  already persists them** in the existing memcomparable row format — the R2
-  acceptance criterion ("an annotated derivation is materialized and
-  queryable without recompute") holds by construction. Pinned by
-  `semiring_tags_persist_in_rows` across a real reopen:
-  - meet-annotated derivations (`min_cost` packs) round-trip;
-  - bounded-meet outputs materialize as k rows per group (pack in the key);
-  - **composition with the tt axis**: materializing an annotated derivation
-    into a `TxTime` relation yields *annotated belief history* — `::history`
-    shows each materialization with its engine-stamped tt, and an as-of read
-    returns the annotation as believed at that time ("what did we believe,
-    and why, as of T" — the persistence half of the R3 story);
-  - custom-aggregate outputs stay readable after reopen with NO
-    re-registration; re-computing without the registration errors loudly.
-- Recorded decisions: a hidden per-row tag slot (Scallop-style) is overbuild
-  — no consumer, contradicts tags-as-columns; custom aggregates in trigger
-  scripts stay rejected **permanently** (factories are process-scoped Rust
-  closures and cannot persist — the doc comment no longer promises R2).
+Detailed entries below, pillar by pillar.
 
-### New — bounded-meet aggregates: `min_cost_k` top-k proofs (provenance semirings R1)
-- **A third aggregate category, `AggrKind::BoundedMeet`** — the genuinely-new
-  engine work of the semirings feature (spec §6/§9.4): a recursive aggregate
-  that keeps **up to k rows per group**, so a query returns the k best whole
-  derivations for each answer instead of one. Rows flow through recursion as
-  ordinary tuples (⊗ stays rule-body arithmetic, exactly like `min_cost`),
-  while the ENGINE owns truncation at every fixpoint step: the new
-  `BoundedMeetStore` insert-sorts each candidate under the aggregate's total
-  order, deduplicates on `Ordering::Equal` (the `○=` equivalence), and
-  truncates to k. NOT the meet path — displacement means rows can leave the
-  store, which the idempotent-semilattice assumptions of `Meet` never allow.
-- **Shipped instance: `min_cost_k([payload, cost], k)`** — the k lowest-cost
-  packs per group, one output row each, cost-ordered (ties break on the whole
-  pack; exact duplicates collapse). K-shortest-paths is the direct idiom:
-  the `min_cost` recursion with `min_cost_k(pack, k)` in the head. The
-  finance/audit shape: "the k most-likely paths plus the exact evidence
-  chains that justify them".
-- **Convergence guard**: the changed-bit is only a saturation check for
-  non-idempotent tags, so the evaluator bails after 4096 CONSECUTIVE epochs
-  in which some bounded k-set changed — catching cost-decreasing cycles
-  loudly instead of hanging (review must-fix: an earlier stratum-wide cap
-  falsely killed converged bounded rules co-stratified with unrelated long
-  recursions; the consecutive-change counter caps only live divergence).
-  Known limit: a legitimate bounded recursion deeper than 4096 epochs also
-  trips the cap (the error says so).
-- Semantics documented: **Scallop-style approximate top-k** — upstream
-  truncation prunes derivations, and candidates already consumed by earlier
-  epochs are not retracted; the k-set at fixpoint = the k best candidates
-  ever surfaced. Cost-order of the k rows is guaranteed only when the
-  bounded aggregate is the entry head (downstream rules re-sort into value
-  order). NaN costs are admitted and deterministically rank worst.
-- v1 restrictions (validated with a loud error): the bounded aggregate must
-  be the single aggregated column, in the last head position; mutual
-  recursion between bounded rules stays unstratifiable; custom registration
-  of bounded-meet operators is deferred (the R0b registry still only takes
-  meet/normal aggregates).
-- Adversarially reviewed: 16-scenario probe battery (relay displacement,
-  DAG-exactness vs brute force, zero-cost cycles converge, equal-cost
-  lexicographic divergence hits the cap, stratification shapes, `::explain`,
-  `:limit`/`:order` post-application) — all sound after the must-fix.
-
-### Perf — temporal-read budget: pinned-cursor bitemporal scans + the bench gate (bitemporality step 6)
-- **`benches/time_travel.rs` rewritten** from the nightly-only `#![feature(test)]`
-  relic into a stable criterion bench (registered `harness = false`;
-  `autobenches = false` keeps the remaining nightly relics pokec/wiki_pagerank
-  from breaking a bare `cargo bench`). Matrix per §9: versions-per-key
-  (1/10/100) × corrections-depth (0/2), point reads + full-scan aggregation +
-  an as-of-past-tt read, against the named baseline "the identical workload on
-  a vt-only relation at `@ 'NOW'`", plus tt-only parity and a plain
-  non-temporal reference. Setup sanity-asserts the gate cells answer
-  identically. `MNESTIC_BACKEND=mem|rocksdb` selects the backend.
-- **The generic probe default measured 4–8× the baseline on scans** (a fresh
-  `range_scan` per probe: statement prepare / iterator construction
-  dominated). Three step-6 changes brought it inside or near the §9 envelope:
-  - **per-backend pinned-cursor overrides** of `range_bitemporal_scan_tuple`
-    (sqlite: one prepared statement, reset+rebind per seek; rocksdb: one
-    pinned iterator) driven through a shared `HybridProbe` — cache-hit →
-    one speculative sequential `step()` → real seek, with a `far` hint from
-    the walk so positional skips (past a whole key/group) seek directly;
-  - **byte-spliced probe bounds** in `BitemporalIter` (a `Validity` key
-    component is exactly 10 bytes) instead of tuple re-encoding, and landings
-    decode only the two temporal axes — the full tuple is decoded only for
-    emitted rows;
-  - **landing reuse**: a landing that already answers the next (monotone)
-    bound is reused without touching the backend.
-- **Measured (medians, 1000 keys; sqlite / rocksdb; end-to-end `run_script`
-  incl. parse — the same basis as the baseline and the AeonG envelope; the
-  storage-layer-only delta is proportionally larger)** — point reads at
-  (vt: NOW, current belief), the §10 fast-path-parity gate: **+3.8–8.8% /
-  +8.2–11.5%** vs the vt-only baseline (≤ ~10% ✓). tt-only current reads:
-  at-or-below baseline on both backends (parity ✓). Non-temporal relations:
-  untouched dispatch (zero by construction). Full scans: v1 **beats the
-  baseline ~2×** on both backends (the sequential walk out-runs the skip
-  scan's per-key seeks); deeper version counts run over — c0 +21–53%, c2 up
-  to ~2× — a **recorded deviation**: the two-level walk has a structural
-  floor of two backend probes per key (assert + retract run) where the
-  single-axis scan needs one, and corrections are physical rows the vt-only
-  baseline cannot even represent. Revisit only if a real scan-heavy workload
-  on deep-version relations shows up.
-
-### New — bitemporal system operations (bitemporality step 5)
-- **`::history rel [[k]…] [limit] [offset]`** — the introspection surface: every
-  (vt, tt) record of the given keys, raw. Columns `keys…, vt_ts, op, tt,
-  values…` (`op` ∈ assert/retract; `vt_ts` absent on tt-only relations; both
-  timestamps as integer µs); ordering key-asc, vt-desc, tt-desc. Errors on
-  non-TxTime relations.
-- **`::history_gc rel <cutoff-tt>`** — drops superseded records below the
-  cutoff while preserving, per (key, vt-group), exactly the record the
-  resolution would pick at tt = cutoff — so as-of reads at or above the
-  cutoff are unchanged. Persists a per-relation **gc floor**: an as-of read
-  below it errors instead of silently returning a post-hoc reconstruction as
-  if it were the historical belief. Read-only-guarded. *(v1 runs in one
-  transaction; chunked online gc is deferred until real store sizes pull it.)*
-- **`::evict rel [[k]…] [unredacted]`** — hard-deletes every record of the
-  given keys (the one deliberate break of append-only, for GDPR), writing an
-  audit row (relation, key marker, eviction tt, rows deleted) to the reserved
-  `mnestic_evict_audit` relation **in the same transaction**. The key marker
-  is a **salted hash** by default — storing the key itself would re-enshrine
-  the PII the eviction removes; `unredacted` opts out. Read-only-guarded.
-- Recorded deviation: **B-tree index legalization on TxTime relations is
-  deferred** (spec §10 step 5 listed it) — statement-time index maintenance is
-  structurally incompatible with buffered commit-time stamping, and there are
-  zero consumers; the rejection message now says so without a step number.
-- Adversarial-review hardening (all empirically confirmed before fixing):
-  `::evict`/`::history_gc` bail when the same transaction holds pending tt
-  writes for the target relation (they'd be stamped after the deletes and
-  resurrect the evicted keys); imperative-only `{::evict}`/`{::history_gc}`
-  programs now get a write transaction + per-relation locks (previously an
-  error on RocksDB, an unlocked mutation elsewhere); all three ops enforce
-  access levels (history ≥ read_only, gc/evict ≥ normal); the
-  `mnestic_evict_audit` name is enforced as reserved (a pre-existing relation
-  with a divergent schema, indices, or triggers is rejected — raw audit puts
-  would corrupt/diverge it); duplicate keys in one `::evict` no longer
-  overwrite the audit row with `rows_deleted = 0`; `::history`/`::evict` keys
-  coerce through the column types (a mistyped key errors instead of silently
-  matching nothing); `::history_gc` reports the *effective* floor, refuses
-  future cutoffs, and no longer raises the floor on a no-op run (nothing
-  deleted ⇒ every read below the cutoff is still exact — and the floor is
-  irreversible); its keeper tie-break now reads the vt flag on bitemporal
-  relations (the tt flag byte is reserved-0 there) and bails on a corrupt vt
-  column instead of silently merging adjacent groups; `::history` output is
-  key-ascending, rejects header collisions with user columns named
-  `op`/`tt`/`vt_ts`, and its limit/offset are strict `pos_int` tokens (`2 -1`
-  no longer silently parses as the single limit `2 - 1`); the burned audit tt
-  is covered by the persisted clock HWM (evict transactions commit through
-  the tt path).
-
-### New — existence-checking writes on TxTime relations (bitemporality step 4c)
-- The §6 write ops owed by step 3 are live, all evaluated against the
-  **resolved current belief** ((vt=NOW, tt=current) on bitemporal relations):
-  `:insert` (tt-only: current-belief absence — re-inserting a believed-deleted
-  key is legal; **bitemporal: no records at any valid time** — a NOW-only gate
-  would let an "insert" silently rewrite past or future vt-groups; duplicate
-  keys within one statement rejected); `:update` (merges provided value
-  columns over the current belief; the correction lands in that belief's own
-  vt-group; binding the vt column is rejected — use `:put` to correct a
-  specific version); `:ensure`/`:ensure_not` (assertions about the current
-  belief; binding vt or tt is rejected — a silently retargeted assertion is
-  worse than none; a key rewritten by the same transaction is an ambiguous
-  target and errors; pending writes/removals count as existing for
-  `:ensure_not`); and the **bitemporal `:rm {k, vt}` remap** — a cessation:
-  buffers a vt-retraction with values copied from the belief at that valid
-  time (no belief → no-op; `:delete` asserts one exists). One belief event
-  per transaction throughout: writes and existence-checks of one key cannot
-  mix in one transaction.
-- `:replace` on TxTime relations stays rejected (destroy-and-recreate would
-  drop history); triggers/indexes/callbacks remain step-5 work.
-
-### Fixed — `%return { <query> }` panicked in imperative scripts (upstream bug)
-- The match arm expected `query_script_inner` where the grammar delivers
-  `imperative_clause`; any braced clause in `%return` hit `unreachable!()`.
-
-### New — bitemporal reads complete: the two-level (vt, tt) resolution (bitemporality step 4b)
-- **Bitemporal relations are now fully readable.** The §3 resolution algorithm
-  is live: per key, vt-groups are walked newest-first from the selected valid
-  time, each group resolved to its greatest `tt ≤ T` belief **across both
-  is_assert runs** (a later-recorded cessation at the same vt is never
-  shadowed by the assert run); assertions answer, retractions mean
-  believed-deleted (no shine-through), empty-at-T groups fall through; equal
-  `(vt, tt)` ties resolve to the assertion. All four §4 selector forms work:
-  bare scan = every vt record at current belief (retract rows included — the
-  migration invariant: a vt relation's results are unchanged by adding
-  `tt: TxTime`, pinned comparatively); `@ V` = the belief now about V;
-  `@ (tt: T)` = the whole relation as it stood at T; `@ (vt: V, tt: T)` = the
-  full quadrant. Implemented as a probe-driven scan (`data/bitemporal.rs`)
-  with a generic default over every backend; per-backend seek-loop overrides
-  are step-6 work (measured ~5x a plain scan on sqlite for correction-heavy
-  data — acceptable until then).
-- **`:as_of <t>`** — one query option pinning the default transaction time for
-  every tt-stamped relation atom in the block that lacks an explicit
-  selector (explicit wins; plain/vt relations untouched; using it in a query
-  that references no tt-stamped relation is an error). The spec's #1 use case:
-  re-run a report exactly as it would have answered at T.
-- **Fixed: joins binding temporal columns silently truncated resolution** —
-  a prefix join whose join columns reached into the trailing temporal key
-  columns clamped the scan to one version: superseded/ceased values were
-  resurrected on sqlite and mem panicked (`BTreeMap::range` inversion).
-  Dispatch now falls back to a materialized join over the resolved scan
-  whenever the join prefix leaves the plain key columns — **including the
-  pre-existing upstream variant on vt-only relations** (`@`-selected joins
-  binding the Validity column had the same wrong answers/panic since before
-  the fork). Defensively, the bitemporal probe treats out-of-range bounds as
-  exhausted. Pinned on mem and sqlite.
-- Recorded deferrals: the unquoted-date parse lint (no warning channel in the
-  engine yet) and the §6 write ops owed by step 3 (`:insert`/`:update`/
-  `:ensure`/`:ensure_not`/bitemporal `:rm` remap) move to **step 4c**, now
-  unblocked by the read path; error messages updated to say so.
-
-### New — system-versioned relations complete: tt-only reads (bitemporality step 4a)
-- **The labeled temporal selector** `@ (vt: …)` / `@ (tt: …)` / order-free
-  `@ (vt: …, tt: …)` parses on every relation-access form; bare `@ E` still
-  means valid time, everywhere, forever. tt tokens: `"NOW"`/`"END"` =
-  end-of-tt-time (current belief — deliberately not the wall clock), numeric
-  µs, ISO-8601 (bare dates now accepted as midnight UTC — on the vt axis too;
-  strict RFC3339 previously rejected the docs' own `@ "2026-01-01"` examples).
-- **tt-only relations are now fully readable**: the default read is the
-  CURRENT STATE (one seek per key; believed-deleted keys absent) — replacing
-  step 3's all-versions interim scan and completing the §4 migration
-  invariant: adding `tt: TxTime` to a relation changes no existing query's
-  results. `@ (tt: T)` reads the state as of any past commit time. Rides the
-  existing single-axis skip-scan; fixed-rule inputs resolve the same way.
-  (Bitemporal relations gained their reads in step 4b below — migrating vt
-  relations to vt+tt is now supported.)
-- **Fixed: negation against versioned scans panicked** (`unreachable!()` in
-  `NegJoin`) — with the current-state default this would have made every
-  `not *audit{…}` against a tt-only relation a crash that poisons the Db
-  handle; `StoredWithValidityRA` gained `neg_join` (skip-scan mirror of the
-  stored one). This also fixes the **pre-existing upstream panic** on negated
-  vt atoms with `@` selectors (`not *rel{k @ 'NOW'}`).
-- Also: nullable `Validity` is rejected when `TxTime` is declared (the 4b
-  resolution has no semantics for a null vt); `choose_index`'s validity flag
-  is honest for tt-stamped reads (inert until step 5 legalizes indexes on tt
-  relations); a projected tt column currently renders as a `[ts, flag]` pair —
-  timestamp-only rendering arrives with `::history` (step 5).
-
-### New — custom aggregate registration (provenance semirings R0b)
-- **`Db::register_custom_aggr(name, is_meet, factory)` / `unregister_custom_aggr`**
-  (+ `DbInstance` dispatchers): register a user-supplied ⊕ operator
-  (`MeetAggrObj`, re-exported with `NormalAggrObj`/`RegisteredAggr`) usable in
-  rule heads by name — the registration slot of the provenance-semirings plan
-  (`docs/specs/provenance-semirings.md` §5 R0b). With `is_meet = true` the
-  aggregate is admitted into **recursive rules**, riding the existing
-  stratifier guard and `changed`-bit saturation with zero stratifier change;
-  the ⊕ must then be an absorptive semilattice operation (the registrant's
-  obligation; a **debug-build probe** in the meet path re-applies operands on
-  custom aggregates and panics on observed non-idempotence). Outside recursion
-  a custom aggregate runs through a derived normal-path adapter (state = 0̄,
-  set = ⊕). Registry is in-memory and `Db`-scoped (persistence is R2); builtin
-  names are reserved; duplicates error (unregister to replace — already-parsed
-  programs keep their factory); names must be lowercase identifiers; custom
-  aggregates take no arguments in R0; ⊗ stays ordinary rule-body arithmetic.
-  Factories and operators must not panic (no `catch_unwind` in the engine) and
-  factories must be cheap (called O(rules × epochs) per query).
-- **Custom aggregates are rejected in trigger scripts** at `::set_triggers`
-  time (a trigger is persisted CozoScript re-parsed on every write; a fresh
-  `Db` open would lack the registration — unsupported until R2).
-- **Breaking (fork-internal API):** `parse::parse_script` gains a
-  `custom_aggrs` parameter.
-
-### Fixed — `and`/`or` meet aggregates reported an inverted changed-bit (upstream bug)
-- `MeetAggrAnd`/`MeetAggrOr::update` returned `true` when the value was
-  **stable** and `false` when it **changed** — so in recursive rules a real
-  change never propagated through the semi-naive delta (wrong results) and
-  stable values were re-enqueued. Found by the R0b adversarial review while
-  auditing the new idempotence probe; fixed to report change, pinned by a
-  unit test.
-
+### New — transaction-time commit clock (bitemporality step 2; internal, no user surface)
+- The engine-assigned transaction-time (tt) allocator for the bitemporality
+  work (`docs/specs/bitemporality.md` §5, decisions §13.10): a wall-clock-floored
+  strictly monotonic commit counter `tt = max(now_µs, last_tt + 1)` held as an
+  `AtomicI64` high-water mark on `Db` (`runtime/tt_clock.rs`), seeded at open
+  from `max(persisted mark, wall clock)` and persisted as a system key
+  (`[Null, "TT_HWM"]` under `RelationId::SYSTEM`, the `STORAGE_VERSION` idiom)
+  **inside the committing transaction** — no crash window between advancing and
+  persisting. `SessionTx::commit_tx_with_tt` allocates under a per-`Db`
+  critical section so tt order == commit order == visibility order; values
+  advanced by transactions that abort are burned, preserving monotonicity.
+  Hardened by adversarial review: the HWM put goes through a new
+  `StoreTx::put_externally_serialized` (RocksDB override clears the
+  pessimistic transaction's begin-snapshot for this one key — otherwise any
+  two temporally-overlapping tt commits would make the later one abort with
+  `Resource busy`, the 0.8.4 `avgdl` hot-key failure mode; default impl is a
+  plain put for sqlite/mem, whose storage-level write locks preclude
+  overlapping write transactions). Seeding is monotone (`fetch_max`, so
+  re-`initialize` and the step-3 restore re-seed can never regress the
+  authority); a malformed persisted mark refuses to open (loud, mirroring the
+  version-mismatch bail) instead of silently degrading to wall-clock seeding;
+  the commit section recovers from mutex poisoning (sound: a mid-section
+  panic only burns a never-committed value); the wall-clock read is
+  cfg-guarded for wasm32 like `current_validity`. Nothing in the write path
+  calls the clock yet — step 3 (schema opt-in + buffered stamping) routes
+  tt-stamped commits through it, and **owes**: the restore/import re-seed
+  (`max(persisted, max restored tt, wall clock)` after `restore_backup`) and
+  the HWM+data-rows same-tx atomicity test. Pinned by tests: same-µs strict
+  monotonicity, backward-clock step, concurrent per-caller monotonicity +
+  global uniqueness, restart re-seeding from the persisted mark (sqlite),
+  corrupt-mark open refusal, abort-doesn't-persist, mem-backend operation,
+  and overlapping-commit non-conflict on RocksDB.
 ### New — TxTime relations: schema opt-in + write path (bitemporality step 3)
 - **`TxTime` column type** (`docs/specs/bitemporality.md` §4): a relation whose
   last key column is `tt: TxTime` is transaction-time-stamped — tt-only
@@ -362,38 +116,312 @@ provenance and licensing.
   review (cross-statement conflict detection, `::remove`-with-pending-writes
   orphan bytes, believed-deleted `:delete` consistency were review catches).
 
-### New — transaction-time commit clock (bitemporality step 2; internal, no user surface)
-- The engine-assigned transaction-time (tt) allocator for the bitemporality
-  work (`docs/specs/bitemporality.md` §5, decisions §13.10): a wall-clock-floored
-  strictly monotonic commit counter `tt = max(now_µs, last_tt + 1)` held as an
-  `AtomicI64` high-water mark on `Db` (`runtime/tt_clock.rs`), seeded at open
-  from `max(persisted mark, wall clock)` and persisted as a system key
-  (`[Null, "TT_HWM"]` under `RelationId::SYSTEM`, the `STORAGE_VERSION` idiom)
-  **inside the committing transaction** — no crash window between advancing and
-  persisting. `SessionTx::commit_tx_with_tt` allocates under a per-`Db`
-  critical section so tt order == commit order == visibility order; values
-  advanced by transactions that abort are burned, preserving monotonicity.
-  Hardened by adversarial review: the HWM put goes through a new
-  `StoreTx::put_externally_serialized` (RocksDB override clears the
-  pessimistic transaction's begin-snapshot for this one key — otherwise any
-  two temporally-overlapping tt commits would make the later one abort with
-  `Resource busy`, the 0.8.4 `avgdl` hot-key failure mode; default impl is a
-  plain put for sqlite/mem, whose storage-level write locks preclude
-  overlapping write transactions). Seeding is monotone (`fetch_max`, so
-  re-`initialize` and the step-3 restore re-seed can never regress the
-  authority); a malformed persisted mark refuses to open (loud, mirroring the
-  version-mismatch bail) instead of silently degrading to wall-clock seeding;
-  the commit section recovers from mutex poisoning (sound: a mid-section
-  panic only burns a never-committed value); the wall-clock read is
-  cfg-guarded for wasm32 like `current_validity`. Nothing in the write path
-  calls the clock yet — step 3 (schema opt-in + buffered stamping) routes
-  tt-stamped commits through it, and **owes**: the restore/import re-seed
-  (`max(persisted, max restored tt, wall clock)` after `restore_backup`) and
-  the HWM+data-rows same-tx atomicity test. Pinned by tests: same-µs strict
-  monotonicity, backward-clock step, concurrent per-caller monotonicity +
-  global uniqueness, restart re-seeding from the persisted mark (sqlite),
-  corrupt-mark open refusal, abort-doesn't-persist, mem-backend operation,
-  and overlapping-commit non-conflict on RocksDB.
+### New — system-versioned relations complete: tt-only reads (bitemporality step 4a)
+- **The labeled temporal selector** `@ (vt: …)` / `@ (tt: …)` / order-free
+  `@ (vt: …, tt: …)` parses on every relation-access form; bare `@ E` still
+  means valid time, everywhere, forever. tt tokens: `"NOW"`/`"END"` =
+  end-of-tt-time (current belief — deliberately not the wall clock), numeric
+  µs, ISO-8601 (bare dates now accepted as midnight UTC — on the vt axis too;
+  strict RFC3339 previously rejected the docs' own `@ "2026-01-01"` examples).
+- **tt-only relations are now fully readable**: the default read is the
+  CURRENT STATE (one seek per key; believed-deleted keys absent) — replacing
+  step 3's all-versions interim scan and completing the §4 migration
+  invariant: adding `tt: TxTime` to a relation changes no existing query's
+  results. `@ (tt: T)` reads the state as of any past commit time. Rides the
+  existing single-axis skip-scan; fixed-rule inputs resolve the same way.
+  (Bitemporal relations gained their reads in step 4b below — migrating vt
+  relations to vt+tt is now supported.)
+- **Fixed: negation against versioned scans panicked** (`unreachable!()` in
+  `NegJoin`) — with the current-state default this would have made every
+  `not *audit{…}` against a tt-only relation a crash that poisons the Db
+  handle; `StoredWithValidityRA` gained `neg_join` (skip-scan mirror of the
+  stored one). This also fixes the **pre-existing upstream panic** on negated
+  vt atoms with `@` selectors (`not *rel{k @ 'NOW'}`).
+- Also: nullable `Validity` is rejected when `TxTime` is declared (the 4b
+  resolution has no semantics for a null vt); `choose_index`'s validity flag
+  is honest for tt-stamped reads (inert until step 5 legalizes indexes on tt
+  relations); a projected tt column currently renders as a `[ts, flag]` pair —
+  timestamp-only rendering arrives with `::history` (step 5).
+
+### New — bitemporal reads complete: the two-level (vt, tt) resolution (bitemporality step 4b)
+- **Bitemporal relations are now fully readable.** The §3 resolution algorithm
+  is live: per key, vt-groups are walked newest-first from the selected valid
+  time, each group resolved to its greatest `tt ≤ T` belief **across both
+  is_assert runs** (a later-recorded cessation at the same vt is never
+  shadowed by the assert run); assertions answer, retractions mean
+  believed-deleted (no shine-through), empty-at-T groups fall through; equal
+  `(vt, tt)` ties resolve to the assertion. All four §4 selector forms work:
+  bare scan = every vt record at current belief (retract rows included — the
+  migration invariant: a vt relation's results are unchanged by adding
+  `tt: TxTime`, pinned comparatively); `@ V` = the belief now about V;
+  `@ (tt: T)` = the whole relation as it stood at T; `@ (vt: V, tt: T)` = the
+  full quadrant. Implemented as a probe-driven scan (`data/bitemporal.rs`)
+  with a generic default over every backend; per-backend seek-loop overrides
+  are step-6 work (measured ~5x a plain scan on sqlite for correction-heavy
+  data — acceptable until then).
+- **`:as_of <t>`** — one query option pinning the default transaction time for
+  every tt-stamped relation atom in the block that lacks an explicit
+  selector (explicit wins; plain/vt relations untouched; using it in a query
+  that references no tt-stamped relation is an error). The spec's #1 use case:
+  re-run a report exactly as it would have answered at T.
+- **Fixed: joins binding temporal columns silently truncated resolution** —
+  a prefix join whose join columns reached into the trailing temporal key
+  columns clamped the scan to one version: superseded/ceased values were
+  resurrected on sqlite and mem panicked (`BTreeMap::range` inversion).
+  Dispatch now falls back to a materialized join over the resolved scan
+  whenever the join prefix leaves the plain key columns — **including the
+  pre-existing upstream variant on vt-only relations** (`@`-selected joins
+  binding the Validity column had the same wrong answers/panic since before
+  the fork). Defensively, the bitemporal probe treats out-of-range bounds as
+  exhausted. Pinned on mem and sqlite.
+- Recorded deferrals: the unquoted-date parse lint (no warning channel in the
+  engine yet) and the §6 write ops owed by step 3 (`:insert`/`:update`/
+  `:ensure`/`:ensure_not`/bitemporal `:rm` remap) move to **step 4c**, now
+  unblocked by the read path; error messages updated to say so.
+
+### New — existence-checking writes on TxTime relations (bitemporality step 4c)
+- The §6 write ops owed by step 3 are live, all evaluated against the
+  **resolved current belief** ((vt=NOW, tt=current) on bitemporal relations):
+  `:insert` (tt-only: current-belief absence — re-inserting a believed-deleted
+  key is legal; **bitemporal: no records at any valid time** — a NOW-only gate
+  would let an "insert" silently rewrite past or future vt-groups; duplicate
+  keys within one statement rejected); `:update` (merges provided value
+  columns over the current belief; the correction lands in that belief's own
+  vt-group; binding the vt column is rejected — use `:put` to correct a
+  specific version); `:ensure`/`:ensure_not` (assertions about the current
+  belief; binding vt or tt is rejected — a silently retargeted assertion is
+  worse than none; a key rewritten by the same transaction is an ambiguous
+  target and errors; pending writes/removals count as existing for
+  `:ensure_not`); and the **bitemporal `:rm {k, vt}` remap** — a cessation:
+  buffers a vt-retraction with values copied from the belief at that valid
+  time (no belief → no-op; `:delete` asserts one exists). One belief event
+  per transaction throughout: writes and existence-checks of one key cannot
+  mix in one transaction.
+- `:replace` on TxTime relations stays rejected (destroy-and-recreate would
+  drop history); triggers/indexes/callbacks remain step-5 work.
+
+### New — bitemporal system operations (bitemporality step 5)
+- **`::history rel [[k]…] [limit] [offset]`** — the introspection surface: every
+  (vt, tt) record of the given keys, raw. Columns `keys…, vt_ts, op, tt,
+  values…` (`op` ∈ assert/retract; `vt_ts` absent on tt-only relations; both
+  timestamps as integer µs); ordering key-asc, vt-desc, tt-desc. Errors on
+  non-TxTime relations.
+- **`::history_gc rel <cutoff-tt>`** — drops superseded records below the
+  cutoff while preserving, per (key, vt-group), exactly the record the
+  resolution would pick at tt = cutoff — so as-of reads at or above the
+  cutoff are unchanged. Persists a per-relation **gc floor**: an as-of read
+  below it errors instead of silently returning a post-hoc reconstruction as
+  if it were the historical belief. Read-only-guarded. *(v1 runs in one
+  transaction; chunked online gc is deferred until real store sizes pull it.)*
+- **`::evict rel [[k]…] [unredacted]`** — hard-deletes every record of the
+  given keys (the one deliberate break of append-only, for GDPR), writing an
+  audit row (relation, key marker, eviction tt, rows deleted) to the reserved
+  `mnestic_evict_audit` relation **in the same transaction**. The key marker
+  is a **salted hash** by default — storing the key itself would re-enshrine
+  the PII the eviction removes; `unredacted` opts out. Read-only-guarded.
+- Recorded deviation: **B-tree index legalization on TxTime relations is
+  deferred** (spec §10 step 5 listed it) — statement-time index maintenance is
+  structurally incompatible with buffered commit-time stamping, and there are
+  zero consumers; the rejection message now says so without a step number.
+- Adversarial-review hardening (all empirically confirmed before fixing):
+  `::evict`/`::history_gc` bail when the same transaction holds pending tt
+  writes for the target relation (they'd be stamped after the deletes and
+  resurrect the evicted keys); imperative-only `{::evict}`/`{::history_gc}`
+  programs now get a write transaction + per-relation locks (previously an
+  error on RocksDB, an unlocked mutation elsewhere); all three ops enforce
+  access levels (history ≥ read_only, gc/evict ≥ normal); the
+  `mnestic_evict_audit` name is enforced as reserved (a pre-existing relation
+  with a divergent schema, indices, or triggers is rejected — raw audit puts
+  would corrupt/diverge it); duplicate keys in one `::evict` no longer
+  overwrite the audit row with `rows_deleted = 0`; `::history`/`::evict` keys
+  coerce through the column types (a mistyped key errors instead of silently
+  matching nothing); `::history_gc` reports the *effective* floor, refuses
+  future cutoffs, and no longer raises the floor on a no-op run (nothing
+  deleted ⇒ every read below the cutoff is still exact — and the floor is
+  irreversible); its keeper tie-break now reads the vt flag on bitemporal
+  relations (the tt flag byte is reserved-0 there) and bails on a corrupt vt
+  column instead of silently merging adjacent groups; `::history` output is
+  key-ascending, rejects header collisions with user columns named
+  `op`/`tt`/`vt_ts`, and its limit/offset are strict `pos_int` tokens (`2 -1`
+  no longer silently parses as the single limit `2 - 1`); the burned audit tt
+  is covered by the persisted clock HWM (evict transactions commit through
+  the tt path).
+
+### Perf — temporal-read budget: pinned-cursor bitemporal scans + the bench gate (bitemporality step 6)
+- **`benches/time_travel.rs` rewritten** from the nightly-only `#![feature(test)]`
+  relic into a stable criterion bench (registered `harness = false`;
+  `autobenches = false` keeps the remaining nightly relics pokec/wiki_pagerank
+  from breaking a bare `cargo bench`). Matrix per §9: versions-per-key
+  (1/10/100) × corrections-depth (0/2), point reads + full-scan aggregation +
+  an as-of-past-tt read, against the named baseline "the identical workload on
+  a vt-only relation at `@ 'NOW'`", plus tt-only parity and a plain
+  non-temporal reference. Setup sanity-asserts the gate cells answer
+  identically. `MNESTIC_BACKEND=mem|rocksdb` selects the backend.
+- **The generic probe default measured 4–8× the baseline on scans** (a fresh
+  `range_scan` per probe: statement prepare / iterator construction
+  dominated). Three step-6 changes brought it inside or near the §9 envelope:
+  - **per-backend pinned-cursor overrides** of `range_bitemporal_scan_tuple`
+    (sqlite: one prepared statement, reset+rebind per seek; rocksdb: one
+    pinned iterator) driven through a shared `HybridProbe` — cache-hit →
+    one speculative sequential `step()` → real seek, with a `far` hint from
+    the walk so positional skips (past a whole key/group) seek directly;
+  - **byte-spliced probe bounds** in `BitemporalIter` (a `Validity` key
+    component is exactly 10 bytes) instead of tuple re-encoding, and landings
+    decode only the two temporal axes — the full tuple is decoded only for
+    emitted rows;
+  - **landing reuse**: a landing that already answers the next (monotone)
+    bound is reused without touching the backend.
+- **Measured (medians, 1000 keys; sqlite / rocksdb; end-to-end `run_script`
+  incl. parse — the same basis as the baseline and the AeonG envelope; the
+  storage-layer-only delta is proportionally larger)** — point reads at
+  (vt: NOW, current belief), the §10 fast-path-parity gate: **+3.8–8.8% /
+  +8.2–11.5%** vs the vt-only baseline (≤ ~10% ✓). tt-only current reads:
+  at-or-below baseline on both backends (parity ✓). Non-temporal relations:
+  untouched dispatch (zero by construction). Full scans: v1 **beats the
+  baseline ~2×** on both backends (the sequential walk out-runs the skip
+  scan's per-key seeks); deeper version counts run over — c0 +21–53%, c2 up
+  to ~2× — a **recorded deviation**: the two-level walk has a structural
+  floor of two backend probes per key (assert + retract run) where the
+  single-axis scan needs one, and corrections are physical rows the vt-only
+  baseline cannot even represent. Revisit only if a real scan-heavy workload
+  on deep-version relations shows up.
+
+### Fixed — `::history` output order now matches spec §7 (step-5 follow-up)
+- Rows were emitted in physical scan order, which interleaves a vt-group's
+  assert and retract RUNS — a belief timeline read top-to-bottom misordered
+  cessations against corrections (surfaced by the R3 review). Output is now
+  key-asc, vt-desc, tt-desc as §7 documents.
+
+### New — custom aggregate registration (provenance semirings R0b)
+- **`Db::register_custom_aggr(name, is_meet, factory)` / `unregister_custom_aggr`**
+  (+ `DbInstance` dispatchers): register a user-supplied ⊕ operator
+  (`MeetAggrObj`, re-exported with `NormalAggrObj`/`RegisteredAggr`) usable in
+  rule heads by name — the registration slot of the provenance-semirings plan
+  (`docs/specs/provenance-semirings.md` §5 R0b). With `is_meet = true` the
+  aggregate is admitted into **recursive rules**, riding the existing
+  stratifier guard and `changed`-bit saturation with zero stratifier change;
+  the ⊕ must then be an absorptive semilattice operation (the registrant's
+  obligation; a **debug-build probe** in the meet path re-applies operands on
+  custom aggregates and panics on observed non-idempotence). Outside recursion
+  a custom aggregate runs through a derived normal-path adapter (state = 0̄,
+  set = ⊕). Registry is in-memory and `Db`-scoped (persistence is R2); builtin
+  names are reserved; duplicates error (unregister to replace — already-parsed
+  programs keep their factory); names must be lowercase identifiers; custom
+  aggregates take no arguments in R0; ⊗ stays ordinary rule-body arithmetic.
+  Factories and operators must not panic (no `catch_unwind` in the engine) and
+  factories must be cheap (called O(rules × epochs) per query).
+- **Custom aggregates are rejected in trigger scripts** at `::set_triggers`
+  time (a trigger is persisted CozoScript re-parsed on every write; a fresh
+  `Db` open would lack the registration — unsupported until R2).
+- **Breaking (fork-internal API):** `parse::parse_script` gains a
+  `custom_aggrs` parameter.
+
+### New — bounded-meet aggregates: `min_cost_k` top-k proofs (provenance semirings R1)
+- **A third aggregate category, `AggrKind::BoundedMeet`** — the genuinely-new
+  engine work of the semirings feature (spec §6/§9.4): a recursive aggregate
+  that keeps **up to k rows per group**, so a query returns the k best whole
+  derivations for each answer instead of one. Rows flow through recursion as
+  ordinary tuples (⊗ stays rule-body arithmetic, exactly like `min_cost`),
+  while the ENGINE owns truncation at every fixpoint step: the new
+  `BoundedMeetStore` insert-sorts each candidate under the aggregate's total
+  order, deduplicates on `Ordering::Equal` (the `○=` equivalence), and
+  truncates to k. NOT the meet path — displacement means rows can leave the
+  store, which the idempotent-semilattice assumptions of `Meet` never allow.
+- **Shipped instance: `min_cost_k([payload, cost], k)`** — the k lowest-cost
+  packs per group, one output row each, cost-ordered (ties break on the whole
+  pack; exact duplicates collapse). K-shortest-paths is the direct idiom:
+  the `min_cost` recursion with `min_cost_k(pack, k)` in the head. The
+  finance/audit shape: "the k most-likely paths plus the exact evidence
+  chains that justify them".
+- **Convergence guard**: the changed-bit is only a saturation check for
+  non-idempotent tags, so the evaluator bails after 4096 CONSECUTIVE epochs
+  in which some bounded k-set changed — catching cost-decreasing cycles
+  loudly instead of hanging (review must-fix: an earlier stratum-wide cap
+  falsely killed converged bounded rules co-stratified with unrelated long
+  recursions; the consecutive-change counter caps only live divergence).
+  Known limit: a legitimate bounded recursion deeper than 4096 epochs also
+  trips the cap (the error says so).
+- Semantics documented: **Scallop-style approximate top-k** — upstream
+  truncation prunes derivations, and candidates already consumed by earlier
+  epochs are not retracted; the k-set at fixpoint = the k best candidates
+  ever surfaced. Cost-order of the k rows is guaranteed only when the
+  bounded aggregate is the entry head (downstream rules re-sort into value
+  order). NaN costs are admitted and deterministically rank worst.
+- v1 restrictions (validated with a loud error): the bounded aggregate must
+  be the single aggregated column, in the last head position; mutual
+  recursion between bounded rules stays unstratifiable; custom registration
+  of bounded-meet operators is deferred (the R0b registry still only takes
+  meet/normal aggregates).
+- Adversarially reviewed: 16-scenario probe battery (relay displacement,
+  DAG-exactness vs brute force, zero-cost cycles converge, equal-cost
+  lexicographic divergence hits the cap, stratification shapes, `::explain`,
+  `:limit`/`:order` post-application) — all sound after the must-fix.
+
+### Resolved — annotation persistence needs no storage-format change (provenance semirings R2)
+- The spec anticipated persisting semiring tags via a row-format change. The
+  tags-as-columns architecture (R0/R1) made that unnecessary: annotation
+  values are ordinary `DataValue`s, so **`:put` of an annotated query output
+  already persists them** in the existing memcomparable row format — the R2
+  acceptance criterion ("an annotated derivation is materialized and
+  queryable without recompute") holds by construction. Pinned by
+  `semiring_tags_persist_in_rows` across a real reopen:
+  - meet-annotated derivations (`min_cost` packs) round-trip;
+  - bounded-meet outputs materialize as k rows per group (pack in the key);
+  - **composition with the tt axis**: materializing an annotated derivation
+    into a `TxTime` relation yields *annotated belief history* — `::history`
+    shows each materialization with its engine-stamped tt, and an as-of read
+    returns the annotation as believed at that time ("what did we believe,
+    and why, as of T" — the persistence half of the R3 story);
+  - custom-aggregate outputs stay readable after reopen with NO
+    re-registration; re-computing without the registration errors loudly.
+- Recorded decisions: a hidden per-row tag slot (Scallop-style) is overbuild
+  — no consumer, contradicts tags-as-columns; custom aggregates in trigger
+  scripts stay rejected **permanently** (factories are process-scoped Rust
+  closures and cannot persist — the doc comment no longer promises R2).
+
+### New — `:reconcile`: recompute-based belief revision (provenance semirings R3)
+- **`:reconcile rel {…}`** — declare a query output to BE a TxTime relation's
+  new complete current belief. The engine diffs the output against the
+  resolved current belief and records, as ONE belief event at commit-tt:
+  assertions for new/changed keys; retractions (tt-only) or vt-cessations
+  with values copied (bitemporal) for currently-believed keys absent from
+  the output. Unchanged keys record nothing — an identical re-reconcile is
+  a true no-op (no tt burned, no history bloat). This is the R3
+  truth-maintenance step in its honest recompute form: retract or append
+  base facts, re-derive, `:reconcile` the derived (annotated) relation —
+  derived annotations stay consistent with the revised base, and
+  `::history` + as-of reads answer **"what did we believe, and why, as of
+  T"** across the revision (pinned end-to-end with a `min_cost_k`-annotated
+  path relation surviving a base-edge retraction). **Truth maintenance is
+  user-driven**: no automatic base→derived propagation; incremental
+  (DRed/counting) maintenance is recorded future work.
+- **The declaration is protected transaction-wide** (review must-fix,
+  empirically probed): a reconciled relation admits no other write in the
+  same transaction, before or after the reconcile — including cases where
+  an idempotent reconcile buffers no rows and would otherwise leave no
+  pending trace (`{reconcile} {rm}` would silently empty the relation the
+  reconcile just declared). Witnessed by a transaction-scoped
+  reconciled-relations set, not the pending-write buffer.
+- Documented contracts: TxTime relations only (plain relations keep
+  `:replace`); the revision is invisible to later reads in the same script
+  (§5 one-belief-event); duplicate keys with conflicting values in one
+  output error; bitemporal inputs must carry assert-flagged, explicit vt
+  timestamps (`'NOW'` mints a fresh group per run); value columns with
+  non-constant defaults defeat idempotence if omitted; cost is
+  O(relation) per call.
+
+### Fixed — `and`/`or` meet aggregates reported an inverted changed-bit (upstream bug)
+- `MeetAggrAnd`/`MeetAggrOr::update` returned `true` when the value was
+  **stable** and `false` when it **changed** — so in recursive rules a real
+  change never propagated through the semi-naive delta (wrong results) and
+  stable values were re-enqueued. Found by the R0b adversarial review while
+  auditing the new idempotence probe; fixed to report change, pinned by a
+  unit test.
+
+### Fixed — `%return { <query> }` panicked in imperative scripts (upstream bug)
+- The match arm expected `query_script_inner` where the grammar delivers
+  `imperative_clause`; any braced clause in `%return` hit `unreachable!()`.
+
 
 ## 0.9.0 — 2026-06-28
 
