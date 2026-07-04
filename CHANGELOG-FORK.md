@@ -3,7 +3,7 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased
+## 0.10.0 — 2026-07-04
 
 ### New — `:reconcile`: recompute-based belief revision (provenance semirings R3)
 - **`:reconcile rel {…}`** — declare a query output to BE a TxTime relation's

@@ -20,10 +20,12 @@ Make the engine the best **substrate for agentic memory**: in *one embedded engi
 
 Every item is judged against that goal — and described as a general database mechanism, not in terms of any specific application.
 
-## What's already shipped (through 0.9.0)
+## What's already shipped (through 0.10.0)
 
 The agentic-memory *retrieval* foundation is largely in place. Highlights (see [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for detail):
 
+- **Bi-temporality — system-versioned (`TxTime`) relations** (0.10.0, the marquee feature): an engine-assigned transaction-time axis alongside Cozo's valid-time — commit-clock stamping, current-state reads by default, time-travel `@ (vt: ..., tt: ...)` and `:as_of`, existence-checking writes, `::history` / `::history_gc` (persisted floor) / `::evict` (audited hard deletion), and `:reconcile` declarative belief revision. "What did we believe at time *T* about period *Y*" — in-engine, in an embedded database. Spec: [`docs/specs/bitemporality.md`](docs/specs/bitemporality.md).
+- **Custom aggregates + top-k proofs** (0.10.0): `register_custom_aggr` for domain-specific absorptive combines in recursive rules, and `min_cost_k([payload, cost], k)` — a bounded-meet aggregate returning the k best derivations per answer with their evidence (Scallop-style approximate top-k). Spec: [`docs/specs/provenance-semirings.md`](docs/specs/provenance-semirings.md).
 - **Read-only Cypher query surface** (alpha; behind the off-by-default `cypher` Cargo feature) — translates a subset of openCypher (`MATCH` / `WHERE` / `RETURN` with `DISTINCT` & aggregates / `ORDER BY` / `SKIP` / `LIMIT`; true bag semantics; null-aware `WHERE`; edge-isomorphism) to CozoScript, so the engine is easy to evaluate without learning Datalog first. Read interop only; Datalog stays the native, full-power language. API: `run_cypher` / `cypher_to_script`. The PyPI wheel ships without it for now (build `--features cypher`). Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
 - **One-call hybrid retrieval** (`HybridSearch`) with **Reciprocal Rank Fusion** and **MMR** diversity reranking.
 - **Native 3-way fused recall** — vector + full-text + *k*-hop graph proximity fused in a single query (typed `GraphLeg`).
@@ -49,7 +51,6 @@ Tiered by value and how ready each item is. This is direction, not dated commitm
 
 - **Extending the Cypher-read surface** — variable-length paths, `OPTIONAL MATCH`, `WITH`, and undirected relationships (today these return explicit not-yet-supported errors). Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
 - **Stored / named queries** — reusable, parameterized retrieval rules; also the substrate for a future compiled-plan cache.
-- **Bi-temporality** — a transaction-time axis alongside Cozo's existing valid-time, with invalidation-without-deletion. Query "what did we believe at time *T* about period *Y*," plus `::history`, history GC, and recorded eviction. The design is being specified now (a second engine-assigned key component behind `Validity`, opt-in per relation); this is the marquee feature — nothing comparable exists *in-engine* in an embedded database — and lands after the developer-experience items above. Spec: [`docs/specs/bitemporality.md`](docs/specs/bitemporality.md).
 - **A first-class ULID type** and sortable auto-keys (the scalar functions already ship; the type does not yet).
 - **An official schema-migration tool** — versioned schema, diff, and rollback.
 - **`LOAD FROM` Parquet/Arrow** + zero-copy Arrow export, for clean handoff with Python/Rust data pipelines.

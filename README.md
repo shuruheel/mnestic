@@ -17,6 +17,45 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
+**0.10.0**
+
+- **Bitemporality — system-versioned (`TxTime`) relations.** An engine-assigned
+  transaction-time axis alongside Cozo's valid-time: declare
+  `{k, tt: TxTime => v}` (system-versioned) or
+  `{k, vld: Validity, tt: TxTime => v}` (fully bitemporal) and every committed
+  write is stamped by a crash-safe monotone commit clock. Reads default to
+  current state; time-travel with `@ (vt: ..., tt: ...)` or a query-wide
+  `:as_of`; existence-checking writes (`:insert`/`:update`/`:ensure`/bitemporal
+  `:rm`) target the resolved current belief. Ask "what did we believe at time
+  T about period Y" in-engine. Spec:
+  [`docs/specs/bitemporality.md`](docs/specs/bitemporality.md).
+- **History lifecycle sys ops** — `::history` (the raw belief timeline per
+  key), `::history_gc` (drop superseded records below a cutoff; a persisted
+  floor keeps as-of reads at/above the cutoff exact and makes reads below it
+  error loudly), `::evict` (hard deletion for data-erasure obligations, with a
+  salted audit trail; `unredacted` opt-out).
+- **`:reconcile` — declarative belief revision.** Declare a query output to BE
+  a `TxTime` relation's new complete current belief; the engine diffs against
+  the resolved current belief and records assertions + retractions as one
+  belief event (idempotent re-runs record nothing). Retract base facts,
+  re-derive, `:reconcile` — then `::history` + as-of reads answer "what did we
+  believe, and why, as of T."
+- **Custom aggregates** — `register_custom_aggr`: register a domain-specific
+  absorptive (semilattice) combine and use it in recursive rules exactly like
+  `min`/`shortest`, including in the recursion guard.
+- **Top-k proofs — `min_cost_k([payload, cost], k)`.** A new bounded-meet
+  aggregate category that keeps the k best derivations per group as ordinary
+  rows: k-shortest-paths with the evidence chain that justifies each answer
+  (Scallop-style approximate top-k), guarded against divergent recursion.
+- **Temporal-read performance, measured:** current-belief point reads within
+  ~4–12% of the vt-only baseline on sqlite/rocksdb (pinned-cursor scans);
+  single-version full scans ~2× faster than the baseline.
+- **Four upstream CozoDB bugs fixed** — inverted changed-bit in `and`/`or`
+  meet aggregates (changes never propagated in recursion), a panic on negated
+  validity atoms, wrong answers from prefix-truncated joins on
+  temporal-column relations, and a parse panic on braced `%return` clauses in
+  imperative scripts.
+
 **0.9.0**
 
 - **Read-only Cypher query surface** (alpha, feature `cypher`, off by default) —

@@ -10,9 +10,9 @@
 
 # Cozo 数据库
 
-## mnestic 0.9.0
+## mnestic 0.10.0
 
-本版本新增**只读 Cypher 查询面**（alpha，位于默认关闭的 `cypher` feature 之后）与数据库损坏修复工具（`::repair_corrupt`）。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+本版本新增**双时态（bitemporal）系统版本化关系**（引擎分配的事务时间轴、时间旅行查询 `@ (vt: ..., tt: ...)`、`::history` / `::history_gc` / `::evict` 历史生命周期操作、`:reconcile` 信念修订）、**自定义聚合注册**与 **top-k 证明聚合 `min_cost_k`**，并修复四个上游 CozoDB 缺陷。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 
 ## 简介
 
