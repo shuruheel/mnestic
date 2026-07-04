@@ -392,6 +392,29 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         })
     }
 
+    fn range_bitemporal_scan_tuple<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        vt_at: Option<ValidityTs>,
+        tt_at: ValidityTs,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        // Step-6 seek override: ONE pinned iterator for the whole walk
+        // (`HybridProbe` turns most probes into sequential `next()`s); the
+        // generic default constructs a fresh iterator per probe.
+        let inner = self.iter_builder().upper_bound(upper).start();
+        let mut probe = crate::data::bitemporal::HybridProbe::new(RocksSeekCursor {
+            inner,
+            upper_bound: upper.to_vec(),
+        });
+        Box::new(crate::data::bitemporal::BitemporalIter::new(
+            move |bound: &[u8], far: bool| probe.probe(bound, far),
+            lower.to_vec(),
+            vt_at,
+            tt_at,
+        ))
+    }
+
     fn range_scan<'a>(
         &'a self,
         lower: &[u8],
@@ -467,6 +490,42 @@ impl Iterator for RocksDbIterator {
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         swap_option_result(self.next_inner())
+    }
+}
+
+/// Pinned-iterator cursor for the bitemporal walk (bitemporality step 6).
+struct RocksSeekCursor {
+    inner: DbIter,
+    upper_bound: Vec<u8>,
+}
+
+impl RocksSeekCursor {
+    fn current(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(match self.inner.pair()? {
+            None => None,
+            Some((k, v)) => {
+                if self.upper_bound.as_slice() <= k {
+                    None
+                } else {
+                    Some((k.to_vec(), v.to_vec()))
+                }
+            }
+        })
+    }
+}
+
+impl crate::data::bitemporal::SeekCursor for RocksSeekCursor {
+    fn seek(&mut self, bound: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if bound >= self.upper_bound.as_slice() {
+            return Ok(None);
+        }
+        self.inner.seek(bound);
+        self.current()
+    }
+
+    fn step(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.inner.next();
+        self.current()
     }
 }
 

@@ -2489,6 +2489,8 @@ fn bitemporal_fixture(engine: &str, path: &str) -> (DbInstance, [i64; 4]) {
             DbInstance::Mem(i) => i.tt_clock().peek(),
             #[cfg(feature = "storage-sqlite")]
             DbInstance::Sqlite(i) => i.tt_clock().peek(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(i) => i.tt_clock().peek(),
             _ => panic!("unsupported engine in fixture"),
         }
     }
@@ -2561,6 +2563,44 @@ fn bitemporal_bare_scan_is_current_belief_per_group() {
         .unwrap()
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([[3]]));
+}
+
+/// The step-6 pinned-iterator seek override on RocksDB must answer exactly
+/// like the generic probe path: four quadrants (resolve-key mode) + the bare
+/// scan (resolve-groups mode) + raw ::history.
+#[cfg(feature = "storage-rocksdb")]
+#[test]
+fn bitemporal_reads_on_rocksdb() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("quad_rocks");
+    let (db, tts) = bitemporal_fixture("rocksdb", path.to_str().unwrap());
+    let q = |vt: i64, tt: i64| -> serde_json::Value {
+        db.run_default(&format!("?[x] := *hist[k, v, t, x @ (vt: {vt}, tt: {tt})]"))
+            .unwrap()
+            .into_json()["rows"]
+            .clone()
+    };
+    assert_eq!(q(250, tts[3]), serde_json::json!([[3]]));
+    assert_eq!(q(150, tts[3]), serde_json::json!([[1]]));
+    assert_eq!(q(250, tts[1]), serde_json::json!([[2]]));
+    assert_eq!(q(250, tts[0]), serde_json::json!([[1]]));
+    assert_eq!(q(350, tts[3]).as_array().unwrap().len(), 0);
+    assert_eq!(q(350, tts[2]), serde_json::json!([[3]]));
+    assert_eq!(q(50, tts[3]).as_array().unwrap().len(), 0);
+
+    let res = db
+        .run_default("?[v, x] := *hist[k, v, t, x]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 3, "{rows:?}");
+    assert_eq!(rows[0][0][0], 300);
+    assert_eq!(rows[0][0][1], serde_json::json!(false));
+    assert_eq!(rows[1][1], 3, "correction wins in the bare scan");
+    assert_eq!(rows[2][1], 1);
+
+    let res = db.run_default("::history hist [[1]]").unwrap().into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 4);
 }
 
 #[test]

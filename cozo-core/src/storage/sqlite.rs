@@ -302,6 +302,31 @@ impl<'s> StoreTx<'s> for SqliteTx<'s> {
         })
     }
 
+    fn range_bitemporal_scan_tuple<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        vt_at: Option<ValidityTs>,
+        tt_at: ValidityTs,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        // Step-6 seek override: ONE prepared statement for the whole walk,
+        // reset + rebound per real seek; sequential probes ride the open
+        // cursor (`HybridProbe`). The generic default re-prepares the range
+        // query per probe, which dominates.
+        let query = QUERIES[RANGE_QUERY];
+        let statement = self.conn.as_ref().unwrap().prepare(query).unwrap();
+        let mut probe = crate::data::bitemporal::HybridProbe::new(SqliteSeekCursor {
+            stmt: statement,
+            upper_bound: upper.to_vec(),
+        });
+        Box::new(crate::data::bitemporal::BitemporalIter::new(
+            move |bound: &[u8], far: bool| probe.probe(bound, far),
+            lower.to_vec(),
+            vt_at,
+            tt_at,
+        ))
+    }
+
     fn range_scan<'a>(
         &'a self,
         lower: &[u8],
@@ -383,6 +408,43 @@ impl<'l> Iterator for RawIter<'l> {
             }
             Err(err) => Some(Err(miette!(err))),
         }
+    }
+}
+
+/// Pinned-statement cursor for the bitemporal walk (bitemporality step 6).
+/// `seek` = reset + rebind the lower bound; `step` = continue the open
+/// cursor. The SQL (`k >= ? and k < ?`) enforces the upper bound.
+struct SqliteSeekCursor<'l> {
+    stmt: Statement<'l>,
+    upper_bound: Vec<u8>,
+}
+
+impl<'l> SqliteSeekCursor<'l> {
+    fn read_row(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        match self.stmt.next().into_diagnostic()? {
+            State::Done => Ok(None),
+            State::Row => {
+                let k = self.stmt.read::<Vec<u8>, _>(0).unwrap();
+                let v = self.stmt.read::<Vec<u8>, _>(1).unwrap();
+                Ok(Some((k, v)))
+            }
+        }
+    }
+}
+
+impl<'l> crate::data::bitemporal::SeekCursor for SqliteSeekCursor<'l> {
+    fn seek(&mut self, bound: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        if bound >= self.upper_bound.as_slice() {
+            return Ok(None);
+        }
+        self.stmt.reset().into_diagnostic()?;
+        self.stmt.bind((1, bound)).unwrap();
+        self.stmt.bind((2, &self.upper_bound as &[u8])).unwrap();
+        self.read_row()
+    }
+
+    fn step(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        self.read_row()
     }
 }
 

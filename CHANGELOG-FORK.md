@@ -5,6 +5,45 @@ provenance and licensing.
 
 ## Unreleased
 
+### Perf — temporal-read budget: pinned-cursor bitemporal scans + the bench gate (bitemporality step 6)
+- **`benches/time_travel.rs` rewritten** from the nightly-only `#![feature(test)]`
+  relic into a stable criterion bench (registered `harness = false`;
+  `autobenches = false` keeps the remaining nightly relics pokec/wiki_pagerank
+  from breaking a bare `cargo bench`). Matrix per §9: versions-per-key
+  (1/10/100) × corrections-depth (0/2), point reads + full-scan aggregation +
+  an as-of-past-tt read, against the named baseline "the identical workload on
+  a vt-only relation at `@ 'NOW'`", plus tt-only parity and a plain
+  non-temporal reference. Setup sanity-asserts the gate cells answer
+  identically. `MNESTIC_BACKEND=mem|rocksdb` selects the backend.
+- **The generic probe default measured 4–8× the baseline on scans** (a fresh
+  `range_scan` per probe: statement prepare / iterator construction
+  dominated). Three step-6 changes brought it inside or near the §9 envelope:
+  - **per-backend pinned-cursor overrides** of `range_bitemporal_scan_tuple`
+    (sqlite: one prepared statement, reset+rebind per seek; rocksdb: one
+    pinned iterator) driven through a shared `HybridProbe` — cache-hit →
+    one speculative sequential `step()` → real seek, with a `far` hint from
+    the walk so positional skips (past a whole key/group) seek directly;
+  - **byte-spliced probe bounds** in `BitemporalIter` (a `Validity` key
+    component is exactly 10 bytes) instead of tuple re-encoding, and landings
+    decode only the two temporal axes — the full tuple is decoded only for
+    emitted rows;
+  - **landing reuse**: a landing that already answers the next (monotone)
+    bound is reused without touching the backend.
+- **Measured (medians, 1000 keys; sqlite / rocksdb; end-to-end `run_script`
+  incl. parse — the same basis as the baseline and the AeonG envelope; the
+  storage-layer-only delta is proportionally larger)** — point reads at
+  (vt: NOW, current belief), the §10 fast-path-parity gate: **+3.8–8.8% /
+  +8.2–11.5%** vs the vt-only baseline (≤ ~10% ✓). tt-only current reads:
+  at-or-below baseline on both backends (parity ✓). Non-temporal relations:
+  untouched dispatch (zero by construction). Full scans: v1 **beats the
+  baseline ~2×** on both backends (the sequential walk out-runs the skip
+  scan's per-key seeks); deeper version counts run over — c0 +21–53%, c2 up
+  to ~2× — a **recorded deviation**: the two-level walk has a structural
+  floor of two backend probes per key (assert + retract run) where the
+  single-axis scan needs one, and corrections are physical rows the vt-only
+  baseline cannot even represent. Revisit only if a real scan-heavy workload
+  on deep-version relations shows up.
+
 ### New — bitemporal system operations (bitemporality step 5)
 - **`::history rel [[k]…] [limit] [offset]`** — the introspection surface: every
   (vt, tt) record of the given keys, raw. Columns `keys…, vt_ts, op, tt,

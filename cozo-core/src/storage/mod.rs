@@ -196,7 +196,7 @@ pub trait StoreTx<'s>: Sync {
     ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
         let upper = upper.to_vec();
         Box::new(crate::data::bitemporal::BitemporalIter::new(
-            move |bound: &[u8]| -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+            move |bound: &[u8], _far: bool| -> Result<Option<(Vec<u8>, Vec<u8>)>> {
                 // A probe bound past the range end means the walk is done —
                 // never hand an inverted range to the backend (mem's
                 // BTreeMap::range panics on start > end).

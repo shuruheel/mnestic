@@ -9,6 +9,9 @@ repository = "https://github.com/shuruheel/mnestic"
 readme = "README-mnestic.md"
 keywords = ["database", "datalog", "graph", "vector", "embedded"]
 categories = ["database", "database-implementations"]
+# only the registered [[bench]] targets build (pokec/wiki_pagerank are
+# nightly-bencher relics kept for reference)
+autobenches = false
 exclude = [
     "tests/*",
 ]
@@ -157,8 +160,10 @@ tempfile = "3.14.0"
 # Test-only: only `runtime/tests.rs` (cfg(test)) initializes a logger. Moved out
 # of [dependencies] so it doesn't bloat downstream builds (upstream cozo #287).
 env_logger = "0.11.3"
-# CI/stable-runnable perf harness for fork work (the upstream pokec/wiki/
-# time_travel benches use the nightly `#![feature(test)]` bencher + external data).
+# CI/stable-runnable perf harness for fork work (the upstream pokec/wiki
+# benches use the nightly `#![feature(test)]` bencher + external data — they
+# are not registered below, and `autobenches = false` in [package] keeps a
+# bare `cargo bench` from tripping over them).
 criterion = { version = "0.5", features = ["html_reports"] }
 
 # mnestic fork perf baselines (stable, self-contained synthetic data).
@@ -168,4 +173,10 @@ harness = false
 
 [[bench]]
 name = "read_path"
+harness = false
+
+# temporal-read budget matrix (bitemporality step 6; rewritten from the
+# upstream nightly bench)
+[[bench]]
+name = "time_travel"
 harness = false

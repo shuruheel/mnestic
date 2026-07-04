@@ -30,7 +30,9 @@ const UUID_TAG: u8 = 0x08;
 const REGEX_TAG: u8 = 0x09;
 const LIST_TAG: u8 = 0x0A;
 const SET_TAG: u8 = 0x0B;
-const VLD_TAG: u8 = 0x0C;
+// pub(crate): the bitemporal walk (data/bitemporal.rs) splices validity
+// bounds at the byte level (bitemporality step 6)
+pub(crate) const VLD_TAG: u8 = 0x0C;
 const JSON_TAG: u8 = 0x0D;
 const BOT_TAG: u8 = 0xFF;
 
@@ -193,11 +195,11 @@ pub fn decode_bytes(data: &[u8]) -> (Vec<u8>, &[u8]) {
 
 const SIGN_MARK: u64 = 0x8000000000000000;
 
-fn order_encode_i64(v: i64) -> u64 {
+pub(crate) fn order_encode_i64(v: i64) -> u64 {
     v as u64 ^ SIGN_MARK
 }
 
-fn order_decode_i64(u: u64) -> i64 {
+pub(crate) fn order_decode_i64(u: u64) -> i64 {
     (u ^ SIGN_MARK) as i64
 }
 
