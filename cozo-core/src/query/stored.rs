@@ -178,6 +178,18 @@ impl<'a> SessionTx<'a> {
                 key_bindings,
                 *span,
             )?,
+            RelationOp::Reconcile => self.reconcile_tt_relation(
+                res_iter,
+                headers,
+                cur_vld,
+                &relation_store,
+                metadata,
+                key_bindings,
+                dep_bindings,
+                callback_targets.contains(&relation_store.name)
+                    || force_collect == relation_store.name,
+                *span,
+            )?,
             RelationOp::Update => self.update_in_relation(
                 db,
                 res_iter,
@@ -1047,6 +1059,252 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
+    /// Bail if `relation_store` was already `:reconcile`d in this
+    /// transaction (provenance semirings R3): the reconcile declared the
+    /// relation's COMPLETE belief, and a later write in the same belief
+    /// event would silently amend or contradict it — an idempotent
+    /// reconcile buffers no rows, so the pending-write checks alone cannot
+    /// witness the declaration.
+    fn check_not_reconciled(&self, relation_store: &RelationHandle, what: &str) -> Result<()> {
+        if self.reconciled_tt_relations.contains(&relation_store.id.0) {
+            bail!(TransactAssertionFailure {
+                relation: relation_store.name.to_string(),
+                key: vec![],
+                notice: format!(
+                    "{what} after :reconcile in one transaction: the reconcile declared \
+                     the relation's complete belief — no further writes"
+                )
+            });
+        }
+        Ok(())
+    }
+
+    /// `:reconcile` on a TxTime relation (mnestic fork, provenance semirings
+    /// R3): declare the query output to BE the relation's new current
+    /// belief. The engine diffs the output against the resolved current
+    /// belief and buffers, as ONE belief event at commit-tt:
+    /// - assertions for keys whose belief is new or changed,
+    /// - retractions (tt-only) / vt-cessations with values copied
+    ///   (bitemporal) for currently-believed keys absent from the output.
+    ///
+    /// Unchanged keys buffer nothing, so re-reconciling an identical output
+    /// is a true no-op (no tt burned, no history bloat). Whole-relation
+    /// semantics: the output must be the COMPLETE intended belief set —
+    /// every believed key missing from it is retracted. This is the
+    /// recompute-based truth-maintenance step: retract or append base
+    /// facts, re-derive, `:reconcile` the derived (annotated) relation;
+    /// `::history` and as-of reads then answer "what did we believe, and
+    /// why, as of T" across the revision. Truth maintenance is USER-driven —
+    /// there is no automatic base→derived propagation (incremental
+    /// DRed-style maintenance is recorded future work).
+    ///
+    /// Caveats (documented contracts):
+    /// - the relation admits no other write in the same transaction, before
+    ///   OR after the reconcile (the declaration must stay complete);
+    /// - like every tt write, the revision is invisible to later reads in
+    ///   the same script (§5: one belief event per transaction);
+    /// - value columns with non-constant defaults (`rand_*`, `now()`)
+    ///   defeat idempotence if omitted from the spec — every run re-asserts
+    ///   every key; supply such columns explicitly;
+    /// - bitemporal inputs should carry explicit vt timestamps: `'NOW'`
+    ///   mints a fresh vt-group every run (each reconcile then asserts the
+    ///   new group and ceases the previous one);
+    /// - cost is O(relation): the current belief is fully resolved and both
+    ///   belief sets are held in memory for the diff.
+    #[allow(clippy::too_many_arguments)]
+    fn reconcile_tt_relation(
+        &mut self,
+        res_iter: impl Iterator<Item = Tuple>,
+        headers: &[Symbol],
+        cur_vld: ValidityTs,
+        relation_store: &RelationHandle,
+        metadata: &StoredRelationMetadata,
+        key_bindings: &[Symbol],
+        dep_bindings: &[Symbol],
+        is_callback_target: bool,
+        span: SourceSpan,
+    ) -> Result<()> {
+        use crate::data::functions::MAX_VALIDITY_TS;
+        if !relation_store.has_txtime() {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error(":reconcile requires a TxTime relation, {0} is not")]
+            #[diagnostic(
+                code(eval::reconcile_needs_txtime),
+                help("reconciliation diffs against the relation's current belief and records the revision in transaction time; for a plain relation use :replace")
+            )]
+            struct ReconcileNeedsTxTime(String);
+            bail!(ReconcileNeedsTxTime(relation_store.name.to_string()));
+        }
+        if relation_store.access_level < AccessLevel::Protected {
+            bail!(InsufficientAccessLevel(
+                relation_store.name.to_string(),
+                "belief reconciliation".to_string(),
+                relation_store.access_level
+            ));
+        }
+        Self::check_tt_write_shape(relation_store, metadata, is_callback_target, ":reconcile")?;
+        self.check_not_reconciled(relation_store, ":reconcile")?;
+        // A reconcile declares the COMPLETE belief; an earlier pending write
+        // in the same transaction would be invisible to the diff (it reads
+        // the store) yet stamped alongside it, silently contradicting the
+        // declaration.
+        if self
+            .pending_tt_writes
+            .iter()
+            .any(|w| w.handle.id == relation_store.id)
+        {
+            bail!(TransactAssertionFailure {
+                relation: relation_store.name.to_string(),
+                key: vec![],
+                notice: ":reconcile must be its relation's only write in the transaction"
+                    .to_string()
+            });
+        }
+
+        let kpos = relation_store.metadata.keys.len() - 1;
+        let is_bitemporal = kpos >= 1
+            && matches!(
+                relation_store.metadata.keys[kpos - 1].typing.coltype,
+                crate::data::relation::ColType::Validity
+            );
+
+        let mut extractors = make_extractors(
+            &relation_store.metadata.keys[..kpos],
+            &metadata.keys,
+            key_bindings,
+            headers,
+        )?;
+        let val_extractors = if metadata.non_keys.is_empty() {
+            make_extractors(
+                &relation_store.metadata.non_keys,
+                &metadata.keys,
+                key_bindings,
+                headers,
+            )?
+        } else {
+            make_extractors(
+                &relation_store.metadata.non_keys,
+                &metadata.non_keys,
+                dep_bindings,
+                headers,
+            )?
+        };
+        extractors.extend(val_extractors);
+
+        // the DESIRED belief set
+        let mut desired: BTreeMap<Tuple, Tuple> = BTreeMap::new();
+        for tuple in res_iter {
+            let extracted: Vec<DataValue> = extractors
+                .iter()
+                .map(|ex| ex.extract_data(&tuple, cur_vld))
+                .try_collect()?;
+            let (prefix, vals) = extracted.split_at(kpos);
+            if is_bitemporal {
+                match &prefix[kpos - 1] {
+                    DataValue::Validity(v) if v.is_assert.0 => {}
+                    _ => bail!(TransactAssertionFailure {
+                        relation: relation_store.name.to_string(),
+                        key: prefix.to_vec(),
+                        notice: ":reconcile rows declare beliefs — the valid-time flag must \
+                                 be ASSERT; cessations are computed from the diff"
+                            .to_string()
+                    }),
+                }
+            }
+            match desired.entry(prefix.to_vec()) {
+                std::collections::btree_map::Entry::Vacant(e) => {
+                    e.insert(vals.to_vec());
+                }
+                std::collections::btree_map::Entry::Occupied(e) => {
+                    if e.get().as_slice() != vals {
+                        bail!(TransactAssertionFailure {
+                            relation: relation_store.name.to_string(),
+                            key: prefix.to_vec(),
+                            notice: "conflicting rows for one key in a single :reconcile"
+                                .to_string()
+                        });
+                    }
+                }
+            }
+        }
+
+        // the CURRENT belief set
+        let mut current: BTreeMap<Tuple, Tuple> = BTreeMap::new();
+        if is_bitemporal {
+            // resolve-groups at current tt; a group whose belief is a
+            // cessation surfaces retract-flagged and is NOT a belief
+            for row in relation_store.bitemporal_scan_all(self, None, MAX_VALIDITY_TS) {
+                let row = row?;
+                match &row[kpos - 1] {
+                    DataValue::Validity(v) if !v.is_assert.0 => continue,
+                    _ => {}
+                }
+                current.insert(row[..kpos].to_vec(), row[kpos + 1..].to_vec());
+            }
+        } else {
+            // per-key latest record, believed-deleted skipped
+            for row in relation_store.skip_scan_all(self, MAX_VALIDITY_TS) {
+                let row = row?;
+                current.insert(row[..kpos].to_vec(), row[kpos + 1..].to_vec());
+            }
+        }
+
+        // the diff — one belief event
+        let mut asserts: Vec<Tuple> = Vec::new();
+        let mut retracts: Vec<Tuple> = Vec::new();
+        for (prefix, vals) in &desired {
+            if current.get(prefix) == Some(vals) {
+                continue;
+            }
+            let mut row = prefix.clone();
+            row.extend(vals.iter().cloned());
+            asserts.push(row);
+        }
+        for (prefix, vals) in &current {
+            if desired.contains_key(prefix) {
+                continue;
+            }
+            let mut row = prefix.clone();
+            if is_bitemporal {
+                // cessation in the belief's own vt-group, values copied
+                let vt_ts = match &row[kpos - 1] {
+                    DataValue::Validity(v) => v.timestamp,
+                    _ => unreachable!("vt column decodes to Validity"),
+                };
+                row[kpos - 1] = DataValue::Validity(crate::data::value::Validity {
+                    timestamp: vt_ts,
+                    is_assert: std::cmp::Reverse(false),
+                });
+                row.extend(vals.iter().cloned());
+                // the retract flag rides the vt axis
+                asserts.push(row);
+            } else {
+                row.extend(vals.iter().cloned());
+                retracts.push(row);
+            }
+        }
+        if !asserts.is_empty() {
+            self.pending_tt_writes.push(PendingTtWrite {
+                handle: relation_store.clone(),
+                rows: asserts,
+                is_retract: false,
+                span,
+            });
+        }
+        if !retracts.is_empty() {
+            self.pending_tt_writes.push(PendingTtWrite {
+                handle: relation_store.clone(),
+                rows: retracts,
+                is_retract: true,
+                span,
+            });
+        }
+        // registered even when nothing was buffered: the declaration itself
+        // must be witnessable by later statements
+        self.reconciled_tt_relations.insert(relation_store.id.0);
+        Ok(())
+    }
+
     /// Buffer `:put`s into a tt-stamped relation (mnestic fork, bitemporality
     /// step 3): rows are extracted now but stamped and written at commit
     /// (`SessionTx::stamp_pending_tt_writes`), so the whole transaction
@@ -1067,6 +1325,7 @@ impl<'a> SessionTx<'a> {
         is_callback_target: bool,
         span: SourceSpan,
     ) -> Result<()> {
+        self.check_not_reconciled(relation_store, ":put")?;
         // On :create the input metadata IS the declared schema (tt included,
         // legitimately); the supplied-column check applies to put specs only —
         // but the query HEADERS must still not smuggle a tt value in.
@@ -1220,6 +1479,7 @@ impl<'a> SessionTx<'a> {
         is_callback_target: bool,
         span: SourceSpan,
     ) -> Result<()> {
+        self.check_not_reconciled(relation_store, ":rm")?;
         let kpos = relation_store.metadata.keys.len() - 1;
         let is_bitemporal = kpos >= 1
             && matches!(
@@ -1356,6 +1616,7 @@ impl<'a> SessionTx<'a> {
         span: SourceSpan,
         kpos: usize,
     ) -> Result<()> {
+        self.check_not_reconciled(relation_store, ":rm")?;
         use crate::data::functions::MAX_VALIDITY_TS;
         // keys minus tt: plain keys + the vt column (user-supplied)
         let extractors = make_extractors(
@@ -1450,6 +1711,7 @@ impl<'a> SessionTx<'a> {
         is_callback_target: bool,
         span: SourceSpan,
     ) -> Result<()> {
+        self.check_not_reconciled(relation_store, ":update")?;
         Self::check_tt_write_shape(relation_store, metadata, is_callback_target, ":update")?;
         let kpos = relation_store.metadata.keys.len() - 1;
         let is_bitemporal = kpos >= 1

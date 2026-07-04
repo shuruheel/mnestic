@@ -348,6 +348,7 @@ pub(crate) fn parse_query(
                 let op = match args.next().unwrap().as_rule() {
                     Rule::relation_create => RelationOp::Create,
                     Rule::relation_replace => RelationOp::Replace,
+                    Rule::relation_reconcile => RelationOp::Reconcile,
                     Rule::relation_put => RelationOp::Put,
                     Rule::relation_insert => RelationOp::Insert,
                     Rule::relation_update => RelationOp::Update,

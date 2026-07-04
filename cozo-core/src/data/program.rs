@@ -110,6 +110,9 @@ impl Display for QueryOutOptions {
                 RelationOp::Replace => {
                     write!(f, ":replace ")?;
                 }
+                RelationOp::Reconcile => {
+                    write!(f, ":reconcile ")?;
+                }
                 RelationOp::Insert => {
                     write!(f, ":insert ")?;
                 }
@@ -200,6 +203,11 @@ pub enum SortDir {
 pub enum RelationOp {
     Create,
     Replace,
+    /// `:reconcile` (mnestic fork, provenance semirings R3): declare the
+    /// query output to BE a TxTime relation's new current belief — the
+    /// engine diffs against the resolved current belief and buffers
+    /// assertions + retractions as one belief event.
+    Reconcile,
     Put,
     Insert,
     Update,

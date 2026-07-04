@@ -3667,3 +3667,226 @@ fn semiring_tags_persist_in_rows() {
         .expect_err("unregistered aggregate must not resolve");
     assert!(format!("{err:?}").contains("not found"), "{err:?}");
 }
+
+// ==== mnestic fork: provenance semirings R3 — :reconcile (belief revision) ====
+
+#[test]
+fn reconcile_tt_only_belief_revision() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create facts {k: Int, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 10], [2, 20], [3, 30]] :reconcile facts {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[k, v] := *facts[k, t, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[1, 10], [2, 20], [3, 30]]),
+        "{res:?}"
+    );
+    // revision: 1 unchanged, 2 changed, 3 gone, 4 new
+    db.run_default("?[k, v] <- [[1, 10], [2, 25], [4, 40]] :reconcile facts {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[k, v] := *facts[k, t, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[1, 10], [2, 25], [4, 40]]),
+        "{res:?}"
+    );
+    // unchanged key 1: exactly ONE record (no history bloat)
+    let res = db.run_default("::history facts [[1]]").unwrap().into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 1, "{res:?}");
+    // retracted key 3: assert + retract, and the as-of read still answers
+    let res = db.run_default("::history facts [[3]]").unwrap().into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0][1], "retract");
+    let first_tt = rows[1][2].as_i64().unwrap();
+    let res = db
+        .run_default(&format!("?[v] := *facts[3, t, v @ (tt: {first_tt})]"))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[30]]), "{res:?}");
+    // idempotence: an identical reconcile buffers nothing
+    db.run_default("?[k, v] <- [[1, 10], [2, 25], [4, 40]] :reconcile facts {k => v}")
+        .unwrap();
+    let res = db.run_default("::history facts [[2]]").unwrap().into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 2, "{res:?}");
+}
+
+#[test]
+fn reconcile_bitemporal_cessations() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create bt {k: Int, vld: Validity, tt: TxTime => v: Int}")
+        .unwrap();
+    db.run_default(
+        "?[k, vld, v] <- [[1, [100, true], 7], [1, [200, true], 8]] :reconcile bt {k, vld => v}",
+    )
+    .unwrap();
+    // revision: group 100 corrected, group 200 dropped (cessation)
+    db.run_default("?[k, vld, v] <- [[1, [100, true], 9]] :reconcile bt {k, vld => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *bt[k, v, t, x @ (vt: 150)]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[9]]), "corrected: {res:?}");
+    let res = db
+        .run_default("?[x] := *bt[k, v, t, x @ (vt: 250)]")
+        .unwrap()
+        .into_json();
+    // group 200 ceased: from vt 200 onward the fact is believed-deleted
+    // (spec §3 — a deciding group does NOT fall through to older groups)
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0, "{res:?}");
+    // the cessation is recorded, not erased: as-of the FIRST event's tt the
+    // old belief at vt 250 was 8
+    let res = db.run_default("::history bt [[1]]").unwrap().into_json();
+    let rows = res["rows"].as_array().unwrap();
+    let first_tt = rows.iter().map(|r| r[3].as_i64().unwrap()).min().unwrap();
+    let res = db
+        .run_default(&format!(
+            "?[x] := *bt[k, v, t, x @ (vt: 250, tt: {first_tt})]"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[8]]), "{res:?}");
+}
+
+/// The R3 acceptance scenario: retract a base fact, re-derive, reconcile —
+/// derived annotations stay consistent, and "what did we believe, and why,
+/// as of T" answers across the revision.
+#[test]
+fn reconcile_tms_retraction_end_to_end() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create base {f: Int, t: Int, tt: TxTime => w: Float}")
+        .unwrap();
+    db.run_default("?[f, t, w] <- [[1, 2, 1.0], [2, 3, 1.0], [1, 3, 3.0]] :put base {f, t => w}")
+        .unwrap();
+    // derived, annotated: top-2 cheapest paths per destination (proofs in key)
+    db.run_default(":create paths {dst: Int, pack, tt: TxTime => }")
+        .unwrap();
+    let derive = r#"
+        edge[f, t, w] := *base[f, t, ttx, w]
+        sp[t, min_cost_k(pack, 2)] := t = 1, pack = [[1], 0.0]
+        sp[t, min_cost_k(pack, 2)] := sp[m, p], edge[m, t, w],
+                                      pack = [concat(first(p), [t]), last(p) + w]
+        ?[dst, pack] := sp[dst, pack]
+        :reconcile paths {dst, pack}
+    "#;
+    db.run_default(derive).unwrap();
+    let res = db
+        .run_default("?[pack] := *paths[3, pack, ttx]")
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[[[1, 2, 3], 2.0]], [[[1, 3], 3.0]]]),
+        "{res:?}"
+    );
+    // retract a base fact (the cheap 2→3 edge), re-derive, reconcile
+    db.run_default("?[f, t] <- [[2, 3]] :rm base {f, t}")
+        .unwrap();
+    db.run_default(derive).unwrap();
+    // derived annotations consistent with the post-retraction base: the
+    // proof through the retracted edge is GONE, not orphaned
+    let res = db
+        .run_default("?[pack] := *paths[3, pack, ttx]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[[[1, 3], 3.0]]]), "{res:?}");
+    // …and the old belief plus its justification still answers as-of T
+    let res = db
+        .run_default("::history paths [[3, [[1, 2, 3], 2.0]]]")
+        .unwrap()
+        .into_json();
+    let rows = res["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 2, "assert then retract: {rows:?}");
+    let first_tt = rows[1][3].as_i64().unwrap();
+    let res = db
+        .run_default(&format!(
+            "?[pack] := *paths[3, pack, ttx @ (tt: {first_tt})]"
+        ))
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[[[1, 2, 3], 2.0]], [[[1, 3], 3.0]]]),
+        "the pre-retraction annotated belief, with proofs: {res:?}"
+    );
+}
+
+#[test]
+fn reconcile_validation() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create plain_r {k: Int => v: Int}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, v] <- [[1, 1]] :reconcile plain_r {k => v}")
+        .expect_err("plain relation");
+    assert!(
+        format!("{err:?}").contains("requires a TxTime relation"),
+        "{err:?}"
+    );
+    db.run_default(":create rc {k: Int, tt: TxTime => v: Int}")
+        .unwrap();
+    // conflicting duplicate keys in one output
+    let err = db
+        .run_default("?[k, v] <- [[1, 1], [1, 2]] :reconcile rc {k => v}")
+        .expect_err("conflicting rows");
+    assert!(format!("{err:?}").contains("conflicting rows"), "{err:?}");
+    // an earlier pending write in the same transaction
+    let err = db
+        .run_default(
+            "{?[k, v] <- [[9, 9]] :put rc {k => v}} {?[k, v] <- [[1, 1]] :reconcile rc {k => v}}",
+        )
+        .expect_err("pending write");
+    assert!(format!("{err:?}").contains("only"), "{err:?}");
+    // bitemporal rows must declare beliefs (assert flag)
+    db.run_default(":create rcb {k: Int, vld: Validity, tt: TxTime => v: Int}")
+        .unwrap();
+    let err = db
+        .run_default("?[k, vld, v] <- [[1, [100, false], 1]] :reconcile rcb {k, vld => v}")
+        .expect_err("retract-flag row");
+    assert!(format!("{err:?}").contains("declare beliefs"), "{err:?}");
+    // empty output retracts every current belief
+    db.run_default("?[k, v] <- [[1, 1], [2, 2]] :reconcile rc {k => v}")
+        .unwrap();
+    db.run_default("?[k, v] <- [] :reconcile rc {k => v}")
+        .unwrap();
+    let res = db
+        .run_default("?[k, v] := *rc[k, t, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"].as_array().unwrap().len(), 0, "{res:?}");
+
+    // the declaration is complete: NO other write to the relation in the
+    // same transaction, before or after — including writes an IDEMPOTENT
+    // reconcile leaves no pending trace of (review must-fix)
+    db.run_default("?[k, v] <- [[1, 10]] :reconcile rc {k => v}")
+        .unwrap();
+    for later in [
+        "{?[k, v] <- [[1, 10]] :reconcile rc {k => v}} {?[k, v] <- [[3, 30]] :put rc {k => v}}",
+        "{?[k, v] <- [[1, 10]] :reconcile rc {k => v}} {?[k] <- [[1]] :rm rc {k}}",
+        // idempotent first reconcile buffers nothing; the second must still bail
+        "{?[k, v] <- [[1, 10]] :reconcile rc {k => v}} {?[k, v] <- [[2, 20]] :reconcile rc {k => v}}",
+    ] {
+        let err = db.run_default(later).expect_err("write after reconcile");
+        assert!(format!("{err:?}").contains("reconcile"), "{later}: {err:?}");
+    }
+    // §5: the revision is invisible to later reads in the same script
+    let res = db
+        .run_default("{?[k, v] <- [[1, 99]] :reconcile rc {k => v}} {?[k, v] := *rc[k, t, v]}")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 10]]), "{res:?}");
+    let res = db
+        .run_default("?[k, v] := *rc[k, t, v]")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[1, 99]]), "{res:?}");
+}

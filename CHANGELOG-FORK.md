@@ -5,6 +5,43 @@ provenance and licensing.
 
 ## Unreleased
 
+### New — `:reconcile`: recompute-based belief revision (provenance semirings R3)
+- **`:reconcile rel {…}`** — declare a query output to BE a TxTime relation's
+  new complete current belief. The engine diffs the output against the
+  resolved current belief and records, as ONE belief event at commit-tt:
+  assertions for new/changed keys; retractions (tt-only) or vt-cessations
+  with values copied (bitemporal) for currently-believed keys absent from
+  the output. Unchanged keys record nothing — an identical re-reconcile is
+  a true no-op (no tt burned, no history bloat). This is the R3
+  truth-maintenance step in its honest recompute form: retract or append
+  base facts, re-derive, `:reconcile` the derived (annotated) relation —
+  derived annotations stay consistent with the revised base, and
+  `::history` + as-of reads answer **"what did we believe, and why, as of
+  T"** across the revision (pinned end-to-end with a `min_cost_k`-annotated
+  path relation surviving a base-edge retraction). **Truth maintenance is
+  user-driven**: no automatic base→derived propagation; incremental
+  (DRed/counting) maintenance is recorded future work.
+- **The declaration is protected transaction-wide** (review must-fix,
+  empirically probed): a reconciled relation admits no other write in the
+  same transaction, before or after the reconcile — including cases where
+  an idempotent reconcile buffers no rows and would otherwise leave no
+  pending trace (`{reconcile} {rm}` would silently empty the relation the
+  reconcile just declared). Witnessed by a transaction-scoped
+  reconciled-relations set, not the pending-write buffer.
+- Documented contracts: TxTime relations only (plain relations keep
+  `:replace`); the revision is invisible to later reads in the same script
+  (§5 one-belief-event); duplicate keys with conflicting values in one
+  output error; bitemporal inputs must carry assert-flagged, explicit vt
+  timestamps (`'NOW'` mints a fresh group per run); value columns with
+  non-constant defaults defeat idempotence if omitted; cost is
+  O(relation) per call.
+
+### Fixed — `::history` output order now matches spec §7 (step-5 follow-up)
+- Rows were emitted in physical scan order, which interleaves a vt-group's
+  assert and retract RUNS — a belief timeline read top-to-bottom misordered
+  cessations against corrections (surfaced by the R3 review). Output is now
+  key-asc, vt-desc, tt-desc as §7 documents.
+
 ### Resolved — annotation persistence needs no storage-format change (provenance semirings R2)
 - The spec anticipated persisting semiring tags via a row-format change. The
   tags-as-columns architecture (R0/R1) made that unnecessary: annotation

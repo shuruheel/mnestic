@@ -55,6 +55,13 @@ pub struct SessionTx<'a> {
     /// (`::evict`'s audit stamp): forces `commit_tx` through
     /// `commit_tx_with_tt` so the persisted HWM covers the burned value.
     pub(crate) tt_hwm_dirty: bool,
+    /// Relations `:reconcile`d in this transaction (provenance semirings
+    /// R3). A reconcile declares its relation's COMPLETE belief; any further
+    /// write to the relation in the same transaction — including another
+    /// reconcile — would silently amend or contradict the declaration
+    /// (an idempotent reconcile buffers no rows, so `pending_tt_writes`
+    /// alone cannot witness it).
+    pub(crate) reconciled_tt_relations: std::collections::BTreeSet<u64>,
 }
 
 /// One statement's worth of buffered writes to a tt-stamped relation.

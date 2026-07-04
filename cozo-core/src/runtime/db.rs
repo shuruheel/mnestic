@@ -1092,6 +1092,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
+            reconciled_tt_relations: Default::default(),
         };
         Ok(ret)
     }
@@ -1107,6 +1108,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
+            reconciled_tt_relations: Default::default(),
         };
         Ok(ret)
     }
@@ -1745,6 +1747,20 @@ impl<'s, S: Storage<'s>> Db<S> {
                         rows.push(row);
                     }
                 }
+                // spec §7 ordering: key-asc, vt-desc, tt-desc. The raw scan
+                // interleaves a vt-group's assert and retract RUNS (physical
+                // order), which misreads as the belief timeline.
+                rows.sort_by(|a, b| {
+                    a[..plain_len].cmp(&b[..plain_len]).then_with(|| {
+                        if is_bitemporal {
+                            b[plain_len]
+                                .cmp(&a[plain_len])
+                                .then_with(|| b[plain_len + 2].cmp(&a[plain_len + 2]))
+                        } else {
+                            b[plain_len + 1].cmp(&a[plain_len + 1])
+                        }
+                    })
+                });
                 let offset = offset.unwrap_or(0);
                 let rows: Vec<_> = rows
                     .into_iter()
