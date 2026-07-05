@@ -27,7 +27,7 @@ use crate::query::compile::{
     AggrKind, CompiledProgram, CompiledRule, CompiledRuleSet, ContainedRuleMultiplicity,
 };
 use crate::runtime::db::Poison;
-use crate::runtime::temp_store::{BoundedMeetStore, EpochStore, MeetAggrStore, RegularTempStore};
+use crate::runtime::temp_store::{EpochStore, MeetAggrStore, RegularTempStore, TempStore};
 use crate::runtime::transact::SessionTx;
 
 /// provenance semirings R1: hard epoch cap for programs containing a
@@ -192,15 +192,12 @@ impl<'a> SessionTx<'a> {
                                 )?;
                                 new.wrap()
                             }
-                            AggrKind::BoundedMeet => {
-                                let new = self.initial_rule_bounded_meet_eval(
-                                    k,
-                                    &ruleset,
-                                    borrowed_stores,
-                                    poison.clone(),
-                                )?;
-                                new.wrap()
-                            }
+                            AggrKind::BoundedMeet => self.initial_rule_bounded_meet_eval(
+                                k,
+                                &ruleset,
+                                borrowed_stores,
+                                poison.clone(),
+                            )?,
                         },
                         CompiledRuleSet::Fixed(fixed) => {
                             let fixed_impl = fixed.fixed_impl.as_ref();
@@ -276,15 +273,12 @@ impl<'a> SessionTx<'a> {
                                     )?;
                                     new.wrap()
                                 }
-                                AggrKind::BoundedMeet => {
-                                    let new = self.incremental_rule_bounded_meet_eval(
-                                        k,
-                                        &ruleset,
-                                        borrowed_stores,
-                                        poison.clone(),
-                                    )?;
-                                    new.wrap()
-                                }
+                                AggrKind::BoundedMeet => self.incremental_rule_bounded_meet_eval(
+                                    k,
+                                    &ruleset,
+                                    borrowed_stores,
+                                    poison.clone(),
+                                )?,
                                 AggrKind::Normal => {
                                     // not doing anything
                                     RegularTempStore::default().wrap()
@@ -412,14 +406,14 @@ impl<'a> SessionTx<'a> {
         ruleset: &[CompiledRule],
         stores: &BTreeMap<MagicSymbol, EpochStore>,
         poison: Poison,
-    ) -> Result<BoundedMeetStore> {
-        let mut out_store = BoundedMeetStore::new(ruleset[0].aggr.clone())?;
+    ) -> Result<TempStore> {
+        let mut out_store = TempStore::new_bounded(ruleset[0].aggr.clone())?;
         for (rule_n, rule) in ruleset.iter().enumerate() {
             debug!("initial calculation for rule {:?}.{}", rule_symb, rule_n);
             for item_res in rule.relation.iter(self, None, stores)? {
                 let item = item_res?;
                 trace!("item for {:?}.{}: {:?} at {}", rule_symb, rule_n, item, 0);
-                out_store.meet_put(item)?;
+                out_store.bounded_meet_put(item)?;
             }
             poison.check()?;
         }
@@ -433,8 +427,8 @@ impl<'a> SessionTx<'a> {
         ruleset: &[CompiledRule],
         stores: &BTreeMap<MagicSymbol, EpochStore>,
         poison: Poison,
-    ) -> Result<BoundedMeetStore> {
-        let mut out_store = BoundedMeetStore::new(ruleset[0].aggr.clone())?;
+    ) -> Result<TempStore> {
+        let mut out_store = TempStore::new_bounded(ruleset[0].aggr.clone())?;
         for (rule_n, rule) in ruleset.iter().enumerate() {
             let mut need_complete_run = false;
             let mut dependencies_changed = false;
@@ -456,7 +450,7 @@ impl<'a> SessionTx<'a> {
             if need_complete_run {
                 debug!("complete run for rule {:?}.{}", rule_symb, rule_n);
                 for item_res in rule.relation.iter(self, None, stores)? {
-                    out_store.meet_put(item_res?)?;
+                    out_store.bounded_meet_put(item_res?)?;
                 }
                 poison.check()?;
             } else {
@@ -469,7 +463,7 @@ impl<'a> SessionTx<'a> {
                         delta_key, rule_symb, rule_n
                     );
                     for item_res in rule.relation.iter(self, Some(delta_key), stores)? {
-                        out_store.meet_put(item_res?)?;
+                        out_store.bounded_meet_put(item_res?)?;
                     }
                     poison.check()?;
                 }

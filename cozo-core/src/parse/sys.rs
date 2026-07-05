@@ -119,7 +119,7 @@ pub(crate) fn parse_sys(
     mut src: Pairs<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     algorithms: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<SysOp> {
     let inner = src.next().unwrap();
@@ -267,9 +267,13 @@ pub(crate) fn parse_sys(
                     script.into_inner(),
                     &Default::default(),
                     algorithms,
-                    // triggers: custom aggregates unsupported (R0) — validate
-                    // against an empty registry so ::set_triggers fails fast.
-                    &Default::default(),
+                    // triggers: custom aggregates unsupported (R0; bounded-
+                    // meet registrations likewise) — validate against empty
+                    // registries so ::set_triggers fails fast.
+                    crate::data::aggr::CustomAggrRegistries {
+                        meet: &Default::default(),
+                        bounded: &Default::default(),
+                    },
                     cur_vld,
                 )?;
                 match op.as_rule() {

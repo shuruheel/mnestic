@@ -31,6 +31,12 @@ pub struct Aggregation {
     /// `define_aggr!` const path is unchanged. Cloned with the Aggregation
     /// (programs are cloned; the ops boxes are not).
     pub meet_factory: Option<std::sync::Arc<dyn Fn() -> Box<dyn MeetAggrObj> + Send + Sync>>,
+    /// A user-registered DOMINANCE bounded-meet (mnestic fork, spec
+    /// `docs/specs/antichain-bounded-meet.md`): keeps the non-dominated
+    /// (antichain / skyline) set per group instead of the k cheapest.
+    /// `None` for every builtin and every R0b registered meet. When `Some`,
+    /// `is_bounded_meet` is true and the store is a `DominanceMeetStore`.
+    pub bounded_dominance: Option<RegisteredBoundedMeet>,
 }
 
 impl Clone for Aggregation {
@@ -42,6 +48,7 @@ impl Clone for Aggregation {
             meet_op: None,
             normal_op: None,
             meet_factory: self.meet_factory.clone(),
+            bounded_dominance: self.bounded_dominance.clone(),
         }
     }
 }
@@ -105,6 +112,54 @@ impl BoundedMeetAggrObj for BoundedMinCostK {
 pub struct RegisteredAggr {
     pub is_meet: bool,
     pub factory: std::sync::Arc<dyn Fn() -> Box<dyn MeetAggrObj> + Send + Sync>,
+}
+
+/// A user-registered dominance bounded-meet aggregate (mnestic fork, spec
+/// `docs/specs/antichain-bounded-meet.md`): the head form `name(operand)`
+/// keeps, per group, the set of operands not dominated by any other — the
+/// antichain / Pareto frontier under `dominates` — each survivor emitted as
+/// its own output row, exactly like `min_cost_k` rows.
+///
+/// Registrant contract (the caller's law; see the spec §3.4):
+/// - `dominates` MUST be a strict partial order — irreflexive and transitive
+///   (hence asymmetric) — and pure (no interior mutability, clock, or RNG).
+///   Debug builds probe irreflexivity and asymmetry on encountered values
+///   and error loudly on violation; transitivity is not probed and stays the
+///   registrant's obligation. Compose lexicographic tie-breaks only over
+///   strict *weak* clauses (incomparability transitive), with a genuinely
+///   partial clause in last position only.
+/// - `dominates` sees ONLY the aggregated operand: pack every field the
+///   predicate inspects into the operand value.
+/// - MUST NOT panic (no `catch_unwind` in the engine — a panic unwinds into
+///   the host) and should be cheap: it runs O(survivors) per candidate.
+/// - `max_survivors` is a mandatory resource guard: a group's non-dominated
+///   set exceeding it is a loud error, never a silent truncation (an
+///   antichain has no canonical k-subset).
+/// - Nothing fingerprints a registered algebra: re-registering a different
+///   `dominates` under the same name silently changes what later reads of
+///   persisted output mean — version algebra names like schemas.
+#[derive(Clone)]
+pub struct RegisteredBoundedMeet {
+    pub dominates: std::sync::Arc<dyn Fn(&DataValue, &DataValue) -> bool + Send + Sync>,
+    pub max_survivors: usize,
+}
+
+impl std::fmt::Debug for RegisteredBoundedMeet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisteredBoundedMeet")
+            .field("max_survivors", &self.max_survivors)
+            .finish()
+    }
+}
+
+/// The two custom-aggregate registries threaded through parsing as one
+/// `Copy` bundle (mnestic fork): R0b meet registrations + dominance
+/// bounded-meet registrations. One bundle keeps every pass-through call
+/// site untouched when a registry category is added.
+#[derive(Clone, Copy)]
+pub struct CustomAggrRegistries<'a> {
+    pub meet: &'a std::collections::BTreeMap<String, RegisteredAggr>,
+    pub bounded: &'a std::collections::BTreeMap<String, RegisteredBoundedMeet>,
 }
 
 /// Intern a custom aggregate name to `&'static str`, leaking each DISTINCT
@@ -179,6 +234,7 @@ macro_rules! define_aggr {
             meet_op: None,
             normal_op: None,
             meet_factory: None,
+            bounded_dominance: None,
         };
     };
 }

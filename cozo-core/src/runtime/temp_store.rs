@@ -15,7 +15,7 @@ use std::ops::Bound::Excluded;
 
 use either::{Left, Right};
 use itertools::Itertools;
-use miette::Result;
+use miette::{bail, ensure, Result};
 
 use crate::data::aggr::Aggregation;
 use crate::data::tuple::Tuple;
@@ -377,19 +377,238 @@ impl BoundedMeetStore {
     }
 }
 
+/// The dominance bounded-meet store (mnestic fork, spec
+/// `docs/specs/antichain-bounded-meet.md`): per group, the set of candidates
+/// not dominated by any other — the antichain / Pareto frontier under a
+/// registered strict partial order. The insert is BNL in-buffer maintenance:
+/// structural-equality dedup first (○= is `DataValue` equality), reject if
+/// any survivor dominates the newcomer (sound without checking what the
+/// newcomer dominates, by transitivity + the antichain invariant), else
+/// evict everything the newcomer dominates and insert. Survivor vectors are
+/// kept in `DataValue` (memcmp) order so dedup is a binary search and
+/// emission order is canonical rather than arrival-dependent. Like
+/// `BoundedMeetStore`, displacement makes this non-monotone: it rides
+/// `AggrKind::BoundedMeet` and the evaluator's epoch cap. `max_survivors`
+/// guards store growth: overflow is a loud error, never a silent truncation
+/// (an antichain has no canonical k-subset). The bail fires on the RUNNING
+/// antichain, so whether a run bails can depend on candidate arrival order —
+/// the confluence guarantee covers the output values of successful runs.
+/// The asymmetry probe runs on reject-direction comparisons; that coverage
+/// suffices to keep a symmetric pair from ever corrupting the set (a
+/// symmetric pair is caught in the reject loop before any eviction).
+pub(crate) struct DominanceMeetStore {
+    /// group key → memcmp-sorted, deduped survivor single-column tuples
+    inner: BTreeMap<Tuple, Vec<Tuple>>,
+    reg: crate::data::aggr::RegisteredBoundedMeet,
+    aggr_name: &'static str,
+    grouping_len: usize,
+    /// `true` for a delta store: equality-dedup only — no dominance pruning,
+    /// no cap. The delta must stay a superset of what may still change the
+    /// total store, mirroring `BoundedMeetStore`'s unbounded twin.
+    dedup_only: bool,
+}
+
+impl std::fmt::Debug for DominanceMeetStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DominanceMeetStore")
+            .field("aggr_name", &self.aggr_name)
+            .field("max_survivors", &self.reg.max_survivors)
+            .field("grouping_len", &self.grouping_len)
+            .field("inner", &self.inner)
+            .finish()
+    }
+}
+
+impl DominanceMeetStore {
+    pub(crate) fn new(aggrs: Vec<Option<(Aggregation, Vec<DataValue>)>>) -> Result<Self> {
+        let total_key_len = aggrs.len();
+        let mut bounded = aggrs.into_iter().flatten().collect_vec();
+        // aggr_kind validated the shape: exactly one, last position
+        debug_assert_eq!(bounded.len(), 1);
+        let (aggr, args) = bounded.pop().unwrap();
+        // belt-and-braces: the parser already rejects call-site args
+        ensure!(
+            args.is_empty(),
+            "registered bounded-meet aggregate '{}' takes no arguments (its cap is set at registration)",
+            aggr.name
+        );
+        let reg = aggr
+            .bounded_dominance
+            .clone()
+            .expect("DominanceMeetStore built for a non-dominance aggregate");
+        Ok(Self {
+            inner: Default::default(),
+            reg,
+            aggr_name: aggr.name,
+            grouping_len: total_key_len - 1,
+            dedup_only: false,
+        })
+    }
+    /// An empty twin for the delta slot: equality-dedup only.
+    pub(crate) fn delta_twin(&self) -> Self {
+        Self {
+            inner: Default::default(),
+            reg: self.reg.clone(),
+            aggr_name: self.aggr_name,
+            grouping_len: self.grouping_len,
+            dedup_only: true,
+        }
+    }
+    pub(crate) fn exists(&self, key: &Tuple) -> bool {
+        let truncated = &key[0..self.grouping_len];
+        self.inner.contains_key(truncated)
+    }
+    pub(crate) fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+    /// Merge one candidate into its group's antichain. Returns whether the
+    /// survivor set changed.
+    pub(crate) fn meet_put(&mut self, tuple: Tuple) -> Result<bool> {
+        let (key_part, val_part) = tuple.split_at(self.grouping_len);
+        let c = &val_part[0];
+        let entry = self.inner.entry(key_part.to_vec()).or_default();
+        // memcmp-order binary search: structural-equality dedup + insertion pos
+        let pos = match entry.binary_search_by(|held| held[0].cmp(c)) {
+            Ok(_) => return Ok(false),
+            Err(pos) => pos,
+        };
+        if self.dedup_only {
+            entry.insert(pos, val_part.to_vec());
+            return Ok(true);
+        }
+        let dom = &self.reg.dominates;
+        #[cfg(debug_assertions)]
+        if dom(c, c) {
+            bail!(
+                "dominance for bounded-meet aggregate '{}' violates irreflexivity: dominates(x, x) is true",
+                self.aggr_name
+            );
+        }
+        for held in entry.iter() {
+            if dom(&held[0], c) {
+                #[cfg(debug_assertions)]
+                if dom(c, &held[0]) {
+                    bail!(
+                        "dominance for bounded-meet aggregate '{}' violates asymmetry: dominates(a, b) and dominates(b, a) both hold",
+                        self.aggr_name
+                    );
+                }
+                // a survivor dominates the newcomer: by transitivity the
+                // newcomer cannot dominate any survivor — reject, unchanged
+                return Ok(false);
+            }
+        }
+        entry.retain(|held| !dom(c, &held[0]));
+        let pos = entry
+            .binary_search_by(|held| held[0].cmp(c))
+            .expect_err("deduped candidate reappeared after retain");
+        entry.insert(pos, val_part.to_vec());
+        if entry.len() > self.reg.max_survivors {
+            bail!(
+                "bounded-meet aggregate '{}' exceeded max_survivors = {}: the group's non-dominated set does not fit the registered resource guard (raise it, strengthen the dominance, or aggregate a coarser candidate)",
+                self.aggr_name,
+                self.reg.max_survivors
+            );
+        }
+        Ok(true)
+    }
+    fn range_iter(
+        &self,
+        lower: &Tuple,
+        upper: &Tuple,
+        upper_inclusive: bool,
+    ) -> impl Iterator<Item = TupleInIter<'_>> {
+        let lower_key = if lower.len() > self.grouping_len {
+            lower[0..self.grouping_len].to_vec()
+        } else {
+            lower.to_vec()
+        };
+        let upper_key = if upper.len() > self.grouping_len {
+            upper[0..self.grouping_len].to_vec()
+        } else {
+            upper.to_vec()
+        };
+        let lower = lower.to_vec();
+        let upper = upper.to_vec();
+        self.inner
+            .range(lower_key..=upper_key)
+            .flat_map(|(k, vs)| vs.iter().map(move |v| TupleInIter(k, v, false)))
+            .filter(move |ret| {
+                if ret.partial_cmp(&lower as &[DataValue]) == Some(Ordering::Less) {
+                    return false;
+                }
+                match ret.partial_cmp(&upper as &[DataValue]).unwrap() {
+                    Ordering::Less => true,
+                    Ordering::Equal => upper_inclusive,
+                    Ordering::Greater => false,
+                }
+            })
+    }
+    /// Returns true if prev is guaranteed to be the same as self after this
+    /// function call, false if we are not sure. `prev` collects the
+    /// candidates that CHANGED a survivor set — the delta for the next epoch.
+    pub(crate) fn merge_in(&mut self, prev: &mut Self, mut new: Self) -> Result<bool> {
+        prev.inner.clear();
+        prev.dedup_only = true;
+        if new.inner.is_empty() {
+            return Ok(false);
+        }
+        if self.inner.is_empty() && new.dedup_only == self.dedup_only {
+            mem::swap(&mut self.inner, &mut new.inner);
+            return Ok(true);
+        }
+        for (k, vs) in new.inner {
+            for v in vs {
+                let mut row = k.clone();
+                row.extend(v.iter().cloned());
+                if self.meet_put(row)? {
+                    let mut prev_row = k.clone();
+                    prev_row.extend(v);
+                    prev.meet_put(prev_row)?;
+                }
+            }
+        }
+        Ok(false)
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum TempStore {
     Normal(RegularTempStore),
     MeetAggr(MeetAggrStore),
     BoundedMeet(BoundedMeetStore),
+    DominanceMeet(DominanceMeetStore),
 }
 
 impl TempStore {
+    /// Build the epoch-output store for a bounded-meet rule: a
+    /// `DominanceMeetStore` for a registered dominance aggregate, else the
+    /// builtin `BoundedMeetStore` (mnestic fork, antichain-bounded-meet spec).
+    pub(crate) fn new_bounded(aggrs: Vec<Option<(Aggregation, Vec<DataValue>)>>) -> Result<Self> {
+        let is_dominance = aggrs
+            .iter()
+            .flatten()
+            .any(|(a, _)| a.bounded_dominance.is_some());
+        Ok(if is_dominance {
+            TempStore::DominanceMeet(DominanceMeetStore::new(aggrs)?)
+        } else {
+            TempStore::BoundedMeet(BoundedMeetStore::new(aggrs)?)
+        })
+    }
+    /// Merge one candidate into a bounded-meet-category store.
+    pub(crate) fn bounded_meet_put(&mut self, tuple: Tuple) -> Result<bool> {
+        match self {
+            TempStore::BoundedMeet(b) => b.meet_put(tuple),
+            TempStore::DominanceMeet(d) => d.meet_put(tuple),
+            _ => unreachable!("bounded_meet_put on a non-bounded store"),
+        }
+    }
     fn exists(&self, key: &Tuple) -> bool {
         match self {
             TempStore::Normal(n) => n.exists(key),
             TempStore::MeetAggr(m) => m.exists(key),
             TempStore::BoundedMeet(b) => b.exists(key),
+            TempStore::DominanceMeet(d) => d.exists(key),
         }
     }
     fn range_iter(
@@ -401,7 +620,12 @@ impl TempStore {
         match self {
             TempStore::Normal(n) => Left(n.range_iter(lower, upper, upper_inclusive)),
             TempStore::MeetAggr(m) => Right(Left(m.range_iter(lower, upper, upper_inclusive))),
-            TempStore::BoundedMeet(b) => Right(Right(b.range_iter(lower, upper, upper_inclusive))),
+            TempStore::BoundedMeet(b) => {
+                Right(Right(Left(b.range_iter(lower, upper, upper_inclusive))))
+            }
+            TempStore::DominanceMeet(d) => {
+                Right(Right(Right(d.range_iter(lower, upper, upper_inclusive))))
+            }
         }
     }
     fn is_empty(&self) -> bool {
@@ -409,6 +633,7 @@ impl TempStore {
             TempStore::Normal(n) => n.inner.is_empty(),
             TempStore::MeetAggr(m) => m.inner.is_empty(),
             TempStore::BoundedMeet(b) => b.inner.is_empty(),
+            TempStore::DominanceMeet(d) => d.inner.is_empty(),
         }
     }
 }
@@ -446,6 +671,22 @@ impl EpochStore {
     pub(crate) fn new_bounded_meet(
         aggrs: &[Option<(Aggregation, Vec<DataValue>)>],
     ) -> Result<Self> {
+        // antichain-bounded-meet spec: a registered dominance aggregate gets
+        // the antichain store; the builtin (min_cost_k) keeps the k-set store.
+        let is_dominance = aggrs
+            .iter()
+            .flatten()
+            .any(|(a, _)| a.bounded_dominance.is_some());
+        if is_dominance {
+            let total = DominanceMeetStore::new(aggrs.to_vec())?;
+            let delta = total.delta_twin();
+            return Ok(Self {
+                total: TempStore::DominanceMeet(total),
+                delta: TempStore::DominanceMeet(delta),
+                use_total_for_delta: true,
+                arity: aggrs.len(),
+            });
+        }
         let total = BoundedMeetStore::new(aggrs.to_vec())?;
         let delta = total.delta_twin();
         Ok(Self {
@@ -467,6 +708,13 @@ impl EpochStore {
                 TempStore::BoundedMeet(total),
                 TempStore::BoundedMeet(prev),
                 TempStore::BoundedMeet(new),
+            ) => {
+                self.use_total_for_delta = total.merge_in(prev, new)?;
+            }
+            (
+                TempStore::DominanceMeet(total),
+                TempStore::DominanceMeet(prev),
+                TempStore::DominanceMeet(new),
             ) => {
                 self.use_total_for_delta = total.merge_in(prev, new)?;
             }

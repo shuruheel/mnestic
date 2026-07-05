@@ -64,7 +64,9 @@ use serde_json::json;
 
 #[cfg(feature = "cypher")]
 pub use cypher::{CypherGraphSchema, EdgeMap, NodeMap};
-pub use data::aggr::{MeetAggrObj, NormalAggrObj, RegisteredAggr};
+pub use data::aggr::{
+    CustomAggrRegistries, MeetAggrObj, NormalAggrObj, RegisteredAggr, RegisteredBoundedMeet,
+};
 pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs};
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 pub use runtime::db::Db;
@@ -232,6 +234,23 @@ impl DbInstance {
             DbInstance::TiKv(db) => db.get_custom_aggrs(),
         }
     }
+
+    /// Dispatcher method. See [crate::Db::get_custom_bounded_meets].
+    pub fn get_custom_bounded_meets(&self) -> BTreeMap<String, RegisteredBoundedMeet> {
+        match self {
+            DbInstance::Mem(db) => db.get_custom_bounded_meets(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.get_custom_bounded_meets(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.get_custom_bounded_meets(),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.get_custom_bounded_meets(),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.get_custom_bounded_meets(),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.get_custom_bounded_meets(),
+        }
+    }
     /// Dispatcher method. See [crate::Db::run_script].
     pub fn run_script(
         &self,
@@ -245,7 +264,10 @@ impl DbInstance {
                 payload,
                 &params,
                 &self.get_fixed_rules(),
-                &self.get_custom_aggrs(),
+                CustomAggrRegistries {
+                    meet: &self.get_custom_aggrs(),
+                    bounded: &self.get_custom_bounded_meets(),
+                },
                 cur_vld,
             )?,
             cur_vld,
@@ -637,6 +659,50 @@ impl DbInstance {
             DbInstance::Sled(db) => db.register_custom_aggr(name, is_meet, factory),
             #[cfg(feature = "storage-tikv")]
             DbInstance::TiKv(db) => db.register_custom_aggr(name, is_meet, factory),
+        }
+    }
+    /// Dispatcher method. See [crate::Db::register_bounded_meet_aggr].
+    pub fn register_bounded_meet_aggr<F>(
+        &self,
+        name: String,
+        dominates: F,
+        max_survivors: usize,
+    ) -> Result<()>
+    where
+        F: Fn(&DataValue, &DataValue) -> bool + Send + Sync + 'static,
+    {
+        match self {
+            DbInstance::Mem(db) => db.register_bounded_meet_aggr(name, dominates, max_survivors),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.register_bounded_meet_aggr(name, dominates, max_survivors),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => {
+                db.register_bounded_meet_aggr(name, dominates, max_survivors)
+            }
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => {
+                db.register_bounded_meet_aggr(name, dominates, max_survivors)
+            }
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.register_bounded_meet_aggr(name, dominates, max_survivors),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.register_bounded_meet_aggr(name, dominates, max_survivors),
+        }
+    }
+    /// Dispatcher method. See [crate::Db::unregister_bounded_meet_aggr].
+    pub fn unregister_bounded_meet_aggr(&self, name: &str) -> Result<bool> {
+        match self {
+            DbInstance::Mem(db) => db.unregister_bounded_meet_aggr(name),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.unregister_bounded_meet_aggr(name),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.unregister_bounded_meet_aggr(name),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.unregister_bounded_meet_aggr(name),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.unregister_bounded_meet_aggr(name),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.unregister_bounded_meet_aggr(name),
         }
     }
     /// Dispatcher method. See [crate::Db::unregister_custom_aggr].

@@ -107,7 +107,7 @@ pub(crate) fn parse_query(
     src: Pairs<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<InputProgram> {
     let mut progs: BTreeMap<Symbol, InputInlineRulesOrFixed> = Default::default();
@@ -543,7 +543,7 @@ pub(crate) fn parse_query(
 fn parse_rule(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<(Symbol, InputInlineRule)> {
     let span = src.extract_span();
@@ -802,7 +802,7 @@ fn extract_named_apply_arg(
 fn parse_rule_head(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
 ) -> Result<(
     Symbol,
     Vec<Symbol>,
@@ -828,7 +828,7 @@ struct AggrNotFound(String, #[label] SourceSpan);
 fn parse_rule_head_arg(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
 ) -> Result<(Symbol, Option<(Aggregation, Vec<DataValue>)>)> {
     let src = src.into_inner().next().unwrap();
     Ok(match src.as_rule() {
@@ -843,7 +843,7 @@ fn parse_rule_head_arg(
                 .try_collect()?;
             let aggr = match parse_aggr(aggr_name) {
                 Some(builtin) => builtin.clone(),
-                None => match custom_aggrs.get(aggr_name) {
+                None => match custom_aggrs.meet.get(aggr_name) {
                     // A user-registered aggregate (mnestic fork, R0b): an
                     // owned Aggregation carrying the ⊕ factory. The stratifier
                     // and aggr_kind read only `is_meet`, so a registered meet
@@ -851,18 +851,40 @@ fn parse_rule_head_arg(
                     Some(reg) => Aggregation {
                         name: crate::data::aggr::intern_aggr_name(aggr_name),
                         is_meet: reg.is_meet,
-                        // custom bounded-meet registration is deferred (R1
-                        // ships the category + the min_cost_k builtin)
                         is_bounded_meet: false,
                         meet_op: None,
                         normal_op: None,
                         meet_factory: Some(reg.factory.clone()),
+                        bounded_dominance: None,
                     },
-                    None => {
-                        return Err(
-                            AggrNotFound(aggr_name.to_string(), aggr_p.extract_span()).into()
-                        )
-                    }
+                    // A registered dominance bounded-meet (mnestic fork,
+                    // spec docs/specs/antichain-bounded-meet.md): rides
+                    // AggrKind::BoundedMeet exactly like min_cost_k. The cap
+                    // lives in the registration, so call-site args are
+                    // rejected loudly rather than silently ignored.
+                    None => match custom_aggrs.bounded.get(aggr_name) {
+                        Some(reg) => {
+                            ensure!(
+                                args.is_empty(),
+                                "registered bounded-meet aggregate '{}' takes no arguments: its cap is set at registration",
+                                aggr_name
+                            );
+                            Aggregation {
+                                name: crate::data::aggr::intern_aggr_name(aggr_name),
+                                is_meet: false,
+                                is_bounded_meet: true,
+                                meet_op: None,
+                                normal_op: None,
+                                meet_factory: None,
+                                bounded_dominance: Some(reg.clone()),
+                            }
+                        }
+                        None => {
+                            return Err(
+                                AggrNotFound(aggr_name.to_string(), aggr_p.extract_span()).into()
+                            )
+                        }
+                    },
                 },
             };
             (
@@ -883,7 +905,7 @@ fn parse_fixed_rule(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<(Symbol, FixedRuleApply)> {
     let mut src = src.into_inner();

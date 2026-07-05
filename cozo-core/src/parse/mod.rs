@@ -320,7 +320,7 @@ pub fn parse_script(
     src: &str,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<CozoScript> {
     let parsed = CozoScriptParser::parse(Rule::script, src)

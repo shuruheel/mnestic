@@ -97,7 +97,10 @@ impl<'a> SessionTx<'a> {
                         trigger,
                         &Default::default(),
                         &db.fixed_rules.read().unwrap(),
-                        &Default::default(), // triggers: custom aggregates unsupported (R0)
+                        crate::data::aggr::CustomAggrRegistries {
+                            meet: &Default::default(),
+                            bounded: &Default::default(),
+                        }, // triggers: custom aggregates unsupported (R0)
                         cur_vld,
                     )?
                     .get_single_program()?;
@@ -753,7 +756,10 @@ impl<'a> SessionTx<'a> {
                     trigger,
                     &Default::default(),
                     &db.fixed_rules.read().unwrap(),
-                    &Default::default(), // triggers: custom aggregates unsupported (R0)
+                    crate::data::aggr::CustomAggrRegistries {
+                        meet: &Default::default(),
+                        bounded: &Default::default(),
+                    }, // triggers: custom aggregates unsupported (R0)
                     cur_vld,
                 )?
                 .get_single_program()?;
@@ -2065,7 +2071,10 @@ impl<'a> SessionTx<'a> {
                         trigger,
                         &Default::default(),
                         &db.fixed_rules.read().unwrap(),
-                        &Default::default(), // triggers: custom aggregates unsupported (R0)
+                        crate::data::aggr::CustomAggrRegistries {
+                            meet: &Default::default(),
+                            bounded: &Default::default(),
+                        }, // triggers: custom aggregates unsupported (R0)
                         cur_vld,
                     )?
                     .get_single_program()?;

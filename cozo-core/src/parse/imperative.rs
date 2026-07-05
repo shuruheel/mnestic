@@ -28,7 +28,7 @@ pub(crate) fn parse_imperative_block(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<ImperativeProgram> {
     let mut collected = vec![];
@@ -63,7 +63,7 @@ fn parse_imperative_stmt(
     pair: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
     fixed_rules: &BTreeMap<String, Arc<Box<dyn FixedRule>>>,
-    custom_aggrs: &BTreeMap<String, crate::data::aggr::RegisteredAggr>,
+    custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<ImperativeStmt> {
     Ok(match pair.as_rule() {

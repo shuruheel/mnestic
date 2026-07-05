@@ -115,6 +115,8 @@ pub struct Db<S> {
     /// policy, recorded in R2: materialized OUTPUTS of custom aggregates
     /// persist fine; the operators themselves are registration-scoped).
     custom_aggrs: Arc<ShardedLock<BTreeMap<String, crate::data::aggr::RegisteredAggr>>>,
+    custom_bounded_meets:
+        Arc<ShardedLock<BTreeMap<String, crate::data::aggr::RegisteredBoundedMeet>>>,
     pub(crate) queries_count: Arc<AtomicU64>,
     pub(crate) running_queries: Arc<Mutex<BTreeMap<u64, RunningQueryHandle>>>,
     pub(crate) fixed_rules: Arc<ShardedLock<BTreeMap<String, Arc<Box<dyn FixedRule>>>>>,
@@ -316,6 +318,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_clock: Default::default(),
             tt_commit_lock: Default::default(),
             custom_aggrs: Default::default(),
+            custom_bounded_meets: Default::default(),
             queries_count: Default::default(),
             running_queries: Default::default(),
             fixed_rules: Arc::new(ShardedLock::new(DEFAULT_FIXED_RULES.clone())),
@@ -396,7 +399,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                         &script,
                         &params,
                         &self.fixed_rules.read().unwrap(),
-                        &self.custom_aggrs.read().unwrap(),
+                        crate::data::aggr::CustomAggrRegistries {
+                            meet: &self.custom_aggrs.read().unwrap(),
+                            bounded: &self.custom_bounded_meets.read().unwrap(),
+                        },
                         ts,
                     ) {
                         Ok(p) => p,
@@ -458,6 +464,14 @@ impl<'s, S: Storage<'s>> Db<S> {
         self.custom_aggrs.read().unwrap().clone()
     }
 
+    /// Snapshot of the registered dominance bounded-meet aggregates
+    /// (mnestic fork, spec `docs/specs/antichain-bounded-meet.md`).
+    pub fn get_custom_bounded_meets(
+        &'s self,
+    ) -> BTreeMap<String, crate::data::aggr::RegisteredBoundedMeet> {
+        self.custom_bounded_meets.read().unwrap().clone()
+    }
+
     /// Run the CozoScript passed in. The `params` argument is a map of parameters.
     pub fn run_script(
         &'s self,
@@ -470,7 +484,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                 payload,
                 &params,
                 &self.get_fixed_rules(),
-                &self.get_custom_aggrs(),
+                crate::data::aggr::CustomAggrRegistries {
+                    meet: &self.get_custom_aggrs(),
+                    bounded: &self.get_custom_bounded_meets(),
+                },
                 current_validity(),
             )?,
             current_validity(),
@@ -952,6 +969,15 @@ impl<'s, S: Storage<'s>> Db<S> {
                 name
             );
         }
+        if crate::data::expr::get_op(&name).is_some() {
+            // antichain-bounded-meet spec §3.1: builtin FUNCTION names are
+            // reserved too — the namespaces are technically separate, which
+            // would make the collision silent (one token, two semantics).
+            bail!(
+                "Cannot register custom aggregate {}: builtin function names are reserved",
+                name
+            );
+        }
         let name_ok = !name.is_empty()
             && name.chars().next().unwrap().is_ascii_lowercase()
             && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
@@ -961,7 +987,22 @@ impl<'s, S: Storage<'s>> Db<S> {
                 name
             );
         }
-        match self.custom_aggrs.write().unwrap().entry(name) {
+        // Fixed lock order (custom_aggrs, then custom_bounded_meets) in both
+        // registration paths: closes the cross-registry TOCTOU without
+        // deadlock risk.
+        let mut aggrs = self.custom_aggrs.write().unwrap();
+        if self
+            .custom_bounded_meets
+            .read()
+            .unwrap()
+            .contains_key(&name)
+        {
+            bail!(
+                "A custom bounded-meet aggregate with the name {} is already registered",
+                name
+            );
+        }
+        match aggrs.entry(name) {
             Entry::Vacant(ent) => {
                 ent.insert(crate::data::aggr::RegisteredAggr {
                     is_meet,
@@ -982,6 +1023,97 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// (they hold the factory `Arc`); future parses no longer resolve it.
     pub fn unregister_custom_aggr(&self, name: &str) -> Result<bool> {
         Ok(self.custom_aggrs.write().unwrap().remove(name).is_some())
+    }
+
+    /// Register a dominance bounded-meet aggregate (mnestic fork, spec
+    /// `docs/specs/antichain-bounded-meet.md`): the head form `name(operand)`
+    /// keeps, per group, the antichain (non-dominated / Pareto set) of
+    /// operands under `dominates`, each survivor as its own output row.
+    ///
+    /// `dominates` MUST be a strict partial order (irreflexive + transitive)
+    /// and pure, and must not panic; debug builds probe irreflexivity and
+    /// asymmetry on encountered values. It receives ONLY the aggregated
+    /// operand — pack every field it inspects. `max_survivors` is a
+    /// mandatory resource guard: a group's non-dominated set exceeding it is
+    /// a loud error, never a silent truncation. Builtin aggregate AND
+    /// builtin function names are reserved; duplicates error (unregister
+    /// first to replace; parsed programs keep their `Arc`). In-memory and
+    /// `Db`-scoped: persisted output rows are plain data, readable after
+    /// reopen with no re-registration, but re-running the query then needs
+    /// the registration again. Nothing fingerprints the algebra — version
+    /// names like schemas (e.g. `antichain_authority_v2`).
+    pub fn register_bounded_meet_aggr<F>(
+        &self,
+        name: String,
+        dominates: F,
+        max_survivors: usize,
+    ) -> Result<()>
+    where
+        F: Fn(&DataValue, &DataValue) -> bool + Send + Sync + 'static,
+    {
+        if crate::data::aggr::parse_aggr(&name).is_some() {
+            bail!(
+                "Cannot register bounded-meet aggregate {}: builtin names are reserved",
+                name
+            );
+        }
+        if crate::data::expr::get_op(&name).is_some() {
+            bail!(
+                "Cannot register bounded-meet aggregate {}: builtin function names are reserved",
+                name
+            );
+        }
+        let name_ok = !name.is_empty()
+            && name.chars().next().unwrap().is_ascii_lowercase()
+            && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+        if !name_ok {
+            bail!(
+                "Cannot register bounded-meet aggregate {}: the name must be a lowercase identifier, or the grammar can never reach it",
+                name
+            );
+        }
+        if max_survivors < 1 {
+            bail!(
+                "Cannot register bounded-meet aggregate {}: max_survivors must be at least 1",
+                name
+            );
+        }
+        // Same fixed lock order as register_custom_aggr (custom_aggrs first):
+        // the read guard is held across the insert to close the TOCTOU.
+        let aggrs = self.custom_aggrs.read().unwrap();
+        if aggrs.contains_key(&name) {
+            bail!(
+                "A custom aggregate with the name {} is already registered",
+                name
+            );
+        }
+        match self.custom_bounded_meets.write().unwrap().entry(name) {
+            Entry::Vacant(ent) => {
+                ent.insert(crate::data::aggr::RegisteredBoundedMeet {
+                    dominates: Arc::new(dominates),
+                    max_survivors,
+                });
+                Ok(())
+            }
+            Entry::Occupied(ent) => {
+                bail!(
+                    "A custom bounded-meet aggregate with the name {} is already registered",
+                    ent.key()
+                )
+            }
+        }
+    }
+
+    /// Unregister a dominance bounded-meet aggregate. Programs already
+    /// parsed keep working (they hold the registration by value); future
+    /// parses no longer resolve it.
+    pub fn unregister_bounded_meet_aggr(&self, name: &str) -> Result<bool> {
+        Ok(self
+            .custom_bounded_meets
+            .write()
+            .unwrap()
+            .remove(name)
+            .is_some())
     }
 
     /// Register callback channel to receive changes when the requested relation are successfully committed.

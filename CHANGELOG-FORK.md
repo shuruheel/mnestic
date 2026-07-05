@@ -5,6 +5,30 @@ provenance and licensing.
 
 ## Unreleased
 
+- **Dominance bounded-meet registration — the antichain / skyline aggregate**
+  (spec: `docs/specs/antichain-bounded-meet.md`, signed off + implemented
+  2026-07-04): `register_bounded_meet_aggr(name, dominates, max_survivors)`
+  opens the bounded-meet category (R1's recorded deferred item) to a
+  host-registered strict partial order. The head form `name(operand)` keeps,
+  per group, the non-dominated set of operands — each survivor its own
+  output row — riding `AggrKind::BoundedMeet`, the stratifier permit, and
+  the 4096-epoch divergence cap exactly like `min_cost_k`. New
+  `DominanceMeetStore` (BNL in-buffer insert: structural-equality dedup,
+  reject-if-dominated, multi-removal eviction; survivors kept in memcmp
+  order so output is canonical, not arrival-dependent; equality-dedup-only
+  delta twin). `max_survivors` is a mandatory resource guard — overflow is
+  a loud error, never a silent truncation (an antichain has no canonical
+  k-subset). Debug builds probe irreflexivity + asymmetry of the registered
+  closure; call-site args are rejected at parse time (the cap lives in the
+  registration). Trigger scripts keep rejecting custom aggregates at
+  `::set_triggers`. Name reservation now also covers builtin FUNCTION names,
+  retrofitted onto `register_custom_aggr` (one token, two semantics — the
+  `coalesce` lesson). Rust-embedded-only v1 (host closures do not cross the
+  Python/served surfaces; see the spec §5). Pinned by the §6 matrix in
+  `cozo-core/tests/antichain_bounded_meet.rs` — Pareto frontier, recursion
+  with a cycle, permuted-input confluence, cap overflow, lawless-closure
+  probes, registration policy, persistence-without-registration.
+
 - **Interval primitives** (spec: `docs/specs/cozoscript-extensions.md` §3.4 v1):
   `interval_overlaps(a, b)` builtin function and `interval_coalesce(span)`
   aggregate over half-open `[start, end)` list intervals. Deliberately plain
