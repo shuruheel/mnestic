@@ -3471,6 +3471,67 @@ fn bounded_meet_divergence_capped() {
 }
 
 #[test]
+fn bounded_meet_relay_recursion_unstratifiable() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    // pins the in-SCC half of the divergence guard's structural
+    // precondition: cyclic recursion into a bounded-meet rule through a
+    // relay is rejected outright (the cross-SCC half — poisoned edges into
+    // an aggregated rule forced across a stratum boundary — is what keeps
+    // acyclic feeders out; together they leave a bounded rule's own delta
+    // as its only in-stratum input, so its changed epochs form a contiguous
+    // prefix). If either half is ever relaxed, a displacement cycle could
+    // improve the k-set only every other epoch — the epoch cap counts TOTAL
+    // changed epochs (not a streak resetting on quiet epochs) so it stays
+    // sound in that world too
+    let err = db
+        .run_default(
+            r#"
+        edge[f, t, w] <- [[1, 2, -1.0], [2, 1, -1.0]]
+        relay[m, p] := sp[m, p]
+        sp[t, min_cost_k(pack, 2)] := t = 1, pack = [[1], 0.0]
+        sp[t, min_cost_k(pack, 2)] := relay[m, p], edge[m, t, w],
+                                      pack = [concat(first(p), [t]), last(p) + w]
+        ?[pack] := sp[2, pack]
+        "#,
+        )
+        .expect_err("relay recursion through a bounded-meet head must not stratify");
+    assert!(format!("{err:?}").contains("unstratifiable"), "{err:?}");
+}
+
+#[test]
+fn meet_bit_and_or_report_changes_accurately() {
+    use crate::data::aggr::{MeetAggrBitAnd, MeetAggrBitOr, MeetAggrObj};
+    // mnestic fork fix: a non-changing AND/OR must report false, or stable
+    // values re-enter the semi-naive delta every epoch (the bool variants
+    // were fixed earlier; the byte variants had the same defect)
+    let and = MeetAggrBitAnd;
+    let mut v = DataValue::Bytes(vec![0xf0]);
+    assert!(!and.update(&mut v, &DataValue::Bytes(vec![0xff])).unwrap());
+    assert_eq!(v, DataValue::Bytes(vec![0xf0]));
+    assert!(and.update(&mut v, &DataValue::Bytes(vec![0x0f])).unwrap());
+    assert_eq!(v, DataValue::Bytes(vec![0x00]));
+
+    let or = MeetAggrBitOr;
+    let mut v = DataValue::Bytes(vec![0xff]);
+    assert!(!or.update(&mut v, &DataValue::Bytes(vec![0x0f])).unwrap());
+    assert_eq!(v, DataValue::Bytes(vec![0xff]));
+    let mut v = DataValue::Bytes(vec![0x0f]);
+    assert!(or.update(&mut v, &DataValue::Bytes(vec![0xf0])).unwrap());
+    assert_eq!(v, DataValue::Bytes(vec![0xff]));
+
+    // first contact with the empty-bytes init_val sentinel seeds the lazy
+    // identity from the operand and MUST report changed — this is the
+    // branch the eval-side empty-rule seeding relies on for a later real
+    // row to enter the semi-naive delta
+    let mut v = DataValue::Bytes(vec![]);
+    assert!(and.update(&mut v, &DataValue::Bytes(vec![0xff])).unwrap());
+    assert_eq!(v, DataValue::Bytes(vec![0xff]));
+    let mut v = DataValue::Bytes(vec![]);
+    assert!(or.update(&mut v, &DataValue::Bytes(vec![0x0f])).unwrap());
+    assert_eq!(v, DataValue::Bytes(vec![0x0f]));
+}
+
+#[test]
 fn bounded_meet_validation() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default("?[g, pack] <- [[1, ['a', 1.0]]] :create bm {g, pack}")
@@ -3519,7 +3580,7 @@ fn bounded_meet_does_not_cap_costratified_recursion() {
     let db = DbInstance::new("mem", "", "").unwrap();
     // a CONVERGED (here: non-recursive) bounded rule sharing a stratum with
     // an unrelated recursion needing more epochs than the cap must not kill
-    // it — the guard counts consecutive epochs the k-sets kept changing
+    // it — the guard counts only epochs in which some k-set actually changed
     let res = db
         .run_default(
             r#"

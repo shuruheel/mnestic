@@ -853,9 +853,9 @@ impl<'a> Iterator for TupleInIterIterator<'a> {
 }
 
 /// Debug-build probe (mnestic fork, semirings R0b), CUSTOM aggregates only
-/// (several builtins are convergence-safe but not probe-stable — bit_and/
-/// bit_or report true unconditionally; intersection normalizes List→Set on
-/// re-entry): after a ⊕ that reported a
+/// (some builtins are convergence-safe but not probe-stable — intersection
+/// normalizes List→Set on re-entry, so `again == current` can fail on a
+/// List-valued first contact): after a ⊕ that reported a
 /// change, re-applying the same operand must be a no-op — the meet path
 /// presumes an idempotent semilattice ("use the idempotency!"). Catches a
 /// non-absorptive ⊕ registered with `is_meet = true` loudly on encountered

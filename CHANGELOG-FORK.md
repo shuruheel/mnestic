@@ -5,6 +5,28 @@ provenance and licensing.
 
 ## Unreleased
 
+- **Follow-up review fixes (0.10.0 hardening)**: (1) `bit_and`/`bit_or` meet
+  aggregates now report whether the value actually CHANGED — the byte loop
+  returned true unconditionally, the same defect family as the 0.10.0
+  `and`/`or` inverted-changed-bit fix, so a non-changing fold (e.g.
+  `[0xF0] & [0xFF]`) re-entered the semi-naive delta every epoch. (2) The
+  bounded-meet divergence cap counts TOTAL changed epochs instead of a
+  consecutive streak that reset on quiet epochs. Behaviorally identical
+  today: the stratifier poisons every cross-rule edge into or out of an
+  aggregated rule except direct self-recursion (in-SCC poisoned edges are
+  rejected as unstratifiable — pinned by
+  `bounded_meet_relay_recursion_unstratifiable` — and cross-SCC ones are
+  forced across a stratum boundary) and exempts aggregated rules from
+  magic-set rewriting, so a bounded rule's only in-stratum input is its
+  own delta and its changed epochs form a contiguous prefix. The total
+  count keeps the guard sound if the isolation is ever relaxed — a
+  displacement cycle improving the k-set only every other epoch evades a
+  resetting streak forever. (3) `bit_and`/`bit_or` `init_val` documented as
+  a lazy identity: the true ⊕-identity (all-ones for `bit_and`, all-zeros
+  for `bit_or`) has runtime-determined width, so empty bytes is a seed
+  sentinel consumed by `update`'s first-contact branch, not the algebra's
+  identity element.
+
 - **Dominance bounded-meet registration — the antichain / skyline aggregate**
   (spec: `docs/specs/antichain-bounded-meet.md`, signed off + implemented
   2026-07-04): `register_bounded_meet_aggr(name, dominates, max_survivors)`

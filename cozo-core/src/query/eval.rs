@@ -141,16 +141,30 @@ impl<'a> SessionTx<'a> {
         // provenance semirings R1: bounded-meet displacement means the
         // changed-bit is a saturation check, not a termination guarantee —
         // a cost-decreasing cycle improves some k-set forever. The guard
-        // counts CONSECUTIVE epochs in which some bounded store changed: a
-        // converged (or non-recursive) bounded rule must not cap an
-        // unrelated long recursion sharing its stratum.
+        // counts TOTAL epochs in which some bounded store changed, NOT a
+        // consecutive streak that resets on quiet epochs: a streak counter
+        // is evaded forever by a displacement cycle that improves the k-set
+        // only every other epoch. Today the two countings coincide — the
+        // stratifier poisons every cross-rule edge into or out of an
+        // aggregated rule except direct self-recursion (in-SCC poisoned
+        // edges are rejected as unstratifiable, pinned by the
+        // `bounded_meet_relay_recursion_unstratifiable` test; cross-SCC
+        // ones are forced across a stratum boundary by generalized_kahn's
+        // unsafe-nodes barrier), and aggregated rules are exempt from
+        // magic-set rewriting, so a bounded rule's only in-stratum input is
+        // its own delta: once quiet it stays quiet, and its changed epochs
+        // form a contiguous prefix. The total count keeps the guard sound
+        // if that isolation is ever relaxed. A
+        // converged (or non-recursive) bounded rule still cannot cap an
+        // unrelated long recursion sharing its stratum: once converged it
+        // contributes no changed epochs, so the total stops growing.
         let mut bounded_symbols: BTreeSet<&MagicSymbol> = BTreeSet::new();
         for (symb, rs) in prog.iter() {
             if matches!(rs.aggr_kind()?, AggrKind::BoundedMeet) {
                 bounded_symbols.insert(symb);
             }
         }
-        let mut bounded_hot_epochs: u32 = 0;
+        let mut bounded_changed_epochs: u32 = 0;
 
         for epoch in 0u32.. {
             debug!("epoch {}", epoch);
@@ -343,18 +357,16 @@ impl<'a> SessionTx<'a> {
                 break;
             }
             if bounded_changed {
-                bounded_hot_epochs += 1;
-                if bounded_hot_epochs >= BOUNDED_MEET_MAX_EPOCHS {
+                bounded_changed_epochs += 1;
+                if bounded_changed_epochs >= BOUNDED_MEET_MAX_EPOCHS {
                     bail!(
-                        "bounded-meet evaluation did not converge within {} epochs: \
-                         some k-set kept improving in every one of them — a \
+                        "bounded-meet evaluation did not converge within {} \
+                         changed epochs: some k-set kept improving — a \
                          cost-decreasing cycle (e.g. negative edge weights under \
                          'min_cost_k'), or a graph deeper than the cap",
                         BOUNDED_MEET_MAX_EPOCHS
                     );
                 }
-            } else {
-                bounded_hot_epochs = 0;
             }
         }
         Ok(used_limiter.load(Ordering::Acquire))

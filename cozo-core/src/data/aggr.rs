@@ -192,6 +192,8 @@ struct MeetToNormalAdapter {
 
 impl NormalAggrObj for MeetToNormalAdapter {
     fn set(&mut self, value: &DataValue) -> Result<()> {
+        // changed-bit deliberately unused: the Normal path folds a fixed row
+        // set once — there is no semi-naive delta to keep clean
         self.op.update(&mut self.state, value)?;
         Ok(())
     }
@@ -1251,6 +1253,10 @@ pub(crate) struct MeetAggrBitAnd;
 
 impl MeetAggrObj for MeetAggrBitAnd {
     fn init_val(&self) -> DataValue {
+        // NOT the ∧-identity (that would be all-ones of the operand width,
+        // which is runtime-determined): the ⊕-identity is lazy, seeded from
+        // the first operand by `update`'s is_empty branch. Empty bytes is a
+        // sentinel.
         DataValue::Bytes(vec![])
     }
 
@@ -1270,11 +1276,17 @@ impl MeetAggrObj for MeetAggrBitAnd {
                     left,
                     right
                 );
+                // mnestic fork fix: report whether the value CHANGED (was
+                // unconditionally true — a non-changing AND re-entered the
+                // semi-naive delta every epoch)
+                let mut changed = false;
                 for (l, r) in left.iter_mut().zip(right.iter()) {
+                    let old = *l;
                     *l &= *r;
+                    changed |= old != *l;
                 }
 
-                Ok(true)
+                Ok(changed)
             }
             v => bail!("cannot apply 'bit_and' to {:?}", v),
         }
@@ -1320,6 +1332,9 @@ pub(crate) struct MeetAggrBitOr;
 
 impl MeetAggrObj for MeetAggrBitOr {
     fn init_val(&self) -> DataValue {
+        // NOT the ∨-identity (all-zeros of the runtime-determined operand
+        // width): like `bit_and`, the identity is lazy — seeded from the
+        // first operand by `update`'s is_empty branch.
         DataValue::Bytes(vec![])
     }
 
@@ -1339,11 +1354,17 @@ impl MeetAggrObj for MeetAggrBitOr {
                     left,
                     right
                 );
+                // mnestic fork fix: report whether the value CHANGED (was
+                // unconditionally true — a non-changing OR re-entered the
+                // semi-naive delta every epoch)
+                let mut changed = false;
                 for (l, r) in left.iter_mut().zip(right.iter()) {
+                    let old = *l;
                     *l |= *r;
+                    changed |= old != *l;
                 }
 
-                Ok(true)
+                Ok(changed)
             }
             v => bail!("cannot apply 'bit_or' to {:?}", v),
         }
