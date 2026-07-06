@@ -34,7 +34,9 @@ crates.io / npm / PyPI, rather than reusing the `cozo`/`cozo-*` names.
 See `CHANGELOG-FORK.md` for the running list of divergences from upstream
 `481af05`. At a high level the fork's roadmap is to make Cozo's engine a
 first-class agentic-memory substrate: performance fixes to the write/ingest and
-HNSW paths, correctness fixes to the query planner, and operational tooling for
+HNSW paths, correctness fixes to the query planner, new engine capabilities —
+bitemporality (system-versioned transaction time) and pluggable provenance
+semirings (custom aggregates + top-k proofs) — and operational tooling for
 long-running graph memory.
 
 ## License

@@ -8,7 +8,7 @@ _Status: **Shipped in 0.9.0 — alpha, behind the off-by-default `cypher` Cargo 
 
 ```toml
 # Cargo.toml — the published crate ships the feature off by default
-cozo = { package = "mnestic", version = "0.9", features = ["cypher"] }
+cozo = { package = "mnestic", version = "0.10", features = ["cypher"] }
 ```
 
 ```rust
@@ -38,7 +38,7 @@ Python (wheel must be built with the feature — the default published wheel omi
 ### Error surface (which layer rejects what)
 
 - **Parse errors** — everything outside the v1 grammar fails in `parse.rs` before any schema is consulted: `WITH`, `OPTIONAL MATCH`, `CALL`, variable-length paths `[*m..n]`, `shortestPath`, and every write clause (`CREATE`/`MERGE`/`SET`/`DELETE`) are parse errors by omission.
-- **Translate errors** — grammatical Cypher the v1 translator refuses, each with a targeted message: undirected relationships (`translate.rs:647`); a schema `filter` set on any map (`reserved and not yet implemented in v1`, `translate.rs:1083-1086`); unknown labels/relationship types; unlabeled nodes without a shared/default relation (`label required`); Cypher variables or user params colliding with the reserved `cy_`/`cyp_`/`cphr_` namespaces.
+- **Translate errors** — grammatical Cypher the v1 translator refuses, each with a targeted message: undirected relationships (the `Direction::Undirected` arm's bail in `translate.rs`); a schema `filter` set on any map (`reserved and not yet implemented in v1`, the `reject_filter` bail in `translate.rs`); unknown labels/relationship types; unlabeled nodes without a shared/default relation (`label required`); Cypher variables or user params colliding with the reserved `cy_`/`cyp_`/`cphr_` namespaces.
 - **Run errors** — whatever the engine raises against the generated script; these can mention generated names (`cy_match`, `cyp_3`) — use `cypher_to_script` to see the script they refer to.
 
 ## 1. Goals & non-goals
@@ -52,9 +52,9 @@ Python (wheel must be built with the feature — the default published wheel omi
 The proven pattern in this codebase (`runtime/hybrid.rs`, the `HybridSearch` builder) is: **a typed request → assemble a CozoScript *string* → pass literal values as query params (never string-interpolated) → validate every interpolated identifier → run via the normal query path, and expose the generated script for inspection.** The Cypher surface is the same shape:
 
 - **Translate Cypher AST → a CozoScript source string**, not to the engine's internal AST. Rationale: the string path is fully inspectable/testable, and it decouples the Cypher layer from internal compiler types that are deliberately not `Clone`/stable, so the surface avoids coupling to them. The translated script then runs through the existing, optimized query pipeline for free.
-- **Run read-only.** `run_cypher` executes via `run_script(.., ScriptMutability::Immutable)` (`lib.rs:270`) — the same read-only path as `run_script_read_only` (`runtime/db.rs:470`). Because the surface is read-only, the engine itself rejects any mutation even if a translation bug emitted one — defense in depth, and it picks up the snapshot read path (0.8.5) automatically.
+- **Run read-only.** `run_cypher` executes via `run_script(.., ScriptMutability::Immutable)` (the `ScriptMutability::Immutable` `run_script` call inside `DbInstance::run_cypher`, `lib.rs`) — the same read-only path as `DbInstance::run_script_read_only` (`runtime/db.rs`). Because the surface is read-only, the engine itself rejects any mutation even if a translation bug emitted one — defense in depth, and it picks up the snapshot read path (0.8.5) automatically.
 - **Injection safety (non-negotiable, copy `hybrid.rs`'s discipline):** every Cypher *literal* becomes a CozoScript **param** (`$cphr_0`, `$cphr_1`, … — a reserved namespace — in the `params` map `run_script` already accepts); every *identifier* that gets interpolated (relation/column names from the property-graph schema, fusion-style tags) is **validated as a bare identifier** via `miette::ensure` before it touches the string. No user value is ever concatenated into the script.
-- **Module:** `cozo-core/src/cypher/` — `mod.rs` (glue: `build_cypher_script`, re-exports), `schema.rs` (schema types, re-exported at crate root: `cozo::{CypherGraphSchema, NodeMap, EdgeMap}`, `lib.rs:71`), `ast.rs`, `cypher.pest`, `parse.rs` (pest → Cypher AST), `translate.rs` (AST → CozoScript string; tests in `translate/tests.rs`). The public `run_cypher` / `cypher_to_script` are `impl DbInstance` in `cozo-core/src/lib.rs:255/:282`. Behind the **`cypher` cargo feature** (see §11, decision 5).
+- **Module:** `cozo-core/src/cypher/` — `mod.rs` (glue: `build_cypher_script`, re-exports), `schema.rs` (schema types, re-exported at crate root by `pub use cypher::{CypherGraphSchema, EdgeMap, NodeMap}` in `lib.rs`: `cozo::{CypherGraphSchema, NodeMap, EdgeMap}`), `ast.rs`, `cypher.pest`, `parse.rs` (pest → Cypher AST), `translate.rs` (AST → CozoScript string; tests in `translate/tests.rs`). The public `DbInstance::run_cypher` / `DbInstance::cypher_to_script` are `impl DbInstance` in `cozo-core/src/lib.rs`. Behind the **`cypher` cargo feature** (see §11, decision 5).
 
 ```text
 run_cypher(query, schema, params)
@@ -115,7 +115,7 @@ For node label `L` → `NodeMap{relation, id_col}` and relationship type `T` →
 
 | Cypher | CozoScript | Notes |
 |---|---|---|
-| `(a:Person)` — relation-per-label | `*person{id: a}` | label → relation; binds the id var. Named-relation access (`relation_named_apply`, grammar :88). |
+| `(a:Person)` — relation-per-label | `*person{id: a}` | label → relation; binds the id var. Named-relation access (the `relation_named_apply` grammar rule in `cozoscript.pest`). |
 | `(a:Person)` — shared relation | `*node{uid: a, node_type: $cphr_0}` | label → discriminator param (`$cphr_0 = "Person"`); hits `node:type_idx` + #1. |
 | `(a:Person)-[r:KNOWS]->(b:Person)` | `*person{id: a}, *knows{fr: a, to: b}, *person{id: b}` | each label/type = one atom; relationship binds endpoints. `r` binds to the edge identity (see §6). |
 | `a.age` (property) | bind the column: `*person{id: a, age: a_age}` → use `a_age` | property access = column binding, **not** the `->` op (that's Json access). |
@@ -123,8 +123,8 @@ For node label `L` → `NodeMap{relation, id_col}` and relationship type `T` →
 | `WHERE a.name = 'Bob'` | `*person{id: a, name: $cphr_0}` (param) | constant equality pushed into the relation access → **indexed lookup via #1**. Literal `'Bob'` → param `$cphr_0`. |
 | `RETURN e1, e2` | head of the final `?[…]` rule | projection (see §5 for bag vs DISTINCT). |
 | `RETURN DISTINCT …` | set-semantics head (no binding key) | Datalog set dedup = DISTINCT. |
-| `count(*)`, `collect(x)`, `sum`/`avg`/`min`/`max` | head aggregate `?[k, count(a)]` (grammar `aggr_arg` :75) | implicit group-by = the non-aggregating RETURN columns. **`count` counts rows with multiplicity** (`aggr.rs:423-434`, *not* `count_unique`) → bag-correct given a per-binding input. |
-| `ORDER BY x [DESC]` / `SKIP n` / `LIMIT m` | `:order -x` / `:offset n` / `:limit m` | **native CozoScript epilogue** (grammar :140-142, :157-160) — no external post-processing. |
+| `count(*)`, `collect(x)`, `sum`/`avg`/`min`/`max` | head aggregate `?[k, count(a)]` (the `aggr_arg` grammar rule) | implicit group-by = the non-aggregating RETURN columns. **`count` counts rows with multiplicity** (`AggrCount` in `data/aggr.rs`, *not* `AggrCountUnique`/`count_unique`) → bag-correct given a per-binding input. |
+| `ORDER BY x [DESC]` / `SKIP n` / `LIMIT m` | `:order -x` / `:offset n` / `:limit m` | **native CozoScript epilogue** (the `sort_option`/`offset_option`/`limit_option` grammar rules) — no external post-processing. |
 
 ### Worked example (end-to-end)
 
@@ -200,7 +200,7 @@ impl DbInstance {
 ```
 
 - **Python binding** (`cozo-lib-python`): expose `run_cypher(query, schema_dict, params)` so the wheel + `langchain-mnestic` can use it (same way `hybrid_search` gained `graph_legs`) (behind the `cypher` feature; the default published wheel does not include it — build with `--features cypher`).
-- **Reserved namespaces (step-5 hardening, user-visible):** user `params` keys starting with `cphr_` are rejected (`lib.rs:261-265`, `translate.rs:783`), and Cypher variable names colliding with the generated namespace (`cy_match`, `cy_agg`, `cy_ret_N`, `cyp_N`) are rejected with a clear error.
+- **Reserved namespaces (step-5 hardening, user-visible):** user `params` keys starting with `cphr_` are rejected (the `cphr_` guard in `DbInstance::run_cypher`, `lib.rs`; and the `CExpr::Param` arm of the translator's `expr` method, `translate.rs`), and Cypher variable names colliding with the generated namespace (`cy_match`, `cy_agg`, `cy_ret_N`, `cyp_N`) are rejected with a clear error by `reserved_check` in `translate.rs`.
 - **Schema delivery (decision 2):** per-call `CypherGraphSchema` in v1 (simplest). A *registered/persisted* graph view (define once, query by name) is a v2 convenience.
 
 ## 8. Grammar choice (decision 4)
@@ -240,7 +240,7 @@ Each step: failing test first, CHANGELOG-FORK entry, `cargo test -p mnestic --li
 
 **Shipped:** `MATCH` single node + fixed-length pattern `(a:A)-[:R]->(b:B)` (directed patterns only) with labels + inline property maps; `WHERE` (comparison, boolean, `IN`, `IS NULL`/`IS NOT NULL`, `STARTS WITH`/`CONTAINS`); `RETURN` with projection, aliases, `DISTINCT`; `ORDER BY`/`SKIP`/`LIMIT`; multi-hop fixed-length chains; basic aggregation (`count`/`collect`/`sum`/`avg`/`min`/`max`) with implicit grouping.
 
-**Deferred:** variable-length/recursive paths `[*m..n]`, `shortestPath` (where Datalog *wins* — a later differentiator showcase, not an on-ramp gap); `OPTIONAL MATCH`; complex multi-stage `WITH`; `CALL`/procedures; all write clauses; **undirected relationships** (parsed, rejected by the translator, `translate.rs:647`); **the schema `filter` field** (reserved, errors if set).
+**Deferred:** variable-length/recursive paths `[*m..n]`, `shortestPath` (where Datalog *wins* — a later differentiator showcase, not an on-ramp gap); `OPTIONAL MATCH`; complex multi-stage `WITH`; `CALL`/procedures; all write clauses; **undirected relationships** (parsed, rejected by the translator — the `Direction::Undirected` arm's bail in `translate.rs`); **the schema `filter` field** (reserved, errors if set).
 
 **v1.x — required before default-on:** the schema `filter` field (MindGraph, the primary consumer, needs a soft-delete guard on every query — today tombstoned rows are returned); SQLite-backed execution tests (§9).
 

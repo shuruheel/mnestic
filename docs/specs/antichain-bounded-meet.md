@@ -35,7 +35,7 @@ Singleton per group → resolved; more than one survivor → contested. `min_cos
 | Non-recursive path: `AggrKind::BoundedMeet` is not recursion-conditional — bounded-meet rules run through the same store in plain non-recursive rules | pinned by the non-recursive `chain` rule in `cozo-core/tests/spec_doc_validation.rs` | verbatim (no normal-path adapter analogue needed) |
 | **What does NOT transfer: the store core.** `BoundedMeetStore` is total-order-shaped end to end — binary-search insertion on a contractually-total `cmp_candidates`, dedup on `Ordering::Equal`, rank-k early reject, single-pop truncation, order-defined delta-twin, cost-ordered output | `runtime/temp_store.rs:236-378` | **replaced** by §3's `DominanceMeetStore` |
 
-Custom aggregates take no call-site arguments in the shipped R0 registration (the bails at `data/aggr.rs:1396` and `:1420`); `min_cost_k`'s `k` is builtin-only plumbing. §3 sidesteps rather than extends this.
+Custom aggregates take no call-site arguments in the shipped R0 registration (the `custom aggregate … takes no arguments` bails in `Aggregation::meet_init` and `Aggregation::normal_init`, `data/aggr.rs`); `min_cost_k`'s `k` is builtin-only plumbing. §3 sidesteps rather than extends this.
 
 ## 3. Design
 
