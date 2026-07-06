@@ -3,7 +3,12 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased
+## 0.10.1 — 2026-07-06
+
+A small additive release on top of 0.10.0 — two new query primitives (the
+antichain/skyline aggregate and interval predicates) plus a correctness fix to
+the `bit_and`/`bit_or` meet aggregates. Pure `cozo-core`; no
+`cozorocks`/`mnestic-rocks` change.
 
 - **Follow-up review fixes (0.10.0 hardening)**: (1) `bit_and`/`bit_or` meet
   aggregates now report whether the value actually CHANGED — the byte loop

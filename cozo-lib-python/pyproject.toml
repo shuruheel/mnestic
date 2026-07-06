@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "mnestic"
-version = "0.10.0"
+version = "0.10.1"
 description = "Embedded graph + vector + full-text database with Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory."
 readme = "README.md"
 requires-python = ">=3.8"
