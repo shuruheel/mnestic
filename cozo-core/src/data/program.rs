@@ -46,12 +46,27 @@ pub(crate) enum ReturnMutation {
     Returning,
 }
 
+/// Join-reorder policy for a query (mnestic fork, 0.10.5). Default `Greedy`: a
+/// deterministic, stat-free min-new-vars greedy reorder of eligible positive
+/// conjunctions (see `query::reorder::greedy_reorder_conjunction`). `:reorder
+/// written` selects `Written`, which leaves the authored atom order untouched.
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
+pub enum ReorderMode {
+    #[default]
+    Greedy,
+    Written,
+}
+
 #[derive(Clone, PartialEq, Default)]
 pub struct QueryOutOptions {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
     /// Terminate query with an error if it exceeds this many seconds.
     pub timeout: Option<f64>,
+    /// Join-reorder policy (mnestic fork, 0.10.5). Default `Greedy`; `:reorder
+    /// written` opts out. A `:limit` without `:sort` also forces `Written` at
+    /// normalization time to keep the returned row subset stable.
+    pub reorder: ReorderMode,
     /// Sleep after performing the query for this number of seconds. Ignored in WASM.
     pub sleep: Option<f64>,
     /// Default transaction-time for every tt-stamped relation atom in this
@@ -80,6 +95,9 @@ impl Display for QueryOutOptions {
         }
         if let Some(l) = self.timeout {
             writeln!(f, ":timeout {l};")?;
+        }
+        if self.reorder == ReorderMode::Written {
+            writeln!(f, ":reorder written;")?;
         }
         for (symb, dir) in &self.sorters {
             write!(f, ":order ")?;
@@ -673,6 +691,20 @@ impl InputProgram {
                 );
             }
         }
+        // mnestic (join-reorder, 0.10.5): the per-query reorder policy. A
+        // `:limit` without `:sort` forces `Written` regardless of the requested
+        // mode — under a reordered plan an early-returning bare `:limit` could
+        // yield a different (still-valid) row subset, so we keep the authored
+        // order there. `key_arity_cache` memoizes primary-key arities across all
+        // rules in this program (SessionTx has no relation-handle cache).
+        let reorder_mode =
+            if self.out_opts.limit.is_some() && self.out_opts.sorters.is_empty() {
+                ReorderMode::Written
+            } else {
+                self.out_opts.reorder
+            };
+        let mut key_arity_cache: BTreeMap<Symbol, Option<usize>> = BTreeMap::new();
+
         let mut prog: BTreeMap<Symbol, _> = Default::default();
         for (k, rules_or_fixed) in self.prog {
             match rules_or_fixed {
@@ -724,7 +756,12 @@ impl InputProgram {
                                 aggr: rule.aggr.clone(),
                                 body,
                             };
-                            collected_rules.push(normalized_rule.convert_to_well_ordered_rule()?);
+                            collected_rules.push(normalized_rule.convert_to_well_ordered_rule(
+                                tx,
+                                reorder_mode,
+                                &k,
+                                &mut key_arity_cache,
+                            )?);
                         }
                     }
                     prog.insert(

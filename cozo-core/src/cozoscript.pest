@@ -141,7 +141,7 @@ list = { "[" ~ (expr ~ ",")* ~ expr? ~ "]" }
 grouping = { "(" ~ expr ~ ")" }
 
 option = _{(limit_option|offset_option|sort_option|relation_option|timeout_option|as_of_option|sleep_option|returning_option|
-            assert_none_option|assert_some_option|disable_magic_rewrite_option) ~ ";"?}
+            assert_none_option|assert_some_option|disable_magic_rewrite_option|reorder_option) ~ ";"?}
 out_arg = @{var ~ ("(" ~ var ~ ")")?}
 disable_magic_rewrite_option = {":disable_magic_rewrite" ~ expr}
 limit_option = {":limit"  ~ expr}
@@ -161,6 +161,7 @@ relation_rm = {":rm"}
 relation_ensure = {":ensure"}
 relation_ensure_not = {":ensure_not"}
 timeout_option = {":timeout" ~ expr }
+reorder_option = {":reorder" ~ ident }
 as_of_option = {":as_of" ~ expr }
 sleep_option = {":sleep" ~ expr }
 sort_arg = { sort_dir? ~ out_arg }

@@ -35,8 +35,14 @@ use std::time::{Duration, Instant};
 const N: i64 = 280;
 
 /// The pathological members-first triangle (selective `knows` atoms last).
+///
+/// `:reorder written` pins the authored (pathological) atom order: this is a
+/// budget/interrupt test, so it deliberately opts out of the 0.10.5 greedy join
+/// reorder, which would otherwise convert this exact N^3 spin to N^2 and leave
+/// nothing slow for the budget to bite. The count (1320) is identical with or
+/// without the reorder — only the runtime differs.
 const SPIN_QUERY: &str = "?[count(x)] := *member[c, a], *member[c, b], *member[c, d], \
-     *knows[a, b], *knows[b, d], *knows[d, a], x = [a, b, d]";
+     *knows[a, b], *knows[b, d], *knows[d, a], x = [a, b, d] :reorder written";
 
 /// Generous upper bound on abort latency (the budgets under test are ~1s; the
 /// poison-check cadence adds at most a batch of work).

@@ -26,7 +26,8 @@ use crate::data::functions::{str2vld, MAX_VALIDITY_TS};
 use crate::data::program::{
     FixedRuleApply, FixedRuleArg, InputAtom, InputInlineRule, InputInlineRulesOrFixed,
     InputNamedFieldRelationApplyAtom, InputProgram, InputRelationApplyAtom, InputRuleApplyAtom,
-    QueryAssertion, QueryOutOptions, RelationOp, ReturnMutation, SearchInput, SortDir, Unification,
+    QueryAssertion, QueryOutOptions, RelationOp, ReorderMode, ReturnMutation, SearchInput, SortDir,
+    Unification,
 };
 use crate::data::relation::{ColType, ColumnDef, NullableColType, StoredRelationMetadata};
 use crate::data::symb::{Symbol, PROG_ENTRY};
@@ -398,6 +399,22 @@ pub(crate) fn parse_query(
                     DuplicateQueryAssertion(pair.extract_span())
                 );
                 out_opts.assertion = Some(QueryAssertion::AssertSome(pair.extract_span()))
+            }
+            Rule::reorder_option => {
+                // mnestic (join-reorder, 0.10.5). `:reorder written` opts out of
+                // the default greedy join reorder; `:reorder greedy` forces it on.
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("unknown :reorder mode '{0}', expected 'greedy' or 'written'")]
+                #[diagnostic(code(parser::bad_reorder_mode))]
+                struct BadReorderMode(String, #[label] SourceSpan);
+
+                let inner = pair.into_inner().next().unwrap();
+                let span = inner.extract_span();
+                match inner.as_str() {
+                    "greedy" => out_opts.reorder = ReorderMode::Greedy,
+                    "written" => out_opts.reorder = ReorderMode::Written,
+                    other => bail!(BadReorderMode(other.to_string(), span)),
+                }
             }
             Rule::disable_magic_rewrite_option => {
                 let pair = pair.into_inner().next().unwrap();

@@ -1532,6 +1532,11 @@ impl<'s, S: Storage<'s>> Db<S> {
                             idx += 1;
 
                             while let Some(rel) = rel_stack.pop() {
+                                // mnestic (join-reorder, 0.10.5): flag a join that
+                                // shares no bound variables with its left input as a
+                                // Cartesian step, so an N-way blow-up is visible in
+                                // the plan (the greedy reorder also `log::warn`s).
+                                let mut is_cartesian = false;
                                 let (atom_type, ref_name, joins_on, filters) = match rel {
                                     r @ RelAlgebra::Fixed(..) => {
                                         if r.is_unit() {
@@ -1591,6 +1596,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                                             joiner,
                                             ..
                                         } = inner.as_ref();
+                                        is_cartesian = joiner.left_keys.is_empty();
                                         rel_stack.push(left);
                                         rel_stack.push(right);
                                         (t, json!(null), json!(joiner.as_map()), json!(null))
@@ -1672,10 +1678,15 @@ impl<'s, S: Storage<'s>> Db<S> {
                                             .collect_vec()),
                                     ),
                                 };
+                                let op_str = if is_cartesian {
+                                    format!("{atom_type} (cartesian)")
+                                } else {
+                                    atom_type.to_string()
+                                };
                                 ret_for_relation.push(json!({
                                     STRATUM: stratum,
                                     ATOM_IDX: idx,
-                                    OP: atom_type,
+                                    OP: op_str,
                                     RULE_IDX: clause_idx,
                                     RULE_NAME: rule_name.to_string(),
                                     REF_NAME: ref_name,
