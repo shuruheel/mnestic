@@ -175,6 +175,14 @@ pub struct Db<S> {
     /// `:timeout`. Anchored at script start, so it bounds the whole
     /// `run_script` call rather than each statement.
     default_query_timeout_ms: Arc<AtomicU64>,
+    /// Kill switch for the automatic factorized-count rewrite (mnestic fork,
+    /// query factorization; `query/factorize.rs`). When `true`, an eligible
+    /// single-clause `count()`-over-a-positive-join query is rewritten to
+    /// Yannakakis-style counting sub-rules with a bit-identical answer. DEFAULT:
+    /// `false` (opt-in) for this first release — a silently-wrong-count risk is
+    /// not worth a default-on rewrite until it has soaked. To flip the default,
+    /// change the `AtomicBool::new(false)` in [`Db::new`] to `true`.
+    enable_factorize: Arc<AtomicBool>,
 }
 
 impl<S> Debug for Db<S> {
@@ -367,6 +375,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             index_builds_in_progress: Default::default(),
             fts_doc_stats_cache: Default::default(),
             default_query_timeout_ms: Default::default(),
+            // DEFAULT for the automatic factorized-count rewrite. Flip this one
+            // line to `AtomicBool::new(true)` to make the rewrite default-on.
+            enable_factorize: Arc::new(AtomicBool::new(false)),
         };
         Ok(ret)
     }
@@ -641,6 +652,22 @@ impl<'s, S: Storage<'s>> Db<S> {
             _ => 0,
         };
         self.default_query_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
+    /// query factorization; `query/factorize.rs`). The kill switch is a Db-wide
+    /// toggle, default OFF for this release. When on, an eligible single-clause
+    /// `count()`-over-a-positive-join is rewritten to Yannakakis-style counting
+    /// sub-rules whose answer is bit-identical to the naive enumeration; every
+    /// query the conservative trigger declines is evaluated exactly as before.
+    pub fn set_query_factorization(&self, enabled: bool) {
+        self.enable_factorize.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Whether the automatic factorized-count rewrite is currently enabled
+    /// (mnestic fork, query factorization).
+    pub fn query_factorization(&self) -> bool {
+        self.enable_factorize.load(Ordering::Relaxed)
     }
 
     /// The current Db-wide default per-query budget in seconds, or `None` if
@@ -1472,7 +1499,11 @@ impl<'s, S: Storage<'s>> Db<S> {
 
         Ok(res)
     }
-    fn explain_compiled(&self, strata: &[CompiledProgram]) -> Result<NamedRows> {
+    fn explain_compiled(
+        &self,
+        strata: &[CompiledProgram],
+        advisory: Option<String>,
+    ) -> Result<NamedRows> {
         let mut ret: Vec<JsonValue> = vec![];
         const STRATUM: &str = "stratum";
         const ATOM_IDX: &str = "atom_idx";
@@ -1711,6 +1742,16 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
         }
 
+        // mnestic fork (query factorization): the detector advisory rides along
+        // as a final row (op = `factorize_advisory`, message in the filters
+        // column) so it is visible in `::explain` output as well as the log.
+        if let Some(msg) = advisory {
+            ret.push(json!({
+                OP: "factorize_advisory",
+                FILTERS: msg,
+            }));
+        }
+
         let rows = ret
             .into_iter()
             .map(|m| {
@@ -1920,10 +1961,18 @@ impl<'s, S: Storage<'s>> Db<S> {
         match op {
             SysOp::Explain(prog) => {
                 let (normalized_program, _) = prog.clone().into_normalized_program(tx)?;
+                // mnestic fork (query factorization): show the rewritten plan
+                // when the kill switch is on, and surface the detector advisory
+                // as an extra `::explain` row either way.
+                let (normalized_program, advisory) =
+                    crate::query::factorize::maybe_rewrite_and_advise(
+                        normalized_program,
+                        self.enable_factorize.load(Ordering::Relaxed),
+                    );
                 let (stratified_program, _) = normalized_program.into_stratified_program()?;
                 let program = stratified_program.magic_sets_rewrite(tx)?;
                 let compiled = tx.stratified_magic_compile(program)?;
-                self.explain_compiled(&compiled)
+                self.explain_compiled(&compiled, advisory)
             }
             SysOp::Compact => {
                 if read_only {
@@ -2692,6 +2741,14 @@ impl<'s, S: Storage<'s>> Db<S> {
         // query compilation
         let entry_head_or_default = input_program.get_entry_out_head_or_default()?;
         let (normalized_program, out_opts) = input_program.into_normalized_program(tx)?;
+        // mnestic fork (query factorization, 0.10.5): detector advisory (always)
+        // + automatic count rewrite (behind the Db kill switch, default OFF).
+        // Output headers come from `entry_head_or_default` (captured above from
+        // the original program), so the rewrite never changes the result schema.
+        let (normalized_program, _advisory) = crate::query::factorize::maybe_rewrite_and_advise(
+            normalized_program,
+            self.enable_factorize.load(Ordering::Relaxed),
+        );
         let (stratified_program, store_lifetimes) = normalized_program.into_stratified_program()?;
         let program = stratified_program.magic_sets_rewrite(tx)?;
         let compiled = tx.stratified_magic_compile(program)?;

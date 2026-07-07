@@ -804,6 +804,80 @@ impl NormalAggrObj for AggrProduct {
     }
 }
 
+// --- internal exact-integer sum-of-products (mnestic fork, query factorization
+// automatic count rewrite; `query/factorize.rs`) ---------------------------
+//
+// This aggregate exists ONLY to back the synthesized factorized-count rules. It
+// is deliberately NOT exposed in `parse_aggr`: no user script can name it, it is
+// injected directly into synthesized `NormalFormInlineRule`s.
+//
+// Why it is not `sum` + `a * b`:
+//   * `AggrSum` accumulates in `f64` — exact only below 2^53, and it changes the
+//     head column's type from Int to Float. A count must stay an exact `i64`.
+//   * `op_mul` multiplies `i64` with a plain `*` that WRAPS in release builds.
+//
+// Per row it receives a `List` of the per-component sub-counts (all `Int`),
+// forms their product, and adds it to a running total — every step through
+// `checked_mul` / `checked_add`. On overflow it returns an error rather than a
+// wrapped (silently wrong) value. Because every intermediate per-key product and
+// partial sum is bounded above by the final answer, an overflow here implies the
+// true count itself exceeds `i64::MAX` (a count that `count()` could never have
+// enumerated in the first place), so erroring is strictly safer than the naive
+// path's silent wrap.
+define_aggr!(AGGR_INT_SUM_PROD, false);
+
+#[derive(Default)]
+pub(crate) struct AggrIntSumProd {
+    sum: i64,
+}
+
+impl NormalAggrObj for AggrIntSumProd {
+    fn set(&mut self, value: &DataValue) -> Result<()> {
+        let items = match value {
+            DataValue::List(l) => l.as_slice(),
+            v => bail!("'int_sum_prod' expects a list of integers, got {:?}", v),
+        };
+        let mut product: i64 = 1;
+        for it in items {
+            let n = it
+                .get_int()
+                .ok_or_else(|| miette!("'int_sum_prod' factor is not an integer: {:?}", it))?;
+            product = product
+                .checked_mul(n)
+                .ok_or_else(|| miette!("'int_sum_prod' overflowed i64 while multiplying factors"))?;
+        }
+        self.sum = self
+            .sum
+            .checked_add(product)
+            .ok_or_else(|| miette!("'int_sum_prod' overflowed i64 while summing products"))?;
+        Ok(())
+    }
+
+    fn get(&self) -> Result<DataValue> {
+        Ok(DataValue::from(self.sum))
+    }
+}
+
+/// The builtin `count` aggregate, cloned for injection into synthesized rules
+/// (mnestic fork, query factorization). Base-case sub-rules count rows in exact
+/// `i64` via `AggrCount`.
+pub(crate) fn count_aggr() -> Aggregation {
+    AGGR_COUNT.clone()
+}
+
+/// The stable interned name of the `count` aggregate — used by the factorizer to
+/// recognize an eligible `count()` head (and to reject `count_unique`, whose name
+/// differs).
+pub(crate) fn count_aggr_name() -> &'static str {
+    AGGR_COUNT.name
+}
+
+/// The internal exact-`i64` sum-of-products aggregate, cloned for injection into
+/// synthesized combine rules (mnestic fork, query factorization).
+pub(crate) fn int_sum_prod_aggr() -> Aggregation {
+    AGGR_INT_SUM_PROD.clone()
+}
+
 define_aggr!(AGGR_MIN, true);
 
 pub(crate) struct AggrMin {
@@ -1509,6 +1583,7 @@ impl Aggregation {
             name if name == AGGR_GROUP_COUNT.name => Box::new(AggrGroupCount::default()),
             name if name == AGGR_COUNT_UNIQUE.name => Box::new(AggrCountUnique::default()),
             name if name == AGGR_SUM.name => Box::new(AggrSum::default()),
+            name if name == AGGR_INT_SUM_PROD.name => Box::new(AggrIntSumProd::default()),
             name if name == AGGR_PRODUCT.name => Box::new(AggrProduct::default()),
             name if name == AGGR_MIN.name => Box::new(AggrMin::default()),
             name if name == AGGR_MAX.name => Box::new(AggrMax::default()),
@@ -1551,5 +1626,55 @@ impl Aggregation {
             _ => unreachable!(),
         });
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int(i: i64) -> DataValue {
+        DataValue::from(i)
+    }
+
+    // The internal exact-i64 sum-of-products aggregate must accumulate exactly
+    // and RETURN AN ERROR (never a wrapped, silently-wrong value) on i64
+    // overflow — the correctness backbone of the factorized-count rewrite.
+    #[test]
+    fn int_sum_prod_is_exact_and_returns_int() {
+        let mut a = AggrIntSumProd::default();
+        a.set(&DataValue::List(vec![int(3), int(4)])).unwrap(); // 12
+        a.set(&DataValue::List(vec![int(5), int(2)])).unwrap(); // +10
+        a.set(&DataValue::List(vec![int(7)])).unwrap(); // +7
+        assert_eq!(a.get().unwrap(), int(29));
+    }
+
+    #[test]
+    fn int_sum_prod_empty_group_is_zero() {
+        let a = AggrIntSumProd::default();
+        assert_eq!(a.get().unwrap(), int(0));
+    }
+
+    #[test]
+    fn int_sum_prod_product_overflow_errors_not_wraps() {
+        let mut a = AggrIntSumProd::default();
+        // 2^62 * 4 overflows i64 — must be a clean error, never a wrapped value.
+        let r = a.set(&DataValue::List(vec![int(1i64 << 62), int(4)]));
+        assert!(r.is_err(), "product overflow must error, got {:?}", r);
+    }
+
+    #[test]
+    fn int_sum_prod_sum_overflow_errors_not_wraps() {
+        let mut a = AggrIntSumProd::default();
+        a.set(&DataValue::List(vec![int(i64::MAX)])).unwrap();
+        let r = a.set(&DataValue::List(vec![int(1)]));
+        assert!(r.is_err(), "sum overflow must error, got {:?}", r);
+    }
+
+    #[test]
+    fn int_sum_prod_rejects_non_integer_factor() {
+        let mut a = AggrIntSumProd::default();
+        assert!(a.set(&DataValue::List(vec![int(3), DataValue::Null])).is_err());
+        assert!(a.set(&int(5)).is_err()); // not a list
     }
 }

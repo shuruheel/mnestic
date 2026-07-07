@@ -313,6 +313,43 @@ impl DbInstance {
             }
         }
     }
+    /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
+    /// query factorization). Db-wide kill switch, default OFF. See
+    /// [`crate::Db::set_query_factorization`].
+    pub fn set_query_factorization(&self, enabled: bool) {
+        match self {
+            DbInstance::Mem(db) => db.set_query_factorization(enabled),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.set_query_factorization(enabled),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.set_query_factorization(enabled),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.set_query_factorization(enabled),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.set_query_factorization(enabled),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.set_query_factorization(enabled),
+        }
+    }
+
+    /// Whether the automatic factorized-count rewrite is enabled (mnestic fork,
+    /// query factorization). See [`crate::Db::query_factorization`].
+    pub fn query_factorization(&self) -> bool {
+        match self {
+            DbInstance::Mem(db) => db.query_factorization(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.query_factorization(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.query_factorization(),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.query_factorization(),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.query_factorization(),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.query_factorization(),
+        }
+    }
+
     /// Set a Db-wide default per-query wall-clock budget in seconds (mnestic
     /// fork, query budget). `None` disables it. See
     /// [`crate::Db::set_default_query_timeout`].

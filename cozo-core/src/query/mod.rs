@@ -8,6 +8,7 @@
 
 pub(crate) mod compile;
 pub(crate) mod eval;
+pub(crate) mod factorize;
 pub(crate) mod graph;
 pub(crate) mod logical;
 pub(crate) mod magic;
