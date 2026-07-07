@@ -410,3 +410,45 @@ fn bare_limit_skips_reorder_but_sorted_limit_reorders() {
         "a sorted :limit must still reorder"
     );
 }
+
+/// Regression: a multi-valued `in`-unification feeding a non-idempotent
+/// aggregation must NOT be reordered — the reorder can otherwise flip the
+/// unification between generator (duplicates) and filter, silently changing a
+/// count/sum/collect. The body carries such a unification, so the whole rule is
+/// ineligible and default (greedy) must equal `:reorder written`. On BOTH
+/// backends (the aggregation stream is a bag on either join path).
+fn assert_multi_in_aggregation_parity(db: &DbInstance) {
+    run_mut(db, ":create r0 { a: Int }");
+    run_mut(db, ":create rbig { a: Int, b: Int, c: Int }");
+    run_mut(db, ":create ry { a: Int, y: Int }");
+    run_mut(db, "?[a] <- [[1]] :put r0 { a }");
+    run_mut(db, "?[a,b,c] <- [[1,9,9]] :put rbig { a, b, c }");
+    run_mut(db, "?[a,y] <- [[1,5]] :put ry { a, y }");
+
+    // Written order compiles `y in [5,5]` (before *ry binds y) as a generator:
+    // two y=5 rows, count = 2. The greedy order would pull *ry ahead, demoting
+    // it to a filter (count = 1) — the reorder must decline (ineligible).
+    let q = "?[count(y)] := *r0[a], y in [5, 5], *rbig[a, b, c], *ry[a, y]";
+    let default = run(db, q).rows[0][0].get_int().unwrap();
+    let written = run(db, &format!("{q} :reorder written"))
+        .rows[0][0]
+        .get_int()
+        .unwrap();
+    assert_eq!(
+        default, written,
+        "multi-`in` + aggregation was reordered: default={default} written={written}"
+    );
+    assert_eq!(default, 2, "written-order semantics: `y in [5,5]` generates two rows");
+}
+
+#[test]
+fn multi_in_aggregation_not_reordered_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlite_db(&dir);
+    assert_multi_in_aggregation_parity(&db);
+}
+
+#[test]
+fn multi_in_aggregation_not_reordered_mem() {
+    assert_multi_in_aggregation_parity(&mem_db());
+}

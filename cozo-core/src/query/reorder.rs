@@ -488,6 +488,17 @@ fn greedy_reorder_conjunction(
             | NormalFormAtom::HnswSearch(_)
             | NormalFormAtom::FtsSearch(_)
             | NormalFormAtom::LshSearch(_) => return None,
+            // A multi-valued `in`-unification is a MULTIPLICITY injector: it
+            // compiles to a generator (one output row per list element, no
+            // dedup) when its variable is unbound at its position, but to a
+            // filter when the variable is already bound. Moving a relation that
+            // binds that variable across it flips generator<->filter, which
+            // changes a body's multiset — invisible to a set-valued (deduped)
+            // head, but it silently changes a non-idempotent aggregation
+            // (count/sum/collect). Every other eligible atom is set-preserving
+            // (stored relations are sets; rule/search atoms are excluded above),
+            // so this is the only unsafe construct — disqualify the whole rule.
+            NormalFormAtom::Unification(u) if u.one_many_unif => return None,
             _ => {}
         }
     }
@@ -597,8 +608,11 @@ fn greedy_reorder_conjunction(
     // --- Reconstruct the body ----------------------------------------------
     // leading (pre-first-relation atoms, incl. hoisted #1 equalities) stay in
     // front; the relation atoms are re-emitted in greedy order; every remaining
-    // non-relation atom follows (the well-ordering pass re-floats each to its
-    // earliest fully-bound slot, so their trailing position is immaterial).
+    // non-relation atom follows. The well-ordering pass re-floats each to its
+    // earliest fully-bound slot; their trailing position is result-immaterial
+    // for every atom that survives the eligibility gate (predicates, negations,
+    // single-valued unifications are all set-preserving — the multiplicity-
+    // injecting multi-`in` unification was excluded above).
     let mut new_body: Vec<NormalFormAtom> = Vec::with_capacity(body.len());
     new_body.extend_from_slice(&body[..first_rel]);
     for &ci in &order {
