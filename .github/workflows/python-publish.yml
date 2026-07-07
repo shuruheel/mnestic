@@ -56,25 +56,42 @@ jobs:
       fail-fast: false
       matrix:
         platform:
-          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2014" }
+          # `features` is a per-leg staged-rollout knob: if one leg's rocksdb
+          # build breaks, drop that leg back to "compact" instead of holding
+          # the whole release.
+          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2014", features: "compact,storage-rocksdb" }
           # aarch64 needs the 2_28 image: the manylinux2014 cross-GCC is too old
           # to assemble ring's ARM asm (#error "ARM assembler must define __ARM_ARCH").
-          - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28" }
+          - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28", features: "compact,storage-rocksdb" }
           # Intel-mac runners (macos-13) are retired — jobs queue forever.
-          # Cross-compile x86_64 on the arm64 runner instead (the binding's
-          # compact feature is pure Rust + cc, so the cross-build is safe).
-          - { os: macos-14,       target: x86_64 }
-          - { os: macos-14,       target: aarch64 }
-          - { os: windows-latest, target: x64 }
+          # Cross-compile x86_64 on the arm64 runner instead (rocksdb compiles
+          # via the cc crate, no cmake, so clang cross-compiles it; validated
+          # locally under Rosetta).
+          - { os: macos-14,       target: x86_64,  features: "compact,storage-rocksdb" }
+          - { os: macos-14,       target: aarch64, features: "compact,storage-rocksdb" }
+          - { os: windows-latest, target: x64,     features: "compact,storage-rocksdb" }
     steps:
       - uses: actions/checkout@v4
+        with:
+          # rocksdb sources for cozorocks — without them every leg fails at
+          # cozorocks/build.rs (rocksdb/AUTHORS check).
+          submodules: recursive
       - uses: PyO3/maturin-action@v1
+        env:
+          # Pin so cc (the C++/rocksdb build) and rustc agree on the macOS
+          # target; moves the mac wheel tags from macosx_10_12_* to
+          # macosx_11_0_* (drops long-EOL 10.x Macs). Empty — and unread — on
+          # the non-mac legs.
+          MACOSX_DEPLOYMENT_TARGET: ${{ startsWith(matrix.platform.os, 'macos') && '11.0' || '' }}
         with:
           working-directory: cozo-lib-python
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
-          # pyproject [tool.maturin] already pins no-default-features + features=compact.
-          args: --release --out dist --compatibility pypi
+          # Full feature list on the CLI — robust regardless of how maturin
+          # merges pyproject [tool.maturin] features with CLI flags. pyproject
+          # stays `compact` so `pip install` from the sdist (which ships no
+          # rocksdb sources) keeps building everywhere.
+          args: --release --out dist --compatibility pypi --no-default-features --features ${{ matrix.platform.features }}
       - uses: actions/upload-artifact@v4
         with:
           name: mnestic-wheels-${{ matrix.platform.os }}-${{ matrix.platform.target }}
@@ -115,9 +132,62 @@ jobs:
           name: dist-${{ matrix.pkg }}
           path: cozo-lib-python/integrations/${{ matrix.pkg }}/dist
 
+  # --- wheel smoke test: a wheel whose rocksdb engine doesn't open must not ship ---
+  # One natively runnable runner per built wheel. The mac x86_64 cross wheel has
+  # no native runner (Intel-mac runners are retired); it was validated locally
+  # under Rosetta when this pipeline was designed.
+  test-wheels:
+    name: smoke test wheels (${{ matrix.platform.os }})
+    needs: [build-mnestic]
+    runs-on: ${{ matrix.platform.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform:
+          - { os: ubuntu-latest,    artifact: mnestic-wheels-ubuntu-latest-x86_64 }
+          - { os: ubuntu-24.04-arm, artifact: mnestic-wheels-ubuntu-latest-aarch64 }
+          - { os: macos-14,         artifact: mnestic-wheels-macos-14-aarch64 }
+          - { os: windows-latest,   artifact: mnestic-wheels-windows-latest-x64 }
+    steps:
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ matrix.platform.artifact }}
+          path: dist
+      - name: Install wheel
+        run: python -m pip install --no-index --find-links dist mnestic
+      # `shell: python` runs the block under the setup-python interpreter on
+      # every OS — no bash/pwsh quoting hazards.
+      - name: Smoke test (rocksdb + mem engines)
+        shell: python
+        run: |
+          import os, tempfile
+
+          import mnestic
+
+          # mem-backend sanity
+          mem = mnestic.CozoDbPy("mem", "", "")
+          res = mem.run_script("?[a] <- [[1]]", {}, True)
+          assert res["rows"] == [[1]], res
+          print("MEM OK:", res["rows"])
+
+          # rocksdb: create relation, put rows, read back
+          path = os.path.join(tempfile.mkdtemp(), "smoke.db")
+          db = mnestic.CozoDbPy("rocksdb", path, "")
+          db.run_script(":create t {k: Int => v: String}", {}, False)
+          db.run_script(
+              '?[k, v] <- [[1, "hello-rocksdb"], [2, "world"]] :put t {k => v}',
+              {},
+              False,
+          )
+          rows = db.run_script("?[k, v] := *t[k, v]", {}, True)["rows"]
+          assert rows == [[1, "hello-rocksdb"], [2, "world"]], rows
+          print("ROCKSDB OK:", rows)
+
   # --- publish (OIDC trusted publishing); one job per PyPI project ---
   publish-mnestic:
-    needs: [build-mnestic, build-mnestic-sdist]
+    needs: [build-mnestic, build-mnestic-sdist, test-wheels]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
@@ -154,7 +224,8 @@ jobs:
           skip-existing: true
 
   publish-langchain-mnestic:
-    needs: [build-adapters]
+    # The adapters wrap the mnestic wheel — don't ship them off a broken wheel set.
+    needs: [build-adapters, test-wheels]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
@@ -169,7 +240,7 @@ jobs:
           skip-existing: true
 
   publish-llama-index-vector-stores-mnestic:
-    needs: [build-adapters]
+    needs: [build-adapters, test-wheels]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
