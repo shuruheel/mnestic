@@ -35,7 +35,7 @@ use tower_http::auth::{AsyncAuthorizeRequest, AsyncRequireAuthorizationLayer};
 use tower_http::compression::CompressionLayer;
 use tower_http::cors::{Any, CorsLayer};
 
-use cozo::{DataValue, DbInstance, format_error_as_json, MultiTransaction, NamedRows, ScriptMutability, SimpleFixedRule};
+use cozo::{DataValue, DbInstance, format_error_as_json, MultiTransaction, NamedRows, ScriptMutability, ScriptRunOptions, SimpleFixedRule};
 
 #[derive(Args, Debug)]
 pub(crate) struct ServerArgs {
@@ -66,6 +66,12 @@ pub(crate) struct ServerArgs {
     /// When set, the content of the named table will be used as a token table
     #[clap(long)]
     token_table: Option<String>,
+
+    /// Default per-query wall-clock budget in seconds (mnestic fork, query
+    /// budget). Unset or non-positive = no default. Bounds every query; a
+    /// per-request `timeout` or an in-script `:timeout` can only tighten it.
+    #[clap(long)]
+    default_query_timeout: Option<f64>,
 }
 
 #[derive(Clone)]
@@ -178,6 +184,9 @@ fn x() {}
 
 pub(crate) async fn server_main(args: ServerArgs) {
     let db = DbInstance::new(&args.engine, &args.path, &args.config).unwrap();
+    if let Some(secs) = args.default_query_timeout {
+        db.set_default_query_timeout(Some(secs));
+    }
     if let Some(p) = &args.restore {
         if let Err(err) = db.restore_backup(p) {
             error!("{}", err);
@@ -352,6 +361,10 @@ struct QueryPayload {
     script: String,
     params: BTreeMap<String, serde_json::Value>,
     immutable: Option<bool>,
+    /// Per-call wall-clock budget in seconds (mnestic fork, query budget).
+    /// Optional; combined via `min` with any in-script `:timeout` and the
+    /// server's `--default-query-timeout`. Ignored on the `/transact/:id` path.
+    timeout: Option<f64>,
 }
 
 async fn text_query(
@@ -368,8 +381,11 @@ async fn text_query(
         ScriptMutability::Mutable => payload.immutable.unwrap_or(false),
         ScriptMutability::Immutable => true,
     };
+    let options = ScriptRunOptions {
+        timeout: payload.timeout,
+    };
     let result = spawn_blocking(move || {
-        st.db.run_script_fold_err(
+        st.db.run_script_fold_err_with_options(
             &payload.script,
             params,
             if immutable {
@@ -377,6 +393,7 @@ async fn text_query(
             } else {
                 ScriptMutability::Mutable
             },
+            options,
         )
     })
         .await;

@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 #[allow(unused_imports)]
 use std::thread;
 #[allow(unused_imports)]
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[allow(unused_imports)]
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
@@ -74,7 +74,7 @@ impl Drop for RunningQueryCleanup {
     fn drop(&mut self) {
         let mut map = self.running_queries.lock().unwrap();
         if let Some(handle) = map.remove(&self.id) {
-            handle.poison.0.store(true, Ordering::Relaxed);
+            handle.poison.kill();
         }
     }
 }
@@ -91,6 +91,34 @@ pub enum ScriptMutability {
     Mutable,
     /// The script is immutable.
     Immutable,
+}
+
+/// Per-call options for [`Db::run_script_with_options`] (mnestic fork, query
+/// budget). Deliberately future-proof: construct with [`ScriptRunOptions::new`]
+/// / the `with_*` builders or `..Default::default()` so new options can be
+/// added without breaking callers.
+#[derive(Debug, Clone, Default)]
+pub struct ScriptRunOptions {
+    /// Per-call wall-clock budget in seconds. `None` (the default) imposes no
+    /// per-call budget. The effective deadline for each statement is the
+    /// minimum of this, any per-block `:timeout`, and the Db default
+    /// ([`Db::set_default_query_timeout`]) — a `:timeout` can only tighten the
+    /// budget, never extend past this guard. It is a single whole-script
+    /// deadline: a multi-statement script does not get it afresh per statement.
+    pub timeout: Option<f64>,
+}
+
+impl ScriptRunOptions {
+    /// A fresh options set with no overrides.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the per-call wall-clock budget in seconds (builder style).
+    pub fn with_timeout(mut self, secs: f64) -> Self {
+        self.timeout = Some(secs);
+        self
+    }
 }
 
 /// The database object of Cozo.
@@ -140,6 +168,13 @@ pub struct Db<S> {
     /// correct and needs no invalidation. Indexes built/migrated under the
     /// counter read it directly (O(1)) and never touch this cache.
     fts_doc_stats_cache: Arc<Mutex<BTreeMap<SmartString<LazyCompact>, (u64, u64)>>>,
+    /// Db-wide default per-query wall-clock budget in milliseconds (mnestic
+    /// fork, query budget). `0` = unset. Set via
+    /// [`Db::set_default_query_timeout`]; folded (via `min`) into every
+    /// script's effective deadline alongside any per-call timeout and per-block
+    /// `:timeout`. Anchored at script start, so it bounds the whole
+    /// `run_script` call rather than each statement.
+    default_query_timeout_ms: Arc<AtomicU64>,
 }
 
 impl<S> Debug for Db<S> {
@@ -331,6 +366,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             relation_locks: Default::default(),
             index_builds_in_progress: Default::default(),
             fts_doc_stats_cache: Default::default(),
+            default_query_timeout_ms: Default::default(),
         };
         Ok(ret)
     }
@@ -479,7 +515,28 @@ impl<'s, S: Storage<'s>> Db<S> {
         params: BTreeMap<String, DataValue>,
         mutability: ScriptMutability,
     ) -> Result<NamedRows> {
-        self.run_script_ast(
+        self.run_script_with_options(payload, params, mutability, ScriptRunOptions::default())
+    }
+
+    /// Run the CozoScript passed in with per-call [`ScriptRunOptions`] (mnestic
+    /// fork, query budget). Currently the only option is a per-call wall-clock
+    /// `timeout` (seconds). The effective budget for each statement is the
+    /// minimum of that timeout, any per-block `:timeout` option, and the Db
+    /// default ([`Db::set_default_query_timeout`]) — a `:timeout` can only
+    /// tighten the budget, never extend past the per-call or Db-default guard.
+    /// The per-call timeout is a single whole-script deadline (a multi-statement
+    /// script does not get the budget afresh per statement); triggers fired by
+    /// the script inherit it. A budget expiry aborts before any commit, so a
+    /// killed mutable script leaves no partial writes.
+    pub fn run_script_with_options(
+        &'s self,
+        payload: &str,
+        params: BTreeMap<String, DataValue>,
+        mutability: ScriptMutability,
+        options: ScriptRunOptions,
+    ) -> Result<NamedRows> {
+        let cur_vld = current_validity();
+        self.run_script_ast_inner(
             parse_script(
                 payload,
                 &params,
@@ -488,10 +545,11 @@ impl<'s, S: Storage<'s>> Db<S> {
                     meet: &self.get_custom_aggrs(),
                     bounded: &self.get_custom_bounded_meets(),
                 },
-                current_validity(),
+                cur_vld,
             )?,
-            current_validity(),
+            cur_vld,
             mutability,
+            options.timeout,
         )
     }
 
@@ -529,11 +587,78 @@ impl<'s, S: Storage<'s>> Db<S> {
         cur_vld: ValidityTs,
         mutability: ScriptMutability,
     ) -> Result<NamedRows> {
+        self.run_script_ast_inner(payload, cur_vld, mutability, None)
+    }
+
+    /// Dispatch a parsed script, computing the whole-script wall-clock deadline
+    /// (mnestic fork, query budget) from the optional per-call timeout and the
+    /// Db default, anchored at this call's start, and threading it onto the
+    /// script's transaction. Sys ops (`::…`) carry no budget.
+    fn run_script_ast_inner(
+        &'s self,
+        payload: CozoScript,
+        cur_vld: ValidityTs,
+        mutability: ScriptMutability,
+        call_timeout: Option<f64>,
+    ) -> Result<NamedRows> {
         let read_only = mutability == ScriptMutability::Immutable;
+        let outer_deadline = self.effective_outer_deadline(call_timeout, Instant::now());
         match payload {
-            CozoScript::Single(p) => self.execute_single(cur_vld, p, read_only),
-            CozoScript::Imperative(ps) => self.execute_imperative(cur_vld, &ps, read_only),
+            CozoScript::Single(p) => self.execute_single(cur_vld, p, read_only, outer_deadline),
+            CozoScript::Imperative(ps) => {
+                self.execute_imperative(cur_vld, &ps, read_only, outer_deadline)
+            }
             CozoScript::Sys(op) => self.run_sys_op(op, read_only),
+        }
+    }
+
+    /// Compute the whole-script deadline from the per-call timeout and the Db
+    /// default (mnestic fork, query budget), both anchored at `start`. Returns
+    /// the earliest (`min`) of whichever are set; `None` if neither is.
+    fn effective_outer_deadline(
+        &self,
+        call_timeout: Option<f64>,
+        start: Instant,
+    ) -> Option<Instant> {
+        let mut deadline: Option<Instant> = None;
+        if let Some(secs) = call_timeout {
+            if secs > 0.0 {
+                deadline = Some(start + Duration::from_secs_f64(secs));
+            }
+        }
+        let default_ms = self.default_query_timeout_ms.load(Ordering::Relaxed);
+        if default_ms > 0 {
+            let d = start + Duration::from_millis(default_ms);
+            deadline = Some(match deadline {
+                Some(existing) => existing.min(d),
+                None => d,
+            });
+        }
+        deadline
+    }
+
+    /// Set a Db-wide default per-query wall-clock budget in seconds (mnestic
+    /// fork, query budget). `None` (or a non-positive value) disables it. The
+    /// default is folded (via `min`) into every subsequent script's effective
+    /// deadline, so a per-block `:timeout` or a per-call timeout can only
+    /// tighten it, never extend past it. Anchored at each `run_script` call's
+    /// start, so it bounds the whole call rather than each statement.
+    pub fn set_default_query_timeout(&self, secs: Option<f64>) {
+        let ms = match secs {
+            Some(s) if s > 0.0 => (s * 1000.0) as u64,
+            _ => 0,
+        };
+        self.default_query_timeout_ms.store(ms, Ordering::Relaxed);
+    }
+
+    /// The current Db-wide default per-query budget in seconds, or `None` if
+    /// unset (mnestic fork, query budget).
+    pub fn default_query_timeout(&self) -> Option<f64> {
+        let ms = self.default_query_timeout_ms.load(Ordering::Relaxed);
+        if ms == 0 {
+            None
+        } else {
+            Some(ms as f64 / 1000.0)
         }
     }
 
@@ -1254,6 +1379,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
+            script_deadline: None,
         };
         Ok(ret)
     }
@@ -1270,6 +1396,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
+            script_deadline: None,
         };
         Ok(ret)
     }
@@ -1300,6 +1427,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         cur_vld: ValidityTs,
         p: InputProgram,
         read_only: bool,
+        outer_deadline: Option<Instant>,
     ) -> Result<NamedRows, Report> {
         let mut callback_collector = BTreeMap::new();
         let write_lock_names = p.needs_write_lock();
@@ -1326,6 +1454,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             } else {
                 self.transact()?
             };
+            // Carry the whole-script wall-clock budget on the tx so run_query
+            // (and any triggers it fires) honour it (mnestic fork, query budget).
+            tx.script_deadline = outer_deadline;
 
             res = self.execute_single_program(
                 p,
@@ -2412,7 +2543,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         vec![vec![DataValue::from("NOT_FOUND")]],
                     ),
                     Some(handle) => {
-                        handle.poison.0.store(true, Ordering::Relaxed);
+                        handle.poison.kill();
                         NamedRows::new(
                             vec![STATUS_STR.to_string()],
                             vec![vec![DataValue::from("KILLING")]],
@@ -2482,7 +2613,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         vec![vec![DataValue::from("NOT_FOUND")]],
                     ),
                     Some(handle) => {
-                        handle.poison.0.store(true, Ordering::Relaxed);
+                        handle.poison.kill();
                         NamedRows::new(
                             vec![STATUS_STR.to_string()],
                             vec![vec![DataValue::from("KILLING")]],
@@ -2562,11 +2693,27 @@ impl<'s, S: Storage<'s>> Db<S> {
         let program = stratified_program.magic_sets_rewrite(tx)?;
         let compiled = tx.stratified_magic_compile(program)?;
 
-        // poison is used to terminate queries early
-        let poison = Poison::default();
-        if let Some(secs) = out_opts.timeout {
-            poison.set_timeout(secs)?;
-        }
+        // poison terminates queries early: on `::kill` (its flag) or when the
+        // effective wall-clock deadline passes (mnestic fork, query budget).
+        // The deadline is the minimum of the whole-script budget carried on the
+        // transaction (per-call timeout + Db default, anchored at script start,
+        // inherited by triggers running in the same tx) and this block's own
+        // `:timeout` (re-armed from now). `min` makes a `:timeout` a guard that
+        // can only tighten the budget, never extend past the call/Db-default.
+        let effective_deadline = {
+            let mut deadline = tx.script_deadline;
+            if let Some(secs) = out_opts.timeout {
+                if secs > 0.0 {
+                    let block = Instant::now() + Duration::from_secs_f64(secs);
+                    deadline = Some(match deadline {
+                        Some(existing) => existing.min(block),
+                        None => block,
+                    });
+                }
+            }
+            deadline
+        };
+        let poison = Poison::with_deadline(effective_deadline);
         // give the query an ID and store it so that it can be queried and cancelled
         let id = self.queries_count.fetch_add(1, Ordering::AcqRel);
 
@@ -2980,37 +3127,74 @@ fn _get_variables(src: &str, params: &BTreeMap<String, DataValue>) -> Result<BTr
     expr.get_variables()
 }
 
-/// Used for user-initiated termination of running queries
+/// Used for user-initiated termination of running queries (`::kill`) and
+/// per-query wall-clock budgets (mnestic fork, query budget). Two independent
+/// trip conditions, distinguished by the error they raise:
+///
+/// * `flag` — set by `::kill`; raises `eval::killed`.
+/// * `deadline` — a monotonic instant computed from the effective budget
+///   (a `:timeout` option, a per-call timeout, or the Db default); raises the
+///   distinct `eval::timeout` once `Instant::now()` reaches it.
+///
+/// Cheap to clone (an `Arc` handle plus a `Copy` deadline), so it is threaded
+/// into fixed rules and the RA enumeration pipeline. The carried deadline
+/// replaces the old detached timer thread: no per-query thread leak, and
+/// `:timeout` no longer depends on spawning a thread.
 #[derive(Clone, Default)]
-pub struct Poison(pub(crate) Arc<AtomicBool>);
+pub struct Poison {
+    pub(crate) flag: Arc<AtomicBool>,
+    pub(crate) deadline: Option<Instant>,
+}
 
 impl Poison {
-    /// Will return `Err` if user has initiated termination.
+    /// Returns `Err` if the query has been killed (`eval::killed`) or has
+    /// exceeded its wall-clock budget (`eval::timeout`). Cheap: an atomic load,
+    /// plus one monotonic clock read only when a deadline is armed — safe at
+    /// the batched (every-`POISON_CHECK_INTERVAL`-pulls) cadence it is called
+    /// at, but keep it off any per-tuple inline path.
     #[inline(always)]
     pub fn check(&self) -> Result<()> {
         #[derive(Debug, Error, Diagnostic)]
         #[error("Running query is killed before completion")]
         #[diagnostic(code(eval::killed))]
-        #[diagnostic(help("A query may be killed by timeout, or explicit command"))]
+        #[diagnostic(help("The query was killed by an explicit `::kill` command"))]
         struct ProcessKilled;
 
-        if self.0.load(Ordering::Relaxed) {
+        if self.flag.load(Ordering::Relaxed) {
             bail!(ProcessKilled)
+        }
+
+        if let Some(deadline) = self.deadline {
+            if Instant::now() >= deadline {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("Query exceeded its time budget")]
+                #[diagnostic(code(eval::timeout))]
+                #[diagnostic(help(
+                    "The query ran past its wall-clock budget, set by a `:timeout` \
+                     option, a per-call timeout, or the Db default query timeout. \
+                     Narrow the query or raise the budget."
+                ))]
+                struct QueryTimeout;
+                bail!(QueryTimeout)
+            }
         }
         Ok(())
     }
-    #[cfg(target_arch = "wasm32")]
-    pub(crate) fn set_timeout(&self, _secs: f64) -> Result<()> {
-        bail!("Cannot set timeout when threading is disallowed");
+
+    /// Mark the query as killed (`::kill`); a subsequent [`Poison::check`]
+    /// raises `eval::killed`.
+    #[inline]
+    pub(crate) fn kill(&self) {
+        self.flag.store(true, Ordering::Relaxed);
     }
-    #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn set_timeout(&self, secs: f64) -> Result<()> {
-        let pill = self.clone();
-        thread::spawn(move || {
-            thread::sleep(Duration::from_micros((secs * 1000000.) as u64));
-            pill.0.store(true, Ordering::Relaxed);
-        });
-        Ok(())
+
+    /// Construct a poison carrying an optional wall-clock deadline (mnestic
+    /// fork, query budget). The kill flag starts un-set.
+    pub(crate) fn with_deadline(deadline: Option<Instant>) -> Self {
+        Poison {
+            flag: Arc::new(AtomicBool::new(false)),
+            deadline,
+        }
     }
 }
 

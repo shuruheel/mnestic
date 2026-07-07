@@ -8,6 +8,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::Ordering;
+use std::time::Instant;
 
 use either::{Either, Left, Right};
 use itertools::Itertools;
@@ -257,6 +258,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         cur_vld: ValidityTs,
         ps: &ImperativeProgram,
         readonly: bool,
+        outer_deadline: Option<Instant>,
     ) -> Result<NamedRows, Report> {
         let mut callback_collector = BTreeMap::new();
         let mut write_lock_names = BTreeSet::new();
@@ -283,8 +285,12 @@ impl<'s, S: Storage<'s>> Db<S> {
             } else {
                 self.transact()?
             };
+            // The whole-script budget spans every statement of the imperative
+            // program (one tx), so carry it on the tx and arm the shared poison
+            // with the same deadline (mnestic fork, query budget).
+            tx.script_deadline = outer_deadline;
 
-            let poison = Poison::default();
+            let poison = Poison::with_deadline(outer_deadline);
             let qid = self.queries_count.fetch_add(1, Ordering::AcqRel);
             let since_the_epoch = seconds_since_the_epoch()?;
 

@@ -99,6 +99,7 @@ pub use crate::runtime::db::get_variables;
 pub use crate::runtime::db::Payload;
 pub use crate::runtime::db::Poison;
 pub use crate::runtime::db::ScriptMutability;
+pub use crate::runtime::db::ScriptRunOptions;
 pub use crate::runtime::db::TransactionPayload;
 
 #[cfg(feature = "cypher")]
@@ -278,6 +279,75 @@ impl DbInstance {
     pub fn run_default(&self, payload: &str) -> Result<NamedRows> {
         self.run_script(payload, BTreeMap::new(), ScriptMutability::Mutable)
     }
+    /// Run the CozoScript with per-call [`ScriptRunOptions`] (mnestic fork,
+    /// query budget) — currently a per-call wall-clock `timeout` in seconds.
+    /// See [`crate::Db::run_script_with_options`] for the budget precedence.
+    pub fn run_script_with_options(
+        &self,
+        payload: &str,
+        params: BTreeMap<String, DataValue>,
+        mutability: ScriptMutability,
+        options: ScriptRunOptions,
+    ) -> Result<NamedRows> {
+        match self {
+            DbInstance::Mem(db) => db.run_script_with_options(payload, params, mutability, options),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => {
+                db.run_script_with_options(payload, params, mutability, options)
+            }
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => {
+                db.run_script_with_options(payload, params, mutability, options)
+            }
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => {
+                db.run_script_with_options(payload, params, mutability, options)
+            }
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => {
+                db.run_script_with_options(payload, params, mutability, options)
+            }
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => {
+                db.run_script_with_options(payload, params, mutability, options)
+            }
+        }
+    }
+    /// Set a Db-wide default per-query wall-clock budget in seconds (mnestic
+    /// fork, query budget). `None` disables it. See
+    /// [`crate::Db::set_default_query_timeout`].
+    pub fn set_default_query_timeout(&self, secs: Option<f64>) {
+        match self {
+            DbInstance::Mem(db) => db.set_default_query_timeout(secs),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.set_default_query_timeout(secs),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.set_default_query_timeout(secs),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.set_default_query_timeout(secs),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.set_default_query_timeout(secs),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.set_default_query_timeout(secs),
+        }
+    }
+    /// The current Db-wide default per-query budget in seconds, or `None`
+    /// (mnestic fork, query budget). See [`crate::Db::default_query_timeout`].
+    pub fn default_query_timeout(&self) -> Option<f64> {
+        match self {
+            DbInstance::Mem(db) => db.default_query_timeout(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.default_query_timeout(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.default_query_timeout(),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.default_query_timeout(),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.default_query_timeout(),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.default_query_timeout(),
+        }
+    }
     /// One-call hybrid retrieval (mnestic fork addition): runs an HNSW + FTS
     /// (+ optional traversal) recall, fuses with Reciprocal Rank Fusion, and
     /// optionally diversifies with Maximal Marginal Relevance. Read-only. See
@@ -366,6 +436,34 @@ impl DbInstance {
         let start = Instant::now();
 
         match self.run_script(payload, params, mutability) {
+            Ok(named_rows) => {
+                let mut j_val = named_rows.into_json();
+                #[cfg(not(target_arch = "wasm32"))]
+                let took = start.elapsed().as_secs_f64();
+                let map = j_val.as_object_mut().unwrap();
+                map.insert("ok".to_string(), json!(true));
+                #[cfg(not(target_arch = "wasm32"))]
+                map.insert("took".to_string(), json!(took));
+
+                j_val
+            }
+            Err(err) => format_error_as_json(err, Some(payload)),
+        }
+    }
+    /// [`DbInstance::run_script_fold_err`] with per-call [`ScriptRunOptions`]
+    /// (mnestic fork, query budget). A budget expiry folds into the JSON with
+    /// `code == "eval::timeout"`, distinct from a `::kill`'s `eval::killed`.
+    pub fn run_script_fold_err_with_options(
+        &self,
+        payload: &str,
+        params: BTreeMap<String, DataValue>,
+        mutability: ScriptMutability,
+        options: ScriptRunOptions,
+    ) -> JsonValue {
+        #[cfg(not(target_arch = "wasm32"))]
+        let start = Instant::now();
+
+        match self.run_script_with_options(payload, params, mutability, options) {
             Ok(named_rows) => {
                 let mut j_val = named_rows.into_json();
                 #[cfg(not(target_arch = "wasm32"))]

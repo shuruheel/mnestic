@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use crate::data::program::ReturnMutation;
 use miette::{bail, Diagnostic, Result};
@@ -62,6 +63,14 @@ pub struct SessionTx<'a> {
     /// (an idempotent reconcile buffers no rows, so `pending_tt_writes`
     /// alone cannot witness it).
     pub(crate) reconciled_tt_relations: std::collections::BTreeSet<u64>,
+    /// Whole-script wall-clock deadline (mnestic fork, query budget): the
+    /// minimum of any per-call timeout (`run_script_with_options`) and the Db
+    /// default (`set_default_query_timeout`), anchored at script start. `None`
+    /// = no whole-script budget. `run_query` combines it (via `min`) with the
+    /// block's own `:timeout`; because a script (or an imperative program, or a
+    /// trigger) shares one tx, every statement it drives inherits the same
+    /// budget — a multi-statement script is bounded as a whole, not per block.
+    pub(crate) script_deadline: Option<Instant>,
 }
 
 /// One statement's worth of buffered writes to a tt-stamped relation.
