@@ -627,6 +627,35 @@ impl<'s, S: Storage<'s>> Db<S> {
             let handle = tx.get_relation(relation, false)?;
             let has_indices = !handle.indices.is_empty();
 
+            // Bulk import maintains B-tree secondary indices (below) but NOT
+            // the HNSW/FTS/LSH indices, whose maintenance runs off the per-row
+            // :put path this bypasses — imported rows silently stay invisible
+            // to vector/text/LSH search until the index is rebuilt. Warn
+            // loudly rather than corrupt-silently; a hard error would break
+            // legitimate import-then-reindex callers. (mnestic fork, hardening)
+            if !handle.hnsw_indices.is_empty()
+                || !handle.fts_indices.is_empty()
+                || !handle.lsh_indices.is_empty()
+            {
+                let mut kinds = vec![];
+                if !handle.hnsw_indices.is_empty() {
+                    kinds.push("HNSW");
+                }
+                if !handle.fts_indices.is_empty() {
+                    kinds.push("FTS");
+                }
+                if !handle.lsh_indices.is_empty() {
+                    kinds.push("LSH");
+                }
+                log::warn!(
+                    "bulk import into relation '{}' does not maintain its {} index(es); \
+                     rebuild them after the import (drop + recreate) or load via :put — \
+                     imported rows are otherwise invisible to those indices",
+                    relation,
+                    kinds.join("/")
+                );
+            }
+
             if handle.access_level < AccessLevel::Protected {
                 bail!(InsufficientAccessLevel(
                     handle.name.to_string(),
@@ -2437,6 +2466,32 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
     }
     fn run_sys_op(&'s self, op: SysOp, read_only: bool) -> Result<NamedRows> {
+        // ::running and ::kill touch only the in-memory query registry, so
+        // they dispatch before any transaction is opened: on mem/sqlite a
+        // write tx takes a store-wide lock that queues behind every running
+        // read query — a ::kill would otherwise block until the query it is
+        // trying to kill finishes. (mnestic fork, interruptibility; the arms
+        // in run_sys_op_with_tx stay for the imperative in-script path)
+        match &op {
+            SysOp::ListRunning => return self.list_running(),
+            SysOp::KillRunning(id) => {
+                let queries = self.running_queries.lock().unwrap();
+                return Ok(match queries.get(id) {
+                    None => NamedRows::new(
+                        vec![STATUS_STR.to_string()],
+                        vec![vec![DataValue::from("NOT_FOUND")]],
+                    ),
+                    Some(handle) => {
+                        handle.poison.0.store(true, Ordering::Relaxed);
+                        NamedRows::new(
+                            vec![STATUS_STR.to_string()],
+                            vec![vec![DataValue::from("KILLING")]],
+                        )
+                    }
+                });
+            }
+            _ => {}
+        }
         // RocksDB builds HNSW indexes off-lock so reads aren't blocked for
         // minutes; that path manages its own transactions and locks, so it runs
         // outside the single-tx wrapper below. (mnestic fork)

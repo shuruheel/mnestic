@@ -385,7 +385,7 @@ impl<'a> SessionTx<'a> {
 
         for (rule_n, rule) in ruleset.iter().enumerate() {
             debug!("initial calculation for rule {:?}.{}", rule_symb, rule_n);
-            for item_res in rule.relation.iter(self, None, stores)? {
+            for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                 let item = item_res?;
                 trace!("item for {:?}.{}: {:?} at {}", rule_symb, rule_n, item, 0);
                 if should_check_limit {
@@ -422,7 +422,7 @@ impl<'a> SessionTx<'a> {
         let mut out_store = TempStore::new_bounded(ruleset[0].aggr.clone())?;
         for (rule_n, rule) in ruleset.iter().enumerate() {
             debug!("initial calculation for rule {:?}.{}", rule_symb, rule_n);
-            for item_res in rule.relation.iter(self, None, stores)? {
+            for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                 let item = item_res?;
                 trace!("item for {:?}.{}: {:?} at {}", rule_symb, rule_n, item, 0);
                 out_store.bounded_meet_put(item)?;
@@ -461,7 +461,7 @@ impl<'a> SessionTx<'a> {
 
             if need_complete_run {
                 debug!("complete run for rule {:?}.{}", rule_symb, rule_n);
-                for item_res in rule.relation.iter(self, None, stores)? {
+                for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                     out_store.bounded_meet_put(item_res?)?;
                 }
                 poison.check()?;
@@ -474,7 +474,9 @@ impl<'a> SessionTx<'a> {
                         "with delta {:?} for rule {:?}.{}",
                         delta_key, rule_symb, rule_n
                     );
-                    for item_res in rule.relation.iter(self, Some(delta_key), stores)? {
+                    for item_res in
+                        rule.relation.iter(self, Some(delta_key), stores, poison.clone())?
+                    {
                         out_store.bounded_meet_put(item_res?)?;
                     }
                     poison.check()?;
@@ -498,7 +500,7 @@ impl<'a> SessionTx<'a> {
             for (aggr, args) in aggr.iter_mut().flatten() {
                 aggr.meet_init(args)?;
             }
-            for item_res in rule.relation.iter(self, None, stores)? {
+            for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                 let item = item_res?;
                 trace!("item for {:?}.{}: {:?} at {}", rule_symb, rule_n, item, 0);
                 out_store.meet_put(item)?;
@@ -558,7 +560,7 @@ impl<'a> SessionTx<'a> {
                 .filter_map(|(i, a)| a.as_ref().map(|aggr| (i, aggr.clone())))
                 .collect_vec();
 
-            for item_res in rule.relation.iter(self, None, stores)? {
+            for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                 let item = item_res?;
                 trace!("item for {:?}.{}: {:?} at {}", rule_symb, rule_n, item, 0);
 
@@ -680,7 +682,7 @@ impl<'a> SessionTx<'a> {
 
             if need_complete_run {
                 debug!("complete rule for rule {:?}.{}", rule_symb, rule_n);
-                for item_res in rule.relation.iter(self, None, stores)? {
+                for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                     let item = item_res?;
                     // improvement: the clauses can actually be evaluated in parallel
                     if prev_store.exists(&item) {
@@ -720,7 +722,9 @@ impl<'a> SessionTx<'a> {
                         "with delta {:?} for rule {:?}.{}",
                         delta_key, rule_symb, rule_n
                     );
-                    for item_res in rule.relation.iter(self, Some(delta_key), stores)? {
+                    for item_res in
+                        rule.relation.iter(self, Some(delta_key), stores, poison.clone())?
+                    {
                         let item = item_res?;
                         // improvement: the clauses can actually be evaluated in parallel
                         if prev_store.exists(&item) {
@@ -789,7 +793,7 @@ impl<'a> SessionTx<'a> {
 
             if need_complete_run {
                 debug!("complete run for rule {:?}.{}", rule_symb, rule_n);
-                for item_res in rule.relation.iter(self, None, stores)? {
+                for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
                     out_store.meet_put(item_res?)?;
                 }
                 poison.check()?;
@@ -802,7 +806,9 @@ impl<'a> SessionTx<'a> {
                         "with delta {:?} for rule {:?}.{}",
                         delta_key, rule_symb, rule_n
                     );
-                    for item_res in rule.relation.iter(self, Some(delta_key), stores)? {
+                    for item_res in
+                        rule.relation.iter(self, Some(delta_key), stores, poison.clone())?
+                    {
                         out_store.meet_put(item_res?)?;
                     }
                     poison.check()?;

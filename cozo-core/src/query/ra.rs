@@ -23,6 +23,7 @@ use crate::data::symb::Symbol;
 use crate::data::tuple::{Tuple, TupleIter};
 use crate::data::value::{DataValue, ValidityTs};
 use crate::parse::SourceSpan;
+use crate::runtime::db::Poison;
 use crate::runtime::minhash_lsh::LshSearch;
 use crate::runtime::relation::RelationHandle;
 use crate::runtime::temp_store::EpochStore;
@@ -128,6 +129,7 @@ impl UnificationRA {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let mut bindings = self.parent.bindings_after_eliminate();
         bindings.push(self.binding.clone());
@@ -136,7 +138,7 @@ impl UnificationRA {
         Ok(if self.is_multi {
             let it = self
                 .parent
-                .iter(tx, delta_rule, stores)?
+                .iter(tx, delta_rule, stores, poison)?
                 .map_ok(move |tuple| -> Result<Vec<Tuple>> {
                     let result_list = eval_bytecode(&self.expr_bytecode, &tuple, &mut stack)?;
                     let result_list = result_list.get_slice().ok_or_else(|| {
@@ -164,7 +166,7 @@ impl UnificationRA {
         } else {
             Box::new(
                 self.parent
-                    .iter(tx, delta_rule, stores)?
+                    .iter(tx, delta_rule, stores, poison)?
                     .map_ok(move |tuple| -> Result<Tuple> {
                         let result = eval_bytecode(&self.expr_bytecode, &tuple, &mut stack)?;
                         let mut ret = tuple;
@@ -221,13 +223,14 @@ impl FilteredRA {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let bindings = self.parent.bindings_after_eliminate();
         let eliminate_indices = get_eliminate_indices(&bindings, &self.to_eliminate);
         let mut stack = vec![];
         Ok(Box::new(
             self.parent
-                .iter(tx, delta_rule, stores)?
+                .iter(tx, delta_rule, stores, poison)?
                 .filter_map(move |tuple| match tuple {
                     Ok(t) => {
                         for (p, span) in self.filters_bytecodes.iter() {
@@ -741,6 +744,7 @@ impl ReorderRA {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let old_order = self.relation.bindings_after_eliminate();
         let old_order_indices: BTreeMap<_, _> = old_order
@@ -759,7 +763,7 @@ impl ReorderRA {
             .collect_vec();
         Ok(Box::new(
             self.relation
-                .iter(tx, delta_rule, stores)?
+                .iter(tx, delta_rule, stores, poison)?
                 .map_ok(move |tuple| {
                     let old = tuple;
                     let new = reorder_indices
@@ -887,6 +891,44 @@ fn invert_option_err<T>(v: Result<Option<T>>) -> Option<Result<T>> {
     }
 }
 
+/// Tuples pulled between poison checks in RA iteration (mnestic fork,
+/// interruptibility). Power of two so the check is a mask test; the
+/// amortized relaxed load is noise next to per-tuple pipeline cost, while
+/// bounding kill/timeout abort latency to ~4096 pulls of work at the
+/// slowest operator boundary or raw scan.
+const POISON_CHECK_INTERVAL: usize = 4096;
+
+/// Iterator adapter that surfaces a poisoned query (::kill or :timeout) as
+/// an `eval::killed` error from inside RA enumeration, so a kill fires even
+/// when filters above never let a tuple out (mnestic fork).
+struct PoisonedIter<I> {
+    inner: I,
+    poison: Poison,
+    count: usize,
+}
+
+impl<I: Iterator<Item = Result<Tuple>>> Iterator for PoisonedIter<I> {
+    type Item = Result<Tuple>;
+    #[inline]
+    fn next(&mut self) -> Option<Self::Item> {
+        self.count = self.count.wrapping_add(1);
+        if self.count & (POISON_CHECK_INTERVAL - 1) == 0 {
+            if let Err(e) = self.poison.check() {
+                return Some(Err(e));
+            }
+        }
+        self.inner.next()
+    }
+}
+
+fn poisoned<I: Iterator<Item = Result<Tuple>>>(inner: I, poison: Poison) -> PoisonedIter<I> {
+    PoisonedIter {
+        inner,
+        poison,
+        count: 0,
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredBitemporalRA {
     pub(crate) bindings: Vec<Symbol>,
@@ -914,12 +956,17 @@ impl StoredBitemporalRA {
         }
         Ok(())
     }
-    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>) -> Result<TupleIter<'a>> {
+    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>, poison: Poison) -> Result<TupleIter<'a>> {
         let it = self.storage.bitemporal_scan_all(tx, self.vt_at, self.tt_at);
         Ok(if self.filters.is_empty() {
             Box::new(it)
         } else {
-            Box::new(filter_iter(self.filters_bytecodes.clone(), Box::new(it)))
+            // the raw scan is wrapped so fused filters that drop every tuple
+            // still hit poison checks (mnestic fork, interruptibility)
+            Box::new(filter_iter(
+                self.filters_bytecodes.clone(),
+                poisoned(it, poison),
+            ))
         })
     }
     fn prefix_join<'a>(
@@ -928,6 +975,7 @@ impl StoredBitemporalRA {
         left_iter: TupleIter<'a>,
         (left_join_indices, right_join_indices): (Vec<usize>, Vec<usize>),
         eliminate_indices: BTreeSet<usize>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
         right_invert_indices.sort_by_key(|(_, b)| **b);
@@ -942,20 +990,23 @@ impl StoredBitemporalRA {
                     .map(|i| tuple[*i].clone())
                     .collect_vec();
                 let mut stack = vec![];
-                self.storage
-                    .bitemporal_scan_prefix(tx, &prefix, self.vt_at, self.tt_at)
-                    .map(move |res_found| -> Result<Option<Tuple>> {
-                        let found = res_found?;
-                        for (p, span) in self.filters_bytecodes.iter() {
-                            if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
-                                return Ok(None);
-                            }
+                poisoned(
+                    self.storage
+                        .bitemporal_scan_prefix(tx, &prefix, self.vt_at, self.tt_at),
+                    poison.clone(),
+                )
+                .map(move |res_found| -> Result<Option<Tuple>> {
+                    let found = res_found?;
+                    for (p, span) in self.filters_bytecodes.iter() {
+                        if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
+                            return Ok(None);
                         }
-                        let mut ret = tuple.clone();
-                        ret.extend(found);
-                        Ok(Some(ret))
-                    })
-                    .filter_map(swap_option_result)
+                    }
+                    let mut ret = tuple.clone();
+                    ret.extend(found);
+                    Ok(Some(ret))
+                })
+                .filter_map(swap_option_result)
             })
             .flatten_ok()
             .map(flatten_err);
@@ -1149,6 +1200,7 @@ impl LshSearchRA {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let bindings = self.parent.bindings_after_eliminate();
         let mut bind_idx = usize::MAX;
@@ -1170,7 +1222,7 @@ impl LshSearchRA {
 
         let it = self
             .parent
-            .iter(tx, delta_rule, stores)?
+            .iter(tx, delta_rule, stores, poison)?
             .map_ok(move |tuple| -> Result<_> {
                 let res = tx.lsh_search(
                     &tuple[bind_idx],
@@ -1222,6 +1274,7 @@ impl FtsSearchRA {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let bindings = self.parent.bindings_after_eliminate();
         let mut bind_idx = usize::MAX;
@@ -1242,7 +1295,7 @@ impl FtsSearchRA {
         )?;
         let it = self
             .parent
-            .iter(tx, delta_rule, stores)?
+            .iter(tx, delta_rule, stores, poison)?
             .map_ok(move |tuple| -> Result<_> {
                 let q = match tuple[bind_idx].clone() {
                     DataValue::Str(s) => s,
@@ -1306,6 +1359,7 @@ impl HnswSearchRA {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let bindings = self.parent.bindings_after_eliminate();
         let mut bind_idx = usize::MAX;
@@ -1320,7 +1374,7 @@ impl HnswSearchRA {
         let mut stack = vec![];
         let it = self
             .parent
-            .iter(tx, delta_rule, stores)?
+            .iter(tx, delta_rule, stores, poison)?
             .map_ok(move |tuple| -> Result<_> {
                 let v = match tuple[bind_idx].clone() {
                     DataValue::Vec(v) => v,
@@ -1474,12 +1528,17 @@ impl StoredWithValidityRA {
         }
         Ok(())
     }
-    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>) -> Result<TupleIter<'a>> {
+    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>, poison: Poison) -> Result<TupleIter<'a>> {
         let it = self.storage.skip_scan_all(tx, self.valid_at);
         Ok(if self.filters.is_empty() {
             Box::new(it)
         } else {
-            Box::new(filter_iter(self.filters_bytecodes.clone(), it))
+            // the raw scan is wrapped so fused filters that drop every tuple
+            // still hit poison checks (mnestic fork, interruptibility)
+            Box::new(filter_iter(
+                self.filters_bytecodes.clone(),
+                poisoned(it, poison),
+            ))
         })
     }
     fn prefix_join<'a>(
@@ -1488,6 +1547,7 @@ impl StoredWithValidityRA {
         left_iter: TupleIter<'a>,
         (left_join_indices, right_join_indices): (Vec<usize>, Vec<usize>),
         eliminate_indices: BTreeSet<usize>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
         right_invert_indices.sort_by_key(|(_, b)| **b);
@@ -1515,46 +1575,50 @@ impl StoredWithValidityRA {
                     {
                         let mut stack = vec![];
                         return Left(
-                            self.storage
-                                .skip_scan_bounded_prefix(
+                            poisoned(
+                                self.storage.skip_scan_bounded_prefix(
                                     tx,
                                     &prefix,
                                     &l_bound,
                                     &u_bound,
                                     self.valid_at,
-                                )
-                                .map(move |res_found| -> Result<Option<Tuple>> {
-                                    let found = res_found?;
-                                    for (p, span) in self.filters_bytecodes.iter() {
-                                        if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
-                                            return Ok(None);
-                                        }
+                                ),
+                                poison.clone(),
+                            )
+                            .map(move |res_found| -> Result<Option<Tuple>> {
+                                let found = res_found?;
+                                for (p, span) in self.filters_bytecodes.iter() {
+                                    if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
+                                        return Ok(None);
                                     }
-                                    let mut ret = tuple.clone();
-                                    ret.extend(found);
-                                    Ok(Some(ret))
-                                })
-                                .filter_map(swap_option_result),
+                                }
+                                let mut ret = tuple.clone();
+                                ret.extend(found);
+                                Ok(Some(ret))
+                            })
+                            .filter_map(swap_option_result),
                         );
                     }
                 }
                 skip_range_check = true;
                 let mut stack = vec![];
                 Right(
-                    self.storage
-                        .skip_scan_prefix(tx, &prefix, self.valid_at)
-                        .map(move |res_found| -> Result<Option<Tuple>> {
-                            let found = res_found?;
-                            for (p, span) in self.filters_bytecodes.iter() {
-                                if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
-                                    return Ok(None);
-                                }
+                    poisoned(
+                        self.storage.skip_scan_prefix(tx, &prefix, self.valid_at),
+                        poison.clone(),
+                    )
+                    .map(move |res_found| -> Result<Option<Tuple>> {
+                        let found = res_found?;
+                        for (p, span) in self.filters_bytecodes.iter() {
+                            if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
+                                return Ok(None);
                             }
-                            let mut ret = tuple.clone();
-                            ret.extend(found);
-                            Ok(Some(ret))
-                        })
-                        .filter_map(swap_option_result),
+                        }
+                        let mut ret = tuple.clone();
+                        ret.extend(found);
+                        Ok(Some(ret))
+                    })
+                    .filter_map(swap_option_result),
                 )
             })
             .flatten_ok()
@@ -1636,6 +1700,7 @@ impl StoredRA {
         left_iter: TupleIter<'a>,
         (left_join_indices, right_join_indices): (Vec<usize>, Vec<usize>),
         eliminate_indices: BTreeSet<usize>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
         right_invert_indices.sort_by_key(|(_, b)| **b);
@@ -1646,6 +1711,8 @@ impl StoredRA {
 
         let key_len = self.storage.metadata.keys.len();
         if left_to_prefix_indices.len() >= key_len {
+            // per-left-tuple work is a single bounded `get`; the left stream
+            // is already poison-wrapped at the RelAlgebra::iter dispatch
             return self.point_lookup_join(
                 tx,
                 left_iter,
@@ -1676,27 +1743,29 @@ impl StoredRA {
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
                         return Left(
-                            self.storage
-                                .scan_bounded_prefix(tx, &prefix, &l_bound, &u_bound)
-                                .map(move |res_found| -> Result<Option<Tuple>> {
-                                    let found = res_found?;
-                                    for (p, span) in self.filters_bytecodes.iter() {
-                                        if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
-                                            return Ok(None);
-                                        }
+                            poisoned(
+                                self.storage
+                                    .scan_bounded_prefix(tx, &prefix, &l_bound, &u_bound),
+                                poison.clone(),
+                            )
+                            .map(move |res_found| -> Result<Option<Tuple>> {
+                                let found = res_found?;
+                                for (p, span) in self.filters_bytecodes.iter() {
+                                    if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
+                                        return Ok(None);
                                     }
-                                    let mut ret = tuple.clone();
-                                    ret.extend(found);
-                                    Ok(Some(ret))
-                                })
-                                .filter_map(swap_option_result),
+                                }
+                                let mut ret = tuple.clone();
+                                ret.extend(found);
+                                Ok(Some(ret))
+                            })
+                            .filter_map(swap_option_result),
                         );
                     }
                 }
                 skip_range_check = true;
                 Right(
-                    self.storage
-                        .scan_prefix(tx, &prefix)
+                    poisoned(self.storage.scan_prefix(tx, &prefix), poison.clone())
                         .map(move |res_found| -> Result<Option<Tuple>> {
                             let found = res_found?;
                             for (p, span) in self.filters_bytecodes.iter() {
@@ -1822,12 +1891,17 @@ impl StoredRA {
         }
     }
 
-    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>) -> Result<TupleIter<'a>> {
+    fn iter<'a>(&'a self, tx: &'a SessionTx<'_>, poison: Poison) -> Result<TupleIter<'a>> {
         let it = self.storage.scan_all(tx);
         Ok(if self.filters.is_empty() {
             Box::new(it)
         } else {
-            Box::new(filter_iter(self.filters_bytecodes.clone(), it))
+            // the raw scan is wrapped so fused filters that drop every tuple
+            // still hit poison checks (mnestic fork, interruptibility)
+            Box::new(filter_iter(
+                self.filters_bytecodes.clone(),
+                poisoned(it, poison),
+            ))
         })
     }
 }
@@ -1882,6 +1956,7 @@ impl TempStoreRA {
         &'a self,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let storage = stores.get(&self.storage_key).unwrap();
 
@@ -1897,7 +1972,12 @@ impl TempStoreRA {
         Ok(if self.filters.is_empty() {
             Box::new(it)
         } else {
-            Box::new(filter_iter(self.filters_bytecodes.clone(), it))
+            // the raw scan is wrapped so fused filters that drop every tuple
+            // still hit poison checks (mnestic fork, interruptibility)
+            Box::new(filter_iter(
+                self.filters_bytecodes.clone(),
+                poisoned(it, poison),
+            ))
         })
     }
     fn neg_join<'a>(
@@ -2005,6 +2085,7 @@ impl TempStoreRA {
         eliminate_indices: BTreeSet<usize>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let storage = stores.get(&self.storage_key).unwrap();
 
@@ -2026,6 +2107,11 @@ impl TempStoreRA {
                     .map(|i| tuple[*i].clone())
                     .collect_vec();
                 let mut stack = vec![];
+                // temp-store scans yield plain tuples (not Result), so the
+                // poison check lives inside the per-scan closure instead of
+                // a `poisoned` wrap (mnestic fork, interruptibility)
+                let poison = poison.clone();
+                let mut pulls = 0usize;
 
                 if !skip_range_check && !self.filters.is_empty() {
                     let other_bindings = &self.bindings[right_join_indices.len()..];
@@ -2045,6 +2131,10 @@ impl TempStoreRA {
                         };
                         return Left(
                             it.map(move |res_found| -> Result<Option<Tuple>> {
+                                pulls = pulls.wrapping_add(1);
+                                if pulls & (POISON_CHECK_INTERVAL - 1) == 0 {
+                                    poison.check()?;
+                                }
                                 if self.filters.is_empty() {
                                     let mut ret = tuple.clone();
                                     ret.extend(res_found.into_iter().cloned());
@@ -2075,6 +2165,10 @@ impl TempStoreRA {
 
                 Right(
                     it.map(move |res_found| -> Result<Option<Tuple>> {
+                        pulls = pulls.wrapping_add(1);
+                        if pulls & (POISON_CHECK_INTERVAL - 1) == 0 {
+                            poison.check()?;
+                        }
                         if self.filters.is_empty() {
                             let mut ret = tuple.clone();
                             ret.extend(res_found.into_iter().cloned());
@@ -2239,22 +2333,28 @@ impl RelAlgebra {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
-        match self {
-            RelAlgebra::Fixed(f) => Ok(Box::new(f.data.iter().map(|t| Ok(t.clone())))),
-            RelAlgebra::TempStore(r) => r.iter(delta_rule, stores),
-            RelAlgebra::Stored(v) => v.iter(tx),
-            RelAlgebra::StoredWithValidity(v) => v.iter(tx),
-            RelAlgebra::StoredBitemporal(v) => v.iter(tx),
-            RelAlgebra::Join(j) => j.iter(tx, delta_rule, stores),
-            RelAlgebra::Reorder(r) => r.iter(tx, delta_rule, stores),
-            RelAlgebra::Filter(r) => r.iter(tx, delta_rule, stores),
-            RelAlgebra::NegJoin(r) => r.iter(tx, delta_rule, stores),
-            RelAlgebra::Unification(r) => r.iter(tx, delta_rule, stores),
-            RelAlgebra::HnswSearch(r) => r.iter(tx, delta_rule, stores),
-            RelAlgebra::FtsSearch(r) => r.iter(tx, delta_rule, stores),
-            RelAlgebra::LshSearch(r) => r.iter(tx, delta_rule, stores),
-        }
+        // every operator-boundary stream is poison-wrapped here, so ::kill
+        // and :timeout abort within POISON_CHECK_INTERVAL pulls at the
+        // slowest boundary instead of after the full enumeration (mnestic
+        // fork, interruptibility)
+        let it: TupleIter<'a> = match self {
+            RelAlgebra::Fixed(f) => Box::new(f.data.iter().map(|t| Ok(t.clone()))),
+            RelAlgebra::TempStore(r) => r.iter(delta_rule, stores, poison.clone())?,
+            RelAlgebra::Stored(v) => v.iter(tx, poison.clone())?,
+            RelAlgebra::StoredWithValidity(v) => v.iter(tx, poison.clone())?,
+            RelAlgebra::StoredBitemporal(v) => v.iter(tx, poison.clone())?,
+            RelAlgebra::Join(j) => j.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::Reorder(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::Filter(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::NegJoin(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::Unification(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::HnswSearch(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::FtsSearch(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+            RelAlgebra::LshSearch(r) => r.iter(tx, delta_rule, stores, poison.clone())?,
+        };
+        Ok(Box::new(poisoned(it, poison)))
     }
 }
 
@@ -2350,6 +2450,7 @@ impl NegJoin {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let bindings = self.left.bindings_after_eliminate();
         let eliminate_indices = get_eliminate_indices(&bindings, &self.to_eliminate);
@@ -2363,7 +2464,7 @@ impl NegJoin {
                     )
                     .unwrap();
                 r.neg_join(
-                    self.left.iter(tx, delta_rule, stores)?,
+                    self.left.iter(tx, delta_rule, stores, poison)?,
                     join_indices,
                     eliminate_indices,
                     stores,
@@ -2379,7 +2480,7 @@ impl NegJoin {
                     .unwrap();
                 v.neg_join(
                     tx,
-                    self.left.iter(tx, delta_rule, stores)?,
+                    self.left.iter(tx, delta_rule, stores, poison)?,
                     join_indices,
                     eliminate_indices,
                 )
@@ -2394,7 +2495,7 @@ impl NegJoin {
                     .unwrap();
                 v.neg_join(
                     tx,
-                    self.left.iter(tx, delta_rule, stores)?,
+                    self.left.iter(tx, delta_rule, stores, poison)?,
                     join_indices,
                     eliminate_indices,
                 )
@@ -2409,7 +2510,7 @@ impl NegJoin {
                     .unwrap();
                 v.neg_join(
                     tx,
-                    self.left.iter(tx, delta_rule, stores)?,
+                    self.left.iter(tx, delta_rule, stores, poison)?,
                     join_indices,
                     eliminate_indices,
                 )
@@ -2538,6 +2639,7 @@ impl InnerJoin {
         tx: &'a SessionTx<'_>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         let bindings = self.bindings();
         let eliminate_indices = get_eliminate_indices(&bindings, &self.to_eliminate);
@@ -2551,7 +2653,7 @@ impl InnerJoin {
                     )
                     .unwrap();
                 f.join(
-                    self.left.iter(tx, delta_rule, stores)?,
+                    self.left.iter(tx, delta_rule, stores, poison)?,
                     join_indices,
                     eliminate_indices,
                 )
@@ -2566,14 +2668,15 @@ impl InnerJoin {
                     .unwrap();
                 if join_is_prefix(&join_indices.1) {
                     r.prefix_join(
-                        self.left.iter(tx, delta_rule, stores)?,
+                        self.left.iter(tx, delta_rule, stores, poison.clone())?,
                         join_indices,
                         eliminate_indices,
                         delta_rule,
                         stores,
+                        poison,
                     )
                 } else {
-                    self.materialized_join(tx, eliminate_indices, delta_rule, stores)
+                    self.materialized_join(tx, eliminate_indices, delta_rule, stores, poison)
                 }
             }
             RelAlgebra::Stored(r) => {
@@ -2587,12 +2690,13 @@ impl InnerJoin {
                 if join_is_prefix(&join_indices.1) {
                     r.prefix_join(
                         tx,
-                        self.left.iter(tx, delta_rule, stores)?,
+                        self.left.iter(tx, delta_rule, stores, poison.clone())?,
                         join_indices,
                         eliminate_indices,
+                        poison,
                     )
                 } else {
-                    self.materialized_join(tx, eliminate_indices, delta_rule, stores)
+                    self.materialized_join(tx, eliminate_indices, delta_rule, stores, poison)
                 }
             }
             RelAlgebra::StoredWithValidity(r) => {
@@ -2607,12 +2711,13 @@ impl InnerJoin {
                 if join_prefix_is_temporally_safe(&join_indices.1, plain_len) {
                     r.prefix_join(
                         tx,
-                        self.left.iter(tx, delta_rule, stores)?,
+                        self.left.iter(tx, delta_rule, stores, poison.clone())?,
                         join_indices,
                         eliminate_indices,
+                        poison,
                     )
                 } else {
-                    self.materialized_join(tx, eliminate_indices, delta_rule, stores)
+                    self.materialized_join(tx, eliminate_indices, delta_rule, stores, poison)
                 }
             }
             RelAlgebra::StoredBitemporal(r) => {
@@ -2627,12 +2732,13 @@ impl InnerJoin {
                 if join_prefix_is_temporally_safe(&join_indices.1, plain_len) {
                     r.prefix_join(
                         tx,
-                        self.left.iter(tx, delta_rule, stores)?,
+                        self.left.iter(tx, delta_rule, stores, poison.clone())?,
                         join_indices,
                         eliminate_indices,
+                        poison,
                     )
                 } else {
-                    self.materialized_join(tx, eliminate_indices, delta_rule, stores)
+                    self.materialized_join(tx, eliminate_indices, delta_rule, stores, poison)
                 }
             }
             RelAlgebra::Join(_)
@@ -2641,7 +2747,7 @@ impl InnerJoin {
             | RelAlgebra::HnswSearch(_)
             | RelAlgebra::FtsSearch(_)
             | RelAlgebra::LshSearch(_) => {
-                self.materialized_join(tx, eliminate_indices, delta_rule, stores)
+                self.materialized_join(tx, eliminate_indices, delta_rule, stores, poison)
             }
             RelAlgebra::Reorder(_) => {
                 panic!("joining on reordered")
@@ -2657,6 +2763,7 @@ impl InnerJoin {
         eliminate_indices: BTreeSet<usize>,
         delta_rule: Option<&MagicSymbol>,
         stores: &'a BTreeMap<MagicSymbol, EpochStore>,
+        poison: Poison,
     ) -> Result<TupleIter<'a>> {
         debug!("using materialized join");
         let right_bindings = self.right.bindings_after_eliminate();
@@ -2665,7 +2772,7 @@ impl InnerJoin {
             .join_indices(&self.left.bindings_after_eliminate(), &right_bindings)
             .unwrap();
 
-        let mut left_iter = self.left.iter(tx, delta_rule, stores)?;
+        let mut left_iter = self.left.iter(tx, delta_rule, stores, poison.clone())?;
         let left_cache = match left_iter.next() {
             None => return Ok(Box::new(iter::empty())),
             Some(Err(err)) => return Err(err),
@@ -2688,7 +2795,7 @@ impl InnerJoin {
             .collect_vec();
         let cached_data = {
             let mut cache = BTreeSet::new();
-            for item in self.right.iter(tx, delta_rule, stores)? {
+            for item in self.right.iter(tx, delta_rule, stores, poison)? {
                 match item {
                     Ok(tuple) => {
                         let stored_tuple = right_store_indices
