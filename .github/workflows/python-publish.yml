@@ -59,7 +59,11 @@ jobs:
           # `features` is a per-leg staged-rollout knob: if one leg's rocksdb
           # build breaks, drop that leg back to "compact" instead of holding
           # the whole release.
-          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2014", features: "compact,storage-rocksdb" }
+          # x86_64 needs the 2_28 image too: with storage-rocksdb, zstd-sys pulls
+          # bindgen, which panics "Unable to find libclang" on manylinux2014
+          # (no libclang in that image). 2_28 ships it — the aarch64 leg already
+          # builds the identical zstd-sys on 2_28. Cost: drops glibc < 2.28 hosts.
+          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2_28", features: "compact,storage-rocksdb" }
           # aarch64 needs the 2_28 image: the manylinux2014 cross-GCC is too old
           # to assemble ring's ARM asm (#error "ARM assembler must define __ARM_ARCH").
           - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28", features: "compact,storage-rocksdb" }
