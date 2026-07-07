@@ -419,9 +419,12 @@ The engine ships a **narrow automatic rewrite** in 0.10.5, doing pattern
 head is exactly one `count()` (with optional group keys) over an all-positive,
 alpha-acyclic body, and is specified to accumulate in exact integer arithmetic
 internally (no §5.2 Float caveat on that path). Everything it declines — the
-inclusion-exclusion shapes, `count_unique`, unions, cyclic bodies, bodies with
-crossing predicates — falls back to naive evaluation unchanged, and this
-document is the reference for rewriting those by hand. Consult
+inclusion-exclusion shapes (§3.3, §3.4), `count_unique`, unions, cyclic bodies,
+**any body containing a `!=` predicate** (the engine-side `!=`
+inclusion-exclusion auto-rewrite was cut before release for miscounting on mixed
+Int/Float data, so §3.3 stays hand-authored), and other crossing predicates —
+falls back to naive evaluation unchanged, and this document is the reference for
+rewriting those by hand. Consult
 `CHANGELOG-FORK.md` for the shipped trigger conditions; the hand patterns in
 this document remain valid (and identical in result) whether or not the
 automatic pass fires.

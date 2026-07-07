@@ -18,7 +18,7 @@ pip install mnestic
 ```python
 from mnestic import CozoDbPy
 
-db = CozoDbPy("mem", "", "{}")  # engines: "mem", "sqlite" (file path), ...
+db = CozoDbPy("mem", "", "{}")  # engines: "mem", "sqlite" (file path), "rocksdb" (dir path)
 db.run_script("?[x] <- [[1],[2],[3]]", {}, False)
 
 # One-call hybrid retrieval (HNSW + full-text fused with Reciprocal Rank Fusion),
@@ -34,6 +34,17 @@ hits = db.hybrid_search({
 # with the within-leg rank the fusion used and the leg's raw score:
 # headers ["id","score","list_id","leg_rank","leg_score"]
 ```
+
+The `"rocksdb"` persistent backend now ships in the published wheel —
+`CozoDbPy("rocksdb", "./my.db", "{}")` works straight from `pip install mnestic`.
+The source distribution stays SQLite/`compact`-only, so the persistent engine is
+wheel-only.
+
+`run_script` takes an optional `timeout=` — a per-query wall-clock budget in
+seconds; on expiry the query raises an `eval::timeout` error.
+`db.set_default_query_timeout(secs)` sets a Db-wide default and
+`db.default_query_timeout()` reads it back; the effective budget for a query is
+the minimum of that default and any per-call `timeout`.
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

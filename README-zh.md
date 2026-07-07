@@ -10,6 +10,14 @@
 
 # Cozo 数据库
 
+## mnestic 0.10.5
+
+本版本聚焦**可中断性与性能**。`::kill` 与 `:timeout` 现在能真正中断正在运行的查询（系统操作在打开存储事务之前派发，并把毒化标志接入关系代数枚举，每 4096 次拉取检查一次）；新增**每查询墙钟预算**——脚本内 `:timeout <秒>` 选项、按调用的 `ScriptRunOptions { timeout }` 以及 Db 级默认值 `set_default_query_timeout`，有效截止时间取三者中已设定者的**最小值**，超时抛出独立的 `eval::timeout` 诊断（wasm 无单调时钟，故不带墙钟预算）。**确定性贪心连接重排序**默认开启（可用 `:reorder written` 逐查询退出）：对朴素书写的合取消除 N³ 中间结果（重排实测 54.5×，N³→N²），结果不变，手工调优的书写顺序保持逐字节一致。**自动 `count()` 因子化重写**为可选、默认关闭（位于 `set_query_factorization` 之后），把符合条件的单子句 `count()`-over-join 重写为逐键计数子规则，得到精确 i64、`Int` 类型的结果而不物化连接；任何含 `!=` 谓词的主体回退到精确的朴素求值。对已建索引关系的批量 `import_relations` 现在会告警（HNSW/FTS/LSH 索引不在批量路径上维护）。此外，**PyPI `mnestic` wheel 现已内置 RocksDB**（`pip install mnestic` 后 `CozoDbPy("rocksdb", path)` 可用；sdist 仍为 compact），Python 绑定改为内部可变以修复实时查询期间 `close()` 的 “Already borrowed” 错误，并为 `run_script` 新增 `timeout=None` 关键字参数。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+
+## mnestic 0.10.1
+
+本版本新增**支配界 meet 聚合——反链 / skyline 聚合** `register_bounded_meet_aggr`（按组保留主体注册的严格偏序下的非支配集，即 Pareto 前沿，每个幸存者各自成行；`max_survivors` 为强制资源上限，溢出为显式错误，v1 仅限 Rust 宿主嵌入）与**区间原语** `interval_overlaps`（内置函数）和 `interval_coalesce`（聚合），作用于半开 `[start, end)` 列表区间；同时修正 `bit_and` / `bit_or` meet 聚合的“是否改变”上报与界 meet 发散上限的计数口径。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+
 ## mnestic 0.10.0
 
 本版本新增**双时态（bitemporal）系统版本化关系**（引擎分配的事务时间轴、时间旅行查询 `@ (vt: ..., tt: ...)`、`::history` / `::history_gc` / `::evict` 历史生命周期操作、`:reconcile` 信念修订）、**自定义聚合注册**与 **top-k 证明聚合 `min_cost_k`**，并修复四个上游 CozoDB 缺陷。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
