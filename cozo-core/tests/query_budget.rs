@@ -294,3 +294,44 @@ fn imperative_budget_rollback_sqlite() {
     let path = dir.path().join("mnestic_budget_imperative.db");
     assert_imperative_rollback("sqlite", path.to_str().unwrap());
 }
+
+// ---------------------------------------------------------------------------
+// 7. Absurd / non-finite budgets must not panic (regression: the deadline was
+//    built with `Duration::from_secs_f64` + `Instant + Duration`, which panic
+//    on infinite/overflowing input — remotely reachable via `:timeout` text
+//    and the cozo-bin HTTP `timeout` field). They now clamp to "no deadline".
+// ---------------------------------------------------------------------------
+
+#[test]
+fn huge_and_infinite_budgets_do_not_panic() {
+    let db = DbInstance::new("mem", "", Default::default()).unwrap();
+
+    // In-script `:timeout` with an absurd value: parses to a finite-but-huge or
+    // infinite f64; must not panic, and a trivial query still completes.
+    for script in ["?[x] <- [[1]] :timeout 1e300", "?[x] <- [[1]] :timeout 1e309"] {
+        let (is_err, code, _) =
+            run_and_code(&db, script, ScriptMutability::Immutable, ScriptRunOptions::default());
+        assert!(!is_err, "{script} should complete, got error {code:?}");
+    }
+
+    // Per-call timeout of +inf / f64::MAX: must not panic; query completes.
+    for secs in [f64::INFINITY, f64::MAX] {
+        let (is_err, code, _) = run_and_code(
+            &db,
+            "?[x] <- [[1]]",
+            ScriptMutability::Immutable,
+            ScriptRunOptions::new().with_timeout(secs),
+        );
+        assert!(!is_err, "per-call timeout {secs} should complete, got {code:?}");
+    }
+
+    // Db-wide default of f64::MAX: saturates, must not panic; query completes.
+    db.set_default_query_timeout(Some(f64::MAX));
+    let (is_err, code, _) = run_and_code(
+        &db,
+        "?[x] <- [[1]]",
+        ScriptMutability::Immutable,
+        ScriptRunOptions::default(),
+    );
+    assert!(!is_err, "huge Db default should complete, got {code:?}");
+}

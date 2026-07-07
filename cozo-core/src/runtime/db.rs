@@ -602,7 +602,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         call_timeout: Option<f64>,
     ) -> Result<NamedRows> {
         let read_only = mutability == ScriptMutability::Immutable;
-        let outer_deadline = self.effective_outer_deadline(call_timeout, Instant::now());
+        let outer_deadline = self.effective_outer_deadline(call_timeout);
         match payload {
             CozoScript::Single(p) => self.execute_single(cur_vld, p, read_only, outer_deadline),
             CozoScript::Imperative(ps) => {
@@ -613,26 +613,18 @@ impl<'s, S: Storage<'s>> Db<S> {
     }
 
     /// Compute the whole-script deadline from the per-call timeout and the Db
-    /// default (mnestic fork, query budget), both anchored at `start`. Returns
-    /// the earliest (`min`) of whichever are set; `None` if neither is.
-    fn effective_outer_deadline(
-        &self,
-        call_timeout: Option<f64>,
-        start: Instant,
-    ) -> Option<Instant> {
-        let mut deadline: Option<Instant> = None;
-        if let Some(secs) = call_timeout {
-            if secs > 0.0 {
-                deadline = Some(start + Duration::from_secs_f64(secs));
-            }
-        }
+    /// default (mnestic fork, query budget), both anchored at one clock reading.
+    /// Returns the earliest (`min`) of whichever are set; `None` if neither is
+    /// set, if the budget overflows `Instant`, or if the target has no monotonic
+    /// clock (wasm).
+    fn effective_outer_deadline(&self, call_timeout: Option<f64>) -> Option<Instant> {
+        let start = budget_now()?;
+        let mut deadline = call_timeout.and_then(|secs| deadline_from_secs(start, secs));
         let default_ms = self.default_query_timeout_ms.load(Ordering::Relaxed);
         if default_ms > 0 {
-            let d = start + Duration::from_millis(default_ms);
-            deadline = Some(match deadline {
-                Some(existing) => existing.min(d),
-                None => d,
-            });
+            if let Some(d) = start.checked_add(Duration::from_millis(default_ms)) {
+                deadline = Some(deadline.map_or(d, |existing| existing.min(d)));
+            }
         }
         deadline
     }
@@ -2703,12 +2695,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         let effective_deadline = {
             let mut deadline = tx.script_deadline;
             if let Some(secs) = out_opts.timeout {
-                if secs > 0.0 {
-                    let block = Instant::now() + Duration::from_secs_f64(secs);
-                    deadline = Some(match deadline {
-                        Some(existing) => existing.min(block),
-                        None => block,
-                    });
+                if let Some(block) = budget_now().and_then(|start| deadline_from_secs(start, secs)) {
+                    deadline = Some(deadline.map_or(block, |existing| existing.min(block)));
                 }
             }
             deadline
@@ -3144,6 +3132,36 @@ fn _get_variables(src: &str, params: &BTreeMap<String, DataValue>) -> Result<BTr
 pub struct Poison {
     pub(crate) flag: Arc<AtomicBool>,
     pub(crate) deadline: Option<Instant>,
+}
+
+/// A monotonic clock reading for a wall-clock query budget, or `None` where no
+/// monotonic clock is available: wasm has no `std` monotonic `Instant`, so on
+/// that target queries simply carry no time budget rather than panicking on
+/// `Instant::now()` (mnestic fork, query budget).
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn budget_now() -> Option<Instant> {
+    Some(Instant::now())
+}
+#[cfg(target_arch = "wasm32")]
+#[inline]
+fn budget_now() -> Option<Instant> {
+    None
+}
+
+/// The deadline `start + secs`, or `None` if `secs` is non-positive/non-finite
+/// or the addition would overflow `Instant`. Saturating cast + `checked_add`,
+/// so an infinite or absurdly large user-supplied budget (`:timeout 1e300`, an
+/// HTTP `timeout` of `1e400`) yields "no deadline" — still interruptible via
+/// `::kill` — instead of panicking. (mnestic fork, query budget)
+fn deadline_from_secs(start: Instant, secs: f64) -> Option<Instant> {
+    if !secs.is_finite() || secs <= 0.0 {
+        return None;
+    }
+    // float→int casts saturate in Rust, so a huge finite `secs` clamps to
+    // u64::MAX ms (~5.8e8 years) and `checked_add` then reports the overflow.
+    let ms = (secs * 1000.0) as u64;
+    start.checked_add(Duration::from_millis(ms))
 }
 
 impl Poison {
