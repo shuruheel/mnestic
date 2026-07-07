@@ -3,6 +3,113 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## 0.10.5 — 2026-07-07
+
+A liveness + performance release responding to an external
+Ladybug-vs-mnestic benchmark. Two themes: queries you can always stop
+(interruptible `::kill`/`:timeout` + a per-query wall-clock budget), and
+naively-ordered queries that stop being pathological (a deterministic join
+reorder + an opt-in factorized-count rewrite). Engine (`cozo-core`) plus the
+Python binding and its wheel CI; no `cozorocks`/`mnestic-rocks` change.
+
+- **`::kill` and `:timeout` now actually interrupt a running query.** Two
+  defects the benchmark surfaced: (1) `::running`/`::kill` opened a storage
+  transaction before dispatching, so on the mem/sqlite backends a `::kill`
+  queued behind the very read query it was trying to kill and blocked for that
+  query's entire remaining runtime — they now dispatch before any transaction
+  (they touch only the in-memory running-query registry). (2) The poison flag
+  was only checked between rule applications, never inside the relational-algebra
+  enumeration, so a naive single-rule join that yields no output for a long time
+  went uninterruptible — the per-query `Poison` is now threaded through
+  `RelAlgebra::iter` and checked every 4096 pulls at every operator boundary and
+  raw scan (the signature change makes coverage compiler-enforced). Overhead is
+  within noise on the `point_lookup` baseline.
+
+- **Per-query wall-clock budget.** A query can carry a deadline three ways —
+  the in-script `:timeout <secs>` option, a per-call
+  `Db::run_script_with_options(payload, params, mutability, ScriptRunOptions { timeout })`,
+  and a Db-wide default `Db::set_default_query_timeout(Option<f64>)`. The
+  effective deadline is the **minimum** of whichever are set, computed once per
+  `run_script` call and shared across every statement of an imperative/multi-
+  statement script and any triggers it fires — a `:timeout` (or per-call
+  timeout) can only *tighten* the budget, never extend past the Db default.
+  Expiry raises a distinct **`eval::timeout`** diagnostic (a `::kill` still
+  raises `eval::killed`). `Poison` gained an `Option<Instant>` deadline and lost
+  its per-timed-query detached timer thread — no more thread leak — riding the
+  interruptibility fix's 4096-pull check cadence so it aborts promptly inside
+  long enumerations. Absurd or non-finite budgets (`:timeout 1e300`, an HTTP
+  `timeout` of `1e400`) clamp to "no deadline" (still `::kill`-able) instead of
+  panicking. On wasm, which has no `std` monotonic clock, a query carries no
+  wall-clock budget rather than panicking on `Instant::now()`. Exposed on
+  `DbInstance` and in cozo-bin (`timeout` field on the HTTP query payload;
+  `--default-query-timeout` CLI flag). A budget-aborted mutable script rolls
+  back with no partial commit. **In-tree breaking:** `Poison` is now a
+  named-field struct — use `Poison::check()`/`Default`, not `.0`.
+
+- **Deterministic greedy join reorder** (default ON; `:reorder written` opts
+  out; spec `docs/specs/join-reorder.md`). No pass considered join order, so a
+  naively-ordered conjunction — exactly what an LLM agent authors — could spin
+  on an N³ intermediate (the benchmark's members-first same-group triangle). A
+  stat-free min-new-vars greedy pre-pass (`query/reorder.rs`, after the #1
+  equality-pushdown) reorders the positive relation atoms of an eligible
+  conjunction (measured 54.5× on the repro; N³→N²). Eligible = ≥3 stored
+  `Relation` atoms, no rule-application or Hnsw/Fts/Lsh atom, no multi-valued
+  `in`-unification, and not a bare `:limit` without `:sort`. Results are
+  unchanged: conjunction is commutative under set semantics, the binding-before-
+  use pass remains the correctness arbiter (with fallback to written order if a
+  reordered body fails to compile), and the pass is the **identity** on any
+  stepwise-greedy-consistent written order, so hand-tuned plans stay byte-
+  identical. The multi-valued-`in` exclusion is load-bearing — that construct is
+  a multiplicity injector (generator vs. filter by position) that would
+  otherwise silently change a non-idempotent aggregation (`count`/`sum`/
+  `collect`). A residual Cartesian step (a genuinely disconnected conjunction)
+  is `log::warn!`-ed and annotated `<op> (cartesian)` in `::explain`.
+
+- **Automatic factorized `count()` rewrite** (opt-in, **default OFF**; spec
+  `docs/specs/cardinality-algebra.md`). `count()` over a join streams every
+  match (O(#matches)); the benchmark measured 4–342× vs an optimizer that counts
+  without enumerating. A normal-form pre-pass (`query/factorize.rs`) rewrites an
+  eligible single-clause `count()`-over-positive-join into Yannakakis-style
+  per-key counting sub-rules — a bit-identical (exact-i64, `Int`-typed) answer
+  computed without materializing the join. It fires only on shapes it can prove
+  exact (declining cyclic, non-free-connex, repeated-variable, negated,
+  recursive, bitemporal, `count_unique`/mixed-aggregate, and any body with a
+  `!=` predicate) and
+  accumulates in an internal `int_sum_prod` aggregate that **errors, never
+  wraps,** on overflow. Behind a Db kill switch `set_query_factorization(bool)`,
+  default OFF this release to soak before any default-on consideration; verified
+  by a 400-case differential harness (naive vs factorized, mem + sqlite, exact
+  row+type equality). An always-on companion detector surfaces a factorization
+  advisory in `::explain` / `log::info!`.
+
+- **Bulk `import_relations` into an index-bearing relation now warns.** The bulk
+  path maintains B-tree secondary indexes but not HNSW/FTS/LSH, so imported rows
+  silently stay invisible to vector/text search until the index is rebuilt — a
+  `log::warn!` now flags it (a warning, not a hard error: consumers legitimately
+  import a snapshot then reindex).
+
+- **RocksDB in the PyPI `mnestic` wheel.** `CozoDbPy("rocksdb", path)` failed
+  from `pip install mnestic` because the wheel build pinned `features=compact` —
+  the binding already forwarded the engine string, so this was purely a build-
+  feature gap. Wheels now compile `storage-rocksdb` on all five platform legs
+  (feature list moved onto the maturin CLI as a per-leg matrix knob; mac legs
+  pin `MACOSX_DEPLOYMENT_TARGET=11.0`), gated by a new `test-wheels` smoke job.
+  The sdist stays compact (no rocksdb sources), so the persist engine is
+  wheel-only.
+
+- **Python binding: interior-mutable `CozoDbPy`.** `close()` took `&mut self`
+  while an in-flight `run_script(&self)` held a shared PyCell borrow, so a
+  concurrent `close()` raised "Already borrowed". The handle is now
+  `RwLock<Option<DbInstance>>`; every method takes `&self` and reads clone the
+  Arc-backed `DbInstance` out of a momentary guard, released before the blocking
+  engine call. `run_script` gains an optional `timeout=None` kwarg plus
+  `set_default_query_timeout`/`default_query_timeout`.
+
+- **New spec: `docs/specs/cardinality-algebra.md`** — the manual factorized-
+  counting authoring patterns (join-tree count DP, star product, `!=` and
+  anti-join inclusion-exclusion) with their exactness conditions, the reference
+  for shapes the automatic rewrite declines.
+
 ## 0.10.1 — 2026-07-06
 
 A small additive release on top of 0.10.0 — two new query primitives (the
