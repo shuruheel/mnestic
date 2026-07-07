@@ -7,6 +7,7 @@
  */
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
 
 use miette::{IntoDiagnostic, Report, Result};
 use pyo3::exceptions::PyException;
@@ -386,9 +387,18 @@ fn named_rows_to_py(named_rows: NamedRows, py: Python<'_>) -> PyObject {
     BTreeMap::from([("rows", rows), ("headers", headers), ("next", next)]).into_py(py)
 }
 
+// Interior mutability so that `close()` can take `&self` (mnestic fork, item D).
+// PyO3's PyCell runtime borrow check would raise "Already borrowed" if `close`
+// took `&mut self` while a concurrent `run_script(&self)` held a shared borrow
+// across its GIL-released blocking call. An `RwLock` (NOT a `RefCell`, which is
+// not `Sync` and cannot back a shareable pyclass) lets every method take `&self`:
+// read paths clone the cheap Arc-backed `DbInstance` out of a *momentary* guard
+// and drop the guard before the blocking engine call; `close` takes a write
+// guard and `take()`s. Concurrent readers never block `close`, and `close` never
+// waits out an in-flight query.
 #[pyclass]
 struct CozoDbPy {
-    db: Option<DbInstance>,
+    db: RwLock<Option<DbInstance>>,
 }
 
 #[pyclass]
@@ -398,48 +408,99 @@ struct CozoDbMulTx {
 
 const DB_CLOSED_MSG: &str = r##"{"ok":false,"message":"database closed"}"##;
 
+impl CozoDbPy {
+    /// Clone the Arc-backed [`DbInstance`] out of a momentary read guard and
+    /// drop the guard before returning, so callers never hold the lock across
+    /// the blocking engine call they run under `py.allow_threads`. Returns a
+    /// clear Python error (never panics) if the handle has already been closed.
+    fn db_ref(&self) -> PyResult<DbInstance> {
+        self.db
+            .read()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| PyException::new_err(DB_CLOSED_MSG))
+    }
+}
+
 #[pymethods]
 impl CozoDbPy {
     #[new]
     fn new(engine: &str, path: &str, options: &str) -> PyResult<Self> {
         match DbInstance::new(engine, path, options) {
-            Ok(db) => Ok(Self { db: Some(db) }),
+            Ok(db) => Ok(Self {
+                db: RwLock::new(Some(db)),
+            }),
             Err(err) => Err(PyException::new_err(format!("{err:?}"))),
         }
     }
+    /// Run a CozoScript query. `timeout` (mnestic fork, item C — query budget)
+    /// is an optional per-call wall-clock budget in seconds; when set the query
+    /// is run through [`DbInstance::run_script_with_options`] and a budget expiry
+    /// surfaces as an `eval::timeout` error (distinct from `::kill`'s
+    /// `eval::killed`). It is appended last so existing positional/keyword
+    /// callers are unaffected.
+    #[pyo3(signature = (query, params, immutable, timeout=None))]
     pub fn run_script(
         &self,
         py: Python<'_>,
         query: &str,
         params: &PyDict,
         immutable: bool,
+        timeout: Option<f64>,
     ) -> PyResult<PyObject> {
-        if let Some(db) = &self.db {
-            let params = convert_params(params)?;
-            match py.allow_threads(|| {
-                db.run_script(
-                    query,
-                    params,
-                    if immutable {
-                        ScriptMutability::Immutable
-                    } else {
-                        ScriptMutability::Mutable
-                    },
-                )
-            }) {
-                Ok(rows) => Ok(named_rows_to_py(rows, py)),
-                Err(err) => {
-                    let reports = format_error_as_json(err, Some(query)).to_string();
-                    let json_mod = py.import("json")?;
-                    let loads_fn = json_mod.getattr("loads")?;
-                    let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                    let msg = loads_fn.call1(args)?;
-                    Err(PyException::new_err(PyObject::from(msg)))
-                }
+        // Clone the handle out of a momentary read guard and drop the guard
+        // BEFORE `py.allow_threads` — holding the lock across the blocking call
+        // would serialize queries and re-block `close`.
+        let db = self.db_ref()?;
+        let params = convert_params(params)?;
+        let result = py.allow_threads(|| {
+            let mutability = if immutable {
+                ScriptMutability::Immutable
+            } else {
+                ScriptMutability::Mutable
+            };
+            if timeout.is_some() {
+                // `..Default::default()` is intentional forward-proofing per the
+                // `ScriptRunOptions` doc (new options land without touching this
+                // call site); it is a no-op only while `timeout` is the sole field.
+                #[allow(clippy::needless_update)]
+                let opts = ScriptRunOptions {
+                    timeout,
+                    ..Default::default()
+                };
+                db.run_script_with_options(query, params, mutability, opts)
+            } else {
+                db.run_script(query, params, mutability)
             }
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG))
+        });
+        match result {
+            Ok(rows) => Ok(named_rows_to_py(rows, py)),
+            Err(err) => {
+                let reports = format_error_as_json(err, Some(query)).to_string();
+                let json_mod = py.import("json")?;
+                let loads_fn = json_mod.getattr("loads")?;
+                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+                let msg = loads_fn.call1(args)?;
+                Err(PyException::new_err(PyObject::from(msg)))
+            }
         }
+    }
+    /// Set (or clear, with `None`) the Db-level default per-query wall-clock
+    /// budget in seconds (mnestic fork, item C). Forwards to
+    /// [`DbInstance::set_default_query_timeout`]. The effective budget for each
+    /// statement is the minimum of this default, any per-call `timeout`, and any
+    /// in-script `:timeout` — so this is a guard a query cannot escape.
+    pub fn set_default_query_timeout(&self, secs: Option<f64>) -> PyResult<()> {
+        let db = self.db_ref()?;
+        db.set_default_query_timeout(secs);
+        Ok(())
+    }
+    /// Read the Db-level default per-query wall-clock budget in seconds, or
+    /// `None` if unset (mnestic fork, item C). Forwards to
+    /// [`DbInstance::default_query_timeout`].
+    pub fn default_query_timeout(&self) -> PyResult<Option<f64>> {
+        let db = self.db_ref()?;
+        Ok(db.default_query_timeout())
     }
     /// One-call hybrid retrieval (mnestic fork): HNSW + FTS (+ optional extra
     /// ranked lists) fused with RRF and optionally diversified with MMR. Takes a
@@ -450,21 +511,18 @@ impl CozoDbPy {
     /// `["id","score","list_id","leg_rank","leg_score"]` (no MMR) or
     /// `["id","rank","score","list_id","leg_rank","leg_score"]` (MMR).
     pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
-        if let Some(db) = &self.db {
-            let q = py_to_hybrid_search(query)?;
-            match py.allow_threads(|| db.hybrid_search(&q)) {
-                Ok(rows) => Ok(named_rows_to_py(rows, py)),
-                Err(err) => {
-                    let reports = format_error_as_json(err, None).to_string();
-                    let json_mod = py.import("json")?;
-                    let loads_fn = json_mod.getattr("loads")?;
-                    let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                    let msg = loads_fn.call1(args)?;
-                    Err(PyException::new_err(PyObject::from(msg)))
-                }
+        let db = self.db_ref()?;
+        let q = py_to_hybrid_search(query)?;
+        match py.allow_threads(|| db.hybrid_search(&q)) {
+            Ok(rows) => Ok(named_rows_to_py(rows, py)),
+            Err(err) => {
+                let reports = format_error_as_json(err, None).to_string();
+                let json_mod = py.import("json")?;
+                let loads_fn = json_mod.getattr("loads")?;
+                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+                let msg = loads_fn.call1(args)?;
+                Err(PyException::new_err(PyObject::from(msg)))
             }
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG))
         }
     }
     /// Run a read-only Cypher query (mnestic fork; built with the `cypher`
@@ -480,46 +538,40 @@ impl CozoDbPy {
         schema: &PyDict,
         params: &PyDict,
     ) -> PyResult<PyObject> {
-        if let Some(db) = &self.db {
-            let sch = py_to_cypher_schema(schema)?;
-            let params = convert_params(params)?;
-            match py.allow_threads(|| db.run_cypher(query, &sch, params)) {
-                Ok(rows) => Ok(named_rows_to_py(rows, py)),
-                Err(err) => {
-                    let reports = format_error_as_json(err, Some(query)).to_string();
-                    let json_mod = py.import("json")?;
-                    let loads_fn = json_mod.getattr("loads")?;
-                    let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                    let msg = loads_fn.call1(args)?;
-                    Err(PyException::new_err(PyObject::from(msg)))
-                }
+        let db = self.db_ref()?;
+        let sch = py_to_cypher_schema(schema)?;
+        let params = convert_params(params)?;
+        match py.allow_threads(|| db.run_cypher(query, &sch, params)) {
+            Ok(rows) => Ok(named_rows_to_py(rows, py)),
+            Err(err) => {
+                let reports = format_error_as_json(err, Some(query)).to_string();
+                let json_mod = py.import("json")?;
+                let loads_fn = json_mod.getattr("loads")?;
+                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+                let msg = loads_fn.call1(args)?;
+                Err(PyException::new_err(PyObject::from(msg)))
             }
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG))
         }
     }
     pub fn register_callback(&self, rel: &str, callback: &PyAny) -> PyResult<u32> {
-        if let Some(db) = &self.db {
-            let cb: Py<PyAny> = callback.into();
-            let (id, ch) = db.register_callback(rel, None);
-            rayon::spawn(move || {
-                for (op, new, old) in ch {
-                    Python::with_gil(|py| {
-                        let op = PyString::new(py, op.as_str()).into();
-                        let new_py = rows_to_py_rows(new.rows, py);
-                        let old_py = rows_to_py_rows(old.rows, py);
-                        let args = PyTuple::new(py, [op, new_py, old_py]);
-                        let callable = cb.as_ref(py);
-                        if let Err(err) = callable.call1(args) {
-                            eprintln!("{}", err);
-                        }
-                    })
-                }
-            });
-            Ok(id)
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG))
-        }
+        let db = self.db_ref()?;
+        let cb: Py<PyAny> = callback.into();
+        let (id, ch) = db.register_callback(rel, None);
+        rayon::spawn(move || {
+            for (op, new, old) in ch {
+                Python::with_gil(|py| {
+                    let op = PyString::new(py, op.as_str()).into();
+                    let new_py = rows_to_py_rows(new.rows, py);
+                    let old_py = rows_to_py_rows(old.rows, py);
+                    let args = PyTuple::new(py, [op, new_py, old_py]);
+                    let callable = cb.as_ref(py);
+                    if let Err(err) = callable.call1(args) {
+                        eprintln!("{}", err);
+                    }
+                })
+            }
+        });
+        Ok(id)
     }
     pub fn register_fixed_rule(
         &self,
@@ -527,85 +579,74 @@ impl CozoDbPy {
         arity: usize,
         callback: &PyAny,
     ) -> PyResult<()> {
-        if let Some(db) = &self.db {
-            let cb: Py<PyAny> = callback.into();
-            let rule_impl = SimpleFixedRule::new(arity, move |inputs, options| -> Result<_> {
-                Python::with_gil(|py| -> Result<NamedRows> {
-                    let py_inputs = PyList::new(
-                        py,
-                        inputs.into_iter().map(|nr| rows_to_py_rows(nr.rows, py)),
-                    );
-                    let py_opts = options_to_py(options, py).into_diagnostic()?;
-                    let args = PyTuple::new(py, vec![PyObject::from(py_inputs), py_opts]);
-                    let res = cb.as_ref(py).call1(args).into_diagnostic()?;
-                    Ok(NamedRows::new(vec![], py_to_rows(res).into_diagnostic()?))
-                })
-            });
-            db.register_fixed_rule(name, rule_impl).map_err(report2py)
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG))
-        }
+        let db = self.db_ref()?;
+        let cb: Py<PyAny> = callback.into();
+        let rule_impl = SimpleFixedRule::new(arity, move |inputs, options| -> Result<_> {
+            Python::with_gil(|py| -> Result<NamedRows> {
+                let py_inputs = PyList::new(
+                    py,
+                    inputs.into_iter().map(|nr| rows_to_py_rows(nr.rows, py)),
+                );
+                let py_opts = options_to_py(options, py).into_diagnostic()?;
+                let args = PyTuple::new(py, vec![PyObject::from(py_inputs), py_opts]);
+                let res = cb.as_ref(py).call1(args).into_diagnostic()?;
+                Ok(NamedRows::new(vec![], py_to_rows(res).into_diagnostic()?))
+            })
+        });
+        db.register_fixed_rule(name, rule_impl).map_err(report2py)
     }
     pub fn unregister_callback(&self, id: u32) -> bool {
-        if let Some(db) = &self.db {
-            db.unregister_callback(id)
-        } else {
-            false
+        // Preserve the pre-fork behavior: a closed handle returns `false`,
+        // not an error. Clone out of a momentary guard, drop it, then call.
+        let maybe_db = self.db.read().unwrap().clone();
+        match maybe_db {
+            Some(db) => db.unregister_callback(id),
+            None => false,
         }
     }
     pub fn unregister_fixed_rule(&self, name: &str) -> PyResult<bool> {
-        if let Some(db) = &self.db {
-            match db.unregister_fixed_rule(name) {
+        // Preserve the pre-fork behavior: a closed handle returns `Ok(false)`,
+        // not an error.
+        let maybe_db = self.db.read().unwrap().clone();
+        match maybe_db {
+            Some(db) => match db.unregister_fixed_rule(name) {
                 Ok(b) => Ok(b),
                 Err(err) => Err(PyException::new_err(err.to_string())),
-            }
-        } else {
-            Ok(false)
+            },
+            None => Ok(false),
         }
     }
     pub fn export_relations(&self, py: Python<'_>, relations: Vec<String>) -> PyResult<PyObject> {
-        if let Some(db) = &self.db {
-            let res = match py.allow_threads(|| db.export_relations(relations.iter())) {
-                Ok(res) => res,
-                Err(err) => return Err(PyException::new_err(err.to_string())),
-            };
-            let ret = PyDict::new(py);
-            for (k, v) in res {
-                ret.set_item(k, named_rows_to_py(v, py))?;
-            }
-            Ok(ret.into())
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG.to_string()))
+        let db = self.db_ref()?;
+        let res = match py.allow_threads(|| db.export_relations(relations.iter())) {
+            Ok(res) => res,
+            Err(err) => return Err(PyException::new_err(err.to_string())),
+        };
+        let ret = PyDict::new(py);
+        for (k, v) in res {
+            ret.set_item(k, named_rows_to_py(v, py))?;
         }
+        Ok(ret.into())
     }
     pub fn import_relations(&self, py: Python<'_>, data: &PyDict) -> PyResult<()> {
-        if let Some(db) = &self.db {
-            let mut arg = BTreeMap::new();
-            for (k, v) in data.iter() {
-                let k = k.extract::<String>()?;
-                let vals = py_to_named_rows(v)?;
-                arg.insert(k, vals);
-            }
-            py.allow_threads(|| db.import_relations(arg))
-                .map_err(report2py)
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG.to_string()))
+        let db = self.db_ref()?;
+        let mut arg = BTreeMap::new();
+        for (k, v) in data.iter() {
+            let k = k.extract::<String>()?;
+            let vals = py_to_named_rows(v)?;
+            arg.insert(k, vals);
         }
+        py.allow_threads(|| db.import_relations(arg))
+            .map_err(report2py)
     }
     pub fn backup(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        if let Some(db) = &self.db {
-            py.allow_threads(|| db.backup_db(path)).map_err(report2py)
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG.to_string()))
-        }
+        let db = self.db_ref()?;
+        py.allow_threads(|| db.backup_db(path)).map_err(report2py)
     }
     pub fn restore(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        if let Some(db) = &self.db {
-            py.allow_threads(|| db.restore_backup(path))
-                .map_err(report2py)
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG.to_string()))
-        }
+        let db = self.db_ref()?;
+        py.allow_threads(|| db.restore_backup(path))
+            .map_err(report2py)
     }
     pub fn import_from_backup(
         &self,
@@ -613,24 +654,23 @@ impl CozoDbPy {
         in_file: &str,
         relations: Vec<String>,
     ) -> PyResult<()> {
-        if let Some(db) = &self.db {
-            py.allow_threads(|| db.import_from_backup(in_file, &relations))
-                .map_err(report2py)
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG.to_string()))
-        }
+        let db = self.db_ref()?;
+        py.allow_threads(|| db.import_from_backup(in_file, &relations))
+            .map_err(report2py)
     }
-    pub fn close(&mut self) -> bool {
-        self.db.take().is_some()
+    /// Close the handle (mnestic fork, item D). Takes `&self` (via a write guard)
+    /// so it no longer collides with an in-flight `run_script(&self)`'s shared
+    /// PyCell borrow — the "Already borrowed" bug. Returns immediately even while
+    /// queries run; the underlying storage drops when the last in-flight
+    /// `DbInstance` clone is dropped.
+    pub fn close(&self) -> bool {
+        self.db.write().unwrap().take().is_some()
     }
     pub fn multi_transact(&self, write: bool) -> PyResult<CozoDbMulTx> {
-        if let Some(db) = &self.db {
-            Ok(CozoDbMulTx {
-                tx: db.multi_transaction(write),
-            })
-        } else {
-            Err(PyException::new_err(DB_CLOSED_MSG.to_string()))
-        }
+        let db = self.db_ref()?;
+        Ok(CozoDbMulTx {
+            tx: db.multi_transaction(write),
+        })
     }
 }
 
