@@ -20,6 +20,82 @@ of upstream `481af05` (the last upstream commit, 2024-12-04).
 Highlights (full detail in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)):
 
+**0.10.5**
+
+- **Interruptible `::kill` / `:timeout`, plus a per-query wall-clock budget.**
+  `::running`/`::kill` now dispatch before opening any storage transaction (so on
+  the mem/sqlite backends a `::kill` no longer queues behind the very read query
+  it targets), and the per-query poison flag is threaded through the
+  relational-algebra enumeration and checked every 4096 pulls — so a long-running
+  single-rule join that yields no output is now actually interruptible. A query
+  can also carry a deadline three ways: the in-script `:timeout <secs>` option, a
+  per-call
+  `run_script_with_options(payload, params, mutability, ScriptRunOptions { timeout })`,
+  and a Db-wide `set_default_query_timeout`. The effective deadline is the
+  **minimum** of whichever are set, expiry raises a distinct `eval::timeout`
+  (versus `eval::killed` for a `::kill`), and the old per-timed-query timer thread
+  is gone (no leak). Exposed on `DbInstance`, in Python (a `timeout=` kwarg), and
+  in cozo-bin (a `--default-query-timeout` flag + a `timeout` payload field). Wasm
+  carries no wall-clock budget (no monotonic clock).
+- **Deterministic greedy join reorder** (default **on**; opt out per-query with
+  `:reorder written`). No pass previously considered join order, so a
+  naively-ordered conjunction — exactly what an LLM agent authors — could spin on
+  an N³ intermediate. A stat-free min-new-vars pre-pass reorders the positive
+  relation atoms of an eligible conjunction (measured **54.5×** on the repro;
+  N³→N²). Results are unchanged: conjunction is commutative under set semantics,
+  and the pass is the identity on any already stepwise-greedy-consistent written
+  order, so hand-tuned plans stay byte-identical. It excludes multi-valued
+  `in`-unifications feeding an aggregation (which would otherwise change a
+  `count`). A residual Cartesian step (a genuinely disconnected conjunction) is
+  warned and annotated in `::explain`. Spec:
+  [`docs/specs/join-reorder.md`](https://github.com/shuruheel/mnestic/blob/main/docs/specs/join-reorder.md).
+- **Automatic factorized `count()` rewrite** (opt-in, **default off**, behind
+  `set_query_factorization`). `count()` over a join streams every match; this
+  rewrites an eligible single-clause `count()`-over-positive-join into per-key
+  counting sub-rules — a bit-identical (exact-i64, `Int`-typed) answer computed
+  without materializing the join (the benchmark measured **4–342×** versus a
+  factorizing optimizer). It fires only on shapes it can prove exact and declines
+  the rest; a body with any `!=` predicate falls back to exact naive evaluation.
+  An always-on companion detector surfaces a factorization advisory in
+  `::explain`. Spec:
+  [`docs/specs/cardinality-algebra.md`](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cardinality-algebra.md).
+- **RocksDB in the PyPI `mnestic` wheel** — `CozoDbPy("rocksdb", path)` now works
+  straight from `pip install mnestic` (the wheel previously shipped
+  compact/SQLite-only). The sdist stays compact, so the persistent engine is
+  wheel-only.
+- **Python binding: interior-mutable `CozoDbPy`.** `close()` now takes a shared
+  `&self`, fixing an "Already borrowed" error when it raced a live `run_script`;
+  `run_script` gains an optional `timeout=None` kwarg, plus
+  `set_default_query_timeout` / `default_query_timeout`.
+- **Bulk `import_relations` into an index-bearing relation now warns** — the bulk
+  path maintains B-tree secondary indexes but not HNSW/FTS/LSH, so imported rows
+  stay invisible to vector/text search until the index is rebuilt. A warning now
+  flags it (still not a hard error: importing a snapshot then reindexing is
+  legitimate).
+
+**0.10.1**
+
+- **Dominance bounded-meet — the antichain / skyline aggregate.**
+  `register_bounded_meet_aggr(name, dominates, max_survivors)` opens the
+  bounded-meet category to a host-registered strict partial order: per group, the
+  head form `name(operand)` keeps the non-dominated (Pareto-frontier) set of
+  operands, each survivor its own output row, riding the same stratifier permit
+  and divergence cap as `min_cost_k`. `max_survivors` is a mandatory resource
+  guard — overflow is a loud error, never a silent truncation. Rust-embedded-only
+  v1. Spec:
+  [`docs/specs/antichain-bounded-meet.md`](https://github.com/shuruheel/mnestic/blob/main/docs/specs/antichain-bounded-meet.md).
+- **Interval primitives** — `interval_overlaps(a, b)` (builtin) and
+  `interval_coalesce(span)` (aggregate) over half-open `[start, end)` list
+  intervals. Touching spans coalesce but do not overlap (`[0,5)` + `[5,10)` =
+  `[0,10)`); empty spans `[x, x)` overlap nothing; mixed int/float bounds compare
+  numerically; malformed spans are loud errors, never silent falses. Spec:
+  [`docs/specs/cozoscript-extensions.md`](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cozoscript-extensions.md) §3.4.
+- **Correctness fix** — the `bit_and`/`bit_or` meet aggregates now report whether
+  the value actually changed (the byte loop returned changed unconditionally, so a
+  non-changing fold re-entered the semi-naive delta every epoch), and the
+  bounded-meet divergence cap now counts total changed epochs rather than a
+  consecutive streak that reset on quiet epochs.
+
 **0.10.0**
 
 - **Bitemporality — system-versioned (`TxTime`) relations.** An engine-assigned
@@ -142,7 +218,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.10.0"
+mnestic = "0.10.5"
 ```
 
 ```rust
