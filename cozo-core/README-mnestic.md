@@ -20,6 +20,28 @@ of upstream `481af05` (the last upstream commit, 2024-12-04).
 Highlights (full detail in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)):
 
+**0.10.6**
+
+- **Fix: relation catalogs written before 0.10.0 now open again** ("Cannot
+  deserialize relation metadata from bytes"). The 0.10.0 bitemporality work
+  inserted a field *mid-struct* in `RelationHandle`; on the catalog-write paths
+  that encode positionally, `#[serde(default)]` only rescues a *missing trailing*
+  field, so any relation whose catalog was last written before 0.10.0 (or by an
+  index/rename/destroy path) failed to deserialize on open — taking the whole
+  database down. The field moved to the end of the struct so the trailing default
+  applies to legacy arrays, and the seven catalog-rewrite paths now serialize
+  self-describing maps (`.with_struct_map()`) like the create path, so future
+  field additions can't reintroduce the bug. No migration: legacy catalogs stay
+  readable and re-canonicalize to maps on their next write. **If you upgraded a
+  pre-0.10.0 database to any of 0.10.0–0.10.5, upgrade to 0.10.6.** Regression-
+  guarded by a real pre-0.10.0 catalog fixture.
+- **Greedy join reorder is now a pure function** over a resolved schema view —
+  an internal refactor of the 0.10.5 join-reorder pass that makes it independently
+  unit-testable. No query-plan or behavior change.
+- **Python-wheel CI hardened for `storage-rocksdb`** — the x86_64 manylinux leg
+  now builds on `manylinux_2_28` with `libclang` so zstd-sys's bindgen resolves.
+  Wheel-build only; no engine change.
+
 **0.10.5**
 
 - **Interruptible `::kill` / `:timeout`, plus a per-query wall-clock budget.**
@@ -218,7 +240,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.10.5"
+mnestic = "0.10.6"
 ```
 
 ```rust

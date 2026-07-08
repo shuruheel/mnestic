@@ -10,6 +10,10 @@
 
 # Cozo 数据库
 
+## mnestic 0.10.6
+
+本版本为一次紧急的升级安全补丁。**修复：0.10.0 之前写入的关系目录（catalog）不再无法打开**（“Cannot deserialize relation metadata from bytes”）。0.10.0 的双时态改动在 `RelationHandle` 结构体*中间*插入了一个字段，而在按位置编码的目录写入路径上，`#[serde(default)]` 只能补齐*缺失的末尾*字段，因此任何在 0.10.0 之前（或经由建索引 / 重命名 / 删除索引路径）最后写入的关系目录在打开时会以“Cannot deserialize relation metadata from bytes”反序列化失败，导致整个数据库无法打开（一处生产多租户部署因此在 0.10.0 升级后被静默拖垮）。修复分两部分：将该字段移到结构体末尾，使末尾默认值对旧式数组生效；并让七条目录重写路径统一以 `.with_struct_map()` 序列化为自描述的 map，使未来新增字段不会再引入此类缺陷。无需迁移：旧目录仍可读取，并在下次写入时重新规范化为 map。**若你曾将 0.10.0 之前创建的数据库升级到 0.10.0–0.10.5，请升级到 0.10.6。** 另有两项内部改动：0.10.5 的连接重排序改写为对已解析 schema 视图的纯函数（内部重构，行为不变），以及为 `storage-rocksdb` 加固 Python wheel 的 CI（x86_64 manylinux 改用 `manylinux_2_28` 并安装 `libclang`，使 zstd-sys 的 bindgen 可解析）。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+
 ## mnestic 0.10.5
 
 本版本聚焦**可中断性与性能**。`::kill` 与 `:timeout` 现在能真正中断正在运行的查询（系统操作在打开存储事务之前派发，并把毒化标志接入关系代数枚举，每 4096 次拉取检查一次）；新增**每查询墙钟预算**——脚本内 `:timeout <秒>` 选项、按调用的 `ScriptRunOptions { timeout }` 以及 Db 级默认值 `set_default_query_timeout`，有效截止时间取三者中已设定者的**最小值**，超时抛出独立的 `eval::timeout` 诊断（wasm 无单调时钟，故不带墙钟预算）。**确定性贪心连接重排序**默认开启（可用 `:reorder written` 逐查询退出）：对朴素书写的合取消除 N³ 中间结果（重排实测 54.5×，N³→N²），结果不变，手工调优的书写顺序保持逐字节一致。**自动 `count()` 因子化重写**为可选、默认关闭（位于 `set_query_factorization` 之后），把符合条件的单子句 `count()`-over-join 重写为逐键计数子规则，得到精确 i64、`Int` 类型的结果而不物化连接；任何含 `!=` 谓词的主体回退到精确的朴素求值。对已建索引关系的批量 `import_relations` 现在会告警（HNSW/FTS/LSH 索引不在批量路径上维护）。此外，**PyPI `mnestic` wheel 现已内置 RocksDB**（`pip install mnestic` 后 `CozoDbPy("rocksdb", path)` 可用；sdist 仍为 compact），Python 绑定改为内部可变以修复实时查询期间 `close()` 的 “Already borrowed” 错误，并为 `run_script` 新增 `timeout=None` 关键字参数。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。

@@ -20,7 +20,7 @@ Make the engine the best **substrate for agentic memory**: in *one embedded engi
 
 Every item is judged against that goal — and described as a general database mechanism, not in terms of any specific application.
 
-## What's already shipped (through 0.10.5)
+## What's already shipped (through 0.10.6)
 
 The agentic-memory *retrieval* foundation is largely in place. Highlights (see [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for detail):
 
@@ -36,7 +36,7 @@ The agentic-memory *retrieval* foundation is largely in place. Highlights (see [
 - **LangChain & LlamaIndex integrations** on PyPI (`mnestic`, `langchain-mnestic`, `llama-index-vector-stores-mnestic`).
 - **Fast, non-blocking HNSW index builds** — a flat in-RAM parallel build (~15× faster on a 40k×384 corpus) that doesn't stall readers.
 - **Snapshot read path** + batched neighbour fetch (`multi_get`) for read-only queries.
-- **Corruption resilience** — `::repair_corrupt` and tolerant index builds, so one bad row never makes a database unopenable.
+- **Corruption resilience & upgrade-safe catalogs** — `::repair_corrupt` and tolerant index builds, so one bad row never makes a database unopenable; and (0.10.6) forward-compatible relation catalogs — a database written by a pre-0.10.0 build keeps opening across engine upgrades (the 0.10.0 bitemporality field addition had made pre-0.10.0 catalogs undeserializable).
 - **Planner & DX fixes** — equality-pushdown keyed lookups (~28× on point queries), keyword-prefixed identifier parsing, ULID functions.
 
 ## What's next

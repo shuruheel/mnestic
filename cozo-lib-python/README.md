@@ -40,6 +40,12 @@ The `"rocksdb"` persistent backend now ships in the published wheel —
 The source distribution stays SQLite/`compact`-only, so the persistent engine is
 wheel-only.
 
+**Upgrade note (0.10.6):** a persistent database whose relation catalogs were
+last written by a build older than 0.10.0 could fail to open with `Cannot
+deserialize relation metadata from bytes` after upgrading to 0.10.0–0.10.5.
+0.10.6 fixes this — legacy catalogs open again with no migration, so upgrade to
+0.10.6 if you carry a pre-0.10.0 database.
+
 `run_script` takes an optional `timeout=` — a per-query wall-clock budget in
 seconds; on expiry the query raises an `eval::timeout` error.
 `db.set_default_query_timeout(secs)` sets a Db-wide default and
