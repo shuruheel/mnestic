@@ -11,6 +11,56 @@ reconstruct them.
 
 _Nothing yet._
 
+## 0.10.7 — 2026-07-08
+
+A plan-quality fix for the 0.10.5 greedy join reorder, plus a Python-facing
+binding addition and a docs note. The headline corrects a tie-break that could
+demote a full-key filter to a partial-key expansion — pulling a high-fan-out
+edge ahead of a selective atom and producing a strictly worse plan on
+high-fan-out cyclic joins. Engine (`cozo-core`) plus the Python binding; no
+`cozorocks`/`mnestic-rocks` change and **no query-result change** (join reorder
+is result-invariant under set semantics).
+
+- **Fix: the greedy join reorder no longer demotes a full-key filter to a
+  partial-key expansion.** The greedy tie-break shipped in 0.10.5
+  (`query/reorder.rs`) rewarded any atom whose *leading* composite-key column was
+  bound. On a `knows{src, dst}`-style composite key, binding only `src` scored as
+  if it were a point lookup — but it is a keyed *expansion* over every neighbour
+  of `src` (the highest-fan-out relation in a graph), not a filter. So the pass
+  could pull a fan-out `knows` edge ahead of a selective membership atom and
+  produce a strictly worse plan: an external benchmarker (LDBC-SNB LSQB) measured
+  Q3 — a same-country `knows` triangle — go from ~19 s to a >120 s timeout at
+  SF0.1, while the tie-break won nothing across the other eight queries at two
+  scale factors. The tie-break helper is renamed
+  `bound_key_prefix_len` → `full_key_lookup_bonus`: it now rewards ONLY a
+  *complete*-key point lookup (all key columns bound — an existence filter that
+  matches ≤1 tuple and cannot increase cardinality) and scores a *partial* prefix
+  `0`, so a partial-key tie falls back to the written order. **No result change**
+  (conjunction is commutative under set semantics), and 0.10.5's ~54.5×
+  "min-new-vars" win is preserved — it is driven by the new-vars criterion, not
+  this tie-break. Regression-guarded by a new high-fan-out integration test
+  (`tests/join_reorder.rs::partial_key_prefix_not_pulled_forward_{sqlite,mem}`,
+  which FAILS on the pre-fix engine) plus rewritten unit tests
+  (`greedy_prefers_full_key_lookup_on_tie`,
+  `greedy_ignores_partial_key_prefix_on_tie`). Anyone relying on the default
+  `:reorder greedy` over high-fan-out cyclic joins benefits.
+- **Python binding: `set_query_factorization` / `query_factorization` are now
+  exposed on `CozoDbPy`.** The 0.10.5 factorized-`count()` rewrite shipped behind
+  a Db-wide kill switch (`Db::set_query_factorization(bool)`, default OFF "to
+  soak") that was reachable only from Rust `DbInstance`. Python callers can now
+  toggle it exactly like the timeout methods that already crossed:
+  `db.set_query_factorization(True)` and `db.query_factorization()` (returns the
+  current state). Purely additive; the default stays OFF. This lets Python-based
+  benchmarks generate the soak evidence the 0.10.5 changelog said default-on is
+  waiting on. (`cozo-lib-python/src/lib.rs`.)
+- **Docs: an "algebra ⟷ fixed-rule map"** in
+  `docs/concepts/semirings-and-fixedrules.md` records which built-in graph
+  fixed-rules are expressible as semiring recursion
+  (`ShortestPathDijkstra`/`ConnectedComponents` validated identical to `min_cost`
+  / min-label forms) and corrects two easy conflations (community
+  `LabelPropagation` is NOT a meet; `KShortestPathYen` ≈ `min_cost_k` only
+  approximately).
+
 ## 0.10.6 — 2026-07-08
 
 An urgent upgrade-safety patch. The headline fixes a data-availability

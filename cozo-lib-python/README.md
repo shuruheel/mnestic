@@ -52,6 +52,15 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
+**New in 0.10.7:** the engine's opt-in factorized-`count()` rewrite is now
+toggleable from Python. `db.set_query_factorization(True)` /
+`db.query_factorization()` control a Db-wide switch (default **off**); when on,
+an eligible `count()` over a positive join is counted per-key without
+materializing the join, for the same result — mirroring the previously Rust-only
+switch so Python benchmarks can measure it. Separately, 0.10.7 corrects a
+tie-break in the default greedy join reorder so a partial composite-key prefix is
+no longer mistaken for a point lookup on high-fan-out joins (no result change).
+
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).
 

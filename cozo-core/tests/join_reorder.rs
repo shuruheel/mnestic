@@ -452,3 +452,77 @@ fn multi_in_aggregation_not_reordered_sqlite() {
 fn multi_in_aggregation_not_reordered_mem() {
     assert_multi_in_aggregation_parity(&mem_db());
 }
+
+// ---------------------------------------------------------------------------
+// 8. Regression (LSQB Q3): a PARTIAL composite-key bind must NOT be pulled
+//    forward as a keyed expansion. Before the fork's `full_key_lookup_bonus`
+//    fix, the greedy tie-break rewarded any atom whose LEADING key column was
+//    bound — so on a `knows{src, dst}`-style composite key, binding only `src`
+//    scored a "prefix 1" and pulled that fan-out expansion ahead of a selective
+//    atom (a benchmarker measured LSQB Q3 go 19s -> timeout). The fix scores a
+//    partial prefix 0, so the tie falls to the written order and the demotion
+//    never happens. This is the integration analog of the reorder unit test
+//    `greedy_ignores_partial_key_prefix_on_tie`, exercised on the real
+//    `stored_*` path (sqlite). It FAILS on the pre-fix engine (greedy produced
+//    `[:ta, :tc, :tb]`).
+// ---------------------------------------------------------------------------
+
+/// `ta{x,y}, tb{z,y}, tc{y,z}` — after the base pick `ta` binds {x,y}, both `tb`
+/// and `tc` add exactly one new var (`z`), a tie. `tc`'s key `[y,z]` has its
+/// leading column `y` bound (a keyed *expansion* over every `z` for that `y`),
+/// while `tb`'s key `[z,y]` has its leading column `z` unbound. The old tie-break
+/// wrongly pulled `tc` ahead (`[ta,tc,tb]`); the fix keeps the written order.
+fn assert_partial_key_not_pulled_forward(db: &DbInstance, assert_plan: bool) {
+    run_mut(db, ":create ta { x: Int, y: Int }");
+    run_mut(db, ":create tb { z: Int, y: Int }");
+    run_mut(db, ":create tc { y: Int, z: Int }");
+    run_mut(db, "?[x, y] <- [[0, 0], [0, 1]] :put ta { x, y }");
+    run_mut(db, "?[z, y] <- [[0, 0], [1, 0], [2, 0], [0, 1]] :put tb { z, y }");
+    // `tc` is high fan-out on its leading key `y` (8 `z` per `y`) — the shape a
+    // partial-key expansion on `y` alone blows up on.
+    let mut tc = vec![];
+    for y in 0..2i64 {
+        for z in 0..8i64 {
+            tc.push(DataValue::List(vec![DataValue::from(y), DataValue::from(z)]));
+        }
+    }
+    let mut p = BTreeMap::new();
+    p.insert("rows".to_string(), DataValue::List(tc));
+    run_mut_p(db, "?[y, z] <- $rows :put tc { y, z }", p);
+
+    let q = "?[x, y, z] := *ta[x, y], *tb[z, y], *tc[y, z]";
+    let greedy = sorted_rows(run(db, q));
+    let written = sorted_rows(run(db, &format!("{q} :reorder written")));
+    assert_eq!(
+        greedy, written,
+        "partial-key regression: reorder must return the same rows as written order"
+    );
+    assert_eq!(greedy.len(), 4, "expected 4 triangle rows");
+
+    if assert_plan {
+        let greedy_loads = load_refs(&explain(db, q));
+        let written_loads = load_refs(&explain(db, &format!("{q} :reorder written")));
+        assert_eq!(
+            written_loads,
+            vec![":ta", ":tb", ":tc"],
+            "written order is the authored order"
+        );
+        assert_eq!(
+            greedy_loads, written_loads,
+            "a partial composite-key bind (`tc[y, z]`, only `y` bound) must NOT be \
+             pulled ahead of the written order — the pre-fix engine demoted it to a \
+             keyed expansion and produced [:ta, :tc, :tb]"
+        );
+    }
+}
+
+#[test]
+fn partial_key_prefix_not_pulled_forward_sqlite() {
+    let dir = tempfile::tempdir().unwrap();
+    assert_partial_key_not_pulled_forward(&sqlite_db(&dir), true);
+}
+
+#[test]
+fn partial_key_prefix_not_pulled_forward_mem() {
+    assert_partial_key_not_pulled_forward(&mem_db(), false);
+}

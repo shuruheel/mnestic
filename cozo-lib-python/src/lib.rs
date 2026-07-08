@@ -502,6 +502,25 @@ impl CozoDbPy {
         let db = self.db_ref()?;
         Ok(db.default_query_timeout())
     }
+    /// Enable or disable the automatic factorized-`count()` rewrite (mnestic
+    /// fork, query factorization). This is a Db-wide kill switch, default OFF —
+    /// when on, a `count()` over an alpha-acyclic all-positive join is computed
+    /// per-separator instead of materializing the full join, without changing the
+    /// result. Forwards to [`DbInstance::set_query_factorization`]. Mirrors the
+    /// Rust-only switch so Python callers can toggle it (and produce soak
+    /// evidence) exactly like `set_default_query_timeout`.
+    pub fn set_query_factorization(&self, enabled: bool) -> PyResult<()> {
+        let db = self.db_ref()?;
+        db.set_query_factorization(enabled);
+        Ok(())
+    }
+    /// Whether the automatic factorized-`count()` rewrite is currently enabled
+    /// (mnestic fork, query factorization). Forwards to
+    /// [`DbInstance::query_factorization`].
+    pub fn query_factorization(&self) -> PyResult<bool> {
+        let db = self.db_ref()?;
+        Ok(db.query_factorization())
+    }
     /// One-call hybrid retrieval (mnestic fork): HNSW + FTS (+ optional extra
     /// ranked lists) fused with RRF and optionally diversified with MMR. Takes a
     /// dict mirroring the Rust `HybridSearch` fields; returns the same shape as

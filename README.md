@@ -17,6 +17,33 @@
 
 Highlights (full detail in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)):
 
+**0.10.7**
+
+- **Fix: the greedy join reorder no longer demotes a full-key filter to a
+  partial-key expansion.** 0.10.5's tie-break rewarded any atom whose *leading*
+  composite-key column was bound — but on a `knows{src, dst}`-style key, binding
+  only `src` is a keyed *expansion* over every neighbour of `src` (a graph's
+  highest-fan-out relation), not a point lookup, so the pass could pull a fan-out
+  edge ahead of a selective atom and produce a strictly worse plan (an external
+  LDBC-SNB LSQB run measured Q3, a `knows` triangle, go from ~19 s to a >120 s
+  timeout at SF0.1). The tie-break now rewards ONLY a *complete*-key point lookup
+  and scores a partial prefix 0, falling back to the written order. **No result
+  change** (reorder is result-invariant under set semantics), and 0.10.5's 54.5×
+  min-new-vars win is preserved (it rides the new-vars criterion, not this
+  tie-break). Guarded by a new high-fan-out regression test.
+- **Python binding: `set_query_factorization` / `query_factorization` on
+  `CozoDbPy`.** The opt-in factorized-`count()` rewrite's Db-wide kill switch
+  (default **off**) is now reachable from Python —
+  `db.set_query_factorization(True)` / `db.query_factorization()` — mirroring the
+  previously Rust-only switch, so Python benchmarks can produce the soak evidence
+  default-on is waiting on. Purely additive.
+- **Docs** — a new "algebra ⟷ fixed-rule map" in
+  [`docs/concepts/semirings-and-fixedrules.md`](docs/concepts/semirings-and-fixedrules.md)
+  records which built-in graph fixed-rules are expressible as semiring recursion
+  (`ShortestPathDijkstra`/`ConnectedComponents` validated identical;
+  `LabelPropagation` is NOT a meet; `KShortestPathYen` ≈ `min_cost_k` only
+  approximately).
+
 **0.10.6**
 
 - **Fix: relation catalogs written before 0.10.0 now open again** ("Cannot

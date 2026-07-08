@@ -457,17 +457,30 @@ struct RelCand {
     /// and are never shared, so they are excluded from connectivity / new-var
     /// scoring).
     vars: BTreeSet<Symbol>,
-    /// Positional arguments (used for the bound-key-prefix tie-break).
+    /// Positional arguments (used for the full-key-lookup tie-break).
     args: Vec<Symbol>,
     /// Number of primary-key columns of the underlying relation.
     key_arity: usize,
 }
 
-/// Length of the bound prefix of `cand`'s primary key given the bound set `b`:
-/// how many leading key columns (positions 0, 1, 2, …) are bound. A wildcard or
-/// an unbound column breaks the prefix. A longer bound prefix means the atom
-/// compiles to a keyed `stored_prefix_join` rather than a scan, so we prefer it.
-fn bound_key_prefix_len(cand: &RelCand, b: &BTreeSet<Symbol>) -> usize {
+/// Tie-break bonus for a candidate that compiles to a **full-key point lookup**
+/// given the bound set `b`: every one of the relation's primary-key columns
+/// (positions `0..key_arity`) is bound, so the atom matches at most one stored
+/// tuple — an existence filter that cannot increase cardinality. Returns the key
+/// arity in that case, and `0` otherwise.
+///
+/// A *partial* key prefix is deliberately scored `0`, NOT its length. Binding
+/// only the leading column(s) of a composite key is a keyed *expansion* over the
+/// whole leading-key range — potentially the highest-fan-out relation in the
+/// graph (`knows{src, dst}` bound on `src` alone enumerates every neighbour of
+/// `src`), not a filter. The stat-blind reorder pass cannot distinguish a cheap
+/// partial expansion from an explosive one, so it must never *prefer* a partial
+/// prefix over the written order: doing so pulled a fan-out `knows` edge ahead of
+/// a selective membership atom and regressed a real high-fan-out triangle join
+/// (LSQB Q3: 19s → timeout). Only a complete-key bind is unconditionally safe to
+/// pull forward. A single-column key with that one column bound is a full key, so
+/// genuine point lookups keep their bonus.
+fn full_key_lookup_bonus(cand: &RelCand, b: &BTreeSet<Symbol>) -> usize {
     let mut n = 0;
     for arg in cand.args.iter().take(cand.key_arity) {
         if arg.is_generated_ignored_symbol() || !b.contains(arg) {
@@ -475,7 +488,11 @@ fn bound_key_prefix_len(cand: &RelCand, b: &BTreeSet<Symbol>) -> usize {
         }
         n += 1;
     }
-    n
+    if n == cand.key_arity {
+        n
+    } else {
+        0
+    }
 }
 
 /// Deterministic, stat-free "min-new-vars" greedy join reorder (mnestic fork,
@@ -599,8 +616,11 @@ fn greedy_reorder_conjunction(
                 .min_by_key(|&&ci| cands[ci].orig_idx)
                 .unwrap()
         } else {
-            // argmin over (new-vars ASC, bound-key-prefix DESC, written idx ASC).
-            // orig_idx is unique, so the ordering is total and deterministic.
+            // argmin over (new-vars ASC, full-key-lookup bonus DESC, written idx
+            // ASC). orig_idx is unique, so the ordering is total and
+            // deterministic. Only a *full*-key point lookup earns the bonus; a
+            // partial composite-key prefix scores 0 and falls to written order
+            // (see `full_key_lookup_bonus`).
             *connected
                 .iter()
                 .min_by(|&&a, &&bx| {
@@ -609,7 +629,7 @@ fn greedy_reorder_conjunction(
                     let na = ca.vars.iter().filter(|v| !b.contains(*v)).count();
                     let nb = cb.vars.iter().filter(|v| !b.contains(*v)).count();
                     na.cmp(&nb)
-                        .then(bound_key_prefix_len(cb, &b).cmp(&bound_key_prefix_len(ca, &b)))
+                        .then(full_key_lookup_bonus(cb, &b).cmp(&full_key_lookup_bonus(ca, &b)))
                         .then(ca.orig_idx.cmp(&cb.orig_idx))
                 })
                 .unwrap()
@@ -687,35 +707,60 @@ mod tests {
             .collect()
     }
 
-    /// Body: `a(x,y), b(z,y), c(y,z)`. The base pick `a` binds {x,y}; then both
-    /// `b` and `c` are connected and each introduce exactly one new var (`z`), so
-    /// the new-var scores tie and the tie-break falls to the bound key prefix:
-    /// `c`'s key `[y,z]` has `y` bound (prefix 1) while `b`'s key `[z,y]` has `z`
-    /// unbound (prefix 0). `c` therefore compiles to a keyed prefix join and is
-    /// pulled ahead of `b`. The reorder is DECIDED by the schema — proving the
+    /// A **full**-key point lookup wins the new-var tie and is pulled forward.
+    /// Body `base(k1,k2), part(k1,w), full(k1,k2,v)` (all key_arity 2). The base
+    /// pick `base` binds {k1,k2}; then `part` and `full` are both connected and
+    /// each introduce exactly one new var (`w` / `v`), so the new-var scores tie.
+    /// The tie-break goes to the full-key-lookup bonus: `full`'s complete key
+    /// `[k1,k2]` is bound (a point lookup, bonus 2) while `part`'s key `[k1,w]`
+    /// binds only the leading column (a keyed expansion, bonus 0). `full` is
+    /// therefore pulled ahead of `part`, permuting written `[base,part,full]` into
+    /// `[base,full,part]`. The reorder is DECIDED by the schema — proving the
     /// `SchemaView` is wired through — and the whole thing runs with no database.
     #[test]
-    fn greedy_prefers_longer_bound_key_prefix_on_tie() {
+    fn greedy_prefers_full_key_lookup_on_tie() {
+        let body = vec![
+            rel("base", &["k1", "k2"]),
+            rel("part", &["k1", "w"]),
+            rel("full", &["k1", "k2", "v"]),
+        ];
+        let schema =
+            SchemaView::from([(sym("base"), 2), (sym("part"), 2), (sym("full"), 2)]);
+        let got = greedy_reorder_conjunction(&body, &schema, "test").expect("should reorder");
+        assert_eq!(relation_order(&got), ["base", "full", "part"]);
+    }
+
+    /// A **partial** composite-key prefix does NOT reorder (regression guard for
+    /// LSQB Q3). Body `a(x,y), b(z,y), c(y,z)` (all key_arity 2). After the base
+    /// pick `a` binds {x,y}, both `b` and `c` add one new var (`z`) — a tie — and
+    /// `c`'s key `[y,z]` has only its leading column `y` bound (a keyed expansion,
+    /// NOT a point lookup). The fork's fix scores that partial prefix 0, same as
+    /// `b`'s unbound-leading key, so the tie falls to written order and the greedy
+    /// order equals the written order — the identity fast path returns `None`.
+    /// (Before the fix a partial prefix scored 1 and wrongly pulled `c` ahead,
+    /// turning a fan-out expansion into the lead atom.)
+    #[test]
+    fn greedy_ignores_partial_key_prefix_on_tie() {
         let body = vec![
             rel("a", &["x", "y"]),
             rel("b", &["z", "y"]),
             rel("c", &["y", "z"]),
         ];
         let schema = SchemaView::from([(sym("a"), 2), (sym("b"), 2), (sym("c"), 2)]);
-        let got = greedy_reorder_conjunction(&body, &schema, "test").expect("should reorder");
-        assert_eq!(relation_order(&got), ["a", "c", "b"]);
+        assert!(greedy_reorder_conjunction(&body, &schema, "test").is_none());
     }
 
-    /// Same body, but with no key-arity information every bound-key prefix is 0,
-    /// so the tie-break falls to written order (`b` before `c`) and the greedy
-    /// order equals the written order — the identity fast path returns `None`.
-    /// Confirms the outcome genuinely depends on the resolved schema.
+    /// Same body as `greedy_prefers_full_key_lookup_on_tie`, but with no key-arity
+    /// information every full-key-lookup bonus is 0, so the tie-break falls to
+    /// written order (`part` before `full`) and the greedy order equals the
+    /// written order — the identity fast path returns `None`. Paired with that
+    /// test, confirms the outcome genuinely depends on the resolved schema.
     #[test]
     fn greedy_is_identity_without_key_arities() {
         let body = vec![
-            rel("a", &["x", "y"]),
-            rel("b", &["z", "y"]),
-            rel("c", &["y", "z"]),
+            rel("base", &["k1", "k2"]),
+            rel("part", &["k1", "w"]),
+            rel("full", &["k1", "k2", "v"]),
         ];
         assert!(greedy_reorder_conjunction(&body, &SchemaView::new(), "test").is_none());
     }

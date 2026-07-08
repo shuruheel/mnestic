@@ -10,6 +10,10 @@
 
 # Cozo 数据库
 
+## mnestic 0.10.7
+
+本版本为 0.10.5 贪心连接重排序的一次计划质量修复，另附一项面向 Python 的绑定改进与一处文档更新。**修复：贪心连接重排序不再把全键过滤误降级为部分键展开。** 0.10.5 的重排序决胜（tie-break）会奖励任何*前导*复合键列已绑定的原子；但对 `knows{src, dst}` 这类复合键，仅绑定 `src` 并不是点查（point lookup），而是对 `src` 的每个邻居的一次按键*展开*（图中扇出最高的关系），并非过滤。因此该遍可能把一条高扇出的 `knows` 边拉到一个高选择性成员原子之前，产生严格更差的计划：一位外部基准测试者（LDBC-SNB LSQB）实测 Q3（一个同国 `knows` 三角）在 SF0.1 上从约 19 秒退化到 >120 秒超时，而该决胜在两个规模因子下的其余八个查询上一无所获。决胜辅助函数由 `bound_key_prefix_len` 更名为 `full_key_lookup_bonus`：现在只奖励*完整*键的点查（所有键列均已绑定——至多匹配一条元组、不会增加基数的存在性过滤），对*部分*前缀记 0 分，使部分键的平局回退到书写顺序。**结果不变**（在集合语义下合取可交换），且 0.10.5 约 54.5× 的“最少新变量”收益得以保留（它由新变量准则驱动，而非此决胜）。另有：Python 绑定现在暴露 `set_query_factorization` / `query_factorization`（`db.set_query_factorization(True)` / `db.query_factorization()`），把 0.10.5 起仅限 Rust 的、默认关闭的因子化 `count()` 改写开关下放给 Python 调用方以生成 soak 证据（纯新增，默认仍关闭）；以及 `docs/concepts/semirings-and-fixedrules.md` 新增“代数 ⟷ fixed-rule 映射”一节。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+
 ## mnestic 0.10.6
 
 本版本为一次紧急的升级安全补丁。**修复：0.10.0 之前写入的关系目录（catalog）不再无法打开**（“Cannot deserialize relation metadata from bytes”）。0.10.0 的双时态改动在 `RelationHandle` 结构体*中间*插入了一个字段，而在按位置编码的目录写入路径上，`#[serde(default)]` 只能补齐*缺失的末尾*字段，因此任何在 0.10.0 之前（或经由建索引 / 重命名 / 删除索引路径）最后写入的关系目录在打开时会以“Cannot deserialize relation metadata from bytes”反序列化失败，导致整个数据库无法打开（一处生产多租户部署因此在 0.10.0 升级后被静默拖垮）。修复分两部分：将该字段移到结构体末尾，使末尾默认值对旧式数组生效；并让七条目录重写路径统一以 `.with_struct_map()` 序列化为自描述的 map，使未来新增字段不会再引入此类缺陷。无需迁移：旧目录仍可读取，并在下次写入时重新规范化为 map。**若你曾将 0.10.0 之前创建的数据库升级到 0.10.0–0.10.5，请升级到 0.10.6。** 另有两项内部改动：0.10.5 的连接重排序改写为对已解析 schema 视图的纯函数（内部重构，行为不变），以及为 `storage-rocksdb` 加固 Python wheel 的 CI（x86_64 manylinux 改用 `manylinux_2_28` 并安装 `libclang`，使 zstd-sys 的 bindgen 可解析）。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
