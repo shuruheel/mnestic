@@ -59,11 +59,13 @@ jobs:
           # `features` is a per-leg staged-rollout knob: if one leg's rocksdb
           # build breaks, drop that leg back to "compact" instead of holding
           # the whole release.
-          # x86_64 needs the 2_28 image too: with storage-rocksdb, zstd-sys pulls
-          # bindgen, which panics "Unable to find libclang" on manylinux2014
-          # (no libclang in that image). 2_28 ships it — the aarch64 leg already
-          # builds the identical zstd-sys on 2_28. Cost: drops glibc < 2.28 hosts.
-          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2_28", features: "compact,storage-rocksdb" }
+          # With storage-rocksdb, zstd-sys pulls bindgen, which needs libclang.
+          # The NATIVE manylinux x86_64 image (2014 or 2_28) ships none, so the
+          # build panics "Unable to find libclang" — install it via
+          # before_script. (The aarch64 leg escapes this: its maturin CROSS image
+          # already bundles clang.) 2_28 = AlmaLinux 8, so `dnf install clang-devel`
+          # gives a modern, bindgen-compatible libclang; cost: drops glibc < 2.28.
+          - { os: ubuntu-latest,  target: x86_64,  manylinux: "2_28", features: "compact,storage-rocksdb", before_script: "dnf install -y clang-devel" }
           # aarch64 needs the 2_28 image: the manylinux2014 cross-GCC is too old
           # to assemble ring's ARM asm (#error "ARM assembler must define __ARM_ARCH").
           - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28", features: "compact,storage-rocksdb" }
@@ -91,6 +93,10 @@ jobs:
           working-directory: cozo-lib-python
           target: ${{ matrix.platform.target }}
           manylinux: ${{ matrix.platform.manylinux }}
+          # Runs inside the manylinux container before the build. Only the native
+          # x86_64 leg sets it (to install libclang for zstd-sys's bindgen);
+          # empty and unread on every other leg.
+          before-script-linux: ${{ matrix.platform.before_script }}
           # Full feature list on the CLI — robust regardless of how maturin
           # merges pyproject [tool.maturin] features with CLI flags. pyproject
           # stays `compact` so `pip install` from the sdist (which ships no
