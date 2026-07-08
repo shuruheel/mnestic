@@ -156,7 +156,12 @@ impl NormalFormInlineRule {
                 Ok(NormalFormInlineRule { head, aggr, body })
             }
             ReorderMode::Greedy => {
-                match greedy_reorder_conjunction(&body, tx, rule_name, key_arity_cache) {
+                // Resolve the single schema fact the greedy pass consumes (each
+                // stored relation's primary-key arity) here at the pass boundary,
+                // which owns the `SessionTx`, so `greedy_reorder_conjunction` is a
+                // pure function of (body, schema) — see `resolve_key_arities`.
+                let schema = resolve_key_arities(&body, tx, key_arity_cache);
+                match greedy_reorder_conjunction(&body, &schema, rule_name) {
                     // Ineligible or identity permutation: use the written order.
                     // The identity fast path keeps hand-tuned (greedy-consistent)
                     // queries byte-identical.
@@ -415,6 +420,33 @@ fn key_arity_of(
     v
 }
 
+/// Immutable view of the single schema fact the greedy join reorder consumes:
+/// each stored relation's primary-key arity. Resolved once at the pass boundary
+/// (`convert_to_well_ordered_rule`, which owns the `SessionTx`) and handed to
+/// `greedy_reorder_conjunction` by value, so that rewrite is a pure function of
+/// (body, schema) — unit-testable on hand-built bodies with no live transaction.
+type SchemaView = BTreeMap<Symbol, usize>;
+
+/// The reorder pass's one effectful step: read each stored relation named in
+/// `body` (memoized in `cache` across the program's rules — `SessionTx` has no
+/// relation-handle cache) into an immutable [`SchemaView`]. Everything the pass
+/// does downstream of this is pure. An unresolvable name (dropped mid-program,
+/// say) maps to arity 0, exactly as the previous inline `unwrap_or(0)` did.
+fn resolve_key_arities(
+    body: &[NormalFormAtom],
+    tx: &SessionTx<'_>,
+    cache: &mut BTreeMap<Symbol, Option<usize>>,
+) -> SchemaView {
+    let mut view = SchemaView::new();
+    for atom in body {
+        if let NormalFormAtom::Relation(r) = atom {
+            view.entry(r.name.clone())
+                .or_insert_with(|| key_arity_of(tx, &r.name, cache).unwrap_or(0));
+        }
+    }
+    view
+}
+
 /// A positive stored-relation atom prepared for greedy reordering.
 struct RelCand {
     /// Position of this atom among the positive relation atoms in written order.
@@ -472,9 +504,8 @@ fn bound_key_prefix_len(cand: &RelCand, b: &BTreeSet<Symbol>) -> usize {
 /// is enforced query-wide by the caller, which forces `ReorderMode::Written`.
 fn greedy_reorder_conjunction(
     body: &[NormalFormAtom],
-    tx: &SessionTx<'_>,
+    schema: &SchemaView,
     rule_name: &str,
-    key_arity_cache: &mut BTreeMap<Symbol, Option<usize>>,
 ) -> Option<Vec<NormalFormAtom>> {
     // --- Eligibility -------------------------------------------------------
     let mut relation_indices = vec![];
@@ -530,7 +561,7 @@ fn greedy_reorder_conjunction(
                 .filter(|a| !a.is_generated_ignored_symbol())
                 .cloned()
                 .collect();
-            let key_arity = key_arity_of(tx, &r.name, key_arity_cache).unwrap_or(0);
+            let key_arity = schema.get(&r.name).copied().unwrap_or(0);
             cands.push(RelCand {
                 orig_idx: ord,
                 atom: body[bi].clone(),
@@ -624,4 +655,77 @@ fn greedy_reorder_conjunction(
         }
     }
     Some(new_body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::data::program::NormalFormRelationApplyAtom;
+
+    fn sym(name: &str) -> Symbol {
+        Symbol::new(name, SourceSpan(0, 0))
+    }
+
+    /// A positive stored-relation atom `name(args..)` in normal form.
+    fn rel(name: &str, args: &[&str]) -> NormalFormAtom {
+        NormalFormAtom::Relation(NormalFormRelationApplyAtom {
+            name: sym(name),
+            args: args.iter().map(|a| sym(a)).collect(),
+            valid_at: None,
+            tx_valid_at: None,
+            span: SourceSpan(0, 0),
+        })
+    }
+
+    /// Relation names in body order (non-relation atoms ignored).
+    fn relation_order(body: &[NormalFormAtom]) -> Vec<String> {
+        body.iter()
+            .filter_map(|a| match a {
+                NormalFormAtom::Relation(r) => Some(r.name.name.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Body: `a(x,y), b(z,y), c(y,z)`. The base pick `a` binds {x,y}; then both
+    /// `b` and `c` are connected and each introduce exactly one new var (`z`), so
+    /// the new-var scores tie and the tie-break falls to the bound key prefix:
+    /// `c`'s key `[y,z]` has `y` bound (prefix 1) while `b`'s key `[z,y]` has `z`
+    /// unbound (prefix 0). `c` therefore compiles to a keyed prefix join and is
+    /// pulled ahead of `b`. The reorder is DECIDED by the schema — proving the
+    /// `SchemaView` is wired through — and the whole thing runs with no database.
+    #[test]
+    fn greedy_prefers_longer_bound_key_prefix_on_tie() {
+        let body = vec![
+            rel("a", &["x", "y"]),
+            rel("b", &["z", "y"]),
+            rel("c", &["y", "z"]),
+        ];
+        let schema = SchemaView::from([(sym("a"), 2), (sym("b"), 2), (sym("c"), 2)]);
+        let got = greedy_reorder_conjunction(&body, &schema, "test").expect("should reorder");
+        assert_eq!(relation_order(&got), ["a", "c", "b"]);
+    }
+
+    /// Same body, but with no key-arity information every bound-key prefix is 0,
+    /// so the tie-break falls to written order (`b` before `c`) and the greedy
+    /// order equals the written order — the identity fast path returns `None`.
+    /// Confirms the outcome genuinely depends on the resolved schema.
+    #[test]
+    fn greedy_is_identity_without_key_arities() {
+        let body = vec![
+            rel("a", &["x", "y"]),
+            rel("b", &["z", "y"]),
+            rel("c", &["y", "z"]),
+        ];
+        assert!(greedy_reorder_conjunction(&body, &SchemaView::new(), "test").is_none());
+    }
+
+    /// Fewer than three positive relation atoms cannot exhibit the blow-up the
+    /// pass targets, so the rule is ineligible regardless of schema.
+    #[test]
+    fn greedy_ineligible_below_three_relations() {
+        let body = vec![rel("a", &["x", "y"]), rel("b", &["y", "z"])];
+        let schema = SchemaView::from([(sym("a"), 2), (sym("b"), 2)]);
+        assert!(greedy_reorder_conjunction(&body, &schema, "test").is_none());
+    }
 }
