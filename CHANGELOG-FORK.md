@@ -3,6 +3,21 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased
+
+Post-0.10.5 work not yet cut to a release. Keep this section current as
+divergences land (see `CLAUDE.md` release rules) so a release never has to
+reconstruct them.
+
+- **Greedy join reorder is now a pure function over a resolved `SchemaView`.**
+  Internal refactor of the deterministic join-reorder pass shipped in 0.10.5
+  (`query/reorder.rs`): the reorder no longer reads mutable planner state,
+  making it independently testable. No query-plan or behavior change.
+- **Python wheel CI hardened for `storage-rocksdb`.** The x86_64 manylinux leg
+  now builds on `manylinux_2_28` and installs `libclang` (`clang-devel`) so
+  zstd-sys's bindgen resolves; the aarch64, macOS and Windows legs are
+  unaffected. Wheel-only — no engine change.
+
 ## 0.10.5 — 2026-07-07
 
 A liveness + performance release responding to an external

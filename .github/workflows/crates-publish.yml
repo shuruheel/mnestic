@@ -1,0 +1,111 @@
+# Publish the mnestic crates to crates.io:
+#   - mnestic-rocks   (cozorocks — the C++/RocksDB bridge; publishes FIRST, only if its
+#                      version isn't already on crates.io)
+#   - mnestic         (cozo-core — the engine; depends on the published mnestic-rocks)
+#
+# This is the crates.io counterpart to python-publish.yml (PyPI). Same test gate, same
+# tag==manifest-version guard. Triggered by `v*` tags (NOT `py-v*`, which drives PyPI).
+# Build-only on workflow_dispatch unless `publish=true`.
+#
+# Auth: CARGO_REGISTRY_TOKEN secret (a crates.io API token). To switch to crates.io
+# Trusted Publishing (OIDC, no long-lived token), replace the token env with the
+# rust-lang/crates-io-auth-action and configure a trusted publisher per crate.
+
+name: crates-publish
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish to crates.io (else verify only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  # --- lint + test gate: a broken engine must not ship (same as build.yml / python-publish) ---
+  test:
+    name: test + clippy (mnestic engine)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build -p mnestic --verbose
+      - run: cargo test -p mnestic --verbose
+      - run: cargo clippy -p mnestic -- -D warnings
+
+  publish:
+    name: publish to crates.io
+    needs: [test]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: crates-io
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # cozorocks bundles the rocksdb C++ sources as a submodule; without them
+          # the mnestic-rocks package build (and mnestic's publish verification with
+          # storage-rocksdb available) fails at cozorocks/build.rs.
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # libclang for zstd-sys's bindgen (pulled in via rocksdb) — the native x86_64
+      # runner ships none. Same root cause as the manylinux legs in python-publish.yml.
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      # Guard: on a tag push, v<X.Y.Z> must match cozo-core's package version.
+      - name: Verify tag matches engine version
+        id: ver
+        run: |
+          ENGINE_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('cozo-core/Cargo.toml','rb'))['package']['version'])")"
+          ROCKS_VERSION="$(python3 -c "import tomllib; print(tomllib.load(open('cozorocks/Cargo.toml','rb'))['package']['version'])")"
+          echo "engine=$ENGINE_VERSION"  >> "$GITHUB_OUTPUT"
+          echo "rocks=$ROCKS_VERSION"    >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" != "push" ]; then
+            echo "workflow_dispatch: no tag; engine version is $ENGINE_VERSION. Skipping tag guard."
+            exit 0
+          fi
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "Tag:    $TAG_VERSION"
+          echo "Engine: $ENGINE_VERSION"
+          if [ "$TAG_VERSION" != "$ENGINE_VERSION" ]; then
+            echo "::error::Tag v$TAG_VERSION != cozo-core/Cargo.toml version $ENGINE_VERSION. Bump the manifest (and README-mnestic.md's install snippet) to match the tag before releasing."
+            exit 1
+          fi
+          echo "Version match OK."
+
+      # Internal consistency — the same intra-repo drift the version-check workflow lints,
+      # re-asserted at the publish boundary so a stale pin can never ship.
+      - name: Verify internal version consistency
+        run: python3 scripts/check_versions.py
+
+      # mnestic-rocks first (mnestic depends on it), but only if this exact version
+      # isn't already on crates.io — re-publishing an existing version is a hard error.
+      - name: Publish mnestic-rocks (if new)
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          ROCKS="${{ steps.ver.outputs.rocks }}"
+          ONLINE="$(curl -s -H 'User-Agent: mnestic-ci (release)' https://crates.io/api/v1/crates/mnestic-rocks | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(v['num'] for v in d.get('versions',[])))" 2>/dev/null || echo '')"
+          if echo " $ONLINE " | grep -q " $ROCKS "; then
+            echo "mnestic-rocks $ROCKS already on crates.io — skipping."
+          else
+            echo "Publishing mnestic-rocks $ROCKS ..."
+            cargo publish -p mnestic-rocks
+          fi
+
+      # cargo publish waits for the crate to appear in the index before returning, so the
+      # engine's dependency on the just-published mnestic-rocks resolves.
+      - name: Publish mnestic (engine)
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p mnestic

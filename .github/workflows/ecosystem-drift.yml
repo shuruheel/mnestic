@@ -1,0 +1,58 @@
+# Weekly cross-repo drift monitor — the durable form of the "drift-monitor loop".
+#
+# The powerful cross-repo checker (release-tools/check_ecosystem.py) needs the whole
+# ecosystem tree + the local versions.toml, which no single-repo CI checkout has. So
+# this scheduled job does the highest-value cross-repo check WITHOUT versions.toml, by
+# comparing the two crates.io siblings directly: mnestic (the engine) is the source of
+# truth for the engine version, and mindgraph-rs must pin exactly that. This is the pin
+# that silently breaks a `mindgraph` publish when the engine moves to a new minor/major.
+#
+# It also runs each repo's own intra-repo version-consistency lint. Failures show up in
+# the Actions tab (and can be wired to an issue/notification later). Runs weekly and
+# on demand. mindgraph-rs is public, so no token is needed to clone it.
+
+name: ecosystem-drift
+
+on:
+  schedule:
+    - cron: "17 8 * * 1"      # Mondays 08:17 UTC (off the :00 mark)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  drift:
+    name: cross-repo version drift
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout mnestic (engine)
+        uses: actions/checkout@v4
+        with: { path: mnestic }
+      - name: Checkout mindgraph-rs (core, public sibling)
+        uses: actions/checkout@v4
+        with:
+          repository: shuruheel/mindgraph-rs
+          path: mindgraph-rs
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+
+      - name: Intra-repo lint — mnestic
+        run: python3 scripts/check_versions.py
+        working-directory: mnestic
+
+      - name: Intra-repo lint — mindgraph-rs
+        run: python3 scripts/check_versions.py
+        working-directory: mindgraph-rs
+
+      - name: Cross-repo — mindgraph-rs engine pin must equal mnestic engine version
+        run: |
+          ENGINE="$(python3 -c "import tomllib; print(tomllib.load(open('mnestic/cozo-core/Cargo.toml','rb'))['package']['version'])")"
+          PIN="$(grep 'package = "mnestic"' mindgraph-rs/Cargo.toml | grep -o 'version = "[^"]*"' | head -1 | sed 's/.*"\(.*\)"/\1/')"
+          echo "mnestic engine version : $ENGINE"
+          echo "mindgraph-rs pin        : $PIN"
+          if [ "$ENGINE" != "$PIN" ]; then
+            echo "::error::DRIFT — mindgraph-rs pins mnestic $PIN but the engine is at $ENGINE. A crates.io publish of mindgraph would pin the wrong engine (and breaks outright once the caret stops matching). Bump the pin in mindgraph-rs/Cargo.toml + mindgraph-server/Cargo.toml."
+            exit 1
+          fi
+          echo "No engine-pin drift."

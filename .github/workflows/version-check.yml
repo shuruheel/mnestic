@@ -1,0 +1,27 @@
+# version-check — intra-repo version-consistency guard.
+#
+# Catches the "bumped cozo-core but forgot cozo-lib-python / cozo-bin / a
+# README pin / a changelog entry" class of drift on EVERY push and PR. It only
+# reads text manifests (no cargo, no C++ bridge, no submodules), so it runs in
+# seconds. The cross-repo consistency checks live in the ecosystem-wide
+# release-tools/check_ecosystem.py, which can't run in per-repo CI (no sibling
+# checkout) — this is the self-contained in-repo half.
+name: version-check
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  version-check:
+    name: intra-repo version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Check versions are internally consistent
+        run: python3 scripts/check_versions.py
