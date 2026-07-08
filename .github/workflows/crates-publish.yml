@@ -7,9 +7,10 @@
 # tag==manifest-version guard. Triggered by `v*` tags (NOT `py-v*`, which drives PyPI).
 # Build-only on workflow_dispatch unless `publish=true`.
 #
-# Auth: CARGO_REGISTRY_TOKEN secret (a crates.io API token). To switch to crates.io
-# Trusted Publishing (OIDC, no long-lived token), replace the token env with the
-# rust-lang/crates-io-auth-action and configure a trusted publisher per crate.
+# Auth: crates.io Trusted Publishing (OIDC) via rust-lang/crates-io-auth-action — no
+# stored token/secret. Requires a Trusted Publisher configured on crates.io for BOTH
+# `mnestic` and `mnestic-rocks` (repo shuruheel/mnestic, workflow crates-publish.yml,
+# environment blank).
 
 name: crates-publish
 
@@ -46,7 +47,9 @@ jobs:
     needs: [test]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
-    environment: crates-io
+    permissions:
+      id-token: write    # OIDC — crates.io Trusted Publishing (no token/secret)
+      contents: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,6 +63,13 @@ jobs:
       # runner ships none. Same root cause as the manylinux legs in python-publish.yml.
       - name: Install libclang
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      # Exchange the GitHub OIDC token for a short-lived crates.io token.
+      # Requires a Trusted Publisher configured on crates.io for BOTH `mnestic`
+      # and `mnestic-rocks`, pointing at repo shuruheel/mnestic + this workflow
+      # file (crates-publish.yml), environment blank.
+      - uses: rust-lang/crates-io-auth-action@v1
+        id: auth
 
       # Guard: on a tag push, v<X.Y.Z> must match cozo-core's package version.
       - name: Verify tag matches engine version
@@ -92,7 +102,7 @@ jobs:
       - name: Publish mnestic-rocks (if new)
         if: github.event_name == 'push' || inputs.publish
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: |
           ROCKS="${{ steps.ver.outputs.rocks }}"
           ONLINE="$(curl -s -H 'User-Agent: mnestic-ci (release)' https://crates.io/api/v1/crates/mnestic-rocks | python3 -c "import sys,json; d=json.load(sys.stdin); print(' '.join(v['num'] for v in d.get('versions',[])))" 2>/dev/null || echo '')"
@@ -107,5 +117,5 @@ jobs:
       # engine's dependency on the just-published mnestic-rocks resolves.
       - name: Publish mnestic (engine)
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish -p mnestic
