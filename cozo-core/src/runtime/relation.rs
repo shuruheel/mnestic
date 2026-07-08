@@ -83,12 +83,6 @@ pub(crate) struct RelationHandle {
     pub(crate) replace_triggers: Vec<String>,
     pub(crate) access_level: AccessLevel,
     pub(crate) is_temp: bool,
-    /// mnestic fork, bitemporality step 5: after `::history_gc rel cutoff`,
-    /// as-of reads below the cutoff would silently return a post-hoc
-    /// reconstruction, so they error instead. `None` = never garbage
-    /// collected. Serde default keeps pre-gc catalogs readable.
-    #[serde(default)]
-    pub(crate) tt_gc_floor: Option<i64>,
     pub(crate) indices: BTreeMap<SmartString<LazyCompact>, (RelationHandle, Vec<usize>)>,
     pub(crate) hnsw_indices:
         BTreeMap<SmartString<LazyCompact>, (RelationHandle, HnswIndexManifest)>,
@@ -98,6 +92,18 @@ pub(crate) struct RelationHandle {
         (RelationHandle, RelationHandle, MinHashLshIndexManifest),
     >,
     pub(crate) description: SmartString<LazyCompact>,
+    /// mnestic fork, bitemporality step 5: after `::history_gc rel cutoff`,
+    /// as-of reads below the cutoff would silently return a post-hoc
+    /// reconstruction, so they error instead. `None` = never garbage
+    /// collected.
+    ///
+    /// MUST stay the LAST field. rmp_serde encodes structs as positional
+    /// arrays on the pre-`with_struct_map` catalog-write paths, and
+    /// `#[serde(default)]` only rescues a *missing trailing* element. A
+    /// mid-struct position here bricks every legacy (13-field) catalog on
+    /// upgrade — see the `legacy_catalog_without_tt_gc_floor` regression test.
+    #[serde(default)]
+    pub(crate) tt_gc_floor: Option<i64>,
 }
 
 impl RelationHandle {
@@ -1219,7 +1225,7 @@ impl<'a> SessionTx<'a> {
             vec![DataValue::from(&rel_handle.name as &str)].encode_as_key(RelationId::SYSTEM);
         let mut meta_val = vec![];
         rel_handle
-            .serialize(&mut Serializer::new(&mut meta_val))
+            .serialize(&mut Serializer::new(&mut meta_val).with_struct_map())
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
@@ -1419,7 +1425,7 @@ impl<'a> SessionTx<'a> {
             vec![DataValue::from(&rel_handle.name as &str)].encode_as_key(RelationId::SYSTEM);
         let mut meta_val = vec![];
         rel_handle
-            .serialize(&mut Serializer::new(&mut meta_val))
+            .serialize(&mut Serializer::new(&mut meta_val).with_struct_map())
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
@@ -1648,7 +1654,7 @@ impl<'a> SessionTx<'a> {
             vec![DataValue::from(&rel_handle.name as &str)].encode_as_key(RelationId::SYSTEM);
         let mut meta_val = vec![];
         rel_handle
-            .serialize(&mut Serializer::new(&mut meta_val))
+            .serialize(&mut Serializer::new(&mut meta_val).with_struct_map())
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
         Ok(())
@@ -1918,7 +1924,7 @@ impl<'a> SessionTx<'a> {
             vec![DataValue::from(&rel_name.name as &str)].encode_as_key(RelationId::SYSTEM);
         let mut meta_val = vec![];
         rel_handle
-            .serialize(&mut Serializer::new(&mut meta_val))
+            .serialize(&mut Serializer::new(&mut meta_val).with_struct_map())
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
@@ -1961,7 +1967,7 @@ impl<'a> SessionTx<'a> {
         let new_encoded =
             vec![DataValue::from(&rel_name.name as &str)].encode_as_key(RelationId::SYSTEM);
         let mut meta_val = vec![];
-        rel.serialize(&mut Serializer::new(&mut meta_val)).unwrap();
+        rel.serialize(&mut Serializer::new(&mut meta_val).with_struct_map()).unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
         Ok(to_clean)
@@ -1992,7 +1998,7 @@ impl<'a> SessionTx<'a> {
         rel.name = new.name.clone();
 
         let mut meta_val = vec![];
-        rel.serialize(&mut Serializer::new(&mut meta_val)).unwrap();
+        rel.serialize(&mut Serializer::new(&mut meta_val).with_struct_map()).unwrap();
         self.store_tx.del(&old_encoded)?;
         self.store_tx.put(&new_encoded, &meta_val)?;
 
@@ -2013,7 +2019,7 @@ impl<'a> SessionTx<'a> {
         rel.name = new.name;
 
         let mut meta_val = vec![];
-        rel.serialize(&mut Serializer::new(&mut meta_val)).unwrap();
+        rel.serialize(&mut Serializer::new(&mut meta_val).with_struct_map()).unwrap();
         self.temp_store_tx.del(&old_encoded)?;
         self.temp_store_tx.put(&new_encoded, &meta_val)?;
 
@@ -2029,3 +2035,104 @@ pub(crate) struct InsufficientAccessLevel(
     pub(crate) String,
     pub(crate) AccessLevel,
 );
+
+#[cfg(test)]
+mod catalog_compat_tests {
+    use super::RelationHandle;
+    use rmp_serde::Serializer;
+    use serde::Serialize;
+
+    /// Real, on-disk `edge` relation catalog captured from a production
+    /// mindgraph graph created before mnestic 0.10.0. It is a **13-field
+    /// positional msgpack array** (rmp_serde struct-as-array, written by an
+    /// index-creation path predating `with_struct_map`) — i.e. it has NO
+    /// `tt_gc_floor` element.
+    ///
+    /// Regression guard for the 0.10.0 outage: `tt_gc_floor` was added
+    /// mid-struct, so positional decode misread the `indices` map as
+    /// `Option<i64>` and every legacy graph failed to open with
+    /// "Cannot deserialize relation metadata from bytes". Keeping the field
+    /// last (with `#[serde(default)]`) makes the trailing element optional.
+    const LEGACY_EDGE_CATALOG: &[u8] = &[
+    157, 164, 101, 100, 103, 101, 2, 146, 145, 147, 163, 117, 105, 100, 146, 166,
+    83, 116, 114, 105, 110, 103, 194, 192, 155, 147, 168, 102, 114, 111, 109, 95,
+    117, 105, 100, 146, 166, 83, 116, 114, 105, 110, 103, 194, 192, 147, 166, 116,
+    111, 95, 117, 105, 100, 146, 166, 83, 116, 114, 105, 110, 103, 194, 192, 147,
+    169, 101, 100, 103, 101, 95, 116, 121, 112, 101, 146, 166, 83, 116, 114, 105,
+    110, 103, 194, 192, 147, 165, 108, 97, 121, 101, 114, 146, 166, 83, 116, 114,
+    105, 110, 103, 194, 192, 147, 170, 99, 114, 101, 97, 116, 101, 100, 95, 97,
+    116, 146, 165, 70, 108, 111, 97, 116, 194, 192, 147, 170, 117, 112, 100, 97,
+    116, 101, 100, 95, 97, 116, 146, 165, 70, 108, 111, 97, 116, 194, 192, 147,
+    167, 118, 101, 114, 115, 105, 111, 110, 146, 163, 73, 110, 116, 194, 129, 165,
+    67, 111, 110, 115, 116, 145, 129, 163, 78, 117, 109, 129, 163, 73, 110, 116,
+    1, 147, 170, 99, 111, 110, 102, 105, 100, 101, 110, 99, 101, 146, 165, 70,
+    108, 111, 97, 116, 194, 129, 165, 67, 111, 110, 115, 116, 145, 129, 163, 78,
+    117, 109, 129, 165, 70, 108, 111, 97, 116, 203, 63, 240, 0, 0, 0, 0,
+    0, 0, 147, 166, 119, 101, 105, 103, 104, 116, 146, 165, 70, 108, 111, 97,
+    116, 194, 129, 165, 67, 111, 110, 115, 116, 145, 129, 163, 78, 117, 109, 129,
+    165, 70, 108, 111, 97, 116, 203, 63, 224, 0, 0, 0, 0, 0, 0, 147,
+    172, 116, 111, 109, 98, 115, 116, 111, 110, 101, 95, 97, 116, 146, 165, 70,
+    108, 111, 97, 116, 194, 129, 165, 67, 111, 110, 115, 116, 145, 129, 163, 78,
+    117, 109, 129, 165, 70, 108, 111, 97, 116, 203, 0, 0, 0, 0, 0, 0,
+    0, 0, 147, 165, 112, 114, 111, 112, 115, 146, 164, 74, 115, 111, 110, 194,
+    129, 165, 65, 112, 112, 108, 121, 146, 174, 79, 80, 95, 74, 83, 79, 78,
+    95, 79, 66, 74, 69, 67, 84, 144, 144, 144, 144, 166, 78, 111, 114, 109,
+    97, 108, 194, 133, 168, 102, 114, 111, 109, 95, 105, 100, 120, 146, 157, 173,
+    101, 100, 103, 101, 58, 102, 114, 111, 109, 95, 105, 100, 120, 8, 146, 147,
+    147, 168, 102, 114, 111, 109, 95, 117, 105, 100, 146, 166, 83, 116, 114, 105,
+    110, 103, 194, 192, 147, 169, 101, 100, 103, 101, 95, 116, 121, 112, 101, 146,
+    166, 83, 116, 114, 105, 110, 103, 194, 192, 147, 163, 117, 105, 100, 146, 166,
+    83, 116, 114, 105, 110, 103, 194, 192, 144, 144, 144, 144, 166, 78, 111, 114,
+    109, 97, 108, 194, 128, 128, 128, 128, 160, 147, 1, 3, 0, 171, 102, 114,
+    111, 109, 95, 116, 111, 95, 105, 100, 120, 146, 157, 176, 101, 100, 103, 101,
+    58, 102, 114, 111, 109, 95, 116, 111, 95, 105, 100, 120, 25, 146, 147, 147,
+    168, 102, 114, 111, 109, 95, 117, 105, 100, 146, 166, 83, 116, 114, 105, 110,
+    103, 194, 192, 147, 166, 116, 111, 95, 117, 105, 100, 146, 166, 83, 116, 114,
+    105, 110, 103, 194, 192, 147, 163, 117, 105, 100, 146, 166, 83, 116, 114, 105,
+    110, 103, 194, 192, 144, 144, 144, 144, 166, 78, 111, 114, 109, 97, 108, 194,
+    128, 128, 128, 128, 160, 147, 1, 2, 0, 166, 116, 111, 95, 105, 100, 120,
+    146, 157, 171, 101, 100, 103, 101, 58, 116, 111, 95, 105, 100, 120, 9, 146,
+    147, 147, 166, 116, 111, 95, 117, 105, 100, 146, 166, 83, 116, 114, 105, 110,
+    103, 194, 192, 147, 169, 101, 100, 103, 101, 95, 116, 121, 112, 101, 146, 166,
+    83, 116, 114, 105, 110, 103, 194, 192, 147, 163, 117, 105, 100, 146, 166, 83,
+    116, 114, 105, 110, 103, 194, 192, 144, 144, 144, 144, 166, 78, 111, 114, 109,
+    97, 108, 194, 128, 128, 128, 128, 160, 147, 2, 3, 0, 173, 116, 111, 109,
+    98, 115, 116, 111, 110, 101, 95, 105, 100, 120, 146, 157, 178, 101, 100, 103,
+    101, 58, 116, 111, 109, 98, 115, 116, 111, 110, 101, 95, 105, 100, 120, 23,
+    146, 146, 147, 172, 116, 111, 109, 98, 115, 116, 111, 110, 101, 95, 97, 116,
+    146, 165, 70, 108, 111, 97, 116, 194, 129, 165, 67, 111, 110, 115, 116, 145,
+    129, 163, 78, 117, 109, 129, 165, 70, 108, 111, 97, 116, 203, 0, 0, 0,
+    0, 0, 0, 0, 0, 147, 163, 117, 105, 100, 146, 166, 83, 116, 114, 105,
+    110, 103, 194, 192, 144, 144, 144, 144, 166, 78, 111, 114, 109, 97, 108, 194,
+    128, 128, 128, 128, 160, 146, 10, 0, 168, 116, 121, 112, 101, 95, 105, 100,
+    120, 146, 157, 173, 101, 100, 103, 101, 58, 116, 121, 112, 101, 95, 105, 100,
+    120, 10, 146, 146, 147, 169, 101, 100, 103, 101, 95, 116, 121, 112, 101, 146,
+    166, 83, 116, 114, 105, 110, 103, 194, 192, 147, 163, 117, 105, 100, 146, 166,
+    83, 116, 114, 105, 110, 103, 194, 192, 144, 144, 144, 144, 166, 78, 111, 114,
+    109, 97, 108, 194, 128, 128, 128, 128, 160, 146, 3, 0, 128, 128, 128, 160,
+    ];
+
+    #[test]
+    fn legacy_catalog_without_tt_gc_floor() {
+        // The exact failure mode from prod: this MUST decode.
+        let handle = RelationHandle::decode(LEGACY_EDGE_CATALOG)
+            .expect("legacy 13-field catalog must still decode after the field move");
+        assert_eq!(handle.name, "edge");
+        assert!(
+            handle.tt_gc_floor.is_none(),
+            "missing trailing field must default to None"
+        );
+        // full nested decode really happened (secondary index survived)
+        assert!(handle.indices.contains_key("from_idx"));
+
+        // And the current write format (self-describing map via with_struct_map)
+        // round-trips too, so both on-disk encodings are readable.
+        let mut buf = Vec::new();
+        handle
+            .serialize(&mut Serializer::new(&mut buf).with_struct_map())
+            .unwrap();
+        let reread = RelationHandle::decode(&buf).expect("map-encoded catalog must decode");
+        assert_eq!(reread.name, "edge");
+        assert!(reread.indices.contains_key("from_idx"));
+    }
+}

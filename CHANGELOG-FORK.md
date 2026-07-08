@@ -9,6 +9,22 @@ Post-0.10.5 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
+- **Fix: relation catalogs written before 0.10.0 no longer fail to open
+  ("Cannot deserialize relation metadata from bytes").** The bitemporality
+  work (0.10.0) inserted `RelationHandle::tt_gc_floor` *mid-struct*. rmp_serde
+  encodes structs positionally on the pre-`with_struct_map` catalog-write
+  paths, and `#[serde(default)]` only rescues a *missing trailing* element — so
+  every relation whose catalog was last written as a 13-field array (any graph
+  created before 0.10.0, or updated by an index/rename/destroy path) failed to
+  deserialize on open, taking the whole database down. Two-part fix: (1)
+  `tt_gc_floor` moved to the **last** field of `RelationHandle` so the trailing
+  default applies to legacy arrays; (2) the seven catalog-rewrite paths
+  (`::index`/HNSW/FTS/LSH create, relation rename, index destroy) now serialize
+  with `.with_struct_map()` like the create path, so catalogs are uniformly
+  self-describing maps and future field additions can't reintroduce this class
+  of bug. No migration: legacy arrays stay readable, and re-canonicalize to
+  maps on their next write. Regression-guarded by a real pre-0.10.0 `edge`
+  catalog fixture (`runtime/relation.rs::catalog_compat_tests`).
 - **Greedy join reorder is now a pure function over a resolved `SchemaView`.**
   Internal refactor of the deterministic join-reorder pass shipped in 0.10.5
   (`query/reorder.rs`): the reorder no longer reads mutable planner state,
