@@ -48,9 +48,11 @@ Tiered by value and how ready each item is. This is direction, not dated commitm
 - **Steady release cadence** with clear migration notes.
 - **Closing long-open upstream issues** under active maintenance — e.g. Sled backend `del()` correctness, SQLite-backend performance (prepared statements / `WITHOUT ROWID`), and modeling ergonomics for tree-shaped / JSON-LD data.
 - **Better onboarding** — clearer binder errors and worked examples, lowering the "modeling my data in Datalog" learning curve.
+- **A planner regression suite in CI.** The 0.10.5 join reorder shipped default-on and introduced a pathological plan on one high-fan-out cyclic shape; it was found in the field and fixed in 0.10.7. A scheduled join-planner smoke (a small labelled-subgraph query set plus the reorder pass's own repro, asserting no query regresses past a wall-clock threshold) should catch that class before a release, not after.
 
 ### The differentiators we're building
 
+- **`::explain` as an advisor, not just a plan dump.** mnestic deliberately has no cost-based optimizer — plans are deterministic and the query author is the optimizer. That makes it the engine's job to *tell you what it sees*: which atom is a full scan, where a residual Cartesian product survives, and when a `count()` would factorize (the last two already ship). Extending this into a coherent diagnostic surface is the single cheapest thing we can do for query authors — and it matters more, not less, when the author is an LLM agent that can read the advice and rewrite the query.
 - **Extending the Cypher-read surface** — variable-length paths, `OPTIONAL MATCH`, `WITH`, and undirected relationships (today these return explicit not-yet-supported errors). Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
 - **Stored / named queries** — reusable, parameterized retrieval rules; also the substrate for a future compiled-plan cache.
 - **A first-class ULID type** and sortable auto-keys (the scalar functions already ship; the type does not yet).
@@ -62,6 +64,7 @@ Tiered by value and how ready each item is. This is direction, not dated commitm
 Pursued when a real workload demonstrates the need, always with before/after measurements (the project's baseline-first rule):
 
 - Compiled-plan / prepared-statement caching for high-frequency point reads.
+- **Robust join execution without a cost-based optimizer** — Bloom/semijoin predicate transfer, which pre-filters relations before the join so that plan quality stops depending on getting the join *order* right ([Debunking the Myth of Join Ordering](https://arxiv.org/pdf/2502.15181): with semijoin Bloom pre-filtering, even random join orders land within ≤1.6× of optimal). This is the principled alternative to accumulating join-order heuristics, and it preserves the no-statistics, deterministic-plan design. Gated on diagnostic evidence (`::explain`) that late-applied filters — rather than query cyclicity — are what makes a given slow query slow; the two have different fixes and only the first is reachable this way.
 - Selectivity-tiered filtered vector search (efficient metadata-filtered ANN).
 - Full-text scale headroom (compact posting-list storage + top-*k* pruning).
 - Tunable/weighted fusion and graph-leg improvements, gated on retrieval benchmarks.
@@ -72,6 +75,7 @@ Pursued when a real workload demonstrates the need, always with before/after mea
 mnestic is an **embedded, single-node** engine specialized for agentic memory. To stay excellent at that, the following are intentionally out of scope:
 
 - **Distributed clustering / replication / consensus** inside the engine.
+- **Worst-case-optimal joins, and competitive performance on cyclic subgraph matching.** mnestic evaluates conjunctions with binary joins. On a *cyclic* pattern (a triangle, say) no join order avoids materializing intermediates above the output's worst-case size bound, so benchmarks built around cyclic subgraph matching — LSQB and its relatives — will show mnestic well behind engines with worst-case-optimal join operators, and no planner or reorder tuning changes that. We consider this a fair trade: agentic-memory workloads are point lookups, small neighbourhoods, vector search, and recursive rules, which are overwhelmingly acyclic; and the published evidence on WCOJ is genuinely mixed (large wins on triangles, ~9.6× *worse* on average for pure Generic Join in the Free Join evaluation). If a real agentic-memory workload ever presents cyclic queries, the entry point would be a runtime hash-trie operator gated by syntactic cyclicity — not a wholesale planner change. Until then, hand-factorize cyclic queries; [`docs/specs/cardinality-algebra.md`](docs/specs/cardinality-algebra.md) documents the patterns.
 - **Multi-model breadth** (becoming a general document/time-series/KV store with many query languages) — the opinionated graph+vector+FTS focus is the point.
 - **Data federation / virtualization** over external warehouses or lakehouses (mapping a schema onto external sources without copying). Agentic memory is copy-and-transform; that's a different kind of system.
 - **Cypher *write* semantics** (read interop already ships as an alpha feature; full/write Cypher is not on the path).
