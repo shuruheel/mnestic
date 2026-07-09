@@ -2796,16 +2796,12 @@ impl InnerJoin {
         let cached_data = {
             let mut cache = BTreeSet::new();
             for item in self.right.iter(tx, delta_rule, stores, poison)? {
-                match item {
-                    Ok(tuple) => {
-                        let stored_tuple = right_store_indices
-                            .iter()
-                            .map(|i| tuple[*i].clone())
-                            .collect_vec();
-                        cache.insert(stored_tuple);
-                    }
-                    Err(e) => return Err(e),
-                }
+                let tuple = item?;
+                let stored_tuple = right_store_indices
+                    .iter()
+                    .map(|i| tuple[*i].clone())
+                    .collect_vec();
+                cache.insert(stored_tuple);
             }
             cache.into_iter().collect_vec()
         };
