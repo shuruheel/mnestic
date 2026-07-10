@@ -39,6 +39,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build with RocksDB backend
         run: cargo build -p mnestic --features storage-rocksdb --verbose
+      # The graph-projection freshness protocol has race windows that mem and
+      # sqlite cannot reach: both pin a read transaction by holding a store-wide
+      # read guard, so no writer can run alongside a long-lived reader. RocksDB
+      # pins with a snapshot and takes no such guard. This is the only job that
+      # can run the interleaving suite.
+      - name: Test (graph-projection interleaving)
+        run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --verbose
 
   clippy:
     name: clippy (blocking, -D warnings)

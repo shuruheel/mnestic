@@ -185,3 +185,10 @@ harness = false
 [[bench]]
 name = "time_travel"
 harness = false
+
+# cached graph projection: cold vs warm vs write-invalidated (graph-projection
+# spec §5). Needs `graph-algo`, which the default feature set carries.
+[[bench]]
+name = "graph_projection"
+harness = false
+required-features = ["graph-algo"]

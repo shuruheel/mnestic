@@ -185,11 +185,19 @@ pub type GraphSource = Arc<ProjectionVariant>;   // cached AND ephemeral builds 
 `ProjectionVariant` also caches its `est_bytes` (computed once at build) and carries a `Debug` impl summarising counts. **Emptiness is `indices().is_empty()`, never `node_count() == 0`** — §3.7.5's warning, restated on the type, since Phase 3's ports read it there.
 The ephemeral/positional arm wraps its fresh build in the same `Arc<ProjectionVariant>` (an `Arc::new` costs nothing), so ported algos have exactly one downstream shape and `TarjanSccG`'s refactor (§3.7.3) borrows from it. Consumers treat `inv_indices` as read-only; CC's isolated-node overlay is a local `BTreeSet<DataValue>` — **empty only when the positional nodes input is covered by the projection's `nodes`**; it stays load-bearing for extra positional nodes and for projections created without `nodes`.
 
-**3.5.2 The helper** (on `FixedRulePayload`, `pub`):
+**3.5.2 The helper** (on `FixedRulePayload`, `pub`). As landed — `Poison` is a parameter (the draft forgot it: `run` receives the poison, and both builders need it), and `VariantSpec` carries a fourth field, `register_nodes`, because only PageRank interns a *positional* nodes relation into the id map:
 ```rust
-pub fn graph_input(&self, idx: usize, spec: VariantSpec /* direction, weighted, strict_weights */)
+pub struct VariantSpec { pub undirected: bool, pub weighted: bool,
+                         pub strict_weights: bool, pub register_nodes: bool }
+impl VariantSpec {                       // the two constructors the ports use
+    pub fn unweighted(undirected: bool) -> Self;
+    pub fn weighted(undirected: bool, strict: bool) -> Self;
+    pub fn registering_nodes(self) -> Self;
+}
+pub fn graph_input(&self, idx: usize, spec: VariantSpec, poison: &Poison)
     -> Result<(GraphSource, usize /* input_base */)>
 ```
+Only `(undirected, weighted)` reach the cache key: `strict_weights` and `register_nodes` are consumer policy, not graph shape, so a strict and a permissive consumer share one weighted variant.
 - `graph:` absent → today's path via `as_directed_graph_checked`, `input_base = idx + 1`.
 - `graph:` present → registry lookup → §3.3 consume rule or single-flight build → `input_base = idx`. Positional inputs shift down by one; **optional-trailing-input semantics are preserved** — a shifted `get_input` failure still reads as "absent optional" (the `fixed_rule::not_enough_args` pattern Dijkstra's `termination` matches on, `shortest_path_dijkstra.rs:41,:55`).
 - `strict_weights` ∧ `has_negative` ⇒ loud error naming algo, projection, and policy.
@@ -214,6 +222,18 @@ pub fn graph_input(&self, idx: usize, spec: VariantSpec /* direction, weighted, 
 **3.5.4 The `graph:` guard.** Unknown options are silently ignored engine-wide (baseline row 9). Add `fn supports_projection(&self) -> bool { false }` to the `FixedRule` trait (defaulted ⇒ non-breaking for out-of-tree implementors); ported algos override to `true`; `parse_fixed_rule` (after `init_options`, where the resolved `Arc<Box<dyn FixedRule>>` is in hand) rejects a `graph` option on unsupported rules with a loud error. The lazy family (BFS/DFS/ShortestPathBFS/RandomWalk/ShortestPathAStar/DegreeCentrality) stays unsupported **by design** (baseline row 2); the budgeted-traversal FixedRule (item 9) is their cache-consuming successor.
 
 **3.5.5 Type reachability** (baseline row 17): under `graph-algo`, re-export the consumer-needed types from the crate root — `pub use graph::prelude::{DirectedCsrGraph, Graph, DirectedNeighbors, DirectedNeighborsWithValues}` (or a dedicated `pub mod graph_types`). A future bump of the `graph` dependency is thereby a **semver-major** event for mnestic — noted in the release checklist.
+
+**Phase 3, as landed 2026-07-10** (grammar, sysops, `graph_input`, the parse guard, the 12 ports; 49 tests in `cozo-core/tests/graph_projection.rs`, **19 mutations verified red**). Five deviations, none of them design changes:
+
+1. **`graph_input` takes `&Poison`** and `VariantSpec` gained `register_nodes` — see §3.5.2 above.
+2. **`ProjectionVariant` grew `unweighted()` / `weighted()` / `has_negative()`**, returning `Result<&DirectedCsrGraph<…>>`. `graph_input` selects a variant by the same `weighted` flag it then narrows on, so the error arm is unreachable through it; it exists so that no `pub` accessor panics. `graph()` still hands out the raw `GraphVariant` for out-of-tree consumers (roadmap item 9).
+3. **`::graph create`'s sources may be bare or quoted** (`edges: knows` or `edges: 'knows'`). `graph_opt_field` mirrors `index_opt_field`, so a bare name arrives as `Expr::Binding`; both shapes are accepted, following `::fts create`'s `tokenizer:`. The `graph:` *option* on an algorithm call, by contrast, is a string — an unbound `Expr::Binding` in a fixed-rule option has no defined meaning.
+4. **The dispatch arms delegate to `sysop_{create,drop,list}_graph`** in `runtime/graph_projection.rs`, which have `#[cfg(not(feature = "graph-algo"))]` twins that `bail!` with "compiled without the `graph-algo` feature". The grammar parses `::graph` unconditionally, so a feature-poor build says *why* rather than "syntax error".
+5. **A strict consumer publishes the variant it then refuses.** `graph_input` runs `graph_source` (which may `produce`) before applying `strict_weights`, so `Dijkstra(graph: 'G')` over a negative-weight graph caches the adjacency and *then* errors. This is correct — the variant is fresh and valid, and the *consumer* is what is strict, so the next permissive consumer takes a hit — and it is now pinned by its own test rather than discovered by accident.
+
+**Phase 4, as landed 2026-07-10** (the §5 matrix, the rocksdb interleaving suite, benches, docs; **26 mutations verified red across Phases 3 and 4**). One addition to the plan:
+
+- **A second test-only fence, inside the build.** `#[cfg(any(test, feature = "test-hooks"))]`, invoked in `graph_source` between the build and `produce`, with `Db::set_graph_build_fence_for_tests`. It exists because a transaction's watermark never moves: Door 2 and the produce rule therefore agree on *every* schedule except one where a commit lands strictly between them, i.e. during the build. Without a fence there, §5 row (c) can only be approximated by racing a slow build against a fast writer — a flaky test, which is worse than none. `Db::graph_projection_builds_for_tests` joins it, since from outside the crate a cache hit and a rebuild that returns the same rows are otherwise indistinguishable.
 
 ### 3.6 Memory control (signed: 512 MiB, host API)
 

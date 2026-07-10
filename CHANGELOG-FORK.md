@@ -11,8 +11,94 @@ reconstruct them.
 
 Toward **0.11.0 — cached graph projection** (spec: `docs/specs/graph-projection.md`).
 Phase 0 lands the graph-algorithm changes that stand on their own; Phase 1 lands
-the freshness substrate the cache sits on; Phase 2 lands the cache. None of it
-is reachable from CozoScript until Phase 3 adds `::graph create`.
+the freshness substrate the cache sits on; Phase 2 lands the cache; Phase 3
+opens it to CozoScript and Phase 4 proves it.
+
+### Phase 3 — `::graph`, and twelve algorithms that can use it
+
+**New: `::graph create G {edges: knows, nodes: person}`.** A projection is a
+named, always-fresh, in-memory adjacency over stored relations, shared across
+queries. Twelve graph algorithms take it in place of their positional edge
+relation:
+
+```
+::graph create g { edges: knows, nodes: person }
+
+?[node, group] <~ ConnectedComponents(graph: 'g')
+?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
+```
+
+- `::graph create NAME {edges: R, nodes: R2}` — `nodes` optional; sources may be
+  named bare or quoted. Validated on the spot: the relations must exist, `edges`
+  must have arity ≥ 2, and index, temporary and transaction-time relations are
+  refused with an explanation. Nothing is built; variants materialise on first
+  use.
+- `::graph drop NAME` frees the definition and every adjacency built from it.
+- `::graph list` reports one row per built variant —
+  `name, edges, nodes, variant, est_bytes, built_at, last_used` — and one
+  null-variant row for a projection that has built nothing yet.
+- **Projections are in-memory and are not persisted.** After a restart, using
+  one is a loud error naming the fix.
+- **Ported algorithms** (`graph: 'G'` in place of input 0): `ConnectedComponents`,
+  `StronglyConnectedComponents` / `SCC`, `PageRank`, `ClusteringCoefficients`,
+  `TopSort`, `BetweennessCentrality`, `ClosenessCentrality`,
+  `ShortestPathDijkstra`, `KShortestPathYen`, `MinimumSpanningTreePrim`,
+  `MinimumSpanningForestKruskal`, `LabelPropagation`,
+  `CommunityDetectionLouvain`. Their remaining positional inputs shift down by
+  one, and optional trailing inputs stay optional.
+- **`BFS`, `DFS`, `ShortestPathBFS`, `RandomWalk`, `ShortestPathAStar` and
+  `DegreeCentrality` cannot use a projection**, by design: they evaluate
+  per-tuple condition, heuristic and weight expressions against the edge
+  relation, and a compressed adjacency does not carry that. Because unknown
+  fixed-rule options are ignored engine-wide, a `graph:` option on any rule that
+  cannot consume one is now **rejected at parse time** rather than silently
+  producing a full rebuild.
+- **Negative weights.** One weighted variant serves every consumer, so it is
+  built permissively; a strict consumer (Dijkstra, Yen, Louvain, Betweenness,
+  Closeness) that meets a negative weight in it fails loudly, naming itself, the
+  projection, and why. The positional forms are unchanged: they still reject the
+  weight as they scan it.
+- **`PageRank`'s positional nodes relation cannot be combined with `graph:`** —
+  a cached variant's vertex ids are fixed when it is built. Declare them on the
+  projection with `nodes:` instead. `ConnectedComponents` still takes a
+  positional nodes relation, as an overlay on top of the projection.
+- **`MinimumSpanningTreePrim` now defaults its start to the lowest vertex with
+  an edge**, not to vertex 0. Under a nodes-bearing projection, vertex 0 may be
+  isolated, and Prim from an isolated vertex spans nothing. A user-supplied
+  starting relation is unaffected, diagnostics included.
+- CC and SCC group ids renumber under a nodes-bearing projection (isolated
+  vertices interleave rather than being appended). The *partition* is unchanged;
+  the labels are arbitrary and always were.
+- New in the public API under `graph-algo`: `VariantSpec`, `VariantKey`,
+  `GraphVariant`, `ProjectionVariant`, `GraphSource`,
+  `FixedRulePayload::graph_input`, `FixedRule::supports_projection` (defaulted,
+  so out-of-tree rules keep compiling), and re-exports of the vendored
+  `DirectedCsrGraph`, `Graph`, `DirectedNeighbors` and
+  `DirectedNeighborsWithValues`. **A future bump of the `graph` dependency is
+  therefore a semver-major event for mnestic.**
+
+### Phase 4 — the proof
+
+- 49 end-to-end tests (`tests/graph_projection.rs`) over the script surface: the
+  sysops, the source-kind rejections, the parse-time `graph:` guard, cache
+  hit/miss/eviction observed through `::graph list`, and a positional-vs-`graph:`
+  equivalence row for each of the twelve ports — including one where a
+  mis-shifted input index changes the answer rather than erroring.
+- 5 interleaving tests (`tests/graph_projection_interleaving.rs`, rocksdb +
+  `test-hooks`, and a CI job to run them): `mem` and `sqlite` pin a read
+  transaction by holding a store-wide read guard, so a long-lived reader and a
+  concurrent writer cannot coexist and none of these schedules is reachable
+  there. A writer parked between its durable commit and its token bump is denied
+  a stale hit by `inflight` alone; a reader that pinned before a commit is never
+  served the fresh entry a later transaction published; a commit landing during
+  a build makes the produce rule refuse the result; eight cold readers coalesce
+  into one build; and a reader hammering a projection under continuous write
+  churn never disagrees with a raw scan of the source in the same transaction.
+- A second `test-hooks` fence, inside the projection build, makes the
+  produce-refusal race deterministic instead of timing-dependent.
+- `benches/graph_projection.rs`: cold vs warm vs write-invalidated, for three
+  kernels. The write-invalidated arm is the bound the design is judged on.
+- 26 mutations verified red across Phases 3 and 4.
 
 ### Phase 2 — the cache, the registry, and the memory ceiling
 
