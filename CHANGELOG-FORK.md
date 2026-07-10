@@ -54,7 +54,23 @@ Still no user-visible behaviour changes: nothing here has a grammar yet.
   functions over tuple streams, since the cache scans relations it resolved by
   name. The two public `as_directed_graph*_checked` methods delegate to them,
   unchanged.
-- 33 tests, 32 mutations verified red.
+- **Transaction-time relations are rejected as projection sources** (loudly, at
+  create and at every use). Everywhere else in the engine a selector-less read
+  of a tt-stamped relation means its *current belief*; a projection build's raw
+  scan would deliver the whole history keyspace — retracted rows included — and
+  cache the wrong graph. Rejecting is the honest v1; current-belief projections
+  of tt relations may come later. Plain-Validity relations project fine (their
+  selector-less scan returns every version row on every engine path, so the
+  projection matches the positional form exactly). Found by adversarial review.
+- The same review hardened the concurrency story: a waiter that went stale
+  while queued for the build slot now releases the slot before rebuilding, and
+  a disabled cache (`capacity 0`) skips single-flight entirely — in both cases
+  concurrent builds run in parallel exactly as they do without the cache. A
+  leak-class race in the commit path's lock-free fast check was closed by
+  ordering the entry-count mirror's update ahead of the freshness-token reads.
+- 40 tests, 38 mutations verified red (after the review round; the initial
+  landing was 33/32 with three tests later shown to pass for the wrong reason
+  and since replaced or strengthened).
 
 ### Phase 1 — the write-invalidation substrate
 

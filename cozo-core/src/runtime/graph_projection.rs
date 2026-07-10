@@ -166,13 +166,27 @@ pub(crate) struct ProjectionCache {
     /// Number of cached variants, mirrored out of the registry so that the
     /// commit path can skip taking the registry lock when nothing is cached.
     /// This is the only cost the substrate imposes on a projection-less
-    /// database beyond Phase 1's.
+    /// database beyond Phase 1's. `produce` raises it *conservatively before*
+    /// reading the freshness tokens — see the ordering argument there.
     #[cfg(feature = "graph-algo")]
     entry_count: AtomicUsize,
+    /// Mirror of `Registry::capacity == 0`, readable without the registry
+    /// lock, so a disabled cache can skip the single-flight slot entirely and
+    /// concurrent lookups build in parallel — exactly today's behaviour.
+    /// `false` by default, matching the nonzero default capacity. Staleness is
+    /// harmless: building outside the slot is always correct, it only loses
+    /// coalescing for one lookup.
+    #[cfg(feature = "graph-algo")]
+    capacity_is_zero: std::sync::atomic::AtomicBool,
     /// Completed CSR builds, cached and ephemeral alike. Tests assert on it to
     /// prove that single-flight coalesces and that a hit does not rebuild.
     #[cfg(feature = "graph-algo")]
     build_count: AtomicU64,
+    /// Cumulative count of build-slot acquisitions, for tests that must see
+    /// whether a lookup went through single-flight at all — the slot map
+    /// self-cleans, so its final state cannot witness that.
+    #[cfg(test)]
+    slots_acquired: AtomicU64,
 }
 
 impl ProjectionCache {
@@ -665,6 +679,17 @@ struct ProjectionTempSourceError(String);
 
 #[cfg(feature = "graph-algo")]
 #[derive(Debug, Error, Diagnostic)]
+#[error("cannot project from transaction-time relation '{0}'")]
+#[diagnostic(code(graph::projection_txtime_source))]
+#[diagnostic(help(
+    "a tt-stamped relation's default read is its current belief, but a projection would scan \
+     the raw history keyspace, retracted rows included. Project from a relation without a \
+     TxTime column; current-belief projections of tt relations may come later"
+))]
+struct ProjectionTxTimeSourceError(String);
+
+#[cfg(feature = "graph-algo")]
+#[derive(Debug, Error, Diagnostic)]
 #[error("edge relation '{0}' of a graph projection has arity {1}, needs at least 2")]
 #[diagnostic(code(graph::projection_bad_edge_arity))]
 struct ProjectionEdgeArityError(String, usize);
@@ -736,6 +761,8 @@ impl ProjectionCache {
     pub(crate) fn set_capacity(&self, bytes: usize) {
         let mut reg = self.registry();
         reg.capacity = bytes;
+        self.capacity_is_zero
+            .store(bytes == 0, std::sync::atomic::Ordering::Relaxed);
         reg.evict_until(bytes);
         self.publish_count(&reg);
     }
@@ -914,35 +941,80 @@ impl ProjectionCache {
             _ => return,
         }
 
-        let (edges_token, nodes_token) = {
-            let states = self.states();
-            let Some(et) = token_if_fresh(&states, edges_id, watermark) else {
-                return;
-            };
-            let nt = match nodes_id {
-                None => 0,
-                Some(n) => match token_if_fresh(&states, n, watermark) {
-                    None => return,
-                    Some(t) => t,
-                },
-            };
-            (et, nt)
-        };
+        // Raise the commit path's fast-check mirror BEFORE reading the tokens,
+        // and let `publish_count` restore it to exact on every exit below.
+        // This closes the one hole in `drop_entries_sourced_on`'s lock-free
+        // fast path: an insert-with-old-tokens requires this thread's
+        // `rel_states` read (below) to precede the writer's bump, and the
+        // writer's `entry_count` load follows its bump — so this store, being
+        // sequenced before our `rel_states` acquisition, is chained ahead of
+        // the writer's load through the `rel_states` mutex and the writer
+        // cannot miss it. The writer then takes the registry lock, waits for
+        // us, and sweeps what we inserted. Without this ordering the writer
+        // could read a stale zero and strand our just-inserted, permanently
+        // unreachable entry as counted-but-dead cache.
+        self.entry_count.fetch_add(1, Ordering::Relaxed);
 
-        if est_bytes > reg.capacity {
-            // A zero ceiling means caching is off, which is a choice, not a
-            // problem to warn about on every query.
-            if reg.capacity > 0 {
-                log::warn!(
-                    "graph projection '{name}' variant {} needs ~{est_bytes} bytes, over the whole \
-                     {} byte cache ceiling; building it fresh for every query. Raise the ceiling \
-                     with `Db::set_graph_projection_capacity`.",
-                    key.label(),
-                    reg.capacity
-                );
+        'rules: {
+            let (edges_token, nodes_token) = {
+                let states = self.states();
+                let Some(et) = token_if_fresh(&states, edges_id, watermark) else {
+                    break 'rules;
+                };
+                let nt = match nodes_id {
+                    None => 0,
+                    Some(n) => match token_if_fresh(&states, n, watermark) {
+                        None => break 'rules,
+                        Some(t) => t,
+                    },
+                };
+                (et, nt)
+            };
+
+            if est_bytes > reg.capacity {
+                // A zero ceiling means caching is off, which is a choice, not
+                // a problem to warn about on every query.
+                if reg.capacity > 0 {
+                    log::warn!(
+                        "graph projection '{name}' variant {} needs ~{est_bytes} bytes, over the \
+                         whole {} byte cache ceiling; building it fresh for every query. Raise \
+                         the ceiling with `Db::set_graph_projection_capacity`.",
+                        key.label(),
+                        reg.capacity
+                    );
+                }
+                break 'rules;
             }
-            return;
+            self.insert_entry(
+                &mut reg,
+                name,
+                key,
+                edges_id,
+                nodes_id,
+                edges_token,
+                nodes_token,
+                est_bytes,
+                source,
+            );
         }
+        // On every exit — insert or refusal — restore the mirror to exact.
+        self.publish_count(&reg);
+    }
+
+    /// The tail of [`produce`](Self::produce): the entry passed every rule.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_entry(
+        &self,
+        reg: &mut Registry,
+        name: &str,
+        key: VariantKey,
+        edges_id: RelationId,
+        nodes_id: Option<RelationId>,
+        edges_token: u64,
+        nodes_token: u64,
+        est_bytes: usize,
+        source: &GraphSource,
+    ) {
 
         // Replace any older entry for this exact variant before making room,
         // so its bytes are not counted twice.
@@ -973,10 +1045,11 @@ impl ProjectionCache {
             },
         );
         reg.used_bytes += est_bytes;
-        self.publish_count(&reg);
     }
 
     fn acquire_slot(&self, key: &BuildKey) -> Arc<Mutex<()>> {
+        #[cfg(test)]
+        self.slots_acquired.fetch_add(1, Ordering::Relaxed);
         let mut slots = self
             .build_slots
             .lock()
@@ -1106,11 +1179,23 @@ pub(crate) fn create_projection(
         .create(name, edges.into(), nodes.map(|n| n.into()))
 }
 
-/// Resolve a projection source, rejecting the two relation kinds that can
+/// Resolve a projection source, rejecting the three relation kinds that can
 /// never be one: index relations (their name carries a `:`, and they hold the
-/// index keyspace rather than the base tuples) and temporary relations (their
+/// index keyspace rather than the base tuples); temporary relations (their
 /// ids come from a per-transaction counter and collide numerically with
-/// persistent ids, and they die with the transaction).
+/// persistent ids, and they die with the transaction); and tt-stamped
+/// relations, whose engine-wide *default read* is their current belief
+/// (`resolve_temporal_read` maps a selector-less read to `AsOf(MAX)` — the
+/// migration invariant), while a projection build's raw scan would deliver
+/// the whole history keyspace, retraction rows included. Serving that CSR
+/// would violate always-fresh in the worst way: not stale, *wrong*, and
+/// cached for every subsequent fresh transaction. Plain-`Validity` (vt-only)
+/// relations are NOT rejected — for those, a selector-less scan returns every
+/// version row on every engine path, so the projection matches the positional
+/// form exactly.
+///
+/// Running at every use, not just at create, this also catches a tt relation
+/// `::rename`d into a source name after the projection was defined.
 #[cfg(feature = "graph-algo")]
 fn resolve_source(tx: &SessionTx<'_>, name: &str) -> Result<RelationHandle> {
     if name.contains(':') {
@@ -1126,6 +1211,9 @@ fn resolve_source(tx: &SessionTx<'_>, name: &str) -> Result<RelationHandle> {
     // id collision this guards against is silent and unrecoverable.
     if handle.is_temp {
         bail!(ProjectionTempSourceError(name.to_string()));
+    }
+    if handle.has_txtime() {
+        bail!(ProjectionTxTimeSourceError(name.to_string()));
     }
     Ok(handle)
 }
@@ -1190,6 +1278,16 @@ pub(crate) fn graph_source(
         return build();
     }
 
+    // A disabled cache never populates, so coalescing behind a slot would
+    // only serialize builds that at HEAD ran in parallel. Skip single-flight
+    // entirely: with the cache off, every lookup behaves exactly as today.
+    if cache
+        .capacity_is_zero
+        .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        return build();
+    }
+
     // Single-flight: concurrent misses on this variant coalesce here. The
     // winner builds from its own snapshot; the losers wake, re-run the consume
     // rule against *their* watermarks, and take the entry if it is fresh for
@@ -1202,9 +1300,10 @@ pub(crate) fn graph_source(
     let slot = cache.acquire_slot(&build_key);
     let outcome = {
         let _guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        match cache.consume(name, generation, key, edges_id, nodes_id, tx.watermark) {
-            Some(hit) => Ok(hit),
-            None => build().inspect(|source| {
+        match slot_action(cache, name, generation, key, edges_id, nodes_id, &sources, tx.watermark)
+        {
+            SlotAction::Hit(hit) => Some(Ok(hit)),
+            SlotAction::BuildAndPublish => Some(build().inspect(|source| {
                 // Door 3 lives inside `produce`, which simply declines.
                 cache.produce(
                     name,
@@ -1215,12 +1314,57 @@ pub(crate) fn graph_source(
                     tx.watermark,
                     source,
                 );
-            }),
+            })),
+            SlotAction::BuildOutsideTheSlot => None,
         }
     };
     drop(slot);
     cache.release_slot(&build_key);
-    outcome
+    match outcome {
+        Some(result) => result,
+        None => build(),
+    }
+}
+
+/// What a transaction holding the build slot should do, given the cache state
+/// it finds on waking. Pure decision, split out so the stale-waiter arm is
+/// testable without a real thread interleaving.
+#[cfg(feature = "graph-algo")]
+enum SlotAction {
+    /// A fresh entry appeared while queued — the single-flight payoff.
+    Hit(GraphSource),
+    /// Still cold, still fresh: build under the slot and offer it to the cache.
+    BuildAndPublish,
+    /// The sources were bumped while this transaction queued. Freshness never
+    /// comes back at a fixed watermark, so its `produce` would be refused —
+    /// building inside the slot would only make every queued reader (including
+    /// fresh ones that *can* publish) wait out a build that publishes nothing.
+    /// Same principle as Door 2, re-checked after the wait it could not
+    /// foresee. Found by adversarial review 2026-07-10: without this arm, one
+    /// commit landing mid-build serializes every queued reader's rebuild
+    /// behind the slot, where at HEAD they ran in parallel.
+    BuildOutsideTheSlot,
+}
+
+#[cfg(feature = "graph-algo")]
+#[allow(clippy::too_many_arguments)]
+fn slot_action(
+    cache: &ProjectionCache,
+    name: &str,
+    generation: u64,
+    key: VariantKey,
+    edges_id: RelationId,
+    nodes_id: Option<RelationId>,
+    sources: &[RelationId],
+    watermark: u64,
+) -> SlotAction {
+    if let Some(hit) = cache.consume(name, generation, key, edges_id, nodes_id, watermark) {
+        return SlotAction::Hit(hit);
+    }
+    if !cache.all_fresh(sources.iter().copied(), watermark) {
+        return SlotAction::BuildOutsideTheSlot;
+    }
+    SlotAction::BuildAndPublish
 }
 
 /// Scan the sources through this transaction's snapshot and build the CSR.
@@ -2103,6 +2247,45 @@ mod cache_tests {
         assert!(define(&db, "g", "knows", None).is_err(), "duplicate name");
     }
 
+    /// A tt-stamped relation's default read is its current belief on every
+    /// engine path — plain Datalog and positional fixed-rule inputs both
+    /// resolve a selector-less read to `AsOf(MAX)` — but a projection build's
+    /// raw scan would deliver the whole history keyspace, retracted rows
+    /// included, and cache the wrong graph for every fresh transaction. Found
+    /// by adversarial review 2026-07-10.
+    #[test]
+    fn a_transaction_time_relation_is_rejected_as_a_source() {
+        let db = db_with_edges();
+        run(&db, ":create tt_knows {a: Int, b: Int, tt: TxTime}").unwrap();
+        run(&db, ":create bi_knows {a: Int, vt: Validity, tt: TxTime => b: Int}").unwrap();
+        run(&db, ":create vt_knows {a: Int, b: Int, vt: Validity}").unwrap();
+
+        for source in ["tt_knows", "bi_knows"] {
+            let err = define(&db, "g", source, None).unwrap_err().to_string();
+            assert!(
+                err.contains("transaction-time"),
+                "a tt-stamped edges source must be rejected by name: {err}"
+            );
+            let err = define(&db, "g", "knows", Some(source))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("transaction-time"), "the nodes slot too: {err}");
+        }
+
+        // Plain-Validity relations are fine: a selector-less scan returns
+        // every version row on every engine path, so the projection matches
+        // the positional form exactly.
+        define(&db, "vt_ok", "vt_knows", None).unwrap();
+
+        // The guard runs at every use, not only at create: a tt relation
+        // renamed into the source name after the fact errors loudly instead
+        // of silently projecting history.
+        define(&db, "g", "knows", None).unwrap();
+        run(&db, "::rename knows -> knows_real, tt_knows -> knows").unwrap();
+        let err = fetch(&db, "g", DIRECTED).unwrap_err().to_string();
+        assert!(err.contains("transaction-time"), "{err}");
+    }
+
     #[test]
     fn an_unregistered_projection_is_a_loud_error() {
         let db = db_with_edges();
@@ -2269,9 +2452,13 @@ mod cache_tests {
     }
 
     /// A missing third column defaults to weight 1.0, so a 2-column relation
-    /// projects into a weighted variant without complaint.
+    /// projects into a weighted variant without complaint. The weights are
+    /// read back out of the CSR: asserting only on counts would stay green
+    /// under any wrong default.
     #[test]
     fn an_unweighted_source_yields_unit_weights() {
+        use graph::prelude::DirectedNeighborsWithValues;
+
         let db = db_with_edges();
         define(&db, "g", "knows", None).unwrap();
         match fetch(&db, "g", WEIGHTED).unwrap().graph() {
@@ -2281,6 +2468,15 @@ mod cache_tests {
             } => {
                 assert!(!has_negative);
                 assert_eq!(graph.edge_count(), 4);
+                let weights: Vec<f32> = (0..graph.node_count())
+                    .flat_map(|v| graph.out_neighbors_with_values(v))
+                    .map(|t| t.value)
+                    .collect();
+                assert_eq!(weights.len(), 4);
+                assert!(
+                    weights.iter().all(|w| *w == 1.0),
+                    "a missing weight column must default to exactly 1.0: {weights:?}"
+                );
             }
             _ => panic!("asked for a weighted variant"),
         }
@@ -2444,6 +2640,63 @@ mod cache_tests {
         let after = fetch(&db, "g", DIRECTED).unwrap();
         assert_eq!(builds(&db), before + 1, "so the entry cannot be served");
         assert_eq!(counts(&after), (3, 2));
+    }
+
+    /// The strictest form of the binding, and the one the spec's forbidden
+    /// alternative actually fails: rotate the edges and nodes relations OF THE
+    /// SAME projection into each other's slots. The *set* of resolved ids is
+    /// unchanged — only their assignment to slots moved — so an
+    /// unordered-set comparison in the consume rule would serve the old entry
+    /// with its edges and nodes exchanged. Tokens cannot catch it here either:
+    /// on a reopened store both read 0, and on a same-process fixture their
+    /// distinct values would mask the id check entirely (which is why the two
+    /// sibling tests alone were insufficient — found by adversarial review
+    /// 2026-07-10). Only a per-slot id comparison stands.
+    #[cfg(feature = "storage-sqlite")]
+    #[test]
+    fn rotating_the_edges_and_nodes_slots_of_one_projection_forces_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rotate.sqlite");
+        {
+            let db = crate::new_cozo_sqlite(&path).unwrap();
+            run(&db, ":create e {a: Int, b: Int}").unwrap();
+            run(&db, ":create n {p: Int, q: Int}").unwrap();
+            run(&db, "?[a, b] <- [[1, 2]] :put e {a, b}").unwrap();
+            run(&db, "?[p, q] <- [[5, 6], [6, 7]] :put n {p, q}").unwrap();
+        }
+
+        let db = crate::new_cozo_sqlite(&path).unwrap();
+        let e = rel_id(&db, "e");
+        let n = rel_id(&db, "n");
+        assert_eq!(db.graph_projections.rel_state(e).token, 0);
+        assert_eq!(db.graph_projections.rel_state(n).token, 0);
+
+        define(&db, "g", "e", Some("n")).unwrap();
+        let before_rotation = fetch(&db, "g", DIRECTED).unwrap();
+        assert_eq!(
+            counts(&before_rotation),
+            (4, 1),
+            "vertices 5, 6 (from n) and 1, 2 (edge endpoints); one edge"
+        );
+        let before = builds(&db);
+
+        run(&db, "::rename e -> rot_tmp, n -> e, rot_tmp -> n").unwrap();
+        assert_eq!(cached(&db), 1, "a rename invalidates nothing");
+        assert_eq!(rel_id(&db, "e"), n, "the ids rotated with the names");
+        assert_eq!(rel_id(&db, "n"), e);
+
+        let after = fetch(&db, "g", DIRECTED).unwrap();
+        assert_eq!(
+            builds(&db),
+            before + 1,
+            "the id SET is unchanged but the slot assignment is not — \
+             serving the old entry would swap edges and nodes"
+        );
+        assert_eq!(
+            counts(&after),
+            (4, 2),
+            "edges now come from old n (5→6, 6→7); nodes from old e's column a"
+        );
     }
 
     /// The same, one slot over: the nodes slot's id binding is checked too, and
@@ -2691,6 +2944,37 @@ mod cache_tests {
         assert_eq!(cached(&db), 0);
     }
 
+    /// The produce half of Door 1, pinned on its own. In the warm-cache test
+    /// above, "published nothing" also follows from the consume hit never
+    /// reaching a build at all — so a mutant that lets a dirty transaction
+    /// fall through to `produce` stays green there. Here the cache is COLD:
+    /// the dirty transaction must build, its tokens are unmoved (nothing has
+    /// committed), so `FRESH` holds and the produce rule alone would happily
+    /// publish a CSR built from uncommitted rows. Only Door 1 stands in the
+    /// way. Found by adversarial review 2026-07-10.
+    #[test]
+    fn a_dirty_transaction_publishes_nothing_even_into_a_cold_cache() {
+        let db = db_with_edges();
+        define(&db, "g", "knows", None).unwrap();
+        assert_eq!(cached(&db), 0, "the cache must start cold");
+        let before = builds(&db);
+
+        {
+            let mut tx = db.transact_write().unwrap();
+            let handle = tx.get_relation("knows", false).unwrap();
+            tx.mark_dirty(&handle);
+            let g = graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default()).unwrap();
+            assert_eq!(builds(&db), before + 1, "the dirty transaction built");
+            assert_eq!(counts(&g), (5, 4));
+            assert_eq!(
+                cached(&db),
+                0,
+                "and must not publish: its snapshot may hold uncommitted rows \
+                 that no other transaction can see"
+            );
+        }
+    }
+
     /// Spec §5, interleaving test (a), on the consume rule. A writer parked
     /// between its durable commit and its token bump has moved no token, so
     /// only `inflight` stands between a reader and a stale hit — and only
@@ -2772,6 +3056,48 @@ mod cache_tests {
 
     // ---- Single-flight ----
 
+    /// The three-way decision a slot holder makes on waking, driven directly
+    /// at the watermarks a real interleaving would produce (`mem` cannot host
+    /// the interleaving itself — a read transaction holds a lock guard for its
+    /// life). The load-bearing arm is the third: a waiter whose sources were
+    /// bumped while it queued must build *outside* the slot — its produce
+    /// would be refused, so building inside would serialize every queued
+    /// reader behind a build that publishes nothing.
+    #[test]
+    fn a_waiter_that_went_stale_while_queued_builds_outside_the_slot() {
+        use super::{slot_action, SlotAction};
+
+        let db = db_with_edges();
+        define(&db, "g", "knows", None).unwrap();
+        let cache = &db.graph_projections;
+        let (generation, ..) = cache.definition("g").unwrap();
+        let edges = rel_id(&db, "knows");
+        let sources = [edges];
+        let watermark = cache.watermark();
+
+        // Cold and fresh: the winner's case.
+        assert!(matches!(
+            slot_action(cache, "g", generation, DIRECTED, edges, None, &sources, watermark),
+            SlotAction::BuildAndPublish
+        ));
+
+        // An entry landed while queued, still fresh for us: the payoff case.
+        fetch(&db, "g", DIRECTED).unwrap();
+        assert!(matches!(
+            slot_action(cache, "g", generation, DIRECTED, edges, None, &sources, watermark),
+            SlotAction::Hit(_)
+        ));
+
+        // The sources were bumped while we queued: our watermark predates the
+        // bump, freshness never comes back, produce would refuse — get out of
+        // everyone's way and build outside.
+        cache.bump_token_leaving_entries(edges);
+        assert!(matches!(
+            slot_action(cache, "g", generation, DIRECTED, edges, None, &sources, watermark),
+            SlotAction::BuildOutsideTheSlot
+        ));
+    }
+
     /// §3.2.8. N concurrent cold readers coalesce into exactly one build: the
     /// winner holds the per-variant slot across its build, and the losers wake
     /// to a populated, fresh-for-them entry.
@@ -2845,6 +3171,35 @@ mod cache_tests {
         db.set_graph_projection_capacity(1 << 20);
         fetch(&db, "g", DIRECTED).unwrap();
         assert_eq!(cached(&db), 1, "raising the ceiling re-enables caching");
+    }
+
+    /// With the cache off, lookups must not touch single-flight at all: a
+    /// disabled cache never populates, so a slot could only serialize builds
+    /// that run in parallel today. (The slot map self-cleans, so only the
+    /// cumulative acquisition counter can witness this.) Found by adversarial
+    /// review 2026-07-10.
+    #[test]
+    fn capacity_zero_skips_the_build_slot() {
+        let db = db_with_edges();
+        define(&db, "g", "knows", None).unwrap();
+        db.set_graph_projection_capacity(0);
+
+        let slots_before = db.graph_projections.slots_acquired.load(Ordering::Relaxed);
+        fetch(&db, "g", DIRECTED).unwrap();
+        fetch(&db, "g", DIRECTED).unwrap();
+        assert_eq!(
+            db.graph_projections.slots_acquired.load(Ordering::Relaxed),
+            slots_before,
+            "a disabled cache must bypass single-flight"
+        );
+
+        db.set_graph_projection_capacity(1 << 20);
+        fetch(&db, "g", DIRECTED).unwrap();
+        assert_eq!(
+            db.graph_projections.slots_acquired.load(Ordering::Relaxed),
+            slots_before + 1,
+            "re-enabling brings the slot back"
+        );
     }
 
     #[test]
