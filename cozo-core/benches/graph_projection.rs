@@ -49,7 +49,10 @@ fn make_db() -> DbInstance {
     for i in 0..N {
         for k in 1..=DEGREE {
             let j = (i * k + 7 * k) % N;
-            rows.push(DataValue::List(vec![DataValue::from(i), DataValue::from(j)]));
+            rows.push(DataValue::List(vec![
+                DataValue::from(i),
+                DataValue::from(j),
+            ]));
         }
     }
     // One `:put` per 100k rows keeps the constant rule's parse tree sane.

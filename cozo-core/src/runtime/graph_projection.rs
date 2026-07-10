@@ -762,7 +762,11 @@ impl Registry {
                 self.used_bytes = 0;
                 break;
             };
-            let Some(entry) = self.defs.get_mut(&name).and_then(|d| d.variants.remove(&key)) else {
+            let Some(entry) = self
+                .defs
+                .get_mut(&name)
+                .and_then(|d| d.variants.remove(&key))
+            else {
                 break;
             };
             self.used_bytes = self.used_bytes.saturating_sub(entry.est_bytes);
@@ -1087,7 +1091,11 @@ impl ProjectionCache {
         reg.lru_seq += 1;
         let seq = reg.lru_seq;
         let now = seconds_since_the_epoch().unwrap_or(0.0);
-        if let Some(entry) = reg.defs.get_mut(name).and_then(|d| d.variants.get_mut(&key)) {
+        if let Some(entry) = reg
+            .defs
+            .get_mut(name)
+            .and_then(|d| d.variants.get_mut(&key))
+        {
             entry.lru_seq = seq;
             entry.last_used_at = now;
         }
@@ -1193,7 +1201,6 @@ impl ProjectionCache {
         est_bytes: usize,
         source: &GraphSource,
     ) {
-
         // Replace any older entry for this exact variant before making room,
         // so its bytes are not counted twice.
         if let Some(old) = reg.defs.get_mut(name).and_then(|d| d.variants.remove(&key)) {
@@ -1294,7 +1301,10 @@ fn estimate_bytes(
     let offsets = 2u64 * (node_count as u64 + 1) * 4;
     let targets = 2u64 * edge_count as u64 * target_bytes as u64;
     let idx = indices.len() as u64 * value
-        + indices.iter().map(|v| value_heap_bytes(v) as u64).sum::<u64>();
+        + indices
+            .iter()
+            .map(|v| value_heap_bytes(v) as u64)
+            .sum::<u64>();
     let inv = inv_indices.len() as u64
         * (value + std::mem::size_of::<u32>() as u64 + BTREE_ENTRY_OVERHEAD as u64)
         + inv_indices
@@ -1399,7 +1409,8 @@ pub(crate) fn sysop_list_graphs(tx: &SessionTx<'_>) -> Result<crate::NamedRows> 
             vec![
                 DataValue::from(s.name.as_str()),
                 DataValue::from(s.edges.as_str()),
-                s.nodes.map_or(DataValue::Null, |n| DataValue::from(n.as_str())),
+                s.nodes
+                    .map_or(DataValue::Null, |n| DataValue::from(n.as_str())),
                 s.variant.map_or(DataValue::Null, DataValue::from),
                 s.est_bytes
                     .map_or(DataValue::Null, |b| DataValue::from(b as i64)),
@@ -1587,8 +1598,16 @@ pub(crate) fn graph_source(
     let slot = cache.acquire_slot(&build_key);
     let outcome = {
         let _guard = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        match slot_action(cache, name, generation, key, edges_id, nodes_id, &sources, tx.watermark)
-        {
+        match slot_action(
+            cache,
+            name,
+            generation,
+            key,
+            edges_id,
+            nodes_id,
+            &sources,
+            tx.watermark,
+        ) {
             SlotAction::Hit(hit) => Some(Ok(hit)),
             SlotAction::BuildAndPublish => Some(build().inspect(|source| {
                 // The one window in which a concurrent commit can turn a legal
@@ -1670,8 +1689,7 @@ fn build_variant(
     poison: &Poison,
 ) -> Result<ProjectionVariant> {
     let edge_iter: TupleIter<'_> = Box::new(edges.scan_all(tx));
-    let node_iter: Option<TupleIter<'_>> =
-        nodes.map(|n| Box::new(n.scan_all(tx)) as TupleIter<'_>);
+    let node_iter: Option<TupleIter<'_>> = nodes.map(|n| Box::new(n.scan_all(tx)) as TupleIter<'_>);
 
     Ok(if key.weighted {
         let (graph, indices, inv_indices, has_negative) = build_weighted_csr(
@@ -2584,7 +2602,11 @@ mod cache_tests {
     fn a_transaction_time_relation_is_rejected_as_a_source() {
         let db = db_with_edges();
         run(&db, ":create tt_knows {a: Int, b: Int, tt: TxTime}").unwrap();
-        run(&db, ":create bi_knows {a: Int, vt: Validity, tt: TxTime => b: Int}").unwrap();
+        run(
+            &db,
+            ":create bi_knows {a: Int, vt: Validity, tt: TxTime => b: Int}",
+        )
+        .unwrap();
         run(&db, ":create vt_knows {a: Int, b: Int, vt: Validity}").unwrap();
 
         for source in ["tt_knows", "bi_knows"] {
@@ -2596,7 +2618,10 @@ mod cache_tests {
             let err = define(&db, "g", "knows", Some(source))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("transaction-time"), "the nodes slot too: {err}");
+            assert!(
+                err.contains("transaction-time"),
+                "the nodes slot too: {err}"
+            );
         }
 
         // Plain-Validity relations are fine: a selector-less scan returns
@@ -2706,7 +2731,11 @@ mod cache_tests {
     fn a_nodes_relation_gives_isolated_vertices_real_ids() {
         let db = db_with_edges();
         run(&db, ":create person {p: Int}").unwrap();
-        run(&db, "?[p] <- [[1], [2], [3], [4], [5], [99]] :put person {p}").unwrap();
+        run(
+            &db,
+            "?[p] <- [[1], [2], [3], [4], [5], [99]] :put person {p}",
+        )
+        .unwrap();
 
         define(&db, "with_nodes", "knows", Some("person")).unwrap();
         let g = fetch(&db, "with_nodes", DIRECTED).unwrap();
@@ -3048,7 +3077,10 @@ mod cache_tests {
         }
 
         let db = crate::new_cozo_sqlite(&path).unwrap();
-        assert_eq!(db.graph_projections.rel_state(rel_id(&db, "person")).token, 0);
+        assert_eq!(
+            db.graph_projections.rel_state(rel_id(&db, "person")).token,
+            0
+        );
         assert_eq!(db.graph_projections.rel_state(rel_id(&db, "city")).token, 0);
 
         define(&db, "g", "knows", Some("person")).unwrap();
@@ -3193,15 +3225,7 @@ mod cache_tests {
         assert!(token > 0, "the fixture's writes gave `knows` a token");
         assert_eq!(cached(&db), 1);
 
-        cache.produce(
-            "h",
-            h_generation,
-            DIRECTED,
-            edges,
-            None,
-            token - 1,
-            &source,
-        );
+        cache.produce("h", h_generation, DIRECTED, edges, None, token - 1, &source);
         assert_eq!(cached(&db), 1, "an unfresh producer must not publish");
 
         cache.produce("h", h_generation, DIRECTED, edges, None, token, &source);
@@ -3486,7 +3510,11 @@ mod cache_tests {
 
         let before = builds(&db);
         let g = fetch(&db, "g", DIRECTED).unwrap();
-        assert_eq!(counts(&g), (5, 4), "lookups still answer, from fresh builds");
+        assert_eq!(
+            counts(&g),
+            (5, 4),
+            "lookups still answer, from fresh builds"
+        );
         assert_eq!(builds(&db), before + 1);
         assert_eq!(cached(&db), 0, "and never populate");
 
@@ -3619,6 +3647,10 @@ mod cache_tests {
         cache.produce("g", generation, DIRECTED, edges, None, token, &source);
 
         assert_eq!(cached(&db), 1);
-        assert_eq!(cache.bytes_used(), once, "the older entry's bytes were freed");
+        assert_eq!(
+            cache.bytes_used(),
+            once,
+            "the older entry's bytes were freed"
+        );
     }
 }

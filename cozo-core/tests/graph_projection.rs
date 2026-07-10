@@ -61,10 +61,7 @@ fn graph_db() -> DbInstance {
         "#,
     );
     run(&db, ":create person {id: Int}");
-    run(
-        &db,
-        "?[id] <- [[1],[2],[3],[4],[5],[9]] :put person {id}",
-    );
+    run(&db, "?[id] <- [[1],[2],[3],[4],[5],[9]] :put person {id}");
     db
 }
 
@@ -126,7 +123,15 @@ fn create_list_and_drop_round_trip() {
     let listing = run(&db, "::graph list");
     assert_eq!(
         listing.headers,
-        vec!["name", "edges", "nodes", "variant", "est_bytes", "built_at", "last_used"]
+        vec![
+            "name",
+            "edges",
+            "nodes",
+            "variant",
+            "est_bytes",
+            "built_at",
+            "last_used"
+        ]
     );
     // Cold: one row, definition only.
     assert_eq!(rows(&listing).len(), 1);
@@ -308,11 +313,20 @@ fn the_graph_option_is_rejected_on_a_rule_that_cannot_use_it() {
     // which a CSR does not carry: excluded by design, not by omission. Unknown
     // options are ignored engine-wide, so without the guard this would silently
     // rebuild the graph the slow way.
-    let msg = err(&db, "?[n, d, o, i] <~ DegreeCentrality(*knows[a, b, w], graph: 'g')");
-    assert!(msg.contains("cannot take its edges from a graph projection"), "{msg}");
+    let msg = err(
+        &db,
+        "?[n, d, o, i] <~ DegreeCentrality(*knows[a, b, w], graph: 'g')",
+    );
+    assert!(
+        msg.contains("cannot take its edges from a graph projection"),
+        "{msg}"
+    );
     // …and so is a utility that has no graph at all.
     let msg = err(&db, "?[a] <~ Constant(data: [[1]], graph: 'g')");
-    assert!(msg.contains("cannot take its edges from a graph projection"), "{msg}");
+    assert!(
+        msg.contains("cannot take its edges from a graph projection"),
+        "{msg}"
+    );
 }
 
 #[test]
@@ -421,7 +435,10 @@ fn each_variant_is_built_and_listed_separately() {
     run(&db, "::graph create g {edges: knows}");
     run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')"); // undirected, unweighted
     run(&db, "?[i, n] <~ TopSort(graph: 'g')"); // directed, unweighted
-    run(&db, "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')"); // undirected+weighted
+    run(
+        &db,
+        "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')",
+    ); // undirected+weighted
 
     let variants: BTreeSet<String> = listed(&db).into_iter().map(|v| v.0).collect();
     assert_eq!(
@@ -617,7 +634,10 @@ fn a_vertex_repeated_in_the_positional_overlay_is_emitted_once() {
     run(&db, ":create pairs {a: Int, b: Int}");
     run(&db, "?[a, b] <- [[100, 1], [100, 2]] :put pairs {a, b}");
 
-    let projected = run(&db, "?[n, c] <~ ConnectedComponents(*pairs[a, b], graph: 'g')");
+    let projected = run(
+        &db,
+        "?[n, c] <~ ConnectedComponents(*pairs[a, b], graph: 'g')",
+    );
     let positional = run(
         &db,
         "?[n, c] <~ ConnectedComponents(*knows[a, b, w], *pairs[x, y])",
@@ -659,7 +679,10 @@ fn strongly_connected_components_agree_at_partition_level() {
         "?[n, c] <~ StronglyConnectedComponents(graph: 'g')",
     );
     // …and the two really do differ: SCC splits 4→5, CC does not.
-    let scc = partition(&run(&db, "?[n, c] <~ StronglyConnectedComponents(graph: 'g')"));
+    let scc = partition(&run(
+        &db,
+        "?[n, c] <~ StronglyConnectedComponents(graph: 'g')",
+    ));
     let cc = partition(&run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')"));
     assert_ne!(scc, cc);
 }
@@ -805,12 +828,22 @@ fn prim_agrees_and_its_default_start_skips_an_isolated_vertex() {
     run(&db2, ":create v {id: Int}");
     run(&db2, "?[id] <- [[0],[1],[2]] :put v {id}"); // 0 is isolated and first
     run(&db2, "::graph create g {edges: e, nodes: v}");
-    let mst = rows(&run(&db2, "?[a, b, c] <~ MinimumSpanningTreePrim(graph: 'g')"));
-    assert_eq!(mst.len(), 1, "the isolated start swallowed the tree: {mst:?}");
+    let mst = rows(&run(
+        &db2,
+        "?[a, b, c] <~ MinimumSpanningTreePrim(graph: 'g')",
+    ));
+    assert_eq!(
+        mst.len(),
+        1,
+        "the isolated start swallowed the tree: {mst:?}"
+    );
 
     // …but a user-supplied starting relation still gets its diagnostic.
     run(&db2, ":create s {id: Int}");
-    let msg = err(&db2, "?[a, b, c] <~ MinimumSpanningTreePrim(*s[id], graph: 'g')");
+    let msg = err(
+        &db2,
+        "?[a, b, c] <~ MinimumSpanningTreePrim(*s[id], graph: 'g')",
+    );
     assert!(msg.contains("empty"), "{msg}");
 }
 
@@ -857,7 +890,10 @@ fn an_unweighted_source_gives_every_edge_unit_weight() {
     run(&db, ":create e {a: Int, b: Int}");
     run(&db, "?[a, b] <- [[1,2],[2,3]] :put e {a, b}");
     run(&db, "::graph create g {edges: e}");
-    let mst = rows(&run(&db, "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')"));
+    let mst = rows(&run(
+        &db,
+        "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')",
+    ));
     assert_eq!(mst.len(), 2);
     for row in mst {
         assert_eq!(row[2].get_float().unwrap(), 1.0);
@@ -877,7 +913,10 @@ fn a_json_keyed_projection_is_charged_its_real_bytes() {
         "?[a, b] <- [[json_object('k', $blob), json_object('k', $k2)]] :put e {a, b}",
         std::collections::BTreeMap::from([
             ("blob".to_string(), DataValue::from(blob.as_str())),
-            ("k2".to_string(), DataValue::from(format!("{blob}2").as_str())),
+            (
+                "k2".to_string(),
+                DataValue::from(format!("{blob}2").as_str()),
+            ),
         ]),
         ScriptMutability::Mutable,
     )
@@ -897,7 +936,10 @@ fn a_json_keyed_projection_is_charged_its_real_bytes() {
 fn negative_db() -> DbInstance {
     let db = mem();
     run(&db, ":create e {a: Int, b: Int => w: Float}");
-    run(&db, "?[a, b, w] <- [[1,2,-1.0],[2,3,1.0]] :put e {a, b => w}");
+    run(
+        &db,
+        "?[a, b, w] <- [[1,2,-1.0],[2,3,1.0]] :put e {a, b => w}",
+    );
     run(&db, ":create start {id: Int}");
     run(&db, "?[id] <- [[1]] :put start {id}");
     run(&db, "::graph create g {edges: e}");
@@ -909,7 +951,10 @@ fn one_weighted_variant_serves_permissive_and_strict_consumers() {
     let db = negative_db();
 
     // Permissive: builds the variant and consumes it, negative weight and all.
-    let mst = run(&db, "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')");
+    let mst = run(
+        &db,
+        "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')",
+    );
     assert_eq!(rows(&mst).len(), 2);
     let built = built_at(&db);
 
@@ -935,8 +980,11 @@ fn a_strict_refusal_still_publishes_the_variant_it_refused() {
     // publishes it, and only then applies its own negative-weight policy. The
     // variant is fresh and correct — the *consumer* is what is strict — so the
     // next permissive consumer of that same variant must take a cache hit.
-    assert!(err(&db, "?[s, t, c, p] <~ ShortestPathDijkstra(*start[u], graph: 'g')")
-        .contains("negative edge weight"));
+    assert!(err(
+        &db,
+        "?[s, t, c, p] <~ ShortestPathDijkstra(*start[u], graph: 'g')"
+    )
+    .contains("negative edge weight"));
     let built = built_at(&db);
     run(&db, "?[c, n] <~ LabelPropagation(graph: 'g')");
     assert_reused(&db, built);
@@ -991,7 +1039,10 @@ fn every_permissive_port_accepts_a_negative_weight_variant() {
     let mst = run(&db, "?[a, b, c] <~ MinimumSpanningTreePrim(graph: 'g')");
     assert_eq!(rows(&mst).len(), 2, "Prim must span the negative edge too");
     run(&db, "?[c, n] <~ LabelPropagation(graph: 'g')");
-    run(&db, "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')");
+    run(
+        &db,
+        "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')",
+    );
 }
 
 /// The `undirected` option must reach the build for the option-taking ports.

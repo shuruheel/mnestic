@@ -210,7 +210,11 @@ fn a_fresh_entry_is_never_served_to_a_transaction_that_pinned_before_it() {
     let second = reader.run_script(CC, BTreeMap::new()).unwrap();
     assert_eq!(builds(&db), published + 1, "the old reader must rebuild");
     // …and its snapshot has two components, so the joined graph is not there.
-    assert_eq!(components(&second), 2, "the reader was served a newer graph");
+    assert_eq!(
+        components(&second),
+        2,
+        "the reader was served a newer graph"
+    );
     assert_eq!(components(&fresh), 1);
 
     // (d) Snapshot consistency: the same query, twice, across the commit.
@@ -333,7 +337,11 @@ fn a_commit_during_a_build_makes_the_produce_rule_refuse_the_result() {
     assert_eq!(seen, BTreeSet::from([1, 2, 3, 4]));
     // …and nothing was cached: an entry tagged with the pre-commit tokens would
     // be a stale hit for every transaction that follows.
-    assert_eq!(resident(&db), 0, "produce must refuse a build it cannot vouch for");
+    assert_eq!(
+        resident(&db),
+        0,
+        "produce must refuse a build it cannot vouch for"
+    );
 
     // The next query, opened after the commit, populates the cache normally.
     let res = run(&db, CC);
@@ -413,7 +421,10 @@ fn a_reader_never_disagrees_with_the_relation_under_write_churn() {
                 if stop.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                run(&db, &format!("?[a, b] <- [[{i}, {}]] :put knows {{a, b}}", i + 1));
+                run(
+                    &db,
+                    &format!("?[a, b] <- [[{i}, {}]] :put knows {{a, b}}", i + 1),
+                );
             }
         })
     };
