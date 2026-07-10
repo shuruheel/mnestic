@@ -251,6 +251,9 @@ impl<'a> SessionTx<'a> {
         force_collect: &str,
         span: SourceSpan,
     ) -> Result<()> {
+        // Graph-projection dirty-set hook (spec §3.4 row 1). At function entry,
+        // so it also covers the `buffer_tt_puts` early return below.
+        self.mark_dirty(relation_store);
         let is_callback_target =
             callback_targets.contains(&relation_store.name) || force_collect == relation_store.name;
 
@@ -577,6 +580,10 @@ impl<'a> SessionTx<'a> {
         force_collect: &str,
         span: SourceSpan,
     ) -> Result<()> {
+        // Graph-projection dirty-set hook (spec §3.4 row 3). Covers both
+        // `buffer_tt_update` and the secondary-index writes in
+        // `update_in_index`, which run against this same relation.
+        self.mark_dirty(relation_store);
         let is_callback_target =
             callback_targets.contains(&relation_store.name) || force_collect == relation_store.name;
 
@@ -1131,6 +1138,10 @@ impl<'a> SessionTx<'a> {
         span: SourceSpan,
     ) -> Result<()> {
         use crate::data::functions::MAX_VALIDITY_TS;
+        // Graph-projection dirty-set hook (spec §3.4 row 4). The reconcile only
+        // buffers rows here; they reach storage in `stamp_pending_tt_writes` at
+        // commit, which is inside the same transaction.
+        self.mark_dirty(relation_store);
         if !relation_store.has_txtime() {
             #[derive(Debug, Error, Diagnostic)]
             #[error(":reconcile requires a TxTime relation, {0} is not")]
@@ -1943,6 +1954,9 @@ impl<'a> SessionTx<'a> {
         force_collect: &str,
         span: SourceSpan,
     ) -> Result<()> {
+        // Graph-projection dirty-set hook (spec §3.4 row 2). At function entry,
+        // so it also covers `buffer_tt_removals` / `buffer_bitemporal_rm`.
+        self.mark_dirty(relation_store);
         let is_callback_target =
             callback_targets.contains(&relation_store.name) || force_collect == relation_store.name;
 

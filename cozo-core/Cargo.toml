@@ -54,6 +54,11 @@ jemalloc = ["dep:tikv-jemallocator-global", "cozorocks?/jemalloc"]
 io-uring = ["cozorocks?/io-uring"]
 ## Polyfills for the WASM target
 wasm = ["uuid/js", "dep:js-sys"]
+## Internal (mnestic fork). Exposes a commit fence inside `commit_tx` so the
+## graph-projection freshness protocol can be tested at its race windows from
+## outside the crate. Never enable in production: it adds a lock acquisition to
+## every writing commit and lets arbitrary code run mid-commit.
+test-hooks = []
 
 #! The following features are highly experimental:
 

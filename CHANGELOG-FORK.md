@@ -10,8 +10,45 @@ divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
 Toward **0.11.0 — cached graph projection** (spec: `docs/specs/graph-projection.md`).
-Phase 0 of that build lands the graph-algorithm changes that stand on their own,
-ahead of the cache itself.
+Phase 0 lands the graph-algorithm changes that stand on their own; Phase 1 lands
+the freshness substrate the cache will sit on. Both precede the cache itself.
+
+### Phase 1 — the write-invalidation substrate
+
+No user-visible behaviour changes. A projection must never serve data that
+differs from what the consuming transaction's own scan would return, in either
+direction; this is the bookkeeping that will make that true.
+
+- **Every transaction now tracks the persistent relations it mutates**, marked
+  at the entry of each of the thirteen mutation paths — the four row-level ops,
+  relation destruction (`:replace`, `::remove`, `::index drop`), `import_relations`
+  in all three of its modes, `import_from_backup`, `::repair_corrupt`,
+  `::history_gc`, and `::evict` (which also dirties `mnestic_evict_audit`).
+  Temp relations are excluded: their ids come from a per-transaction counter and
+  collide numerically with persistent ones. Triggers need no hook of their own —
+  they run on the same transaction, so the row-level hooks fire for their targets.
+- **A monotone freshness token per relation**, bumped inside `commit_tx` after
+  the storage commit returns — on failure as well as success, since `mem`'s
+  range deletes write through outside the transaction cache — and on a
+  transaction dropped without committing. Each transaction captures a watermark
+  before its storage snapshot pins, and a relation is fresh to it only if no
+  commit against that relation is in flight and its token does not exceed the
+  watermark. Both staleness directions close on that one predicate; the argument
+  is in `runtime/graph_projection.rs`.
+- Cost to a database with no projections: one atomic load per transaction, one
+  set insert per mutation *statement* (not per row), and one uncontended mutex
+  acquisition per *writing* commit. Read-only commits take a fast path and touch
+  none of it. `restore_backup` invalidates the whole cache at function entry: it
+  rewrites the keyspace through `batch_put`, outside any transaction.
+- New internal `test-hooks` feature, exposing `Db::set_commit_fence_for_tests` —
+  a callback run inside every writing commit, between the storage commit and the
+  token bump, so a test can park a writer in the one window where a commit is
+  durable but its token has not moved. **Not a supported API**; never enable it
+  in production.
+- Tests: `cozo-core/src/runtime/graph_projection.rs` (26) and
+  `cozo-core/tests/commit_fence.rs` (2). 24 mutations verified red.
+
+### Phase 0 — graph-algorithm ride-alongs
 
 - **BREAKING (results): `PageRank` accepts an optional second input relation
   naming the vertices**, exactly as `ConnectedComponents` already did. Vertices

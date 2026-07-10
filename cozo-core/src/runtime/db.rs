@@ -51,6 +51,7 @@ use crate::query::ra::{
 use crate::runtime::callback::{
     CallbackCollector, CallbackDeclaration, CallbackOp, EventCallbackRegistry,
 };
+use crate::runtime::graph_projection::ProjectionCache;
 use crate::runtime::relation::{
     extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
 };
@@ -183,6 +184,11 @@ pub struct Db<S> {
     /// not worth a default-on rewrite until it has soaked. To flip the default,
     /// change the `AtomicBool::new(false)` in [`Db::new`] to `true`.
     enable_factorize: Arc<AtomicBool>,
+    /// Freshness substrate for cached graph projections (mnestic fork;
+    /// `runtime/graph_projection.rs`, spec §3.3). Cloned into every
+    /// `SessionTx`, which captures a watermark off it before its storage
+    /// transaction pins and reports its dirty relations back at commit.
+    pub(crate) graph_projections: Arc<ProjectionCache>,
 }
 
 impl<S> Debug for Db<S> {
@@ -378,6 +384,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // DEFAULT for the automatic factorized-count rewrite. Flip this one
             // line to `AtomicBool::new(true)` to make the rewrite default-on.
             enable_factorize: Arc::new(AtomicBool::new(false)),
+            graph_projections: Default::default(),
         };
         Ok(ret)
     }
@@ -769,6 +776,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                 bail!(ImportIntoIndex(relation.to_string()))
             }
             let handle = tx.get_relation(relation, false)?;
+            // Graph-projection dirty-set hook (spec §3.4 row 7). Marked at
+            // relation resolution, so it covers all three import modes: plain
+            // put, the `-`-prefixed delete, and the TxTime-buffered branch.
+            tx.mark_dirty(&handle);
             let has_indices = !handle.indices.is_empty();
 
             // Bulk import maintains B-tree secondary indices (below) but NOT
@@ -981,6 +992,12 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// Restore from an Sqlite backup
     #[allow(unused_variables)]
     pub fn restore_backup(&'s self, in_file: impl AsRef<Path>) -> Result<()> {
+        // Graph-projection dirty-set hook (spec §3.4 row 13). Defensive: the
+        // precondition below admits only an empty store, in which no relation
+        // exists to project. But the restore writes through `batch_put`,
+        // outside any `SessionTx`, so no dirty set could ever see it — and the
+        // check runs after this point, on an error path a caller may ignore.
+        self.graph_projections.invalidate_all();
         #[cfg(feature = "storage-sqlite")]
         {
             let sqlite_db = crate::new_cozo_sqlite(in_file)?;
@@ -1047,6 +1064,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                 }
                 let src_handle = src_tx.get_relation(relation, false)?;
                 let dst_handle = dst_tx.get_relation(relation, false)?;
+                // Graph-projection dirty-set hook (spec §3.4 row 8): the rows
+                // below go straight to `store_tx.put`, bypassing the mutation
+                // paths that would otherwise mark this relation.
+                dst_tx.mark_dirty(&dst_handle);
 
                 if dst_handle.has_txtime() || src_handle.has_txtime() {
                     bail!(
@@ -1386,6 +1407,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         &self.tt_clock
     }
     pub(crate) fn transact(&'s self) -> Result<SessionTx<'s>> {
+        // Read the watermark BEFORE opening the storage transaction: opening
+        // is pinning, and the protocol's correctness rests on the capture
+        // being sequenced before the snapshot (graph_projection.rs §3.3). A
+        // struct-literal field would be evaluated in source order, which is
+        // too easy to reorder by accident — hence the separate binding.
+        let watermark = self.graph_projections.watermark();
         let ret = SessionTx {
             store_tx: Box::new(self.db.transact(false)?),
             temp_store_tx: self.temp_db.transact(true)?,
@@ -1399,10 +1426,17 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
+            projections: self.graph_projections.clone(),
+            watermark,
+            dirty_relations: Default::default(),
+            retired_relations: Default::default(),
+            commit_inflight: false,
         };
         Ok(ret)
     }
     pub(crate) fn transact_write(&'s self) -> Result<SessionTx<'s>> {
+        // See `transact`: the watermark capture must precede the pin.
+        let watermark = self.graph_projections.watermark();
         let ret = SessionTx {
             store_tx: Box::new(self.db.transact(true)?),
             temp_store_tx: self.temp_db.transact(true)?,
@@ -1416,6 +1450,11 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
+            projections: self.graph_projections.clone(),
+            watermark,
+            dirty_relations: Default::default(),
+            retired_relations: Default::default(),
+            commit_inflight: false,
         };
         Ok(ret)
     }
@@ -2125,6 +2164,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
 
                 let mut handle = tx.get_relation(rel, true)?;
+                // Graph-projection dirty-set hook (spec §3.4 row 11).
+                tx.mark_dirty(&handle);
                 if !handle.has_txtime() {
                     bail!("::history_gc requires a TxTime relation, {} is not", rel);
                 }
@@ -2277,6 +2318,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
 
                 let handle = tx.get_relation(rel, true)?;
+                // Graph-projection dirty-set hook (spec §3.4 row 12). The audit
+                // relation this arm also writes is marked where it is resolved.
+                tx.mark_dirty(&handle);
                 if !handle.has_txtime() {
                     bail!("::evict requires a TxTime relation, {} is not", rel);
                 }
@@ -2322,6 +2366,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let ns = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, &salt);
 
                 let audit = self.tt_evict_audit_relation(tx)?;
+                // Graph-projection dirty-set hook (spec §3.4 row 12, second
+                // relation): `::evict` writes audit rows into `mnestic_evict_audit`.
+                tx.mark_dirty(&audit);
                 let evict_tt = tx.tt_clock.advance();
                 // route this tx's commit through the tt path so the burned
                 // audit tt is covered by the persisted HWM (crash + clock
@@ -2443,6 +2490,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                     .unwrap();
                 let _guard = lock.write().unwrap();
                 let handle = tx.get_relation(rel_name, true)?;
+                // Graph-projection dirty-set hook (spec §3.4 row 10).
+                tx.mark_dirty(&handle);
                 let expected = handle.metadata.keys.len() + handle.metadata.non_keys.len();
                 let lower = Tuple::default().encode_as_key(handle.id);
                 let upper = Tuple::default().encode_as_key(handle.id.next());

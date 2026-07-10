@@ -6,7 +6,7 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -22,6 +22,7 @@ use crate::data::value::{Validity, ValidityTs};
 use crate::fts::TokenizerCache;
 use crate::parse::SourceSpan;
 use crate::runtime::callback::CallbackCollector;
+use crate::runtime::graph_projection::ProjectionCache;
 use crate::runtime::relation::{RelationHandle, RelationId};
 use crate::runtime::tt_clock::{tt_hwm_key, TtClock};
 use crate::storage::temp::TempTx;
@@ -71,6 +72,28 @@ pub struct SessionTx<'a> {
     /// trigger) shares one tx, every statement it drives inherits the same
     /// budget — a multi-statement script is bounded as a whole, not per block.
     pub(crate) script_deadline: Option<Instant>,
+    /// Graph-projection freshness state, shared with the `Db` (mnestic fork;
+    /// `runtime/graph_projection.rs`).
+    pub(crate) projections: Arc<ProjectionCache>,
+    /// `bump_seq` as of **before** this transaction's storage snapshot pinned.
+    /// A source relation whose token exceeds this was mutated by a commit this
+    /// transaction cannot see, so no cached projection over it may be served.
+    pub(crate) watermark: u64,
+    /// Every persistent relation this transaction has mutated, marked at
+    /// mutation-function entry. Drives the commit-time token bump, and marks
+    /// the transaction's own uncommitted writes so it never consults or
+    /// populates the cache for them. Temp relations are excluded: their ids
+    /// come from a separate per-transaction counter and collide numerically
+    /// with persistent ids.
+    pub(crate) dirty_relations: BTreeSet<RelationId>,
+    /// The subset of `dirty_relations` this transaction destroyed (`::remove`,
+    /// and `:replace`'s old id). Their `RelState` is purged after the
+    /// post-commit bump, and only if the commit landed.
+    pub(crate) retired_relations: BTreeSet<RelationId>,
+    /// Set between `begin_commit` and `finish_commit`. If a panic unwinds
+    /// through the storage commit, `Drop` reads this and balances the `inflight`
+    /// increment — otherwise the sources would be denied cache hits forever.
+    pub(crate) commit_inflight: bool,
 }
 
 /// One statement's worth of buffered writes to a tt-stamped relation.
@@ -95,6 +118,27 @@ fn storage_version_key() -> Vec<u8> {
 
 const STATUS_STR: &str = "status";
 const OK_STR: &str = "OK";
+
+/// A transaction that mutated relations and went away without committing —
+/// aborted, errored, or unwound — still forces a token bump (mnestic fork;
+/// `runtime/graph_projection.rs` §3.3). An abort is not proof that nothing
+/// changed: `mem`'s `del_range_from_persisted` writes straight through to the
+/// persisted store. `commit_tx` empties the dirty set, so a committed
+/// transaction does no work here.
+///
+/// The bump is the whole body, so it survives an unwinding panic — including a
+/// panic inside the storage commit itself, which leaves `commit_inflight` set
+/// and an unbalanced `inflight` that only this impl can put back.
+impl Drop for SessionTx<'_> {
+    fn drop(&mut self) {
+        if self.commit_inflight {
+            self.projections
+                .finish_commit(&self.dirty_relations, &self.retired_relations, false);
+        } else if !self.dirty_relations.is_empty() {
+            self.projections.bump_aborted(&self.dirty_relations);
+        }
+    }
+}
 
 impl<'a> SessionTx<'a> {
     pub(crate) fn get_returning_rows(
@@ -189,7 +233,54 @@ impl<'a> SessionTx<'a> {
         Ok(ret)
     }
 
+    /// Record that this transaction mutates `handle`'s contents, for the
+    /// graph-projection freshness protocol (mnestic fork; spec §3.4). Called
+    /// at the entry of every mutation path. Temp relations are skipped: their
+    /// ids come from a per-transaction counter and collide numerically with
+    /// persistent relation ids.
+    pub(crate) fn mark_dirty(&mut self, handle: &RelationHandle) {
+        if !handle.is_temp {
+            self.dirty_relations.insert(handle.id);
+        }
+    }
+
+    /// As [`mark_dirty`](Self::mark_dirty), and additionally record that the
+    /// relation ceases to exist if this transaction commits, so its freshness
+    /// state can be purged after the commit-time bump.
+    pub(crate) fn mark_retired(&mut self, handle: &RelationHandle) {
+        if !handle.is_temp {
+            self.dirty_relations.insert(handle.id);
+            self.retired_relations.insert(handle.id);
+        }
+    }
+
+    /// Commit, maintaining the graph-projection freshness protocol
+    /// (`runtime/graph_projection.rs` §3.3): raise `inflight` before the
+    /// storage commit, mint fresh tokens after it returns — whether it
+    /// succeeded or failed — and only then purge the relations it destroyed.
+    ///
+    /// This is the single commit funnel for every write path, so no mutation
+    /// can escape the protocol. Taking the dirty set here also disarms
+    /// [`Drop`], whose bump exists for transactions that never reach a commit.
     pub fn commit_tx(&mut self) -> Result<()> {
+        if self.dirty_relations.is_empty() {
+            // Read-only transaction: nothing to invalidate, no lock to take.
+            return self.commit_tx_inner();
+        }
+        self.projections.begin_commit(&self.dirty_relations);
+        self.commit_inflight = true;
+        let res = self.commit_tx_inner();
+        #[cfg(any(test, feature = "test-hooks"))]
+        self.projections.run_commit_fence(&self.dirty_relations);
+        self.commit_inflight = false;
+        self.projections
+            .finish_commit(&self.dirty_relations, &self.retired_relations, res.is_ok());
+        self.dirty_relations.clear();
+        self.retired_relations.clear();
+        res
+    }
+
+    fn commit_tx_inner(&mut self) -> Result<()> {
         if !self.pending_tt_writes.is_empty() || self.tt_hwm_dirty {
             // Route through the tt commit path (mnestic fork): stamp the
             // buffered rows, persist the HWM, commit — all under the per-Db

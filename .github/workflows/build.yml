@@ -23,6 +23,10 @@ jobs:
         run: cargo build -p mnestic --verbose
       - name: Test (lib + integration, incl. fork regressions)
         run: cargo test -p mnestic --verbose
+      # The `test-hooks` commit fence is only reachable from outside the crate
+      # when its feature is on, so the default job above never compiles it.
+      - name: Test (test-hooks commit fence)
+        run: cargo test -p mnestic --features test-hooks --test commit_fence --verbose
 
   rocksdb:
     name: build (storage-rocksdb, C++ bridge)
