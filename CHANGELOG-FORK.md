@@ -5,21 +5,13 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.10.6 work not yet cut to a release. Keep this section current as
+Post-0.10.7 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
-Toward **0.11.0 — cached graph projection** (spec: `docs/specs/graph-projection.md`).
-Phase 0 lands the graph-algorithm changes that stand on their own; Phase 1 lands
-the freshness substrate the cache sits on; Phase 2 lands the cache; Phase 3
-opens it to CozoScript and Phase 4 proves it.
-
-### Phase 3 — `::graph`, and twelve algorithms that can use it
-
-**New: `::graph create G {edges: knows, nodes: person}`.** A projection is a
-named, always-fresh, in-memory adjacency over stored relations, shared across
-queries. Twelve graph algorithms take it in place of their positional edge
-relation:
+**Cached graph projections.** `::graph create G { edges: knows, nodes: person }`
+names an in-memory adjacency over stored relations that twelve graph algorithms
+reuse across queries instead of rebuilding on every call:
 
 ```
 ::graph create g { edges: knows, nodes: person }
@@ -28,293 +20,166 @@ relation:
 ?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
 ```
 
-- `::graph create NAME {edges: R, nodes: R2}` — `nodes` optional; sources may be
-  named bare or quoted. Validated on the spot: the relations must exist, `edges`
-  must have arity ≥ 2, and index, temporary and transaction-time relations are
-  refused with an explanation. Nothing is built; variants materialise on first
-  use.
-- `::graph drop NAME` frees the definition and every adjacency built from it.
-- `::graph list` reports one row per built variant —
+It is **always fresh**. A projection never serves a transaction data that differs
+from what that transaction's own scan of the sources would return — in either
+direction, so a long-lived reader is not handed an entry newer than its snapshot
+either. Writing to a source frees the adjacencies built from it. Under continuous
+write churn the cache degrades to build-per-query; it never goes stale.
+
+Measured on a 400,000-edge graph (release build; *cold* is the positional form,
+i.e. today's behaviour):
+
+| kernel | cold | warm | |
+|---|---|---|---|
+| `ConnectedComponents` | 127 ms | 7.9 ms | **16×** |
+| `PageRank`, 20 iterations | 150 ms | 10 ms | **15×** |
+| `ClusteringCoefficients` | 169 ms | 56 ms | 3× |
+
+What is cached is the *setup* — scanning the edge relation and building the CSR —
+so the gain shrinks as the kernel itself dominates: `ClusteringCoefficients`
+spends its time counting triangles, and `CommunityDetectionLouvain` rebuilds a
+coarsened graph per level internally, so only its first build is reused.
+
+A database that defines no projections pays one atomic load per transaction, one
+set insert per mutation *statement* (not per row), and one uncontended mutex
+acquisition per *writing* commit. Read-only commits touch none of it.
+
+### Added
+
+- **`::graph create NAME { edges: R, nodes: R2 }`** — `nodes` optional; sources
+  may be written bare or quoted. Validated on the spot: the relations must exist
+  and `edges` must have arity ≥ 2. Index, temporary and transaction-time
+  relations are refused with an explanation. Nothing is built at create time;
+  adjacencies materialise per `(direction, weighted)` variant on first use.
+- **`::graph drop NAME`** frees the definition and every adjacency built from it.
+- **`::graph list`** reports one row per built variant —
   `name, edges, nodes, variant, est_bytes, built_at, last_used` — and one
   null-variant row for a projection that has built nothing yet.
-- **Projections are in-memory and are not persisted.** After a restart, using
-  one is a loud error naming the fix.
-- **Ported algorithms** (`graph: 'G'` in place of input 0): `ConnectedComponents`,
-  `StronglyConnectedComponents` / `SCC`, `PageRank`, `ClusteringCoefficients`,
-  `TopSort`, `BetweennessCentrality`, `ClosenessCentrality`,
-  `ShortestPathDijkstra`, `KShortestPathYen`, `MinimumSpanningTreePrim`,
-  `MinimumSpanningForestKruskal`, `LabelPropagation`,
+- **`graph: 'G'` on twelve algorithms**, in place of their positional edge
+  relation: `ConnectedComponents`, `StronglyConnectedComponents` / `SCC`,
+  `PageRank`, `ClusteringCoefficients`, `TopSort`, `BetweennessCentrality`,
+  `ClosenessCentrality`, `ShortestPathDijkstra`, `KShortestPathYen`,
+  `MinimumSpanningTreePrim`, `MinimumSpanningForestKruskal`, `LabelPropagation`,
   `CommunityDetectionLouvain`. Their remaining positional inputs shift down by
   one, and optional trailing inputs stay optional.
-- **`BFS`, `DFS`, `ShortestPathBFS`, `RandomWalk`, `ShortestPathAStar` and
-  `DegreeCentrality` cannot use a projection**, by design: they evaluate
-  per-tuple condition, heuristic and weight expressions against the edge
-  relation, and a compressed adjacency does not carry that. Because unknown
-  fixed-rule options are ignored engine-wide, a `graph:` option on any rule that
-  cannot consume one is now **rejected at parse time** rather than silently
-  producing a full rebuild.
-- **Negative weights.** One weighted variant serves every consumer, so it is
-  built permissively; a strict consumer (Dijkstra, Yen, Louvain, Betweenness,
-  Closeness) that meets a negative weight in it fails loudly, naming itself, the
-  projection, and why. The positional forms are unchanged: they still reject the
-  weight as they scan it.
-- **`PageRank`'s positional nodes relation cannot be combined with `graph:`** —
-  a cached variant's vertex ids are fixed when it is built. Declare them on the
-  projection with `nodes:` instead. `ConnectedComponents` still takes a
-  positional nodes relation, as an overlay on top of the projection.
-- **`MinimumSpanningTreePrim` now defaults its start to the lowest vertex with
-  an edge**, not to vertex 0. Under a nodes-bearing projection, vertex 0 may be
-  isolated, and Prim from an isolated vertex spans nothing. A user-supplied
-  starting relation is unaffected, diagnostics included.
-- CC and SCC group ids renumber under a nodes-bearing projection (isolated
-  vertices interleave rather than being appended). The *partition* is unchanged;
-  the labels are arbitrary and always were.
-- New in the public API under `graph-algo`: `VariantSpec`, `VariantKey`,
-  `GraphVariant`, `ProjectionVariant`, `GraphSource`,
-  `FixedRulePayload::graph_input`, `FixedRule::supports_projection` (defaulted,
-  so out-of-tree rules keep compiling), and re-exports of the vendored
-  `DirectedCsrGraph`, `Graph`, `DirectedNeighbors` and
-  `DirectedNeighborsWithValues`. **A future bump of the `graph` dependency is
-  therefore a semver-major event for mnestic.**
+- **`nodes:` makes isolated vertices real.** A vertex named by the node relation
+  but by no edge becomes a genuine degree-0 vertex: `PageRank` counts it in `N`
+  and ranks it, `ConnectedComponents` emits it as its own component. The vertex
+  set is the union of the two relations.
+- **A 512 MiB memory ceiling**, enforced on the spot by least-recently-used
+  eviction. Set it with `Db::set_graph_projection_capacity(bytes)`,
+  `DbInstance::set_graph_projection_capacity(bytes)`, or, from Python,
+  `CozoDbPy.set_graph_projection_capacity(bytes)`. `0` turns caching off while
+  leaving `::graph create`/`list`/`drop` working. A single variant larger than
+  the whole ceiling is built for each query, with a warning.
+- **Concurrent cold callers coalesce into one build** per variant rather than
+  each building their own.
+- **`PageRank` accepts an optional second input naming the vertices**, as
+  `ConnectedComponents` already did. Passing it changes the ranks: isolated
+  vertices enter `N`, so every rank moves. On LDBC SNB sf1, 694 of 10,620
+  persons have no `knows` edge and were previously absent from the ranking
+  altogether. Single-input queries are unaffected.
 
-### Phase 4 — the proof
+### Changed
 
-- 58 end-to-end tests (`tests/graph_projection.rs`) over the script surface: the
-  sysops, the source-kind rejections, the parse-time `graph:` guard, cache
-  hit/miss/eviction observed through `::graph list`, and a positional-vs-`graph:`
-  equivalence row for each of the twelve ports — including one where a
-  mis-shifted input index changes the answer rather than erroring.
-- 6 interleaving tests (`tests/graph_projection_interleaving.rs`, rocksdb +
-  `test-hooks`, and a CI job to run them): `mem` and `sqlite` pin a read
-  transaction by holding a store-wide read guard, so a long-lived reader and a
-  concurrent writer cannot coexist and none of these schedules is reachable
-  there. A writer parked between its durable commit and its token bump is denied
-  a stale hit by `inflight` alone; a reader that pinned before a commit is never
-  served the fresh entry a later transaction published; a commit landing during
-  a build makes the produce rule refuse the result; eight cold readers coalesce
-  into one build; a reader hammering a projection under continuous write
-  churn never disagrees with a raw scan of the source in the same transaction;
-  and — added by the review round — a pre-destroy snapshot can neither publish
-  into nor read from the cache across a `:replace` (the tombstone fix's exact
-  two-reader poisoning schedule).
-- A second `test-hooks` fence, inside the projection build, makes the
-  produce-refusal race deterministic instead of timing-dependent.
-- `benches/graph_projection.rs`: cold vs warm vs write-invalidated, for three
-  kernels. The write-invalidated arm is the bound the design is judged on.
-- 37 mutations verified red across Phases 3 and 4 (29 surface + 8 interleaving,
-  after the same-day adversarial-review round; the pre-review landing was 28).
-
-### Phase 3/4 adversarial review — a freshness hole closed, and an engine-wide deadlock class removed
-
-A 90-agent adversarial review of Phases 3 and 4 (10 finder lenses, 3 refuters
-per finding, completeness critic) confirmed 12 findings and refuted 12. The
-fixes, in order of consequence:
-
-- **A destroyed relation's freshness state is now kept forever as a tombstone**
-  (it was purged after the commit-time bump). The purge assumed a destroyed id
-  is never re-resolved, which is false: name resolution reads the catalog
-  through each transaction's own pinned snapshot, so on RocksDB a reader that
-  pinned *before* a `:replace` or `::remove` still resolves the old id after
-  it. With the state purged, absence read as token 0 — fresh at every
-  watermark — and two such pre-destroy readers could republish and then
-  *consume* a projection whose content the second reader's own scan
-  contradicts: a stale hit, in the direction the always-fresh proof claims
-  closed. The tombstone's token exceeds every watermark that can still resolve
-  the id. Cost: one ~40-byte map entry per relation destroyed per process
-  lifetime. The `retired_relations` plumbing is gone — destruction is now an
-  ordinary dirtying — and a new interleaving test drives the exact two-reader
-  poisoning schedule.
-- **`DbInstance::multi_transaction` now runs its transaction loop on a
-  dedicated thread, as its documentation always claimed.** It used
-  `rayon::spawn`, which parks a global-pool worker in a blocking `recv` loop
-  for the transaction's whole life; with `available_parallelism` transactions
-  open (or one open transaction on a one-core machine racing any parallel
-  query), every rayon-using query in the process deadlocks. Not
-  projection-specific — any `multi_transaction` user was exposed.
-- **Json vertex keys are now charged their walked size** in the cache's byte
-  estimate, not a flat 64 bytes. Json is a storable key type and each vertex
-  is interned as two owned deep clones, so the flat charge let the real
-  footprint exceed the 512 MiB ceiling without bound while `::graph list`
-  reported a near-empty cache.
-- **`SimpleFixedRule` is exempt from the parse-time `graph:` guard.** Its
-  closure receives every option, so an option named `graph` was never silently
-  dropped there — a pre-0.11 out-of-tree rule reading it keeps working. The
-  guard's help text no longer tells `Constant` or `CsvReader` users to "pass
-  the relation positionally".
-- **`Db::set_graph_projection_capacity` gained its `DbInstance` dispatcher**
-  and a Python binding (`CozoDbPy.set_graph_projection_capacity(bytes)`) — it
-  was unreachable from every language binding and from `cozo-bin`, while the
-  oversize-variant warning told users to call it. The published wheel ships
-  `graph-algo`, so PyPI users had `::graph create` with a hardwired 512 MiB
-  ceiling and no way to raise it or set `0` to disable caching.
-- The `graph` crate is now a documented **public dependency**: its adjacency
-  types are re-exported, so moving off `graph = "0.3"` is a semver-major bump
-  for mnestic. Recorded in the release checklist. (It is not pinned with `=`,
-  which would make mnestic unresolvable beside any crate wanting a later
-  `0.3.x`; within `0.3.x` semver obliges API compatibility, and the `0.3.1`
-  and `0.3.2` preludes are in fact identical.)
-- **`::graph create`/`drop` inside an imperative script survive the script's
-  abort — now documented and test-pinned as a decision.** The registry is
-  process-global in-memory state; deferring creation to commit would break
-  using a projection later in the script that defines it. Definitions hold
-  only names and every use re-resolves them, so an orphaned definition errors
-  loudly at use; the escape is `::graph drop`.
-- Test hardening from the review's coverage findings: the strict/permissive
-  flag of every port is now pinned (a flipped Louvain/Yen/Closeness/Prim
-  policy was previously invisible to every test), the `undirected` option is
-  pinned per optioned port on an asymmetric fixture, `last_used` movement on a
-  hit is asserted strictly, and all three graph test files gained the
-  `graph-algo` cfg gate they were missing (a `--no-default-features
-  --features minimal,storage-rocksdb,test-hooks` build now skips them instead
-  of failing to compile).
-- The bench and the D3 `verify.py` warm arm no longer claim their invalidating
-  self-loop writes are structure-neutral (each adds a singleton component),
-  and both now state that the write sits inside the timed region — a bias
-  against the projection, i.e. conservative for the never-worse bound.
-
-### Phase 2 — the cache, the registry, and the memory ceiling
-
-Still no user-visible behaviour changes: nothing here has a grammar yet.
-
-- **A named, in-memory projection registry**, `graph-algo`-gated. A projection
-  names an edge relation and optionally a node relation, and materialises a
-  compressed adjacency lazily per `(direction, weighted)` variant on first use.
-  Definitions store *names*; every use re-resolves them against the consuming
-  transaction's own catalog, and an entry is served only if each slot resolves
-  to the exact relation id it was built from. That, not the freshness tokens, is
-  what defeats a multi-pair `::rename` swap — a rename moves no token at all.
-- **Always fresh, in both directions.** A cached adjacency is served only to a
-  transaction whose own scan of the sources would return the same rows, and is
-  published only by a transaction that can vouch for what it read. A transaction
-  builds privately, caching nothing, when it has uncommitted writes to a source,
-  when a commit against one is in flight or landed after it pinned, or when the
-  result does not fit the ceiling. Under write churn the cache degrades to
-  build-per-query — never worse than today.
-- **Concurrent cold readers coalesce into one build** per variant. The winner
-  builds from its own snapshot; the losers wake and re-validate against their
-  own watermarks.
-- **A 512 MiB default ceiling**, `Db::set_graph_projection_capacity(bytes)`,
-  enforced on the spot: variants are evicted least-recently-used first until the
-  cache fits, an insert evicts to make room for itself, and `0` evicts
-  everything and turns caching off while leaving the registry working. A variant
-  larger than the whole ceiling is built for each query, with a warning.
-  Writing to a source relation returns its variants' bytes immediately: a bumped
-  token makes them unreachable, so holding them would be a leak.
-- **Isolated vertices are real vertices.** A projection with a node relation
-  registers its vertices before any edge is read, so a vertex in no edge becomes
-  a genuine degree-0 vertex rather than being silently dropped. The vertex set
-  is the union of the two relations.
-- **One weighted variant serves both strict and permissive algorithms.** It
-  builds permissively and records whether any weight was negative, so Phase 3's
-  strict consumers — Dijkstra, Yen, Louvain, Betweenness, Closeness — can reject
-  it loudly rather than forcing a second copy of the adjacency.
-- Internally, the CSR builders moved out of `FixedRuleInputRelation` into free
-  functions over tuple streams, since the cache scans relations it resolved by
-  name. The two public `as_directed_graph*_checked` methods delegate to them,
-  unchanged.
-- **Transaction-time relations are rejected as projection sources** (loudly, at
-  create and at every use). Everywhere else in the engine a selector-less read
-  of a tt-stamped relation means its *current belief*; a projection build's raw
-  scan would deliver the whole history keyspace — retracted rows included — and
-  cache the wrong graph. Rejecting is the honest v1; current-belief projections
-  of tt relations may come later. Plain-Validity relations project fine (their
-  selector-less scan returns every version row on every engine path, so the
-  projection matches the positional form exactly). Found by adversarial review.
-- The same review hardened the concurrency story: a waiter that went stale
-  while queued for the build slot now releases the slot before rebuilding, and
-  a disabled cache (`capacity 0`) skips single-flight entirely — in both cases
-  concurrent builds run in parallel exactly as they do without the cache. A
-  leak-class race in the commit path's lock-free fast check was closed by
-  ordering the entry-count mirror's update ahead of the freshness-token reads.
-- 40 tests, 38 mutations verified red (after the review round; the initial
-  landing was 33/32 with three tests later shown to pass for the wrong reason
-  and since replaced or strengthened).
-
-### Phase 1 — the write-invalidation substrate
-
-No user-visible behaviour changes. A projection must never serve data that
-differs from what the consuming transaction's own scan would return, in either
-direction; this is the bookkeeping that will make that true.
-
-- **Every transaction now tracks the persistent relations it mutates**, marked
-  at the entry of each of the thirteen mutation paths — the four row-level ops,
-  relation destruction (`:replace`, `::remove`, `::index drop`), `import_relations`
-  in all three of its modes, `import_from_backup`, `::repair_corrupt`,
-  `::history_gc`, and `::evict` (which also dirties `mnestic_evict_audit`).
-  Temp relations are excluded: their ids come from a per-transaction counter and
-  collide numerically with persistent ones. Triggers need no hook of their own —
-  they run on the same transaction, so the row-level hooks fire for their targets.
-- **A monotone freshness token per relation**, bumped inside `commit_tx` after
-  the storage commit returns — on failure as well as success, since `mem`'s
-  range deletes write through outside the transaction cache — and on a
-  transaction dropped without committing. Each transaction captures a watermark
-  before its storage snapshot pins, and a relation is fresh to it only if no
-  commit against that relation is in flight and its token does not exceed the
-  watermark. Both staleness directions close on that one predicate; the argument
-  is in `runtime/graph_projection.rs`.
-- Cost to a database with no projections: one atomic load per transaction, one
-  set insert per mutation *statement* (not per row), and one uncontended mutex
-  acquisition per *writing* commit. Read-only commits take a fast path and touch
-  none of it. `restore_backup` invalidates the whole cache at function entry: it
-  rewrites the keyspace through `batch_put`, outside any transaction.
-- New internal `test-hooks` feature, exposing `Db::set_commit_fence_for_tests` —
-  a callback run inside every writing commit, between the storage commit and the
-  token bump, so a test can park a writer in the one window where a commit is
-  durable but its token has not moved. **Not a supported API**; never enable it
-  in production.
-- Tests: `cozo-core/src/runtime/graph_projection.rs` (26) and
-  `cozo-core/tests/commit_fence.rs` (2). 24 mutations verified red.
-
-### Phase 0 — graph-algorithm ride-alongs
-
-- **BREAKING (results): `PageRank` accepts an optional second input relation
-  naming the vertices**, exactly as `ConnectedComponents` already did. Vertices
-  in it that appear in no edge become real degree-0 vertices: they are ranked
-  (an isolated vertex's rank is exactly the base score `(1 - theta) / N`) and,
-  because `N` grows, **every other rank changes too**. Without the second input
-  the vertex set is still exactly the set of edge endpoints, so existing
-  single-input queries are unaffected. Concretely: on LDBC SNB sf1, 694 of
-  10,620 persons have no `knows` edge and were silently absent from the ranking
-  (the old output had 9,926 rows where a graph-native engine emits 10,620).
 - **BREAKING (results): `PageRank`'s default `iterations` is now 20, up from
-  10.** 10 was a below-upstream override — the vendored `graph` crate's own
-  `PageRankConfig::DEFAULT_MAX_ITERATIONS` is 20 — and it is measurably
-  non-convergent: at sf1 the ranks still move by `2.1e-4` at iteration 10
-  against the default `epsilon` of `1e-4`, versus `1.6e-6` at iteration 20. Pass
-  `iterations: 10` to restore the old numbers.
-- **`PageRank` warns when the `iterations` cap stops it short of `epsilon`**
-  (`log::warn`), instead of silently returning unconverged ranks. `epsilon: 0.0`
-  opts out of the convergence test — it means "run exactly `iterations`" — and
-  stays quiet.
-- **Fix: building a graph algorithm's CSR is now interruptible.** The scan that
-  interns vertices and collects edges checks the poison flag every 4096 tuples,
-  so `::kill` and `:timeout` abort a large build instead of waiting for it to
-  finish. Previously the flag was only observed once the algorithm proper began
-  — on a 300k-edge graph, most of the query's time was un-interruptible.
-- **Fix: an oversized graph errors instead of silently wrapping.** The CSR
-  indexes vertices and edge offsets with `u32`; the vertex count and the
-  post-doubling (undirected) edge count are now checked before the build
+  10.** Ten was a below-upstream override — the `graph` crate's own default is
+  20 — and it is measurably non-convergent: on sf1 the ranks still move by
+  `2.1e-4` at iteration 10 against the default `epsilon` of `1e-4`, versus
+  `1.6e-6` at iteration 20. **Pass `iterations: 10` to restore the old numbers.**
+- **`PageRank` now warns** (`log::warn`) when the `iterations` cap stops it short
+  of `epsilon`, instead of silently returning unconverged ranks. `epsilon: 0.0`
+  means "run exactly `iterations`" and stays quiet.
+- **A `graph:` option on a rule that cannot consume one is now a parse error.**
+  Unknown fixed-rule options are ignored engine-wide, so this would otherwise
+  silently rebuild the graph the slow way. `BFS`, `DFS`, `ShortestPathBFS`,
+  `RandomWalk`, `ShortestPathAStar` and `DegreeCentrality` are excluded by
+  design: they evaluate per-tuple condition, heuristic and weight expressions
+  against the edge relation, which a compressed adjacency does not carry.
+  **If you registered a custom `FixedRule` that reads an option named `graph`,
+  override the new `supports_projection()` to return `true`.** `SimpleFixedRule`
+  is exempt automatically — it forwards every option to its closure.
+- **`PageRank` rejects a positional nodes relation combined with `graph:`** — a
+  cached variant's vertex ids are fixed when it is built. Declare them on the
+  projection with `nodes:`. `ConnectedComponents` still takes a positional nodes
+  relation, as an overlay on top of the projection.
+- **`ConnectedComponents` and `SCC` group ids renumber** when a projection
+  declares `nodes:` — isolated vertices interleave rather than being appended.
+  The partition is unchanged, and the labels always were arbitrary.
+- **`MinimumSpanningTreePrim` starts from the lowest vertex with an edge**, not
+  vertex 0, so a nodes-bearing projection whose first vertex is isolated still
+  spans a tree. A supplied starting relation is unaffected, diagnostics included.
+- Errors raised while scanning edges (`algo::not_an_edge`,
+  `algo::invalid_edge_weight`) now surface eagerly rather than after the graph
+  has been built.
+
+### Fixed
+
+- **An empty edge relation panicked seven graph algorithms**, aborting the
+  process: `TopSort`, `ConnectedComponents`, `StronglyConnectedComponents`,
+  `ClusteringCoefficients`, `BetweennessCentrality`, `ClosenessCentrality` and
+  `LabelPropagation`. They now return no rows, as `PageRank` already did. The
+  builder sizes a graph from its largest edge endpoint, and `max` over an empty
+  edge list is `0`, so an empty relation produced a *one-vertex* graph with an
+  empty id map and the first index aborted. Four of these algorithms already
+  carried a `node_count() == 0` guard for exactly this case; it could never
+  fire. Present in upstream CozoDB.
+- **`multi_transaction` could deadlock the process.** It ran its transaction
+  loop on a `rayon` global-pool worker, which the loop then parked in a blocking
+  receive for the transaction's whole life. With as many open transactions as
+  the pool has workers — one, on a single-core host or under a CPU quota — every
+  parallel query in the process blocked forever. It now uses a dedicated thread,
+  as its documentation always claimed. Affects every caller, not just graph
+  algorithms.
+- **An oversized graph wrapped silently.** The CSR indexes vertices and edge
+  offsets with `u32`; both counts are now checked before the build
   (`algo::graph_too_large`).
-- **Fix: an empty edge relation no longer panics seven graph algorithms**
-  (`TopSort`, `ConnectedComponents`, `StronglyConnectedComponents`,
-  `ClusteringCoefficients`, `BetweennessCentrality`, `ClosenessCentrality`,
-  `LabelPropagation`); they now return no rows, as `PageRank` already did. The
-  vendored builder sizes a graph from its largest edge endpoint, and the `max`
-  reduce over an empty edge list returns `0` — so an empty relation produced a
-  **one-vertex** graph with an empty id map, and the first `indices[0]` aborted
-  the process. Four algorithms already carried a `node_count() == 0` guard for
-  exactly this case; it could never fire. The id map, not the graph, is now the
-  authority on emptiness. `ConnectedComponents` keeps emitting its optional node
-  relation in this case, and `MinimumSpanningTreePrim` keeps raising its
-  `starting_node_not_found`/`empty_starting` diagnostics when a starting
-  relation is supplied over an empty graph. Present in upstream CozoDB.
-- New public API on `FixedRuleInputRelation`: `as_directed_graph_checked` and
-  `as_directed_weighted_graph_checked`, which take the optional node relation
-  and a `Poison`. The existing `as_directed_graph` / `as_directed_weighted_graph`
-  are unchanged in signature and behaviour, and now delegate. Errors during the
-  scan (`algo::not_an_edge`, `algo::invalid_edge_weight`) are now raised eagerly
-  rather than after the graph has been built.
-- Tests: `cozo-core/tests/graph_algo_nodes.rs`.
+- **Long CSR builds were un-interruptible.** The scan now checks the poison flag
+  every 4096 tuples, so `::kill` and `:timeout` abort a large build instead of
+  waiting it out. Previously the flag was only observed once the algorithm
+  proper began, which on a 300k-edge graph was most of the query.
+
+### API and compatibility
+
+- New public types under `graph-algo`: `VariantSpec`, `VariantKey`,
+  `GraphVariant`, `ProjectionVariant`, `GraphSource`, and
+  `FixedRulePayload::graph_input`.
+- New defaulted trait method `FixedRule::supports_projection` — non-breaking for
+  out-of-tree implementations; see the parse-error note above.
+- New on `FixedRuleInputRelation`: `as_directed_graph_checked` and
+  `as_directed_weighted_graph_checked`, which take an optional node relation and
+  a `Poison`. The existing `as_directed_graph` / `as_directed_weighted_graph` are
+  unchanged and now delegate to them.
+- **`graph` is now a public dependency.** Its adjacency types are re-exported
+  under `graph-algo` (`DirectedCsrGraph`, `Graph`, `DirectedNeighbors`,
+  `DirectedNeighborsWithValues`), so moving off `graph = "0.3"` is a
+  semver-major event for mnestic.
+- New internal `test-hooks` feature exposing `Db::set_commit_fence_for_tests`,
+  `Db::set_graph_build_fence_for_tests` and
+  `Db::graph_projection_builds_for_tests`, which let a test park a transaction
+  inside the freshness protocol's race windows. **Not a supported API**; never
+  enable it in production.
+
+### Known limitations
+
+- **Projections are not persisted.** After a restart, using one is a loud error
+  naming the fix; re-create them at startup.
+- **Transaction-time relations cannot be projection sources.** Everywhere else
+  in the engine, a selector-less read of a tt-stamped relation means its
+  *current belief*, while a projection's raw scan would deliver the whole
+  history keyspace, retracted rows included. Plain `Validity` relations project
+  fine. Current-belief projections of tt relations may come later.
+- **Weighted variants are built permissively**, so one adjacency serves every
+  consumer. An algorithm whose result is undefined under negative weights —
+  `ShortestPathDijkstra`, `KShortestPathYen`, `CommunityDetectionLouvain`,
+  `BetweennessCentrality`, `ClosenessCentrality` — fails loudly if it meets one,
+  naming itself and the projection.
+
+Design and correctness argument: [`docs/specs/graph-projection.md`](docs/specs/graph-projection.md)
+and the module docs in `cozo-core/src/runtime/graph_projection.rs`. Proven by 58
+end-to-end tests, 6 RocksDB interleaving tests that drive the protocol's race
+windows directly, and 37 mutations verified to turn those tests red.
+
 
 ## 0.10.7 — 2026-07-08
 
