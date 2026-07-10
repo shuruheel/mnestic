@@ -2,6 +2,9 @@
 #   - mnestic-rocks   (cozorocks — the C++/RocksDB bridge; publishes FIRST, only if its
 #                      version isn't already on crates.io)
 #   - mnestic         (cozo-core — the engine; depends on the published mnestic-rocks)
+# …then cut the GitHub Release for the tag, so "released" means the same thing on the
+# registry and on the repo's Releases page. (Before this job, Releases were hand-made and
+# silently drifted: crates.io was at 0.10.7 while the Releases page still said 0.10.0.)
 #
 # This is the crates.io counterpart to python-publish.yml (PyPI). Same test gate, same
 # tag==manifest-version guard. Triggered by `v*` tags (NOT `py-v*`, which drives PyPI).
@@ -119,3 +122,58 @@ jobs:
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
         run: cargo publish -p mnestic
+
+  # --- the Releases page, driven off the same tag that drove the publish ---
+  # Only on a real tag push: a workflow_dispatch run has no tag to hang a release on.
+  # Runs after `publish` so a release never advertises a crate that failed to ship.
+  github-release:
+    name: cut the GitHub Release
+    needs: [publish]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # gh release create
+    steps:
+      - uses: actions/checkout@v4
+
+      # The release body is the version's CHANGELOG-FORK.md section, verbatim, minus its
+      # own `## <version> — <date>` heading (the release title carries that). A tag whose
+      # version has no changelog section is a release-prep miss, so fail loudly.
+      - name: Extract release notes from CHANGELOG-FORK.md
+        id: notes
+        run: |
+          VERSION="${GITHUB_REF#refs/tags/v}"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          python3 - "$VERSION" > release-notes.md <<'PY'
+          import re, sys
+          version = sys.argv[1]
+          text = open("CHANGELOG-FORK.md").read()
+          m = re.search(rf"(?m)^##\s+{re.escape(version)}\b.*?(?=^##\s|\Z)", text, re.S)
+          if not m:
+              sys.exit(f"::error::No '## {version}' section in CHANGELOG-FORK.md — "
+                       f"write the changelog entry before tagging.")
+          print(m.group(0).split("\n", 1)[1].strip())
+          PY
+          echo "--- release notes ---"
+          cat release-notes.md
+
+      # Idempotent: re-running the workflow on an existing tag updates the release body
+      # rather than erroring out. A `-`-bearing version (0.7.3-beta1) is a prerelease and
+      # must not be marked latest.
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION="${{ steps.notes.outputs.version }}"
+          TAG="v$VERSION"
+          case "$VERSION" in
+            *-*) FLAGS=(--prerelease) ;;
+            *)   FLAGS=(--latest) ;;
+          esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists — updating notes."
+            gh release edit "$TAG" --notes-file release-notes.md "${FLAGS[@]}"
+          else
+            echo "Creating release $TAG."
+            gh release create "$TAG" --title "$TAG" --notes-file release-notes.md "${FLAGS[@]}"
+          fi
