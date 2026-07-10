@@ -26,9 +26,16 @@
 //! per-relation [`RelState`] holding the token of that relation's last
 //! observed mutation plus a count of commits currently in flight against it.
 //! An absent map entry reads as `{token: 0, inflight: 0}` — "never mutated in
-//! this process" — which is sound because entries are validated against exact
-//! resolved relation ids, and destroyed ids are purged and never re-resolved
-//! (`relation_store_id` is monotone).
+//! this process" — which is sound because a relation's state, once written,
+//! is **never removed**: a destroyed relation keeps its entry as a permanent
+//! tombstone. Destruction does not make an id unresolvable — a transaction
+//! whose snapshot predates the destroy still resolves it through its own
+//! catalog view — and the tombstone's bumped token is the only thing denying
+//! such transactions a cache exchange (Phase 3/4 adversarial review,
+//! 2026-07-10; an earlier purge-on-destroy made absence ambiguous and opened
+//! a stale-hit window). Ids are never reused within a process
+//! (`relation_store_id` is monotone), so a tombstone cannot shadow a live
+//! relation.
 //!
 //! Every [`SessionTx`](crate::runtime::transact::SessionTx) captures
 //! `watermark = bump_seq.load()` **strictly before** the storage transaction
@@ -259,23 +266,29 @@ impl ProjectionCache {
         }
     }
 
-    /// Assign fresh tokens and lower `inflight`, then — only if the commit
-    /// actually landed — purge the relations this transaction destroyed.
+    /// Assign fresh tokens and lower `inflight`.
     ///
     /// The bump runs whether or not the commit succeeded: a failed destructive
     /// transaction on `mem` may already have mutated the persisted store
     /// through `del_range_from_persisted`, which does not go through the
-    /// transaction cache. The purge does not, because a failed commit leaves
-    /// the catalog row — and hence the relation id — alive.
+    /// transaction cache.
     ///
-    /// Purging *after* the bump is required by §3.3: a purge at the hook site
-    /// would be resurrected by this function's own `entry(..).or_default()`.
-    pub(crate) fn finish_commit(
-        &self,
-        dirty: &BTreeSet<RelationId>,
-        retired: &BTreeSet<RelationId>,
-        committed: bool,
-    ) {
+    /// A destroyed relation's state is deliberately **kept, forever** — a
+    /// tombstone. Destroying a relation does not make its id unresolvable:
+    /// name resolution reads the catalog through each transaction's own pinned
+    /// snapshot, so on rocksdb a long-lived reader that pinned *before* the
+    /// destroy still resolves the old id afterwards. If the state were purged
+    /// (as Phase 1 originally did), absence would read as `{token: 0}` —
+    /// fresh at *every* watermark — and two such pre-destroy readers could
+    /// republish and then consume a projection with no token left to arbitrate
+    /// which content version it holds: a stale hit, found by the Phase 3/4
+    /// adversarial review (2026-07-10). The tombstone's token, minted after
+    /// the destroy's commit, exceeds every watermark that can still resolve
+    /// the id, so those readers build ephemerally and publish nothing. The
+    /// cost is one small map entry per relation destroyed in the process's
+    /// lifetime; ids are never reused, so a tombstone can never shadow a live
+    /// relation.
+    pub(crate) fn finish_commit(&self, dirty: &BTreeSet<RelationId>) {
         {
             let mut states = self.states();
             for rel in dirty {
@@ -284,19 +297,15 @@ impl ProjectionCache {
                 st.token = token;
                 st.inflight = st.inflight.saturating_sub(1);
             }
-            if committed {
-                for rel in retired {
-                    states.remove(rel);
-                }
-            }
         }
         // Outside the `rel_states` guard: the registry lock is only ever taken
         // *before* it, so taking it here — with nothing else held — cannot
         // invert the order. The gap is harmless. A consumer that slips in
         // between re-resolves each source name against its own snapshot: a
-        // destroyed relation no longer resolves, a `:replace`d one resolves to
-        // a fresh id that no entry is bound to, and a merely-written one now
-        // carries a token the entry cannot match. All three miss.
+        // destroyed relation resolves only for snapshots its tombstone token
+        // already exceeds, a `:replace`d one resolves to a fresh id that no
+        // entry is bound to, and a merely-written one now carries a token the
+        // entry cannot match. All three miss.
         self.drop_entries_sourced_on(dirty);
     }
 
@@ -437,9 +446,10 @@ pub(crate) const DEFAULT_PROJECTION_CAPACITY: usize = 512 * 1024 * 1024;
 #[cfg(feature = "graph-algo")]
 const BTREE_ENTRY_OVERHEAD: usize = 48;
 
-/// Flat charge for a vertex key whose heap footprint we do not walk. Such keys
-/// are pathological — a JSON blob or a compiled regex as a graph vertex — and
-/// the ceiling only needs to be the right order of magnitude.
+/// Flat charge for the part of a vertex key we cannot see into: a compiled
+/// regex's program. Its pattern text is counted exactly; the compiled
+/// automaton is opaque, and the ceiling only needs the right order of
+/// magnitude for a key type this pathological.
 #[cfg(feature = "graph-algo")]
 const OPAQUE_KEY_ESTIMATE: usize = 64;
 
@@ -1320,7 +1330,30 @@ fn value_heap_bytes(v: &DataValue) -> usize {
             .sum(),
         DataValue::Vec(Vector::F32(a)) => a.len() * 4,
         DataValue::Vec(Vector::F64(a)) => a.len() * 8,
-        DataValue::Json(_) | DataValue::Regex(_) => OPAQUE_KEY_ESTIMATE,
+        // Json must be walked, not flat-charged: it is a storable key type, a
+        // single blob vertex can be megabytes, and the build interns every
+        // vertex as two owned deep clones. A flat 64-byte charge let the real
+        // footprint exceed the ceiling without bound while `::graph list`
+        // reported a near-empty cache (Phase 3/4 review, 2026-07-10).
+        DataValue::Json(j) => json_heap_bytes(&j.0),
+        DataValue::Regex(r) => r.0.as_str().len() + OPAQUE_KEY_ESTIMATE,
+        _ => 0,
+    }
+}
+
+/// Heap bytes owned by a JSON value, beyond one inline `serde_json::Value`.
+#[cfg(feature = "graph-algo")]
+fn json_heap_bytes(v: &serde_json::Value) -> usize {
+    let node = std::mem::size_of::<serde_json::Value>();
+    match v {
+        serde_json::Value::String(s) => s.len(),
+        serde_json::Value::Array(a) => {
+            a.len() * node + a.iter().map(json_heap_bytes).sum::<usize>()
+        }
+        serde_json::Value::Object(m) => m
+            .iter()
+            .map(|(k, x)| k.len() + node + BTREE_ENTRY_OVERHEAD + json_heap_bytes(x))
+            .sum(),
         _ => 0,
     }
 }
@@ -1769,7 +1802,7 @@ mod tests {
         let before = c.watermark();
 
         c.begin_commit(&r);
-        c.finish_commit(&r, &Default::default(), true);
+        c.finish_commit(&r);
         let after = c.watermark();
 
         assert!(before < after);
@@ -1792,7 +1825,7 @@ mod tests {
         assert!(!c.is_fresh(RelationId(1), u64::MAX));
         assert_eq!(c.rel_state(RelationId(1)).inflight, 1);
 
-        c.finish_commit(&r, &Default::default(), true);
+        c.finish_commit(&r);
         assert_eq!(c.rel_state(RelationId(1)).inflight, 0);
         assert!(c.is_fresh(RelationId(1), c.watermark()));
     }
@@ -1806,13 +1839,13 @@ mod tests {
 
         c.begin_commit(&r);
         c.begin_commit(&r);
-        c.finish_commit(&r, &Default::default(), true);
+        c.finish_commit(&r);
         assert!(
             !c.is_fresh(RelationId(1), u64::MAX),
             "one writer is still in flight"
         );
 
-        c.finish_commit(&r, &Default::default(), true);
+        c.finish_commit(&r);
         assert!(c.is_fresh(RelationId(1), c.watermark()));
     }
 
@@ -1825,7 +1858,7 @@ mod tests {
         let before = c.watermark();
 
         c.begin_commit(&r);
-        c.finish_commit(&r, &Default::default(), false);
+        c.finish_commit(&r);
 
         assert!(!c.is_fresh(RelationId(1), before));
         assert_eq!(c.rel_state(RelationId(1)).inflight, 0);
@@ -1835,21 +1868,28 @@ mod tests {
     /// landed — and always *after* the bump, never at the hook site, or
     /// `finish_commit`'s own `entry(..).or_default()` would resurrect it.
     #[test]
-    fn retired_state_is_purged_on_commit_and_kept_on_failure() {
+    fn a_destroyed_relations_state_is_a_permanent_tombstone() {
         let c = ProjectionCache::default();
         let r = ids(&[1]);
+        let before = c.watermark();
 
+        // The destroy commits. The state must survive it: a snapshot pinned
+        // before the destroy still resolves the id, and the tombstone's token
+        // is the only thing denying that snapshot a cache exchange. (Purging
+        // here — as Phase 1 originally did — makes the absent entry read as
+        // token 0, fresh at every watermark: the review's stale-hit window.)
         c.begin_commit(&r);
-        c.finish_commit(&r, &r, false);
+        c.finish_commit(&r);
         assert_ne!(
             c.rel_state(RelationId(1)),
             RelState::default(),
-            "a failed destroy leaves the catalog row, so the id lives on"
+            "the tombstone must outlive the relation"
         );
-
-        c.begin_commit(&r);
-        c.finish_commit(&r, &r, true);
-        assert_eq!(c.rel_state(RelationId(1)), RelState::default());
+        assert!(
+            !c.is_fresh(RelationId(1), before),
+            "and be permanently unfresh at every pre-destroy watermark"
+        );
+        assert_eq!(c.rel_state(RelationId(1)).inflight, 0);
     }
 
     /// `all_fresh` is a conjunction over the source set, evaluated under one
@@ -1861,7 +1901,7 @@ mod tests {
         assert!(c.all_fresh(ids(&[1, 2]).into_iter(), w));
 
         c.begin_commit(&ids(&[2]));
-        c.finish_commit(&ids(&[2]), &Default::default(), true);
+        c.finish_commit(&ids(&[2]));
 
         assert!(c.is_fresh(RelationId(1), w));
         assert!(!c.all_fresh(ids(&[1, 2]).into_iter(), w));
@@ -1888,7 +1928,7 @@ mod tests {
         let c = ProjectionCache::default();
         let r = ids(&[1]);
         c.begin_commit(&r);
-        c.finish_commit(&r, &Default::default(), true);
+        c.finish_commit(&r);
         let settled = c.watermark();
         assert!(c.is_fresh(RelationId(1), settled));
 
@@ -1990,8 +2030,9 @@ mod tests {
 
     /// §3.4 row 5: `:replace` destroys the relation and creates a new one with
     /// a fresh id. The *old* id must be dirtied (entries sourced on it are
-    /// dropped in Phase 2) and then purged, because nothing will ever resolve
-    /// to it again. The new id is a different relation entirely.
+    /// dropped in Phase 2) and its state kept as a tombstone — a snapshot
+    /// pinned before the `:replace` still resolves it. The new id is a
+    /// different relation entirely.
     #[test]
     fn replace_retires_the_old_id_and_mints_a_new_one() {
         let db = plain_db();
@@ -2002,10 +2043,14 @@ mod tests {
 
         let new = rel_id(&db, "r");
         assert_ne!(old, new, ":replace mints a new relation id");
-        assert_eq!(
+        assert_ne!(
             db.graph_projections.rel_state(old),
             RelState::default(),
-            "the retired id's state is purged after the commit-time bump"
+            "the old id's state is retained as a tombstone"
+        );
+        assert!(
+            !db.graph_projections.is_fresh(old, before),
+            "which denies every pre-replace watermark"
         );
         assert!(
             !db.graph_projections.is_fresh(new, before),
@@ -2013,16 +2058,10 @@ mod tests {
         );
     }
 
-    /// §3.4 row 9: `::remove` dirties the relation and then retires its id.
-    ///
-    /// The oracle is deliberately two-sided. `is_fresh` cannot serve here: a
-    /// purged id reads as `{token: 0, inflight: 0}`, i.e. *fresh*, and that is
-    /// correct — nothing will ever resolve to it again, so no entry can name
-    /// it. What must hold is that the id was bumped (so Phase 2's eager drop
-    /// has a dirty set to work from) and *then* purged. Seeding a token first
-    /// is what makes the purge distinguishable from never having marked it.
+    /// §3.4 row 9: `::remove` dirties the relation it destroys, and the id's
+    /// state lives on as a tombstone that no pre-destroy watermark can pass.
     #[test]
-    fn remove_relation_dirties_then_retires_the_id() {
+    fn remove_relation_dirties_and_tombstones_the_id() {
         let db = plain_db();
         let r = rel_id(&db, "r");
         run(&db, "?[a, b] <- [[1, 1]] :put r {a => b}").unwrap();
@@ -2035,11 +2074,15 @@ mod tests {
             watermark(&db) > before,
             "::remove must bump the relation it destroys"
         );
-        assert_eq!(
+        assert!(
+            !db.graph_projections.is_fresh(r, before),
+            "the tombstone denies every watermark captured before the destroy"
+        );
+        assert_ne!(
             db.graph_projections.rel_state(r),
             RelState::default(),
-            "and then purge it, after the bump — a hook-site purge would be \
-             resurrected by finish_commit's or_default()"
+            "and it is never purged: a snapshot pinned before the destroy \
+             still resolves this id"
         );
     }
 

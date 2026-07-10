@@ -79,12 +79,12 @@ relation:
 
 ### Phase 4 — the proof
 
-- 49 end-to-end tests (`tests/graph_projection.rs`) over the script surface: the
+- 58 end-to-end tests (`tests/graph_projection.rs`) over the script surface: the
   sysops, the source-kind rejections, the parse-time `graph:` guard, cache
   hit/miss/eviction observed through `::graph list`, and a positional-vs-`graph:`
   equivalence row for each of the twelve ports — including one where a
   mis-shifted input index changes the answer rather than erroring.
-- 5 interleaving tests (`tests/graph_projection_interleaving.rs`, rocksdb +
+- 6 interleaving tests (`tests/graph_projection_interleaving.rs`, rocksdb +
   `test-hooks`, and a CI job to run them): `mem` and `sqlite` pin a read
   transaction by holding a store-wide read guard, so a long-lived reader and a
   concurrent writer cannot coexist and none of these schedules is reachable
@@ -92,13 +92,76 @@ relation:
   a stale hit by `inflight` alone; a reader that pinned before a commit is never
   served the fresh entry a later transaction published; a commit landing during
   a build makes the produce rule refuse the result; eight cold readers coalesce
-  into one build; and a reader hammering a projection under continuous write
-  churn never disagrees with a raw scan of the source in the same transaction.
+  into one build; a reader hammering a projection under continuous write
+  churn never disagrees with a raw scan of the source in the same transaction;
+  and — added by the review round — a pre-destroy snapshot can neither publish
+  into nor read from the cache across a `:replace` (the tombstone fix's exact
+  two-reader poisoning schedule).
 - A second `test-hooks` fence, inside the projection build, makes the
   produce-refusal race deterministic instead of timing-dependent.
 - `benches/graph_projection.rs`: cold vs warm vs write-invalidated, for three
   kernels. The write-invalidated arm is the bound the design is judged on.
-- 26 mutations verified red across Phases 3 and 4.
+- 37 mutations verified red across Phases 3 and 4 (29 surface + 8 interleaving,
+  after the same-day adversarial-review round; the pre-review landing was 28).
+
+### Phase 3/4 adversarial review — a freshness hole closed, and an engine-wide deadlock class removed
+
+A 90-agent adversarial review of Phases 3 and 4 (10 finder lenses, 3 refuters
+per finding, completeness critic) confirmed 12 findings and refuted 12. The
+fixes, in order of consequence:
+
+- **A destroyed relation's freshness state is now kept forever as a tombstone**
+  (it was purged after the commit-time bump). The purge assumed a destroyed id
+  is never re-resolved, which is false: name resolution reads the catalog
+  through each transaction's own pinned snapshot, so on RocksDB a reader that
+  pinned *before* a `:replace` or `::remove` still resolves the old id after
+  it. With the state purged, absence read as token 0 — fresh at every
+  watermark — and two such pre-destroy readers could republish and then
+  *consume* a projection whose content the second reader's own scan
+  contradicts: a stale hit, in the direction the always-fresh proof claims
+  closed. The tombstone's token exceeds every watermark that can still resolve
+  the id. Cost: one ~40-byte map entry per relation destroyed per process
+  lifetime. The `retired_relations` plumbing is gone — destruction is now an
+  ordinary dirtying — and a new interleaving test drives the exact two-reader
+  poisoning schedule.
+- **`DbInstance::multi_transaction` now runs its transaction loop on a
+  dedicated thread, as its documentation always claimed.** It used
+  `rayon::spawn`, which parks a global-pool worker in a blocking `recv` loop
+  for the transaction's whole life; with `available_parallelism` transactions
+  open (or one open transaction on a one-core machine racing any parallel
+  query), every rayon-using query in the process deadlocks. Not
+  projection-specific — any `multi_transaction` user was exposed.
+- **Json vertex keys are now charged their walked size** in the cache's byte
+  estimate, not a flat 64 bytes. Json is a storable key type and each vertex
+  is interned as two owned deep clones, so the flat charge let the real
+  footprint exceed the 512 MiB ceiling without bound while `::graph list`
+  reported a near-empty cache.
+- **`SimpleFixedRule` is exempt from the parse-time `graph:` guard.** Its
+  closure receives every option, so an option named `graph` was never silently
+  dropped there — a pre-0.11 out-of-tree rule reading it keeps working. The
+  guard's help text no longer tells `Constant` or `CsvReader` users to "pass
+  the relation positionally".
+- **`Db::set_graph_projection_capacity` gained its `DbInstance` dispatcher** —
+  it was unreachable from every language binding and from `cozo-bin`, while
+  the oversize-variant warning told users to call it.
+- **`::graph create`/`drop` inside an imperative script survive the script's
+  abort — now documented and test-pinned as a decision.** The registry is
+  process-global in-memory state; deferring creation to commit would break
+  using a projection later in the script that defines it. Definitions hold
+  only names and every use re-resolves them, so an orphaned definition errors
+  loudly at use; the escape is `::graph drop`.
+- Test hardening from the review's coverage findings: the strict/permissive
+  flag of every port is now pinned (a flipped Louvain/Yen/Closeness/Prim
+  policy was previously invisible to every test), the `undirected` option is
+  pinned per optioned port on an asymmetric fixture, `last_used` movement on a
+  hit is asserted strictly, and all three graph test files gained the
+  `graph-algo` cfg gate they were missing (a `--no-default-features
+  --features minimal,storage-rocksdb,test-hooks` build now skips them instead
+  of failing to compile).
+- The bench and the D3 `verify.py` warm arm no longer claim their invalidating
+  self-loop writes are structure-neutral (each adds a singleton component),
+  and both now state that the write sits inside the timed region — a bias
+  against the projection, i.e. conservative for the never-worse bound.
 
 ### Phase 2 — the cache, the registry, and the memory ceiling
 

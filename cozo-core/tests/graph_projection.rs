@@ -15,6 +15,8 @@
 //! `last_used`. The in-crate `mod cache_tests` drives the consume and produce
 //! rules directly; this file proves the surface those rules sit behind.
 
+#![cfg(feature = "graph-algo")]
+
 use std::collections::BTreeSet;
 
 use cozo::{DataValue, DbInstance, NamedRows, ScriptMutability};
@@ -222,6 +224,63 @@ fn a_projection_survives_inside_an_imperative_script() {
 }
 
 #[test]
+fn a_projection_created_earlier_in_the_script_is_usable_later_in_it() {
+    // This is the load-bearing reason `::graph create` registers immediately
+    // rather than at commit: the natural setup script defines and uses the
+    // projection in one transaction.
+    let db = graph_db();
+    let res = run(
+        &db,
+        r#"
+        {::graph create g {edges: knows}}
+        {?[n, c] <~ ConnectedComponents(graph: 'g')}
+        "#,
+    );
+    assert_eq!(rows(&res).len(), 5);
+}
+
+#[test]
+fn registry_changes_survive_their_scripts_abort_by_design() {
+    // The registry is process-global in-memory state, deliberately outside
+    // transaction semantics (like the FTS stats cache): deferring `::graph
+    // create` to commit would break same-script use, above. The consequence,
+    // pinned here so it stays a decision rather than becoming an accident: a
+    // create or drop SURVIVES its script's abort. Definitions hold only
+    // names and every use re-resolves them, so this can never produce a wrong
+    // answer — an orphaned definition errors loudly at use, and the escape is
+    // `::graph drop`.
+    let db = graph_db();
+    let msg = err(
+        &db,
+        r#"
+        {::graph create g {edges: knows}}
+        {?[x] <- [[1]] :put no_such_relation {x}}
+        "#,
+    );
+    assert!(msg.contains("Cannot find"), "{msg}");
+    assert_eq!(
+        rows(&run(&db, "::graph list")).len(),
+        1,
+        "the create survived the abort"
+    );
+    run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+
+    let msg = err(
+        &db,
+        r#"
+        {::graph drop g}
+        {?[x] <- [[1]] :put no_such_relation {x}}
+        "#,
+    );
+    assert!(msg.contains("Cannot find"), "{msg}");
+    assert_eq!(
+        rows(&run(&db, "::graph list")).len(),
+        0,
+        "the drop survived the abort too"
+    );
+}
+
+#[test]
 fn create_and_drop_are_refused_in_read_only_mode() {
     let db = graph_db();
     let ro = |s: &str| {
@@ -254,6 +313,28 @@ fn the_graph_option_is_rejected_on_a_rule_that_cannot_use_it() {
     // …and so is a utility that has no graph at all.
     let msg = err(&db, "?[a] <~ Constant(data: [[1]], graph: 'g')");
     assert!(msg.contains("cannot take its edges from a graph projection"), "{msg}");
+}
+
+#[test]
+fn a_simple_fixed_rule_still_receives_an_option_named_graph() {
+    // SimpleFixedRule forwards every option to its closure, so an option
+    // spelled `graph` was never silently dropped — the misfire the parse-time
+    // guard exists to prevent. A pre-0.11 out-of-tree rule reading it must
+    // keep working; the name gains no projection semantics for it.
+    let db = graph_db();
+    db.register_fixed_rule(
+        "EchoGraphOption".to_string(),
+        cozo::SimpleFixedRule::new(1, |_inputs, options| {
+            let val = options
+                .get("graph")
+                .cloned()
+                .unwrap_or(DataValue::from("MISSING"));
+            Ok(NamedRows::new(vec!["x".to_string()], vec![vec![val]]))
+        }),
+    )
+    .unwrap();
+    let res = run(&db, "?[x] <~ EchoGraphOption(graph: 'social')");
+    assert_eq!(rows(&res), vec![vec![DataValue::from("social")]]);
 }
 
 // ---------------------------------------------------- source-kind rejection
@@ -324,7 +405,14 @@ fn a_hit_moves_last_used_but_not_built_at() {
     run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
     let (_, _, built2, second_used) = listed(&db)[0].clone();
     assert_eq!(built, built2);
-    assert!(second_used >= first_used);
+    // Strictly greater: `>=` is satisfied by a last_used that never moves at
+    // all, which is precisely the defect this test exists to catch. The clock
+    // is sub-microsecond f64 seconds and the two lookups are separate script
+    // runs, so equality can only mean the hit did not touch the field.
+    assert!(
+        second_used > first_used,
+        "the hit did not move last_used ({second_used} vs {first_used})"
+    );
 }
 
 #[test]
@@ -776,6 +864,33 @@ fn an_unweighted_source_gives_every_edge_unit_weight() {
     }
 }
 
+#[test]
+fn a_json_keyed_projection_is_charged_its_real_bytes() {
+    // Json is a storable key type and a blob vertex is interned as two owned
+    // deep clones, so a flat per-key charge would let the real footprint
+    // exceed the 512 MiB ceiling without bound while `::graph list` reported
+    // a near-empty cache. The estimate must scale with the payload.
+    let db = mem();
+    run(&db, ":create e {a: Json, b: Json}");
+    let blob = "x".repeat(10_000);
+    db.run_script(
+        "?[a, b] <- [[json_object('k', $blob), json_object('k', $k2)]] :put e {a, b}",
+        std::collections::BTreeMap::from([
+            ("blob".to_string(), DataValue::from(blob.as_str())),
+            ("k2".to_string(), DataValue::from(format!("{blob}2").as_str())),
+        ]),
+        ScriptMutability::Mutable,
+    )
+    .unwrap();
+    run(&db, "::graph create g {edges: e}");
+    run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+    let (_, est_bytes, _, _) = listed(&db)[0].clone();
+    assert!(
+        est_bytes > 2 * 10_000,
+        "two ~10 KB Json vertices estimated at only {est_bytes} bytes"
+    );
+}
+
 // ----------------------------------------------------- negative-weight policy
 
 /// A negative-weight fixture whose projection is `g`.
@@ -838,6 +953,87 @@ fn a_strict_positional_call_still_fails_at_the_weight_it_reads() {
     assert!(msg.contains("edge weight"), "{msg}");
 }
 
+/// One row per strict port whose flag no other test pins. The positional and
+/// projected arms share one `VariantSpec`, so the *_agrees equivalence tests
+/// are structurally blind to a flipped flag — both arms flip together. Only
+/// the policy's own observable (reject vs accept) discriminates.
+#[test]
+fn every_strict_port_refuses_a_negative_weight_variant() {
+    let db = negative_db();
+    run(&db, ":create goal {id: Int}");
+    run(&db, "?[id] <- [[3]] :put goal {id}");
+    for (name, script) in [
+        (
+            "CommunityDetectionLouvain",
+            "?[l, n] <~ CommunityDetectionLouvain(graph: 'g')",
+        ),
+        (
+            "KShortestPathYen",
+            "?[s, t, c, p] <~ KShortestPathYen(*start[u], *goal[v], k: 2, graph: 'g')",
+        ),
+        (
+            "ClosenessCentrality",
+            "?[n, c] <~ ClosenessCentrality(graph: 'g')",
+        ),
+    ] {
+        // The diagnostic code, not the prose: miette wraps long messages, so
+        // "negative edge weight" can straddle a line break.
+        let msg = err(&db, script);
+        assert!(msg.contains("projection_negative_weight"), "{name}: {msg}");
+        assert!(msg.contains(name), "{name}: {msg}");
+    }
+}
+
+/// …and the permissive ports consume the same variant without complaint.
+#[test]
+fn every_permissive_port_accepts_a_negative_weight_variant() {
+    let db = negative_db();
+    let mst = run(&db, "?[a, b, c] <~ MinimumSpanningTreePrim(graph: 'g')");
+    assert_eq!(rows(&mst).len(), 2, "Prim must span the negative edge too");
+    run(&db, "?[c, n] <~ LabelPropagation(graph: 'g')");
+    run(&db, "?[a, b, c] <~ MinimumSpanningForestKruskal(graph: 'g')");
+}
+
+/// The `undirected` option must reach the build for the option-taking ports.
+/// The two arms of `graph_input` share the spec, so equivalence rows cannot
+/// see a hardcoded direction; what can is the *result changing with the
+/// option* on an asymmetric graph — plus an equivalence row at the
+/// non-default setting so both forms agree there too.
+#[test]
+fn the_undirected_option_changes_the_answer_on_an_asymmetric_graph() {
+    let db = graph_db();
+    run(&db, "::graph create g {edges: knows}");
+    for (name, directed, undirected, positional_undirected) in [
+        (
+            "PageRank",
+            "?[n, r] <~ PageRank(graph: 'g')",
+            "?[n, r] <~ PageRank(undirected: true, graph: 'g')",
+            "?[n, r] <~ PageRank(*knows[a, b], undirected: true)",
+        ),
+        (
+            "BetweennessCentrality",
+            "?[n, c] <~ BetweennessCentrality(graph: 'g')",
+            "?[n, c] <~ BetweennessCentrality(undirected: true, graph: 'g')",
+            "?[n, c] <~ BetweennessCentrality(*knows[a, b, w], undirected: true)",
+        ),
+        (
+            "ClosenessCentrality",
+            "?[n, c] <~ ClosenessCentrality(graph: 'g')",
+            "?[n, c] <~ ClosenessCentrality(undirected: true, graph: 'g')",
+            "?[n, c] <~ ClosenessCentrality(*knows[a, b, w], undirected: true)",
+        ),
+    ] {
+        let d = rows(&run(&db, directed));
+        let u = rows(&run(&db, undirected));
+        assert_ne!(d, u, "{name}: the undirected option had no effect");
+        assert_eq!(
+            u,
+            rows(&run(&db, positional_undirected)),
+            "{name}: undirected forms disagree"
+        );
+    }
+}
+
 // -------------------------------------------------------------- empty graphs
 
 #[test]
@@ -873,10 +1069,8 @@ fn capacity_zero_disables_caching_but_not_the_registry() {
     run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
     assert_eq!(resident(&db), 1);
 
-    match &db {
-        DbInstance::Mem(d) => d.set_graph_projection_capacity(0),
-        _ => unreachable!(),
-    }
+    // Through the DbInstance dispatcher — the path every language binding uses.
+    db.set_graph_projection_capacity(0);
     assert_eq!(resident(&db), 0, "shrinking to zero must evict");
 
     // Still answers, still lists, still never caches.
@@ -890,10 +1084,7 @@ fn capacity_zero_disables_caching_but_not_the_registry() {
 fn a_variant_larger_than_the_ceiling_is_built_for_every_query() {
     let db = graph_db();
     run(&db, "::graph create g {edges: knows}");
-    match &db {
-        DbInstance::Mem(d) => d.set_graph_projection_capacity(1),
-        _ => unreachable!(),
-    }
+    db.set_graph_projection_capacity(1);
     let res = run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
     assert_eq!(rows(&res).len(), 5);
     assert_eq!(resident(&db), 0);

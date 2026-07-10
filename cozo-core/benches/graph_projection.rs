@@ -65,8 +65,13 @@ fn make_db() -> DbInstance {
     db
 }
 
-/// A row nobody else touches, so writing it invalidates `g` without changing
-/// its component structure.
+/// A self-loop on a fresh synthetic id. It invalidates `g` while leaving the
+/// timed kernel's asymptotics alone — but note it is NOT structure-neutral:
+/// every edge endpoint becomes a CSR vertex, so each write adds one new
+/// singleton component to the graph. Note also that the write itself sits
+/// inside the timed region below, so the "invalidated" numbers carry the
+/// write's cost — a bias *against* the projection, i.e. conservative for the
+/// "never worse than today" bound they exist to check.
 fn dirty(db: &DbInstance, i: i64) {
     db.run_script(
         "?[a, b] <- [[$i, $i]] :put knows {a, b}",

@@ -24,6 +24,8 @@
 //! * **An empty edge relation no longer panics** seven of the graph algorithms, and Prim keeps
 //!   raising its starting-node diagnostics on one.
 
+#![cfg(feature = "graph-algo")]
+
 use cozo::{
     DataValue, DbInstance, FixedRule, FixedRulePayload, NamedRows, Poison, RegularTempStore,
     ScriptMutability,

@@ -26,7 +26,11 @@
 //! Run with:
 //! `cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving`
 
-#![cfg(all(feature = "storage-rocksdb", feature = "test-hooks"))]
+#![cfg(all(
+    feature = "storage-rocksdb",
+    feature = "test-hooks",
+    feature = "graph-algo"
+))]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -224,6 +228,76 @@ fn components(res: &NamedRows) -> usize {
         .map(|r| r[1].get_int().unwrap())
         .collect::<BTreeSet<_>>()
         .len()
+}
+
+// --------------------------------------------------------------- tombstones
+
+/// The Phase 3/4 review's high finding. A destroyed relation's freshness state
+/// must be kept as a permanent tombstone, because destruction does not make
+/// the id unresolvable: a reader whose snapshot predates the destroy still
+/// resolves it through its own catalog view. If the state were purged, absence
+/// would read as `{token: 0}` — fresh at every watermark — and two pre-destroy
+/// readers could republish and then *consume* a projection with no token left
+/// to arbitrate content versions:
+///
+/// reader T pins → writer adds rows → reader T3 pins (sees the new rows) →
+/// `:replace` retires the id → T builds its old content and publishes at
+/// token 0 → T3 takes the hit and is served content its own scan contradicts.
+///
+/// With the tombstone, T's produce is refused (token exceeds its watermark)
+/// and T3 rebuilds from its own snapshot.
+#[test]
+fn a_snapshot_predating_a_replace_cannot_poison_the_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = fixture(dir.path());
+
+    // T pins first, seeing edges {1→2, 3→4}.
+    let t = DbInstance::RocksDb(db.clone()).multi_transaction(false);
+    assert_eq!(
+        vertices(&t.run_script(CC, BTreeMap::new()).unwrap()),
+        BTreeSet::from([1, 2, 3, 4])
+    );
+
+    // A writer adds 5→6; T3 pins after it, sees all six vertices, and — being
+    // fresh — legitimately republishes the six-vertex variant.
+    run(&db, "?[a, b] <- [[5,6]] :put knows {a, b}");
+    let t3 = DbInstance::RocksDb(db.clone()).multi_transaction(false);
+    assert_eq!(
+        vertices(&t3.run_script(CC, BTreeMap::new()).unwrap()),
+        BTreeSet::from([1, 2, 3, 4, 5, 6])
+    );
+    assert_eq!(resident(&db), 1);
+
+    // The relation is `:replace`d: the old id is retired, and the entry bound
+    // to it is freed.
+    run(&db, "?[a, b] <- [[7,8]] :replace knows {a: Int, b: Int}");
+    assert_eq!(resident(&db), 0);
+
+    // T queries. It resolves the OLD id through its pinned snapshot, builds
+    // its own four-vertex content — and must NOT be allowed to publish it:
+    // only the tombstone's token stands between this build and the cache.
+    let t_res = t.run_script(CC, BTreeMap::new()).unwrap();
+    assert_eq!(vertices(&t_res), BTreeSet::from([1, 2, 3, 4]));
+    assert_eq!(
+        resident(&db),
+        0,
+        "a pre-destroy snapshot published into the cache: the tombstone is gone"
+    );
+
+    // T3 queries. Same old id, different snapshot content. It must rebuild
+    // from its own snapshot, never take an entry of T's.
+    let before = builds(&db);
+    let t3_res = t3.run_script(CC, BTreeMap::new()).unwrap();
+    assert_eq!(builds(&db), before + 1, "T3 must rebuild, not hit");
+    assert_eq!(
+        vertices(&t3_res),
+        BTreeSet::from([1, 2, 3, 4, 5, 6]),
+        "T3 was served another snapshot's graph — the stale hit the tombstone exists to deny"
+    );
+    assert_eq!(resident(&db), 0, "neither pre-destroy snapshot may publish");
+
+    t.abort().unwrap();
+    t3.abort().unwrap();
 }
 
 // ---------------------------------------------------------------------- (c)

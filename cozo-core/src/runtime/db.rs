@@ -1430,7 +1430,6 @@ impl<'s, S: Storage<'s>> Db<S> {
             projections: self.graph_projections.clone(),
             watermark,
             dirty_relations: Default::default(),
-            retired_relations: Default::default(),
             commit_inflight: false,
         };
         Ok(ret)
@@ -1454,7 +1453,6 @@ impl<'s, S: Storage<'s>> Db<S> {
             projections: self.graph_projections.clone(),
             watermark,
             dirty_relations: Default::default(),
-            retired_relations: Default::default(),
             commit_inflight: false,
         };
         Ok(ret)

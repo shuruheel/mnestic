@@ -901,6 +901,16 @@ impl FixedRule for SimpleFixedRule {
         Ok(self.return_arity)
     }
 
+    /// `true`, but not because a `SimpleFixedRule` consumes a projection — it
+    /// cannot. The parse-time guard on the `graph:` option exists to catch
+    /// options a rule would *silently drop*; `run` below forwards every option
+    /// to the user's closure, so an option named `graph` is not dropped, and a
+    /// pre-0.11 rule that read it from its options map must keep working. The
+    /// name gains no projection semantics here: the closure sees the raw value.
+    fn supports_projection(&self) -> bool {
+        true
+    }
+
     fn run(
         &self,
         payload: FixedRulePayload<'_, '_>,

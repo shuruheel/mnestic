@@ -924,6 +924,26 @@ impl DbInstance {
             receiver: db2app_recv,
         }
     }
+    /// Dispatcher method. See [crate::Db::set_graph_projection_capacity].
+    /// (mnestic fork; without this the graph-projection memory ceiling was
+    /// unreachable from every language binding and from `cozo-bin`, while the
+    /// engine's oversize-variant warning named it as the remedy.)
+    #[cfg(feature = "graph-algo")]
+    pub fn set_graph_projection_capacity(&self, bytes: usize) {
+        match self {
+            DbInstance::Mem(db) => db.set_graph_projection_capacity(bytes),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.set_graph_projection_capacity(bytes),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.set_graph_projection_capacity(bytes),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.set_graph_projection_capacity(bytes),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.set_graph_projection_capacity(bytes),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.set_graph_projection_capacity(bytes),
+        }
+    }
 }
 
 /// A multi-transaction handle.

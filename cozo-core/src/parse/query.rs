@@ -1103,8 +1103,11 @@ fn parse_fixed_rule(
     #[error("'{0}' cannot take its edges from a graph projection")]
     #[diagnostic(code(parser::fixed_rule_no_projection))]
     #[diagnostic(help(
-        "this rule evaluates per-tuple expressions against its edge relation, which a cached \
-         adjacency does not carry. Drop the `graph:` option and pass the relation positionally"
+        "this rule does not read a `graph:` option, and unread fixed-rule options are ignored \
+         engine-wide — the call would silently run without the projection. Drop the option. \
+         The lazy graph algorithms (BFS, DFS, ShortestPathBFS, RandomWalk, ShortestPathAStar, \
+         DegreeCentrality) are excluded by design — they evaluate per-tuple expressions a \
+         cached adjacency does not carry — and take their edge relation positionally"
     ))]
     struct FixedRuleNoProjectionError(String, #[label] SourceSpan);
 

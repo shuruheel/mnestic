@@ -86,10 +86,6 @@ pub struct SessionTx<'a> {
     /// come from a separate per-transaction counter and collide numerically
     /// with persistent ids.
     pub(crate) dirty_relations: BTreeSet<RelationId>,
-    /// The subset of `dirty_relations` this transaction destroyed (`::remove`,
-    /// and `:replace`'s old id). Their `RelState` is purged after the
-    /// post-commit bump, and only if the commit landed.
-    pub(crate) retired_relations: BTreeSet<RelationId>,
     /// Set between `begin_commit` and `finish_commit`. If a panic unwinds
     /// through the storage commit, `Drop` reads this and balances the `inflight`
     /// increment — otherwise the sources would be denied cache hits forever.
@@ -132,8 +128,7 @@ const OK_STR: &str = "OK";
 impl Drop for SessionTx<'_> {
     fn drop(&mut self) {
         if self.commit_inflight {
-            self.projections
-                .finish_commit(&self.dirty_relations, &self.retired_relations, false);
+            self.projections.finish_commit(&self.dirty_relations);
         } else if !self.dirty_relations.is_empty() {
             self.projections.bump_aborted(&self.dirty_relations);
         }
@@ -244,20 +239,12 @@ impl<'a> SessionTx<'a> {
         }
     }
 
-    /// As [`mark_dirty`](Self::mark_dirty), and additionally record that the
-    /// relation ceases to exist if this transaction commits, so its freshness
-    /// state can be purged after the commit-time bump.
-    pub(crate) fn mark_retired(&mut self, handle: &RelationHandle) {
-        if !handle.is_temp {
-            self.dirty_relations.insert(handle.id);
-            self.retired_relations.insert(handle.id);
-        }
-    }
-
     /// Commit, maintaining the graph-projection freshness protocol
     /// (`runtime/graph_projection.rs` §3.3): raise `inflight` before the
-    /// storage commit, mint fresh tokens after it returns — whether it
-    /// succeeded or failed — and only then purge the relations it destroyed.
+    /// storage commit, and mint fresh tokens after it returns — whether it
+    /// succeeded or failed. A destroyed relation's state stays behind as a
+    /// permanent tombstone; see `finish_commit` for why a purge here would
+    /// re-open a stale-hit window for pre-destroy snapshots.
     ///
     /// This is the single commit funnel for every write path, so no mutation
     /// can escape the protocol. Taking the dirty set here also disarms
@@ -273,10 +260,8 @@ impl<'a> SessionTx<'a> {
         #[cfg(any(test, feature = "test-hooks"))]
         self.projections.run_commit_fence(&self.dirty_relations);
         self.commit_inflight = false;
-        self.projections
-            .finish_commit(&self.dirty_relations, &self.retired_relations, res.is_ok());
+        self.projections.finish_commit(&self.dirty_relations);
         self.dirty_relations.clear();
-        self.retired_relations.clear();
         res
     }
 

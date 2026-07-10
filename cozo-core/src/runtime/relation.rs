@@ -1067,11 +1067,12 @@ impl<'a> SessionTx<'a> {
 
         // Graph-projection dirty-set hook (spec §3.4 rows 5 and 9). This is the
         // single funnel for relation destruction: `::remove`, `::index drop`,
-        // and `:replace`'s destroy-then-recreate all land here. The id is
-        // retired, not merely dirtied — if this transaction commits, nothing
-        // will ever resolve to it again (`relation_store_id` is monotone), so
-        // its freshness state is purged after the commit-time bump.
-        self.mark_retired(&store);
+        // and `:replace`'s destroy-then-recreate all land here. Destruction is
+        // just a dirtying like any other: the id's freshness state is KEPT as
+        // a permanent tombstone, because a transaction whose snapshot predates
+        // the destroy still resolves this id, and only the tombstone's bumped
+        // token denies it a cache exchange (Phase 3/4 review, 2026-07-10).
+        self.mark_dirty(&store);
 
         for k in store.indices.keys() {
             let more_to_clean = self.destroy_relation(&format!("{name}:{k}"))?;
