@@ -104,7 +104,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.10.7"
+mnestic = "0.11.0"
 ```
 
 ```rust

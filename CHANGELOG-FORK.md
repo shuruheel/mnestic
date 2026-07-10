@@ -5,9 +5,11 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.10.7 work not yet cut to a release. Keep this section current as
+Post-0.11.0 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
+
+## 0.11.0 — 2026-07-10
 
 **Cached graph projections.** `::graph create G { edges: knows, nodes: person }`
 names an in-memory adjacency over stored relations that twelve graph algorithms

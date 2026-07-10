@@ -52,14 +52,19 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-**New in 0.10.7:** the engine's opt-in factorized-`count()` rewrite is now
-toggleable from Python. `db.set_query_factorization(True)` /
-`db.query_factorization()` control a Db-wide switch (default **off**); when on,
-an eligible `count()` over a positive join is counted per-key without
-materializing the join, for the same result — mirroring the previously Rust-only
-switch so Python benchmarks can measure it. Separately, 0.10.7 corrects a
-tie-break in the default greedy join reorder so a partial composite-key prefix is
-no longer mistaken for a point lookup on high-fan-out joins (no result change).
+**New in 0.11.0: cached graph projections.** Run
+`db.run_script("::graph create g { edges: knows, nodes: person }", {}, False)` to
+name an in-memory adjacency that twelve graph algorithms reuse across queries:
+pass `graph: 'g'` in place of the positional edge relation
+(`ConnectedComponents(graph: 'g')`, `PageRank(graph: 'g', iterations: 20)`, …)
+and the setup — scanning the edges and rebuilding a CSR — is paid once instead of
+on every call (measured 15–16× on a 400,000-edge graph). A projection is always
+fresh: a write to a source relation frees what was built from it, and it lives
+only in memory. `::graph list` and `::graph drop` manage them, and
+`db.set_graph_projection_capacity(bytes)` sets the cache's ceiling (512 MiB by
+default; `0` disables caching while leaving `::graph create` working).
+**Breaking (results):** `PageRank`'s default `iterations` is now 20, up from 10;
+pass `iterations: 10` to restore the old numbers.
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

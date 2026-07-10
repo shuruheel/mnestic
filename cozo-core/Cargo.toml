@@ -1,6 +1,6 @@
 [package]
 name = "mnestic"
-version = "0.10.7"
+version = "0.11.0"
 edition = "2021"
 description = "A transactional relational-graph-vector database using Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory"
 authors = ["Shan Rizvi", "Ziyang Hu (original CozoDB author)"]
