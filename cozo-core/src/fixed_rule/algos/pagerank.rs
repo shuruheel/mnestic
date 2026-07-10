@@ -20,6 +20,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct PageRank;
@@ -31,7 +32,6 @@ impl FixedRule for PageRank {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
         let theta = payload.unit_interval_option("theta", Some(0.85))? as f32;
         let epsilon = payload.unit_interval_option("epsilon", Some(0.0001))? as f32;
@@ -39,16 +39,20 @@ impl FixedRule for PageRank {
 
         // The optional second input names the vertices. Vertices with no edge then take part in
         // the ranking as isolated vertices, which also puts them into the `1/N` base score.
-        let nodes = payload.get_input(1).ok();
-        let (graph, indices, _) =
-            edges.as_directed_graph_checked(undirected, nodes.as_ref(), &poison)?;
+        // A projection declares them with `nodes:` instead; supplying both is rejected.
+        let (source, _input_base) = payload.graph_input(
+            0,
+            VariantSpec::unweighted(undirected).registering_nodes(),
+            &poison,
+        )?;
+        let indices = source.indices();
 
         if indices.is_empty() {
             return Ok(());
         }
 
         let (ranks, n_run, error) = page_rank(
-            &graph,
+            source.unweighted()?,
             PageRankConfig::new(iterations, epsilon as f64, theta),
         );
         // `page_rank` returns as soon as `error < epsilon`, so reaching here with a larger error
@@ -75,6 +79,10 @@ impl FixedRule for PageRank {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(2)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

@@ -25,6 +25,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct ShortestPathDijkstra;
@@ -36,14 +37,18 @@ impl FixedRule for ShortestPathDijkstra {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-        let starting = payload.get_input(1)?;
-        let termination = payload.get_input(2);
         let undirected = payload.bool_option("undirected", Some(false))?;
         let keep_ties = payload.bool_option("keep_ties", Some(false))?;
 
-        let (graph, indices, inv_indices) =
-            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
+        let (source, input_base) =
+            payload.graph_input(0, VariantSpec::weighted(undirected, true), &poison)?;
+        let graph = source.weighted()?;
+        let indices = source.indices();
+        let inv_indices = source.inv_indices();
+
+        let starting = payload.get_input(input_base)?;
+        // An absent optional input still reads as `fixed_rule::not_enough_args` after the shift.
+        let termination = payload.get_input(input_base + 1);
 
         let mut starting_nodes = BTreeSet::new();
         for tuple in starting.iter()? {
@@ -74,17 +79,17 @@ impl FixedRule for ShortestPathDijkstra {
                     if tn.len() == 1 {
                         let single = Some(*tn.iter().next().unwrap());
                         if keep_ties {
-                            dijkstra_keep_ties(&graph, start, &single, &(), &(), poison.clone())?
+                            dijkstra_keep_ties(graph, start, &single, &(), &(), poison.clone())?
                         } else {
-                            dijkstra(&graph, start, &single, &(), &())
+                            dijkstra(graph, start, &single, &(), &())
                         }
                     } else if keep_ties {
-                        dijkstra_keep_ties(&graph, start, tn, &(), &(), poison.clone())?
+                        dijkstra_keep_ties(graph, start, tn, &(), &(), poison.clone())?
                     } else {
-                        dijkstra(&graph, start, tn, &(), &())
+                        dijkstra(graph, start, tn, &(), &())
                     }
                 } else {
-                    dijkstra(&graph, start, &(), &(), &())
+                    dijkstra(graph, start, &(), &(), &())
                 };
                 for (target, cost, path) in res {
                     let t = vec![
@@ -112,7 +117,7 @@ impl FixedRule for ShortestPathDijkstra {
                                 let single = Some(*tn.iter().next().unwrap());
                                 if keep_ties {
                                     dijkstra_keep_ties(
-                                        &graph,
+                                        graph,
                                         start,
                                         &single,
                                         &(),
@@ -120,15 +125,15 @@ impl FixedRule for ShortestPathDijkstra {
                                         poison.clone(),
                                     )?
                                 } else {
-                                    dijkstra(&graph, start, &single, &(), &())
+                                    dijkstra(graph, start, &single, &(), &())
                                 }
                             } else if keep_ties {
-                                dijkstra_keep_ties(&graph, start, tn, &(), &(), poison.clone())?
+                                dijkstra_keep_ties(graph, start, tn, &(), &(), poison.clone())?
                             } else {
-                                dijkstra(&graph, start, tn, &(), &())
+                                dijkstra(graph, start, tn, &(), &())
                             }
                         } else {
-                            dijkstra(&graph, start, &(), &(), &())
+                            dijkstra(graph, start, &(), &(), &())
                         },
                     ))
                 })
@@ -160,6 +165,10 @@ impl FixedRule for ShortestPathDijkstra {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(4)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

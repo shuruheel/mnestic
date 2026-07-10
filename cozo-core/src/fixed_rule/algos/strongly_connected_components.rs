@@ -9,7 +9,7 @@
 
 use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, Graph};
 use std::cmp::min;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use itertools::Itertools;
 use miette::Result;
@@ -23,6 +23,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::{EpochStore, RegularTempStore};
 use crate::runtime::transact::SessionTx;
 
@@ -45,10 +46,10 @@ impl FixedRule for StronglyConnectedComponent {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-
-        let (graph, indices, mut inv_indices) =
-            edges.as_directed_graph_checked(!self.strong, None, &poison)?;
+        let (source, input_base) =
+            payload.graph_input(0, VariantSpec::unweighted(!self.strong), &poison)?;
+        let indices = source.indices();
+        let inv_indices = source.inv_indices();
 
         // An empty edge relation yields a graph with one phantom vertex (the vendored builder
         // sizes it from the largest edge endpoint, and `max_node_id()` of an empty edge list is
@@ -57,7 +58,7 @@ impl FixedRule for StronglyConnectedComponent {
         let tarjan = if indices.is_empty() {
             vec![]
         } else {
-            TarjanSccG::new(&graph).run(poison)?
+            TarjanSccG::new(source.unweighted()?).run(poison)?
         };
         for (grp_id, cc) in tarjan.iter().enumerate() {
             for idx in cc {
@@ -69,12 +70,16 @@ impl FixedRule for StronglyConnectedComponent {
 
         let mut counter = tarjan.len() as i64;
 
-        if let Ok(nodes) = payload.get_input(1) {
+        // Nodes the graph does not know about get singleton components of their own. The
+        // adjacency may be shared with other transactions, so the "already emitted" set is a
+        // local overlay rather than an insertion into `inv_indices`. It is empty exactly when
+        // the projection's own `nodes:` already covers this relation.
+        if let Ok(nodes) = payload.get_input(input_base) {
+            let mut emitted: BTreeSet<DataValue> = BTreeSet::new();
             for tuple in nodes.iter()? {
                 let tuple = tuple?;
                 let node = tuple.into_iter().next().unwrap();
-                if !inv_indices.contains_key(&node) {
-                    inv_indices.insert(node.clone(), u32::MAX);
+                if !inv_indices.contains_key(&node) && emitted.insert(node.clone()) {
                     let tuple = vec![node, DataValue::from(counter)];
                     out.put(tuple);
                     counter += 1;
@@ -83,6 +88,10 @@ impl FixedRule for StronglyConnectedComponent {
         }
 
         Ok(())
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 
     fn arity(

@@ -21,6 +21,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct ClusteringCoefficients;
@@ -32,12 +33,12 @@ impl FixedRule for ClusteringCoefficients {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-        let (graph, indices, _) = edges.as_directed_graph_checked(true, None, &poison)?;
+        let (source, _input_base) = payload.graph_input(0, VariantSpec::unweighted(true), &poison)?;
+        let indices = source.indices();
         if indices.is_empty() {
             return Ok(());
         }
-        let coefficients = clustering_coefficients(&graph, poison)?;
+        let coefficients = clustering_coefficients(source.unweighted()?, poison)?;
         for (idx, (cc, n_triangles, degree)) in coefficients.into_iter().enumerate() {
             out.put(vec![
                 indices[idx].clone(),
@@ -57,6 +58,10 @@ impl FixedRule for ClusteringCoefficients {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(4)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

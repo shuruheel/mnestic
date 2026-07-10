@@ -22,6 +22,7 @@ use crate::fixed_rule::algos::shortest_path_dijkstra::dijkstra;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct KShortestPathYen;
@@ -33,14 +34,17 @@ impl FixedRule for KShortestPathYen {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-        let starting = payload.get_input(1)?;
-        let termination = payload.get_input(2)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
         let k = payload.pos_integer_option("k", None)?;
 
-        let (graph, indices, inv_indices) =
-            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
+        let (source, input_base) =
+            payload.graph_input(0, VariantSpec::weighted(undirected, true), &poison)?;
+        let graph = source.weighted()?;
+        let indices = source.indices();
+        let inv_indices = source.inv_indices();
+
+        let starting = payload.get_input(input_base)?;
+        let termination = payload.get_input(input_base + 1)?;
 
         let mut starting_nodes = BTreeSet::new();
         for tuple in starting.iter()? {
@@ -62,7 +66,7 @@ impl FixedRule for KShortestPathYen {
             for start in starting_nodes {
                 for goal in &termination_nodes {
                     for (cost, path) in
-                        k_shortest_path_yen(k, &graph, start, *goal, poison.clone())?
+                        k_shortest_path_yen(k, graph, start, *goal, poison.clone())?
                     {
                         let t = vec![
                             indices[start as usize].clone(),
@@ -91,7 +95,7 @@ impl FixedRule for KShortestPathYen {
                         Ok((
                             start,
                             goal,
-                            k_shortest_path_yen(k, &graph, start, goal, poison.clone())?,
+                            k_shortest_path_yen(k, graph, start, goal, poison.clone())?,
                         ))
                     },
                 )
@@ -123,6 +127,10 @@ impl FixedRule for KShortestPathYen {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(4)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

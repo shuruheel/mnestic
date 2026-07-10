@@ -35,6 +35,11 @@ use crate::fixed_rule::algos::*;
 use crate::fixed_rule::utilities::*;
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+#[cfg(feature = "graph-algo")]
+use crate::runtime::graph_projection::{
+    graph_source, GraphSource, GraphVariant, ProjectionNegativeWeightError,
+    ProjectionNodesInputConflict, ProjectionVariant, VariantSpec,
+};
 use crate::runtime::temp_store::{EpochStore, RegularTempStore};
 use crate::runtime::transact::SessionTx;
 use crate::NamedRows;
@@ -484,7 +489,100 @@ fn check_csr_capacity(
     Ok(())
 }
 
+/// The option through which a fixed rule names the graph projection it wants
+/// to consume instead of its positional edge relation.
+#[cfg(feature = "graph-algo")]
+pub(crate) const GRAPH_OPTION: &str = "graph";
+
 impl<'a, 'b> FixedRulePayload<'a, 'b> {
+    /// Obtain this rule's adjacency, from the graph-projection cache when the
+    /// call carries `graph: 'G'`, and by scanning input `idx` otherwise.
+    /// Alongside it, `input_base`: the index of the first positional input
+    /// *after* the edge slot, which the projection form shifts down by one.
+    ///
+    /// ```text
+    /// ShortestPathDijkstra(*edges[a,b,w], *start[n])       input_base = 1
+    /// ShortestPathDijkstra(*start[n], graph: 'G')          input_base = 0
+    /// ```
+    ///
+    /// A shifted `get_input` failure still reads as "absent optional input",
+    /// so `Dijkstra`'s optional `termination` keeps working in both forms.
+    ///
+    /// The cached form is subject to the freshness protocol in
+    /// [`graph_projection`](crate::runtime::graph_projection): the returned
+    /// adjacency always agrees with what this transaction's own scan of the
+    /// sources would have produced, and may well be an ephemeral build.
+    #[cfg(feature = "graph-algo")]
+    pub fn graph_input(
+        &self,
+        idx: usize,
+        spec: VariantSpec,
+        poison: &Poison,
+    ) -> Result<(GraphSource, usize)> {
+        let Some(option) = self.manifest.options.get(GRAPH_OPTION) else {
+            let edges = self.get_input(idx)?;
+            // Only PageRank registers a positional nodes relation into the id
+            // map; for everyone else input `idx + 1` means something else
+            // entirely (a starting relation, an overlay) and must not be read
+            // here.
+            let nodes = if spec.register_nodes {
+                self.get_input(idx + 1).ok()
+            } else {
+                None
+            };
+            let variant = if spec.weighted {
+                // A positional build is private to this call, so strictness is
+                // enforced as the weights are scanned — exactly as it was
+                // before projections existed, down to the diagnostic's span.
+                let (graph, indices, inv_indices, has_negative) = edges.build_weighted_graph(
+                    spec.undirected,
+                    !spec.strict_weights,
+                    nodes.as_ref(),
+                    poison,
+                )?;
+                ProjectionVariant::new(
+                    GraphVariant::Weighted {
+                        graph,
+                        has_negative,
+                    },
+                    indices,
+                    inv_indices,
+                )
+            } else {
+                let (graph, indices, inv_indices) =
+                    edges.as_directed_graph_checked(spec.undirected, nodes.as_ref(), poison)?;
+                ProjectionVariant::new(GraphVariant::Unweighted(graph), indices, inv_indices)
+            };
+            return Ok((Arc::new(variant), idx + 1));
+        };
+
+        let span = option.span();
+        // `graph: g` and `graph: 'g'` both name the projection `g`. A bare name
+        // arrives as a binding, and an option expression gives a binding no
+        // other meaning — `::graph create g {edges: knows}` reads its sources
+        // the same way.
+        let name = match option {
+            Expr::Binding { var, .. } => var.name.clone(),
+            _ => self.string_option(GRAPH_OPTION, None)?,
+        };
+        if spec.register_nodes && self.inputs_count() > idx {
+            bail!(ProjectionNodesInputConflict(
+                self.name().to_string(),
+                name.to_string(),
+                span
+            ));
+        }
+        let source = graph_source(self.tx, &name, spec.key(), span, poison)?;
+        if spec.strict_weights && source.has_negative() {
+            bail!(ProjectionNegativeWeightError(
+                self.name().to_string(),
+                name.to_string(),
+                span
+            ));
+        }
+        Ok((source, idx))
+    }
+
     /// Get the total number of input relations.
     pub fn inputs_count(&self) -> usize {
         self.manifest.relations_count()
@@ -720,6 +818,16 @@ pub trait FixedRule: Send + Sync {
         out: &'_ mut RegularTempStore,
         poison: Poison,
     ) -> Result<()>;
+    /// Whether this rule can take its adjacency from a cached graph projection,
+    /// i.e. whether [`FixedRulePayload::graph_input`] mediates its edge input.
+    ///
+    /// Unknown options are silently ignored engine-wide, so without this a
+    /// `graph:` option on a rule that never reads it would quietly build the
+    /// graph the slow way. `parse_fixed_rule` rejects that combination instead.
+    /// Defaulted to `false`, so out-of-tree implementations keep compiling.
+    fn supports_projection(&self) -> bool {
+        false
+    }
 }
 
 /// Simple wrapper for custom fixed rule. You have less control than implementing [FixedRule] directly,

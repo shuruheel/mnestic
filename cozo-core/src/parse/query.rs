@@ -1094,6 +1094,27 @@ fn parse_fixed_rule(
         .get(&fixed.name as &str)
         .ok_or_else(|| FixedRuleNotFoundError(fixed.name.to_string(), name_pair.extract_span()))?;
     fixed_impl.init_options(&mut options, args_list_span)?;
+
+    // Unknown fixed-rule options are silently ignored engine-wide, so `graph:`
+    // on a rule that never reads it would quietly fall back to a full rebuild
+    // — the opposite of what the user asked for (mnestic fork,
+    // `docs/specs/graph-projection.md` §3.5.4).
+    #[derive(Debug, Error, Diagnostic)]
+    #[error("'{0}' cannot take its edges from a graph projection")]
+    #[diagnostic(code(parser::fixed_rule_no_projection))]
+    #[diagnostic(help(
+        "this rule evaluates per-tuple expressions against its edge relation, which a cached \
+         adjacency does not carry. Drop the `graph:` option and pass the relation positionally"
+    ))]
+    struct FixedRuleNoProjectionError(String, #[label] SourceSpan);
+
+    if let Some(opt) = options.get("graph") {
+        ensure!(
+            fixed_impl.supports_projection(),
+            FixedRuleNoProjectionError(fixed.name.to_string(), opt.span())
+        );
+    }
+
     let arity = fixed_impl.arity(&options, &head, name_pair.extract_span())?;
 
     ensure!(

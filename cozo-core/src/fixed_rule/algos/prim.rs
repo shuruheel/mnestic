@@ -6,7 +6,7 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use graph::prelude::{DirectedCsrGraph, DirectedNeighborsWithValues, Graph};
+use graph::prelude::{DirectedCsrGraph, DirectedDegrees, DirectedNeighborsWithValues, Graph};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
@@ -23,6 +23,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct MinimumSpanningTreePrim;
@@ -34,18 +35,28 @@ impl FixedRule for MinimumSpanningTreePrim {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-        let (graph, indices, inv_indices) =
-            edges.as_directed_weighted_graph_checked(true, true, None, &poison)?;
+        let (source, input_base) =
+            payload.graph_input(0, VariantSpec::weighted(true, false), &poison)?;
+        let graph = source.weighted()?;
+        let indices = source.indices();
+        let inv_indices = source.inv_indices();
         // The empty early-return sits inside the no-starting-input arm: a user who names a
         // starting node (or supplies an empty starting relation) must still get the loud
         // `starting_node_not_found` / `empty_starting` diagnostic, not a silent empty result.
-        let starting = match payload.get_input(1) {
+        let starting = match payload.get_input(input_base) {
             Err(_) => {
                 if indices.is_empty() {
                     return Ok(());
                 }
-                0
+                // Vertex 0 is an edge endpoint in any graph built from an edge relation alone,
+                // but a projection's `nodes:` can seat an isolated vertex there, and Prim from
+                // an isolated vertex spans nothing. Start from the lowest vertex with an edge;
+                // when no vertex has one, the tree really is empty. (The build is undirected,
+                // so out-degree is degree.)
+                match (0..graph.node_count()).find(|n| graph.out_degree(*n) > 0) {
+                    None => return Ok(()),
+                    Some(n) => n,
+                }
             }
             Ok(rel) => {
                 let tuple = rel.iter()?.next().ok_or_else(|| {
@@ -67,7 +78,7 @@ impl FixedRule for MinimumSpanningTreePrim {
                 })?
             }
         };
-        let msp = prim(&graph, starting, poison)?;
+        let msp = prim(graph, starting, poison)?;
         for (src, dst, cost) in msp {
             out.put(vec![
                 indices[src as usize].clone(),
@@ -85,6 +96,10 @@ impl FixedRule for MinimumSpanningTreePrim {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(3)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

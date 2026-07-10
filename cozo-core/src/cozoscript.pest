@@ -13,14 +13,18 @@ query_script_inner_no_bracket = { (option | rule | const_rule | fixed_rule)+ }
 imperative_script = {SOI ~ imperative_stmt+ ~ EOI}
 sys_script = {SOI ~ "::" ~ (history_op | history_gc_op | evict_op | list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | remove_relations_op | trigger_relation_op |
                     trigger_relation_show_op | rename_relations_op | running_op | kill_op | explain_op |
-                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules) ~ EOI}
+                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules | graph_op) ~ EOI}
 sys_script_inner = {"{" ~ "::" ~ (history_op | history_gc_op | evict_op | list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | remove_relations_op | trigger_relation_op |
                     trigger_relation_show_op | rename_relations_op | running_op | kill_op | explain_op |
-                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules) ~ "}"}
+                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules | graph_op) ~ "}"}
 index_op = {"index" ~ (index_create | index_drop)}
 vec_idx_op = {"hnsw" ~ (index_create_adv | index_drop)}
 fts_idx_op = {"fts" ~ (index_create_adv | index_drop)}
 lsh_idx_op = {"lsh" ~ (index_create_adv | index_drop)}
+graph_op = {"graph" ~ (graph_create | graph_drop | graph_list)}
+graph_create = {"create" ~ ident ~ "{" ~ (graph_opt_field ~ ",")* ~ graph_opt_field? ~ "}"}
+graph_drop = {"drop" ~ ident}
+graph_list = {"list"}
 index_create = {"create" ~ compound_ident ~ ":" ~ ident ~ "{" ~ (ident ~ ",")* ~ ident? ~ "}"}
 index_create_adv = {"create" ~ compound_ident ~ ":" ~ ident ~ "{" ~ (index_opt_field ~ ",")* ~ index_opt_field? ~ "}"}
 index_drop = {"drop" ~ compound_ident ~ ":" ~ ident }
@@ -52,6 +56,7 @@ rename_pair = {compound_ident ~ "->" ~ compound_ident}
 from_clause = {"from" ~ expr}
 to_clause = {"to" ~ expr}
 index_opt_field = {ident ~ ":" ~ expr}
+graph_opt_field = {ident ~ ":" ~ expr}
 
 WHITESPACE = _{ " " | "\t" | "\r" | "\n" }
 BLOCK_COMMENT = _{ "/*" ~ (BLOCK_COMMENT | !"*/" ~ ANY)* ~ "*/" }

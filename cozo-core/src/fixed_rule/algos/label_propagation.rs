@@ -20,6 +20,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct LabelPropagation;
@@ -31,15 +32,15 @@ impl FixedRule for LabelPropagation {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
         let max_iter = payload.pos_integer_option("max_iter", Some(10))?;
-        let (graph, indices, _inv_indices) =
-            edges.as_directed_weighted_graph_checked(undirected, true, None, &poison)?;
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::weighted(undirected, false), &poison)?;
+        let indices = source.indices();
         if indices.is_empty() {
             return Ok(());
         }
-        let labels = label_propagation(&graph, max_iter, poison)?;
+        let labels = label_propagation(source.weighted()?, max_iter, poison)?;
         for (idx, label) in labels.into_iter().enumerate() {
             let node = indices[idx].clone();
             out.put(vec![DataValue::from(label as i64), node]);
@@ -54,6 +55,10 @@ impl FixedRule for LabelPropagation {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(2)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

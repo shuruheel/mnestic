@@ -22,6 +22,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct MinimumSpanningForestKruskal;
@@ -33,13 +34,13 @@ impl FixedRule for MinimumSpanningForestKruskal {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-        let (graph, indices, _) =
-            edges.as_directed_weighted_graph_checked(true, true, None, &poison)?;
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::weighted(true, false), &poison)?;
+        let indices = source.indices();
         if indices.is_empty() {
             return Ok(());
         }
-        let msp = kruskal(&graph, poison)?;
+        let msp = kruskal(source.weighted()?, poison)?;
         for (src, dst, cost) in msp {
             out.put(vec![
                 indices[src as usize].clone(),
@@ -58,6 +59,10 @@ impl FixedRule for MinimumSpanningForestKruskal {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(3)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

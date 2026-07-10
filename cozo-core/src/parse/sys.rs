@@ -60,6 +60,18 @@ pub enum SysOp {
     /// (relation, keys, unredacted): hard-delete every record of the keys
     /// (GDPR); audit row written in the same transaction
     TtEvict(Symbol, Vec<Vec<DataValue>>, bool),
+    /// mnestic fork, graph projection: register `name` as a cached CSR over
+    /// the `edges` relation, optionally with `nodes` naming the vertex set.
+    /// Builds nothing — variants materialise on first algorithm use.
+    CreateGraph {
+        name: SmartString<LazyCompact>,
+        edges: SmartString<LazyCompact>,
+        nodes: Option<SmartString<LazyCompact>>,
+    },
+    /// mnestic fork, graph projection: forget a projection, freeing its CSRs
+    DropGraph(SmartString<LazyCompact>),
+    /// mnestic fork, graph projection: one row per built variant
+    ListGraphs,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -466,6 +478,46 @@ pub(crate) fn parse_sys(
                 r => unreachable!("{:?}", r),
             }
         }
+        // mnestic fork, graph projection (`docs/specs/graph-projection.md` §3.1)
+        Rule::graph_op => {
+            let inner = inner.into_inner().next().unwrap();
+            match inner.as_rule() {
+                Rule::graph_create => {
+                    let mut inner = inner.into_inner();
+                    let name = inner.next().unwrap();
+                    let mut edges = None;
+                    let mut nodes = None;
+                    for opt_pair in inner {
+                        let mut opt_inner = opt_pair.into_inner();
+                        let opt_name = opt_inner.next().unwrap();
+                        let opt_val = opt_inner.next().unwrap();
+                        let slot = match opt_name.as_str() {
+                            "edges" => &mut edges,
+                            "nodes" => &mut nodes,
+                            other => bail!(
+                                "unknown option '{other}' for `::graph create`: \
+                                 expected 'edges' or 'nodes'"
+                            ),
+                        };
+                        *slot = Some(graph_source_name(opt_val, param_pool)?);
+                    }
+                    let Some(edges) = edges else {
+                        bail!("`::graph create` requires an `edges` relation");
+                    };
+                    SysOp::CreateGraph {
+                        name: SmartString::from(name.as_str()),
+                        edges,
+                        nodes,
+                    }
+                }
+                Rule::graph_drop => {
+                    let name = inner.into_inner().next().unwrap();
+                    SysOp::DropGraph(SmartString::from(name.as_str()))
+                }
+                Rule::graph_list => SysOp::ListGraphs,
+                r => unreachable!("{:?}", r),
+            }
+        }
         Rule::fts_idx_op => {
             let inner = inner.into_inner().next().unwrap();
             match inner.as_rule() {
@@ -750,6 +802,25 @@ fn sysop_keys(expr: crate::data::expr::Expr) -> Result<Vec<Vec<DataValue>>> {
             })
             .collect(),
         _ => bail!("expected a list of keys, e.g. [[1], [2]]"),
+    }
+}
+
+/// Read a `::graph create` source relation out of its option expression
+/// (mnestic fork). A bare `edges: knows` parses as a binding, a quoted
+/// `edges: 'knows'` as a string constant; both name the same relation. Same
+/// two shapes `::fts create`'s `tokenizer:` accepts.
+fn graph_source_name(
+    pair: crate::parse::Pair<'_>,
+    param_pool: &BTreeMap<String, DataValue>,
+) -> Result<SmartString<LazyCompact>> {
+    let mut expr = build_expr(pair, param_pool)?;
+    expr.partial_eval()?;
+    if let Expr::Binding { var, .. } = expr {
+        return Ok(var.name);
+    }
+    match expr.eval_to_const()? {
+        DataValue::Str(s) => Ok(s),
+        _ => bail!("a `::graph create` source must be a relation name, bare or quoted"),
     }
 }
 

@@ -140,6 +140,15 @@ pub(crate) struct RelState {
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) type CommitFence = std::sync::Arc<dyn Fn(&BTreeSet<RelationId>) + Send + Sync>;
 
+/// A test-only parking point inside `graph_source`, invoked once a build has
+/// finished and before its result is offered to the produce rule. It is the
+/// only way to hold a transaction inside the window a concurrent commit must
+/// land in for a *legal* insert to become a refused one — Door 2 and `produce`
+/// agree on every other schedule, because a watermark does not move.
+/// See `docs/specs/graph-projection.md` §5.
+#[cfg(all(feature = "graph-algo", any(test, feature = "test-hooks")))]
+pub(crate) type BuildFence = std::sync::Arc<dyn Fn() + Send + Sync>;
+
 /// Process-global freshness state for graph projections; one per [`Db`], held
 /// behind an `Arc` and cloned into every `SessionTx`.
 ///
@@ -182,6 +191,8 @@ pub(crate) struct ProjectionCache {
     /// prove that single-flight coalesces and that a hit does not rebuild.
     #[cfg(feature = "graph-algo")]
     build_count: AtomicU64,
+    #[cfg(all(feature = "graph-algo", any(test, feature = "test-hooks")))]
+    build_fence: Mutex<Option<BuildFence>>,
     /// Cumulative count of build-slot acquisitions, for tests that must see
     /// whether a lookup went through single-flight at all — the slot map
     /// self-cleans, so its final state cannot witness that.
@@ -352,6 +363,37 @@ impl ProjectionCache {
         }
     }
 
+    /// Install the test-only build fence. Returns the previous one.
+    #[cfg(all(feature = "graph-algo", any(test, feature = "test-hooks")))]
+    pub(crate) fn set_build_fence(&self, fence: Option<BuildFence>) -> Option<BuildFence> {
+        let mut slot = self
+            .build_fence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::replace(&mut *slot, fence)
+    }
+
+    /// Run the build fence, if installed. Cloned out of its lock before running,
+    /// like the commit fence, so it may itself touch this cache.
+    #[cfg(all(feature = "graph-algo", any(test, feature = "test-hooks")))]
+    fn run_build_fence(&self) {
+        let fence = {
+            let slot = self
+                .build_fence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            slot.clone()
+        };
+        if let Some(fence) = fence {
+            fence();
+        }
+    }
+
+    /// The build fence compiles away entirely outside tests.
+    #[cfg(all(feature = "graph-algo", not(any(test, feature = "test-hooks"))))]
+    #[inline(always)]
+    fn run_build_fence(&self) {}
+
     /// Snapshot of a relation's state, for tests and `::graph list`.
     #[allow(dead_code)] // Phase 2: `::graph list` reports it.
     pub(crate) fn rel_state(&self, rel: RelationId) -> RelState {
@@ -424,7 +466,67 @@ impl VariantKey {
             (true, true) => "undirected+weighted",
         }
     }
+}
 
+/// What a fixed rule asks [`FixedRulePayload::graph_input`] for: which CSR it
+/// needs, and what it does with the things a CSR alone cannot decide.
+///
+/// [`FixedRulePayload::graph_input`]: crate::FixedRulePayload::graph_input
+#[cfg(feature = "graph-algo")]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct VariantSpec {
+    /// Feed every stored edge to the builder in both directions.
+    pub undirected: bool,
+    /// Read column 3 of the edge relation as the weight (default `1.0`).
+    pub weighted: bool,
+    /// Refuse a graph any of whose weights is negative (§3.2.2). Positional
+    /// builds reject it as they scan; a shared cached variant is built
+    /// permissively and rejected here, by the consumer that cares.
+    pub strict_weights: bool,
+    /// The positional input *after* the edges names the vertex set, and its
+    /// vertices must be interned before the edges are scanned so that the
+    /// isolated ones become real degree-0 CSR vertices. Only PageRank sets
+    /// this, and it is incompatible with `graph:` — a cached variant's ids are
+    /// already assigned (§3.5.2).
+    pub register_nodes: bool,
+}
+
+#[cfg(feature = "graph-algo")]
+impl VariantSpec {
+    /// An unweighted adjacency.
+    pub fn unweighted(undirected: bool) -> Self {
+        Self {
+            undirected,
+            weighted: false,
+            strict_weights: false,
+            register_nodes: false,
+        }
+    }
+    /// A weighted adjacency. `strict` rejects negative edge weights.
+    pub fn weighted(undirected: bool, strict: bool) -> Self {
+        Self {
+            undirected,
+            weighted: true,
+            strict_weights: strict,
+            register_nodes: false,
+        }
+    }
+    /// Also intern the vertices named by the positional input after the edges,
+    /// so that isolated ones become real degree-0 CSR vertices.
+    pub fn registering_nodes(mut self) -> Self {
+        self.register_nodes = true;
+        self
+    }
+
+    /// The cache key this spec selects. `strict_weights` and `register_nodes`
+    /// are consumer policy, not graph shape, so they are deliberately absent:
+    /// a strict and a permissive consumer share one weighted variant.
+    pub(crate) fn key(&self) -> VariantKey {
+        VariantKey {
+            undirected: self.undirected,
+            weighted: self.weighted,
+        }
+    }
 }
 
 /// A built adjacency, weighted or not.
@@ -462,7 +564,15 @@ pub struct ProjectionVariant {
 
 #[cfg(feature = "graph-algo")]
 impl ProjectionVariant {
-    fn new(graph: GraphVariant, indices: Vec<DataValue>, inv_indices: BTreeMap<DataValue, u32>) -> Self {
+    /// `est_bytes` is computed eagerly, on ephemeral builds as much as on
+    /// cached ones: it is one pass over the id map, next to a build that
+    /// already interned every endpoint through that same map, and paying it
+    /// once here keeps the produce rule from doing it under the registry lock.
+    pub(crate) fn new(
+        graph: GraphVariant,
+        indices: Vec<DataValue>,
+        inv_indices: BTreeMap<DataValue, u32>,
+    ) -> Self {
         // `Target<u32, ()>` is a bare `u32`; `Target<u32, f32>` carries the
         // weight alongside it.
         let (nodes, edges, target_bytes) = match &graph {
@@ -487,6 +597,34 @@ impl ProjectionVariant {
     /// The adjacency.
     pub fn graph(&self) -> &GraphVariant {
         &self.graph
+    }
+    /// The unweighted adjacency.
+    ///
+    /// Errors if this variant is weighted, which cannot happen to a caller that
+    /// obtained it from [`graph_input`] with `weighted: false`: the cache is
+    /// keyed on that flag and the builder dispatches on it.
+    ///
+    /// [`graph_input`]: crate::FixedRulePayload::graph_input
+    pub fn unweighted(&self) -> Result<&DirectedCsrGraph<u32>> {
+        match &self.graph {
+            GraphVariant::Unweighted(g) => Ok(g),
+            GraphVariant::Weighted { .. } => bail!(ProjectionVariantMismatch("unweighted")),
+        }
+    }
+    /// The weighted adjacency. See [`unweighted`](Self::unweighted).
+    pub fn weighted(&self) -> Result<&DirectedCsrGraph<u32, (), f32>> {
+        match &self.graph {
+            GraphVariant::Weighted { graph, .. } => Ok(graph),
+            GraphVariant::Unweighted(_) => bail!(ProjectionVariantMismatch("weighted")),
+        }
+    }
+    /// Whether the scan that built this variant saw a negative edge weight.
+    /// Always `false` for an unweighted variant.
+    pub fn has_negative(&self) -> bool {
+        match &self.graph {
+            GraphVariant::Weighted { has_negative, .. } => *has_negative,
+            GraphVariant::Unweighted(_) => false,
+        }
     }
     /// Vertex values, indexed by the dense `u32` id the CSR uses.
     pub fn indices(&self) -> &[DataValue] {
@@ -693,6 +831,36 @@ struct ProjectionTxTimeSourceError(String);
 #[error("edge relation '{0}' of a graph projection has arity {1}, needs at least 2")]
 #[diagnostic(code(graph::projection_bad_edge_arity))]
 struct ProjectionEdgeArityError(String, usize);
+
+/// Asking a variant for the adjacency it does not hold. Unreachable through
+/// `graph_input`, which selects the variant by the same flag it then narrows on.
+#[cfg(feature = "graph-algo")]
+#[derive(Debug, Error, Diagnostic)]
+#[error("internal error: expected the {0} adjacency of a graph projection")]
+#[diagnostic(code(graph::projection_variant_mismatch))]
+struct ProjectionVariantMismatch(&'static str);
+
+/// `strict_weights` met a permissively-built variant carrying a negative weight.
+#[cfg(feature = "graph-algo")]
+#[derive(Debug, Error, Diagnostic)]
+#[error("'{0}' cannot run on graph projection '{1}': it has a negative edge weight")]
+#[diagnostic(code(graph::projection_negative_weight))]
+#[diagnostic(help(
+    "one weighted variant serves every consumer of a projection, so it is built permissively and \
+     rejected here. This algorithm's result is undefined under negative weights"
+))]
+pub(crate) struct ProjectionNegativeWeightError(pub String, pub String, #[label] pub SourceSpan);
+
+/// PageRank's positional nodes relation, combined with `graph:`.
+#[cfg(feature = "graph-algo")]
+#[derive(Debug, Error, Diagnostic)]
+#[error("'{0}' cannot take a positional nodes relation alongside graph projection '{1}'")]
+#[diagnostic(code(graph::projection_nodes_input_conflict))]
+#[diagnostic(help(
+    "a cached variant's vertex ids are fixed when it is built, so isolated vertices must be \
+     declared on the projection: `::graph create {1} {{edges: …, nodes: …}}`"
+))]
+pub(crate) struct ProjectionNodesInputConflict(pub String, pub String, #[label] pub SourceSpan);
 
 #[cfg(feature = "graph-algo")]
 impl ProjectionCache {
@@ -1157,10 +1325,96 @@ fn value_heap_bytes(v: &DataValue) -> usize {
     }
 }
 
+/// `::graph create G {edges: …, nodes: …}`. Validates loudly and immediately;
+/// builds nothing — variants materialise on first algorithm use (§3.1, §3.2).
+#[cfg(feature = "graph-algo")]
+pub(crate) fn sysop_create_graph(
+    tx: &SessionTx<'_>,
+    name: &str,
+    edges: &str,
+    nodes: Option<&str>,
+) -> Result<()> {
+    create_projection(tx, name, edges, nodes)
+}
+
+/// `::graph drop G`. Forgets the definition and frees every variant it built.
+#[cfg(feature = "graph-algo")]
+pub(crate) fn sysop_drop_graph(tx: &SessionTx<'_>, name: &str) -> Result<()> {
+    tx.projections.drop_projection(name)
+}
+
+/// `::graph list`. One row per built variant; one null-variant row for a
+/// projection that has built nothing yet.
+#[cfg(feature = "graph-algo")]
+pub(crate) fn sysop_list_graphs(tx: &SessionTx<'_>) -> Result<crate::NamedRows> {
+    let headers = [
+        "name",
+        "edges",
+        "nodes",
+        "variant",
+        "est_bytes",
+        "built_at",
+        "last_used",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    let rows = tx
+        .projections
+        .list()
+        .into_iter()
+        .map(|s| {
+            vec![
+                DataValue::from(s.name.as_str()),
+                DataValue::from(s.edges.as_str()),
+                s.nodes.map_or(DataValue::Null, |n| DataValue::from(n.as_str())),
+                s.variant.map_or(DataValue::Null, DataValue::from),
+                s.est_bytes
+                    .map_or(DataValue::Null, |b| DataValue::from(b as i64)),
+                s.built_at.map_or(DataValue::Null, DataValue::from),
+                s.last_used.map_or(DataValue::Null, DataValue::from),
+            ]
+        })
+        .collect();
+    Ok(crate::NamedRows::new(headers, rows))
+}
+
+/// Graph projections need the vendored `graph` crate, which rides on the
+/// `graph-algo` feature. The grammar parses `::graph …` unconditionally so that
+/// a feature-poor build says *why* it cannot run the script.
+#[cfg(not(feature = "graph-algo"))]
+mod without_graph_algo {
+    use miette::{bail, Result};
+
+    use crate::runtime::transact::SessionTx;
+
+    const NO_FEATURE: &str = "this build of mnestic was compiled without the `graph-algo` \
+                              feature, so graph projections are unavailable";
+
+    pub(crate) fn sysop_create_graph(
+        _tx: &SessionTx<'_>,
+        _name: &str,
+        _edges: &str,
+        _nodes: Option<&str>,
+    ) -> Result<()> {
+        bail!("{NO_FEATURE}")
+    }
+
+    pub(crate) fn sysop_drop_graph(_tx: &SessionTx<'_>, _name: &str) -> Result<()> {
+        bail!("{NO_FEATURE}")
+    }
+
+    pub(crate) fn sysop_list_graphs(_tx: &SessionTx<'_>) -> Result<crate::NamedRows> {
+        bail!("{NO_FEATURE}")
+    }
+}
+
+#[cfg(not(feature = "graph-algo"))]
+pub(crate) use without_graph_algo::{sysop_create_graph, sysop_drop_graph, sysop_list_graphs};
+
 /// Validate and register `::graph create name { edges, nodes }` (§3.1).
 /// Loud and immediate; builds nothing.
 #[cfg(feature = "graph-algo")]
-pub(crate) fn create_projection(
+fn create_projection(
     tx: &SessionTx<'_>,
     name: &str,
     edges: &str,
@@ -1304,6 +1558,10 @@ pub(crate) fn graph_source(
         {
             SlotAction::Hit(hit) => Some(Ok(hit)),
             SlotAction::BuildAndPublish => Some(build().inspect(|source| {
+                // The one window in which a concurrent commit can turn a legal
+                // insert into a refused one: a watermark does not move, so
+                // Door 2 and `produce` agree on every schedule but this.
+                cache.run_build_fence();
                 // Door 3 lives inside `produce`, which simply declines.
                 cache.produce(
                     name,
@@ -1422,6 +1680,32 @@ impl<S> crate::Db<S> {
     /// built for each query, with a warning.
     pub fn set_graph_projection_capacity(&self, bytes: usize) {
         self.graph_projections.set_capacity(bytes);
+    }
+}
+
+#[cfg(all(feature = "test-hooks", feature = "graph-algo"))]
+impl<S> crate::Db<S> {
+    /// Install a callback run once a projection build has completed and before
+    /// its result is offered to the produce rule. Passing `None` removes it.
+    ///
+    /// Like [`set_commit_fence_for_tests`](Self::set_commit_fence_for_tests),
+    /// this is **not** a supported API: it exists so that the interleaving
+    /// suite can park a builder in the window where a concurrent commit turns
+    /// a legal insert into a refused one.
+    #[doc(hidden)]
+    pub fn set_graph_build_fence_for_tests(
+        &self,
+        fence: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+    ) {
+        self.graph_projections.set_build_fence(fence);
+    }
+
+    /// CSR builds completed since this `Db` opened — cached and ephemeral
+    /// alike. The only way, from outside the crate, to tell a cache hit from a
+    /// rebuild that happens to produce the same rows.
+    #[doc(hidden)]
+    pub fn graph_projection_builds_for_tests(&self) -> u64 {
+        self.graph_projections.build_count()
     }
 }
 

@@ -51,6 +51,7 @@ use crate::query::ra::{
 use crate::runtime::callback::{
     CallbackCollector, CallbackDeclaration, CallbackOp, EventCallbackRegistry,
 };
+use crate::runtime::graph_projection;
 use crate::runtime::graph_projection::ProjectionCache;
 use crate::runtime::relation::{
     extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
@@ -2034,6 +2035,32 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .collect_vec(),
                 ))
             }
+            // mnestic fork, graph projection (`docs/specs/graph-projection.md`
+            // §3.1). The registry is process-local in-memory state, so these
+            // arms take no relation locks and are trivially correct under
+            // `skip_locking` — but `::graph create` reads the catalog through
+            // `tx` to validate its sources.
+            SysOp::CreateGraph { name, edges, nodes } => {
+                if read_only {
+                    bail!("Cannot create a graph projection in read-only mode");
+                }
+                graph_projection::sysop_create_graph(tx, name, edges, nodes.as_deref())?;
+                Ok(NamedRows::new(
+                    vec![STATUS_STR.to_string()],
+                    vec![vec![DataValue::from(OK_STR)]],
+                ))
+            }
+            SysOp::DropGraph(name) => {
+                if read_only {
+                    bail!("Cannot drop a graph projection in read-only mode");
+                }
+                graph_projection::sysop_drop_graph(tx, name)?;
+                Ok(NamedRows::new(
+                    vec![STATUS_STR.to_string()],
+                    vec![vec![DataValue::from(OK_STR)]],
+                ))
+            }
+            SysOp::ListGraphs => graph_projection::sysop_list_graphs(tx),
             SysOp::TtHistory(rel, keys, limit, offset) => {
                 // mnestic fork, bitemporality step 5: the introspection
                 // surface — every (vt, tt) record of the given keys.

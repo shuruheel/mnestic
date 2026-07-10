@@ -24,6 +24,7 @@ use crate::fixed_rule::algos::shortest_path_dijkstra::dijkstra_keep_ties;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct BetweennessCentrality;
@@ -35,11 +36,12 @@ impl FixedRule for BetweennessCentrality {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
 
-        let (graph, indices, _inv_indices) =
-            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::weighted(undirected, true), &poison)?;
+        let graph = source.weighted()?;
+        let indices = source.indices();
 
         if indices.is_empty() {
             return Ok(());
@@ -51,7 +53,7 @@ impl FixedRule for BetweennessCentrality {
         let centrality_segs: Vec<_> = it
             .map(|start| -> Result<BTreeMap<u32, f32>> {
                 let res_for_start =
-                    dijkstra_keep_ties(&graph, start, &(), &(), &(), poison.clone())?;
+                    dijkstra_keep_ties(graph, start, &(), &(), &(), poison.clone())?;
                 let mut ret: BTreeMap<u32, f32> = Default::default();
                 let grouped = res_for_start.into_iter().group_by(|(n, _, _)| *n);
                 for (_, grp) in grouped.into_iter() {
@@ -93,6 +95,10 @@ impl FixedRule for BetweennessCentrality {
     ) -> Result<usize> {
         Ok(2)
     }
+
+    fn supports_projection(&self) -> bool {
+        true
+    }
 }
 
 pub(crate) struct ClosenessCentrality;
@@ -104,11 +110,12 @@ impl FixedRule for ClosenessCentrality {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
 
-        let (graph, indices, _inv_indices) =
-            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::weighted(undirected, true), &poison)?;
+        let graph = source.weighted()?;
+        let indices = source.indices();
 
         if indices.is_empty() {
             return Ok(());
@@ -118,7 +125,7 @@ impl FixedRule for ClosenessCentrality {
 
         let res: Vec<_> = it
             .map(|start| -> Result<f32> {
-                let distances = dijkstra_cost_only(&graph, start, poison.clone())?;
+                let distances = dijkstra_cost_only(graph, start, poison.clone())?;
                 let total_dist: f32 = distances.iter().filter(|d| d.is_finite()).cloned().sum();
                 let nc: f32 = distances.iter().filter(|d| d.is_finite()).count() as f32;
                 Ok(nc * nc / total_dist / (n - 1) as f32)
@@ -141,6 +148,10 @@ impl FixedRule for ClosenessCentrality {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(2)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 

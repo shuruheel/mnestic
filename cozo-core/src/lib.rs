@@ -69,7 +69,16 @@ pub use data::aggr::{
 };
 pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs};
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
+/// The vendored adjacency types a graph projection hands out (mnestic fork).
+/// A future bump of the `graph` dependency is therefore a semver-major event
+/// for mnestic — see the release checklist.
+#[cfg(feature = "graph-algo")]
+pub use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, DirectedNeighborsWithValues, Graph};
 pub use runtime::db::Db;
+#[cfg(feature = "graph-algo")]
+pub use runtime::graph_projection::{
+    GraphSource, GraphVariant, ProjectionVariant, VariantKey, VariantSpec,
+};
 pub use runtime::db::NamedRows;
 pub use runtime::hybrid::{build_hybrid_query, GraphLeg, HybridList, HybridSearch, MmrParams};
 pub use runtime::relation::decode_tuple_from_kv;

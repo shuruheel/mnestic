@@ -22,6 +22,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct CommunityDetectionLouvain;
@@ -33,16 +34,15 @@ impl FixedRule for CommunityDetectionLouvain {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
         let max_iter = payload.pos_integer_option("max_iter", Some(10))?;
         let delta = payload.unit_interval_option("delta", Some(0.0001))? as f32;
         let keep_depth = payload.non_neg_integer_option("keep_depth", None).ok();
 
-        let (graph, indices, _inv_indices) =
-            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
-        let result = louvain(&graph, delta, max_iter, poison)?;
-        for (idx, node) in indices.into_iter().enumerate() {
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::weighted(undirected, true), &poison)?;
+        let result = louvain(source.weighted()?, delta, max_iter, poison)?;
+        for (idx, node) in source.indices().iter().enumerate() {
             let mut labels = vec![];
             let mut cur_idx = idx as u32;
             for hierarchy in &result {
@@ -54,10 +54,14 @@ impl FixedRule for CommunityDetectionLouvain {
             if let Some(l) = keep_depth {
                 labels.truncate(l);
             }
-            out.put(vec![DataValue::List(labels), node]);
+            out.put(vec![DataValue::List(labels), node.clone()]);
         }
 
         Ok(())
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 
     fn arity(

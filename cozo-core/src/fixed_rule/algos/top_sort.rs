@@ -18,6 +18,7 @@ use crate::data::value::DataValue;
 use crate::fixed_rule::{FixedRule, FixedRulePayload};
 use crate::parse::SourceSpan;
 use crate::runtime::db::Poison;
+use crate::runtime::graph_projection::VariantSpec;
 use crate::runtime::temp_store::RegularTempStore;
 
 pub(crate) struct TopSort;
@@ -29,14 +30,13 @@ impl FixedRule for TopSort {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let edges = payload.get_input(0)?;
-
-        let (graph, indices, _) = edges.as_directed_graph_checked(false, None, &poison)?;
+        let (source, _input_base) = payload.graph_input(0, VariantSpec::unweighted(false), &poison)?;
+        let indices = source.indices();
         if indices.is_empty() {
             return Ok(());
         }
 
-        let sorted = kahn_g(&graph, poison)?;
+        let sorted = kahn_g(source.unweighted()?, poison)?;
 
         for (idx, val_id) in sorted.iter().enumerate() {
             let val = indices.get(*val_id as usize).unwrap();
@@ -54,6 +54,10 @@ impl FixedRule for TopSort {
         _span: SourceSpan,
     ) -> Result<usize> {
         Ok(2)
+    }
+
+    fn supports_projection(&self) -> bool {
+        true
     }
 }
 
