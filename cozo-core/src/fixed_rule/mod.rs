@@ -183,36 +183,19 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
         Vec<DataValue>,
         BTreeMap<DataValue, u32>,
     )> {
-        let mut indices: Vec<DataValue> = vec![];
-        let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
-        register_nodes(nodes, &mut indices, &mut inv_indices, poison)?;
-
-        let mut edges: Vec<(u32, u32)> = vec![];
-        for (i, r_tuple) in self.iter()?.enumerate() {
-            let mut tuple = r_tuple?.into_iter();
-            let from = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
-            let to = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
-            let from_idx = intern_node(&mut indices, &mut inv_indices, from);
-            let to_idx = intern_node(&mut indices, &mut inv_indices, to);
-            edges.push((from_idx, to_idx));
-            if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
-                poison.check()?;
-            }
-        }
-        check_csr_capacity(edges.len(), undirected, indices.len(), self.span())?;
-
-        let node_count = nodes.map(|_| indices.len());
-        let it = if undirected {
-            Right(edges.into_iter().flat_map(|(f, t)| [(f, t), (t, f)]))
-        } else {
-            Left(edges.into_iter())
+        let node_span = nodes.map(|n| n.span()).unwrap_or_else(|| self.span());
+        let node_iter = match nodes {
+            Some(n) => Some(n.iter()?),
+            None => None,
         };
-        let builder = GraphBuilder::new().csr_layout(CsrLayout::Sorted).edges(it);
-        let graph: DirectedCsrGraph<u32> = match node_count {
-            Some(n) if n > 0 => builder.node_values(vec![(); n]).build(),
-            _ => builder.build(),
-        };
-        Ok((graph, indices, inv_indices))
+        build_unweighted_csr(
+            self.iter()?,
+            node_iter,
+            undirected,
+            self.span(),
+            node_span,
+            poison,
+        )
     }
     /// Convert the input relation into a directed weighted graph.
     /// If `undirected` is true, then each edge in the input relation is treated as a pair
@@ -275,66 +258,165 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
         BTreeMap<DataValue, u32>,
         bool,
     )> {
-        let mut indices: Vec<DataValue> = vec![];
-        let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
-        register_nodes(nodes, &mut indices, &mut inv_indices, poison)?;
-
-        let weight_span = || {
-            self.arg_manifest
-                .bindings()
-                .get(2)
-                .map(|s| s.span)
-                .unwrap_or_else(|| self.span())
+        let node_span = nodes.map(|n| n.span()).unwrap_or_else(|| self.span());
+        let weight_span = self
+            .arg_manifest
+            .bindings()
+            .get(2)
+            .map(|s| s.span)
+            .unwrap_or_else(|| self.span());
+        let node_iter = match nodes {
+            Some(n) => Some(n.iter()?),
+            None => None,
         };
-
-        let mut has_negative = false;
-        let mut edges: Vec<(u32, u32, f32)> = vec![];
-        for (i, r_tuple) in self.iter()?.enumerate() {
-            let mut tuple = r_tuple?.into_iter();
-            let from = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
-            let to = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
-            let from_idx = intern_node(&mut indices, &mut inv_indices, from);
-            let to_idx = intern_node(&mut indices, &mut inv_indices, to);
-            let weight = match tuple.next() {
-                None => 1.0,
-                Some(d) => {
-                    let f = match d.get_float() {
-                        Some(f) if f.is_finite() => f,
-                        _ => bail!(BadEdgeWeightError(d, weight_span())),
-                    };
-                    if f < 0. {
-                        ensure!(allow_negative_weights, BadEdgeWeightError(d, weight_span()));
-                        has_negative = true;
-                    }
-                    f
-                }
-            };
-            edges.push((from_idx, to_idx, weight as f32));
-            if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
-                poison.check()?;
-            }
-        }
-        check_csr_capacity(edges.len(), undirected, indices.len(), self.span())?;
-
-        let node_count = nodes.map(|_| indices.len());
-        let it = if undirected {
-            Right(
-                edges
-                    .into_iter()
-                    .flat_map(|(f, t, w)| [(f, t, w), (t, f, w)]),
-            )
-        } else {
-            Left(edges.into_iter())
-        };
-        let builder = GraphBuilder::new()
-            .csr_layout(CsrLayout::Sorted)
-            .edges_with_values(it);
-        let graph: DirectedCsrGraph<u32, (), f32> = match node_count {
-            Some(n) if n > 0 => builder.node_values(vec![(); n]).build(),
-            _ => builder.build(),
-        };
-        Ok((graph, indices, inv_indices, has_negative))
+        build_weighted_csr(
+            self.iter()?,
+            node_iter,
+            undirected,
+            allow_negative_weights,
+            self.span(),
+            node_span,
+            weight_span,
+            poison,
+        )
     }
+}
+
+/// The unweighted CSR builder proper, over raw tuple streams rather than
+/// [`FixedRuleInputRelation`]s: the graph-projection cache scans stored
+/// relations it resolved by name, and has no rule manifest to wrap them in
+/// (mnestic fork; `docs/specs/graph-projection.md` §3.2).
+///
+/// `nodes`, when present, is drained first so that ids `0..nodes.len()` name
+/// exactly the declared vertices; the resulting `node_count` is then taken from
+/// the id map rather than from the maximum edge endpoint, which is what keeps
+/// isolated vertices alive. `edges` is collected eagerly because
+/// [`GraphBuilder::node_values`] materialises the edge list at call time and
+/// then asserts that the node values cover every endpoint — a vertex may
+/// legally appear in an edge and not in `nodes`.
+#[cfg(feature = "graph-algo")]
+pub(crate) fn build_unweighted_csr(
+    edges: TupleIter<'_>,
+    nodes: Option<TupleIter<'_>>,
+    undirected: bool,
+    edge_span: SourceSpan,
+    node_span: SourceSpan,
+    poison: &Poison,
+) -> Result<(
+    DirectedCsrGraph<u32>,
+    Vec<DataValue>,
+    BTreeMap<DataValue, u32>,
+)> {
+    let mut indices: Vec<DataValue> = vec![];
+    let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
+    let has_nodes = nodes.is_some();
+    if let Some(nodes) = nodes {
+        register_nodes(nodes, node_span, &mut indices, &mut inv_indices, poison)?;
+    }
+
+    let mut edge_list: Vec<(u32, u32)> = vec![];
+    for (i, r_tuple) in edges.enumerate() {
+        let mut tuple = r_tuple?.into_iter();
+        let from = tuple.next().ok_or(NotAnEdgeError(edge_span))?;
+        let to = tuple.next().ok_or(NotAnEdgeError(edge_span))?;
+        let from_idx = intern_node(&mut indices, &mut inv_indices, from);
+        let to_idx = intern_node(&mut indices, &mut inv_indices, to);
+        edge_list.push((from_idx, to_idx));
+        if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
+            poison.check()?;
+        }
+    }
+    check_csr_capacity(edge_list.len(), undirected, indices.len(), edge_span)?;
+
+    let node_count = has_nodes.then_some(indices.len());
+    let it = if undirected {
+        Right(edge_list.into_iter().flat_map(|(f, t)| [(f, t), (t, f)]))
+    } else {
+        Left(edge_list.into_iter())
+    };
+    let builder = GraphBuilder::new().csr_layout(CsrLayout::Sorted).edges(it);
+    let graph: DirectedCsrGraph<u32> = match node_count {
+        Some(n) if n > 0 => builder.node_values(vec![(); n]).build(),
+        _ => builder.build(),
+    };
+    Ok((graph, indices, inv_indices))
+}
+
+/// The weighted counterpart of [`build_unweighted_csr`]. Additionally reports
+/// whether any edge weight was negative: the graph-projection cache builds
+/// permissively and records this, so that a strict consumer of a shared variant
+/// can reject it (`docs/specs/graph-projection.md` §3.2.2).
+#[cfg(feature = "graph-algo")]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn build_weighted_csr(
+    edges: TupleIter<'_>,
+    nodes: Option<TupleIter<'_>>,
+    undirected: bool,
+    allow_negative_weights: bool,
+    edge_span: SourceSpan,
+    node_span: SourceSpan,
+    weight_span: SourceSpan,
+    poison: &Poison,
+) -> Result<(
+    DirectedCsrGraph<u32, (), f32>,
+    Vec<DataValue>,
+    BTreeMap<DataValue, u32>,
+    bool,
+)> {
+    let mut indices: Vec<DataValue> = vec![];
+    let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
+    let has_nodes = nodes.is_some();
+    if let Some(nodes) = nodes {
+        register_nodes(nodes, node_span, &mut indices, &mut inv_indices, poison)?;
+    }
+
+    let mut has_negative = false;
+    let mut edge_list: Vec<(u32, u32, f32)> = vec![];
+    for (i, r_tuple) in edges.enumerate() {
+        let mut tuple = r_tuple?.into_iter();
+        let from = tuple.next().ok_or(NotAnEdgeError(edge_span))?;
+        let to = tuple.next().ok_or(NotAnEdgeError(edge_span))?;
+        let from_idx = intern_node(&mut indices, &mut inv_indices, from);
+        let to_idx = intern_node(&mut indices, &mut inv_indices, to);
+        let weight = match tuple.next() {
+            None => 1.0,
+            Some(d) => {
+                let f = match d.get_float() {
+                    Some(f) if f.is_finite() => f,
+                    _ => bail!(BadEdgeWeightError(d, weight_span)),
+                };
+                if f < 0. {
+                    ensure!(allow_negative_weights, BadEdgeWeightError(d, weight_span));
+                    has_negative = true;
+                }
+                f
+            }
+        };
+        edge_list.push((from_idx, to_idx, weight as f32));
+        if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
+            poison.check()?;
+        }
+    }
+    check_csr_capacity(edge_list.len(), undirected, indices.len(), edge_span)?;
+
+    let node_count = has_nodes.then_some(indices.len());
+    let it = if undirected {
+        Right(
+            edge_list
+                .into_iter()
+                .flat_map(|(f, t, w)| [(f, t, w), (t, f, w)]),
+        )
+    } else {
+        Left(edge_list.into_iter())
+    };
+    let builder = GraphBuilder::new()
+        .csr_layout(CsrLayout::Sorted)
+        .edges_with_values(it);
+    let graph: DirectedCsrGraph<u32, (), f32> = match node_count {
+        Some(n) if n > 0 => builder.node_values(vec![(); n]).build(),
+        _ => builder.build(),
+    };
+    Ok((graph, indices, inv_indices, has_negative))
 }
 
 /// Batched cadence for [`Poison`] checks while a fixed rule scans tuples into a CSR — the same
@@ -364,17 +446,14 @@ fn intern_node(
 /// name exactly the declared vertices and the isolated ones survive into the CSR.
 #[cfg(feature = "graph-algo")]
 fn register_nodes(
-    nodes: Option<&FixedRuleInputRelation<'_, '_>>,
+    nodes: TupleIter<'_>,
+    span: SourceSpan,
     indices: &mut Vec<DataValue>,
     inv_indices: &mut BTreeMap<DataValue, u32>,
     poison: &Poison,
 ) -> Result<()> {
-    let Some(nodes) = nodes else { return Ok(()) };
-    for (i, tuple) in nodes.iter()?.enumerate() {
-        let node = tuple?
-            .into_iter()
-            .next()
-            .ok_or_else(|| NotANodeError(nodes.span()))?;
+    for (i, tuple) in nodes.enumerate() {
+        let node = tuple?.into_iter().next().ok_or(NotANodeError(span))?;
         intern_node(indices, inv_indices, node);
         if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
             poison.check()?;

@@ -11,7 +11,50 @@ reconstruct them.
 
 Toward **0.11.0 — cached graph projection** (spec: `docs/specs/graph-projection.md`).
 Phase 0 lands the graph-algorithm changes that stand on their own; Phase 1 lands
-the freshness substrate the cache will sit on. Both precede the cache itself.
+the freshness substrate the cache sits on; Phase 2 lands the cache. None of it
+is reachable from CozoScript until Phase 3 adds `::graph create`.
+
+### Phase 2 — the cache, the registry, and the memory ceiling
+
+Still no user-visible behaviour changes: nothing here has a grammar yet.
+
+- **A named, in-memory projection registry**, `graph-algo`-gated. A projection
+  names an edge relation and optionally a node relation, and materialises a
+  compressed adjacency lazily per `(direction, weighted)` variant on first use.
+  Definitions store *names*; every use re-resolves them against the consuming
+  transaction's own catalog, and an entry is served only if each slot resolves
+  to the exact relation id it was built from. That, not the freshness tokens, is
+  what defeats a multi-pair `::rename` swap — a rename moves no token at all.
+- **Always fresh, in both directions.** A cached adjacency is served only to a
+  transaction whose own scan of the sources would return the same rows, and is
+  published only by a transaction that can vouch for what it read. A transaction
+  builds privately, caching nothing, when it has uncommitted writes to a source,
+  when a commit against one is in flight or landed after it pinned, or when the
+  result does not fit the ceiling. Under write churn the cache degrades to
+  build-per-query — never worse than today.
+- **Concurrent cold readers coalesce into one build** per variant. The winner
+  builds from its own snapshot; the losers wake and re-validate against their
+  own watermarks.
+- **A 512 MiB default ceiling**, `Db::set_graph_projection_capacity(bytes)`,
+  enforced on the spot: variants are evicted least-recently-used first until the
+  cache fits, an insert evicts to make room for itself, and `0` evicts
+  everything and turns caching off while leaving the registry working. A variant
+  larger than the whole ceiling is built for each query, with a warning.
+  Writing to a source relation returns its variants' bytes immediately: a bumped
+  token makes them unreachable, so holding them would be a leak.
+- **Isolated vertices are real vertices.** A projection with a node relation
+  registers its vertices before any edge is read, so a vertex in no edge becomes
+  a genuine degree-0 vertex rather than being silently dropped. The vertex set
+  is the union of the two relations.
+- **One weighted variant serves both strict and permissive algorithms.** It
+  builds permissively and records whether any weight was negative, so Phase 3's
+  strict consumers — Dijkstra, Yen, Louvain, Betweenness, Closeness — can reject
+  it loudly rather than forcing a second copy of the adjacency.
+- Internally, the CSR builders moved out of `FixedRuleInputRelation` into free
+  functions over tuple streams, since the cache scans relations it resolved by
+  name. The two public `as_directed_graph*_checked` methods delegate to them,
+  unchanged.
+- 33 tests, 32 mutations verified red.
 
 ### Phase 1 — the write-invalidation substrate
 
