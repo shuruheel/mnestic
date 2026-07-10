@@ -141,9 +141,18 @@ fixes, in order of consequence:
   dropped there — a pre-0.11 out-of-tree rule reading it keeps working. The
   guard's help text no longer tells `Constant` or `CsvReader` users to "pass
   the relation positionally".
-- **`Db::set_graph_projection_capacity` gained its `DbInstance` dispatcher** —
-  it was unreachable from every language binding and from `cozo-bin`, while
-  the oversize-variant warning told users to call it.
+- **`Db::set_graph_projection_capacity` gained its `DbInstance` dispatcher**
+  and a Python binding (`CozoDbPy.set_graph_projection_capacity(bytes)`) — it
+  was unreachable from every language binding and from `cozo-bin`, while the
+  oversize-variant warning told users to call it. The published wheel ships
+  `graph-algo`, so PyPI users had `::graph create` with a hardwired 512 MiB
+  ceiling and no way to raise it or set `0` to disable caching.
+- The `graph` crate is now a documented **public dependency**: its adjacency
+  types are re-exported, so moving off `graph = "0.3"` is a semver-major bump
+  for mnestic. Recorded in the release checklist. (It is not pinned with `=`,
+  which would make mnestic unresolvable beside any crate wanting a later
+  `0.3.x`; within `0.3.x` semver obliges API compatibility, and the `0.3.1`
+  and `0.3.2` preludes are in fact identical.)
 - **`::graph create`/`drop` inside an imperative script survive the script's
   abort — now documented and test-pinned as a decision.** The registry is
   process-global in-memory state; deferring creation to commit would break

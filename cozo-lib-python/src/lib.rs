@@ -635,6 +635,21 @@ impl CozoDbPy {
             None => Ok(false),
         }
     }
+    /// Set the ceiling, in bytes, on the total size of cached graph projections
+    /// (mnestic fork; default 512 MiB).
+    ///
+    /// Enforced immediately: variants are evicted least-recently-used first
+    /// until the cache fits. `0` evicts everything and turns caching off, while
+    /// `::graph create`/`list`/`drop` keep working and every algorithm builds
+    /// its adjacency fresh. Without this the ceiling was unreachable from
+    /// Python, yet the engine's oversize-variant warning names it as the
+    /// remedy.
+    #[cfg(feature = "graph-algo")]
+    pub fn set_graph_projection_capacity(&self, bytes: usize) -> PyResult<()> {
+        let db = self.db_ref()?;
+        db.set_graph_projection_capacity(bytes);
+        Ok(())
+    }
     pub fn export_relations(&self, py: Python<'_>, relations: Vec<String>) -> PyResult<PyObject> {
         let db = self.db_ref()?;
         let res = match py.allow_threads(|| db.export_relations(relations.iter())) {

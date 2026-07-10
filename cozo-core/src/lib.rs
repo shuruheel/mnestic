@@ -69,9 +69,19 @@ pub use data::aggr::{
 };
 pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs};
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
-/// The vendored adjacency types a graph projection hands out (mnestic fork).
-/// A future bump of the `graph` dependency is therefore a semver-major event
-/// for mnestic — see the release checklist.
+/// The adjacency types a graph projection hands out (mnestic fork).
+///
+/// These come from the [`graph`](https://docs.rs/graph) crate, so it is a
+/// **public dependency** of mnestic: these are its types, not ours, and a
+/// consumer that also depends on `graph` directly must resolve to the same
+/// semver-compatible version or the types will not unify.
+///
+/// The `graph = "0.3"` requirement therefore constrains mnestic's own API.
+/// Moving it to `0.4` is a **semver-major event for mnestic** and must be
+/// released as one; within `0.3.x`, cargo may pick a newer patch, which semver
+/// obliges to stay API-compatible (verified: the `0.3.1` and `0.3.2` preludes
+/// are identical). Pinning `=0.3.1` is deliberately *not* done — it would make
+/// mnestic unresolvable alongside any crate wanting a later `0.3.x`.
 #[cfg(feature = "graph-algo")]
 pub use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, DirectedNeighborsWithValues, Graph};
 pub use runtime::db::Db;
