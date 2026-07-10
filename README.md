@@ -60,27 +60,39 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.11.1
+## New in 0.11
 
-**Skyline aggregates in every binding.** `pareto_min` / `pareto_max` keep, per
-group, the Pareto frontier of a numeric vector — the points no other point
-dominates — as ordinary CozoScript aggregates:
+**Cached graph projections.** `::graph create G { edges: knows, nodes: person }`
+names an in-memory adjacency over stored relations that twelve graph algorithms
+reuse across queries instead of rebuilding on every call:
 
 ```
-?[frontier] := offer[price, quality], v = [price, -quality], frontier = pareto_min(v)
+::graph create g { edges: knows, nodes: person }
+
+?[node, group] <~ ConnectedComponents(graph: 'g')
+?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
 ```
 
-`pareto_min` treats smaller as better, `pareto_max` larger; express mixed
-objectives (minimize price, maximize quality) by negating the maximized
-components, as above. Being native (the product order, a provable strict partial
-order), they need no host registration — unlike the Rust-only
-`register_bounded_meet_aggr` dominance aggregate they build on — and are reachable
-from every surface (the PyPI wheel, `cozo-bin`, langchain, llama-index) through
-plain `run_script`. A malformed operand (non-list, non-numeric component, NaN, or
-empty vector) is a loud error.
+A projection is **always fresh**: it never serves a transaction data that differs
+from what that transaction's own scan of the sources would return, and writing to
+a source frees the adjacencies built from it. Under continuous write churn the
+cache degrades to build-per-query — it never goes stale. On a 400,000-edge graph,
+warming the cache cuts `ConnectedComponents` from 127 ms to 7.9 ms (16×) and a
+20-iteration `PageRank` from 150 ms to 10 ms (15×); what is cached is the *setup*
+— scanning the edge relation and building the CSR — so the gain shrinks as the
+kernel itself dominates.
 
-This is a non-breaking, purely additive patch (two reserved aggregate names); no
-existing query changes result. Full detail is in
+Twelve algorithms accept `graph: 'G'` in place of their positional edge relation,
+an optional `nodes:` makes isolated vertices real (counted and ranked), and a
+512 MiB LRU ceiling (tunable; `0` disables caching without disabling `::graph`)
+bounds memory. A database that defines no projections pays one atomic load per
+transaction and nothing extra on the read path. `PageRank`'s default `iterations`
+also rose from 10 to 20 (the non-converged old value); pass `iterations: 10` to
+restore the old numbers.
+
+The follow-up 0.11.1 patch added the built-in skyline aggregates `pareto_min` /
+`pareto_max` (see the feature list above) — reachable from every binding, no host
+registration. Full detail for both is in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
 
