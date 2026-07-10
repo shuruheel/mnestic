@@ -10,25 +10,71 @@
 
 # Cozo 数据库
 
-## mnestic 0.10.7
+## mnestic 相比 CozoDB 新增的能力
 
-本版本为 0.10.5 贪心连接重排序的一次计划质量修复，另附一项面向 Python 的绑定改进与一处文档更新。**修复：贪心连接重排序不再把全键过滤误降级为部分键展开。** 0.10.5 的重排序决胜（tie-break）会奖励任何*前导*复合键列已绑定的原子；但对 `knows{src, dst}` 这类复合键，仅绑定 `src` 并不是点查（point lookup），而是对 `src` 的每个邻居的一次按键*展开*（图中扇出最高的关系），并非过滤。因此该遍可能把一条高扇出的 `knows` 边拉到一个高选择性成员原子之前，产生严格更差的计划：一位外部基准测试者（LDBC-SNB LSQB）实测 Q3（一个同国 `knows` 三角）在 SF0.1 上从约 19 秒退化到 >120 秒超时，而该决胜在两个规模因子下的其余八个查询上一无所获。决胜辅助函数由 `bound_key_prefix_len` 更名为 `full_key_lookup_bonus`：现在只奖励*完整*键的点查（所有键列均已绑定——至多匹配一条元组、不会增加基数的存在性过滤），对*部分*前缀记 0 分，使部分键的平局回退到书写顺序。**结果不变**（在集合语义下合取可交换），且 0.10.5 约 54.5× 的“最少新变量”收益得以保留（它由新变量准则驱动，而非此决胜）。另有：Python 绑定现在暴露 `set_query_factorization` / `query_factorization`（`db.set_query_factorization(True)` / `db.query_factorization()`），把 0.10.5 起仅限 Rust 的、默认关闭的因子化 `count()` 改写开关下放给 Python 调用方以生成 soak 证据（纯新增，默认仍关闭）；以及 `docs/concepts/semirings-and-fixedrules.md` 新增“代数 ⟷ fixed-rule 映射”一节。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+上游最后一次提交停留在 2024-12-04。mnestic 在其之上继续维护引擎，并新增以下能力：
 
-## mnestic 0.10.6
+- **图投影缓存** —— `::graph create G { edges: knows }` 命名一份常驻内存的邻接结构，
+  十二个图算法可跨查询复用，而不必每次调用都重新扫描边关系并重建 CSR。**始终新鲜**：
+  投影绝不会返回与消费事务自身扫描不一致的数据；对源关系的写入会立即释放由它构建的邻接结构。
+  （[规格说明](docs/specs/graph-projection.md)）
+- **双时态（bitemporal）** —— `TxTime` 列类型与崩溃安全的单调提交时钟、`:as_of` 读取、
+  两级 `(有效时间, 事务时间)` 解析，以及 `::history` / `::history_gc` / `::evict`。
+  （[规格说明](docs/specs/bitemporality.md)）
+- **来源半环（provenance semirings）** —— 递归中用户自定义的吸收性合并
+  （`Db::register_custom_aggr`）、返回前 *k* 条推导及其证据链的 `min_cost_k` 有界 meet 聚合，
+  以及基于重算的信念修订 `:reconcile`。
+  （[规格说明](docs/specs/provenance-semirings.md)）
+- **引擎内混合检索** —— 以单个可被 Datalog 组合的 fixed rule，对向量、全文与图三路结果做
+  RRF 倒数排名融合，并支持 MMR 多样化。
+- **只读 Cypher** —— 将 openCypher 子集翻译为 CozoScript（alpha；`cypher` feature，默认关闭）。
+  （[规格说明](docs/specs/cypher-read.md)）
+- **更快的查找与计划** —— 等值下推把后置过滤的点查转为按键定位（5k 行实测约 28×），
+  另有确定性贪心连接重排序与可选的因子化 `count()` 重写。
+- **非阻塞的向量索引构建** —— HNSW 改为内存中并行构建，不再让读操作阻塞数分钟；
+  搜索路径上的邻居向量通过 RocksDB `MultiGet` 批量获取。
+- **可运维的损坏恢复** —— `::repair_corrupt` 精确删除被截断的元组，
+  而不必丢弃整个未通过完整性检查的数据库。
+- **真正生效的可中断性** —— `::kill` 与 `:timeout` 能中断正在运行的查询，
+  包括耗时较长的图邻接结构构建。
 
-本版本为一次紧急的升级安全补丁。**修复：0.10.0 之前写入的关系目录（catalog）不再无法打开**（“Cannot deserialize relation metadata from bytes”）。0.10.0 的双时态改动在 `RelationHandle` 结构体*中间*插入了一个字段，而在按位置编码的目录写入路径上，`#[serde(default)]` 只能补齐*缺失的末尾*字段，因此任何在 0.10.0 之前（或经由建索引 / 重命名 / 删除索引路径）最后写入的关系目录在打开时会以“Cannot deserialize relation metadata from bytes”反序列化失败，导致整个数据库无法打开（一处生产多租户部署因此在 0.10.0 升级后被静默拖垮）。修复分两部分：将该字段移到结构体末尾，使末尾默认值对旧式数组生效；并让七条目录重写路径统一以 `.with_struct_map()` 序列化为自描述的 map，使未来新增字段不会再引入此类缺陷。无需迁移：旧目录仍可读取，并在下次写入时重新规范化为 map。**若你曾将 0.10.0 之前创建的数据库升级到 0.10.0–0.10.5，请升级到 0.10.6。** 另有两项内部改动：0.10.5 的连接重排序改写为对已解析 schema 视图的纯函数（内部重构，行为不变），以及为 `storage-rocksdb` 加固 Python wheel 的 CI（x86_64 manylinux 改用 `manylinux_2_28` 并安装 `libclang`，使 zstd-sys 的 bindgen 可解析）。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
+[`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## mnestic 0.10.5
+## 0.11.0 新增
 
-本版本聚焦**可中断性与性能**。`::kill` 与 `:timeout` 现在能真正中断正在运行的查询（系统操作在打开存储事务之前派发，并把毒化标志接入关系代数枚举，每 4096 次拉取检查一次）；新增**每查询墙钟预算**——脚本内 `:timeout <秒>` 选项、按调用的 `ScriptRunOptions { timeout }` 以及 Db 级默认值 `set_default_query_timeout`，有效截止时间取三者中已设定者的**最小值**，超时抛出独立的 `eval::timeout` 诊断（wasm 无单调时钟，故不带墙钟预算）。**确定性贪心连接重排序**默认开启（可用 `:reorder written` 逐查询退出）：对朴素书写的合取消除 N³ 中间结果（重排实测 54.5×，N³→N²），结果不变，手工调优的书写顺序保持逐字节一致。**自动 `count()` 因子化重写**为可选、默认关闭（位于 `set_query_factorization` 之后），把符合条件的单子句 `count()`-over-join 重写为逐键计数子规则，得到精确 i64、`Int` 类型的结果而不物化连接；任何含 `!=` 谓词的主体回退到精确的朴素求值。对已建索引关系的批量 `import_relations` 现在会告警（HNSW/FTS/LSH 索引不在批量路径上维护）。此外，**PyPI `mnestic` wheel 现已内置 RocksDB**（`pip install mnestic` 后 `CozoDbPy("rocksdb", path)` 可用；sdist 仍为 compact），Python 绑定改为内部可变以修复实时查询期间 `close()` 的 “Already borrowed” 错误，并为 `run_script` 新增 `timeout=None` 关键字参数。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+**图投影缓存。** 十二个图算法现在可以从一份具名、始终新鲜、常驻内存的投影中获取邻接结构，
+而不必每次调用都重新扫描边关系并重建 CSR：
 
-## mnestic 0.10.1
+```
+::graph create g { edges: knows, nodes: person }
 
-本版本新增**支配界 meet 聚合——反链 / skyline 聚合** `register_bounded_meet_aggr`（按组保留主体注册的严格偏序下的非支配集，即 Pareto 前沿，每个幸存者各自成行；`max_survivors` 为强制资源上限，溢出为显式错误，v1 仅限 Rust 宿主嵌入）与**区间原语** `interval_overlaps`（内置函数）和 `interval_coalesce`（聚合），作用于半开 `[start, end)` 列表区间；同时修正 `bit_and` / `bit_or` meet 聚合的“是否改变”上报与界 meet 发散上限的计数口径。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+?[node, group] <~ ConnectedComponents(graph: 'g')
+?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
+```
 
-## mnestic 0.10.0
+在一张 400,000 条边的图上实测（*冷*即按位置传参的旧形式）：
 
-本版本新增**双时态（bitemporal）系统版本化关系**（引擎分配的事务时间轴、时间旅行查询 `@ (vt: ..., tt: ...)`、`::history` / `::history_gc` / `::evict` 历史生命周期操作、`:reconcile` 信念修订）、**自定义聚合注册**与 **top-k 证明聚合 `min_cost_k`**，并修复四个上游 CozoDB 缺陷。详见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+| 算法 | 冷 | 热 | |
+|---|---|---|---|
+| `ConnectedComponents` | 127 ms | 7.9 ms | **16×** |
+| `PageRank`（20 轮迭代） | 150 ms | 10 ms | **15×** |
+| `ClusteringCoefficients` | 169 ms | 56 ms | 3× |
+
+被缓存的是**准备开销** —— 扫描边关系并构建 CSR —— 因此当算法本身成为瓶颈时收益随之减小。
+在持续写入下，缓存退化为每次查询重建，但绝不会返回陈旧数据。投影仅存于内存，不做持久化。
+
+本版本另含：
+
+- **破坏性变更（结果）：** `PageRank` 的默认 `iterations` 由 10 改为 20。10 低于上游默认值，
+  且实测并未收敛。传入 `iterations: 10` 可恢复旧结果。
+- **修复：** 空边关系此前会令七个图算法直接终止进程；`multi_transaction` 会在事务的整个生命周期内
+  占用一个 `rayon` 工作线程，从而可能导致进程死锁。
+- `PageRank` 支持可选的节点关系，孤立顶点将参与排名，而不再被静默丢弃。
+
+完整内容（含升级说明与已知限制）见
+[`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+
 
 ## 简介
 
