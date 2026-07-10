@@ -35,6 +35,13 @@ capabilities on top of it:
   the *k* best derivations with their evidence chains, and `:reconcile`
   recompute-based belief revision.
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/provenance-semirings.md))
+- **Skyline / Pareto-frontier aggregates** — `pareto_min` / `pareto_max` keep, per
+  group, the non-dominated set over a numeric vector (native componentwise
+  dominance), surfacing a *contested set* — answers none of which beats another —
+  instead of collapsing to one winner. Reachable from every binding through plain
+  `run_script`; arbitrary caller-defined dominance is available in Rust via
+  `register_bounded_meet_aggr`.
+  ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/antichain-bounded-meet.md))
 - **In-engine hybrid retrieval** — reciprocal-rank fusion over vector, full-text
   and graph legs as one Datalog-composable fixed rule, with MMR diversification.
 - **Read-only Cypher** — an openCypher subset translated to CozoScript (alpha;
@@ -55,45 +62,27 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.11.0
+## New in 0.11.1
 
-**Cached graph projections.** Twelve graph algorithms can now take their
-adjacency from a named, always-fresh, in-memory projection instead of rescanning
-the edge relation and rebuilding a CSR on every call:
+**Skyline aggregates in every binding.** `pareto_min` / `pareto_max` keep, per
+group, the Pareto frontier of a numeric vector — the points no other point
+dominates — as ordinary CozoScript aggregates:
 
 ```
-::graph create g { edges: knows, nodes: person }
-
-?[node, group] <~ ConnectedComponents(graph: 'g')
-?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
+?[frontier] := offer[price, quality], v = [price, -quality], frontier = pareto_min(v)
 ```
 
-Measured on a 400,000-edge graph (*cold* is the positional form, i.e. the
-previous behaviour):
+`pareto_min` treats smaller as better and `pareto_max` larger; express mixed
+objectives (minimize price, maximize quality) by negating the maximized
+components, as above. Being native (the product order, a provable strict partial
+order), they need no host registration — unlike the Rust-only
+`register_bounded_meet_aggr` dominance aggregate they build on — and are reachable
+from every surface (the PyPI wheel, `cozo-bin`, langchain, llama-index) through
+plain `run_script`. A malformed operand (non-list, non-numeric component, NaN, or
+empty vector) is a loud error.
 
-| kernel | cold | warm | |
-|---|---|---|---|
-| `ConnectedComponents` | 127 ms | 7.9 ms | **16×** |
-| `PageRank`, 20 iterations | 150 ms | 10 ms | **15×** |
-| `ClusteringCoefficients` | 169 ms | 56 ms | 3× |
-
-What is cached is the setup — scanning the edges and building the CSR — so the
-gain shrinks as the kernel itself dominates. Under write churn the cache degrades
-to build-per-query; it never goes stale. Projections are in-memory and are not
-persisted.
-
-Also in this release:
-
-- **BREAKING (results):** `PageRank`'s default `iterations` is now 20, up from
-  10, which was a below-upstream default and measurably non-convergent. Pass
-  `iterations: 10` to restore the old numbers.
-- **Fixed:** an empty edge relation used to abort the process in seven graph
-  algorithms; and `multi_transaction` could deadlock a process by parking a
-  `rayon` worker for the transaction's lifetime.
-- `PageRank` accepts an optional node relation, so vertices with no edges are
-  ranked instead of silently dropped.
-
-Full detail, including the upgrade notes and known limitations, is in
+This is a non-breaking, purely additive patch (two reserved aggregate names); no
+existing query changes result. Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
 
@@ -104,7 +93,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.11.0"
+mnestic = "0.11.1"
 ```
 
 ```rust

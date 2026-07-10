@@ -152,6 +152,113 @@ impl std::fmt::Debug for RegisteredBoundedMeet {
     }
 }
 
+/// Strict Pareto dominance over a numeric vector (mnestic fork — the built-in
+/// skyline aggregates). Under the *minimize* convention `a` dominates `b` iff
+/// every component of `a` is `<=` the matching component of `b` and at least
+/// one is strictly `<`; the *maximize* convention flips both comparisons.
+///
+/// This is the componentwise (product) strict partial order: irreflexive
+/// (`a` vs `a` has no strictly-better component), asymmetric, and transitive.
+/// It therefore satisfies the `dominates` contract natively — unlike a
+/// host-supplied closure it cannot violate the order, so it is sound even in
+/// the release wheel where the debug irreflexivity/asymmetry probes are
+/// compiled out. Non-numeric or differing-length operands are treated as
+/// incomparable (return `false`); `pareto_validate` rejects those at ingest,
+/// so in practice this only ever sees well-formed equal-length vectors and the
+/// guards here are belt-and-braces.
+pub(crate) fn pareto_dominates(a: &DataValue, b: &DataValue, minimize: bool) -> bool {
+    let (la, lb) = match (a, b) {
+        (DataValue::List(la), DataValue::List(lb)) => (la, lb),
+        _ => return false,
+    };
+    if la.is_empty() || la.len() != lb.len() {
+        return false;
+    }
+    let mut strictly_better_somewhere = false;
+    for (x, y) in la.iter().zip(lb.iter()) {
+        let (xf, yf) = match (x.get_float(), y.get_float()) {
+            (Some(x), Some(y)) => (x, y),
+            _ => return false,
+        };
+        // NaN is excluded by pareto_validate, so `<=`/`<` are a total order
+        // per component here (±inf compares fine).
+        let (weakly_better, strictly_better) = if minimize {
+            (xf <= yf, xf < yf)
+        } else {
+            (xf >= yf, xf > yf)
+        };
+        if !weakly_better {
+            return false;
+        }
+        strictly_better_somewhere |= strictly_better;
+    }
+    strictly_better_somewhere
+}
+
+/// Operand contract for the built-in skyline aggregates: a non-empty list of
+/// numbers, none NaN. Runs once per candidate at the top of
+/// `DominanceMeetStore::meet_put` (attached there, by name, so the public
+/// `RegisteredBoundedMeet` stays unchanged). Needed because `dominates`
+/// returns a bare `bool` and has no channel to report a malformed operand.
+pub(crate) fn pareto_validate(value: &DataValue) -> Result<()> {
+    match value {
+        DataValue::List(l) => {
+            ensure!(
+                !l.is_empty(),
+                "the skyline aggregates 'pareto_min'/'pareto_max' require a non-empty list of numbers as the aggregated value"
+            );
+            for x in l {
+                match x.get_float() {
+                    Some(f) => ensure!(
+                        !f.is_nan(),
+                        "a skyline vector component must be a number, got NaN"
+                    ),
+                    None => bail!("a skyline vector component must be a number, got {:?}", x),
+                }
+            }
+            Ok(())
+        }
+        v => bail!(
+            "the skyline aggregates 'pareto_min'/'pareto_max' aggregate a list of numbers, got {:?}",
+            v
+        ),
+    }
+}
+
+/// If `name` is a built-in skyline aggregate, return its native dominance
+/// registration (mnestic fork). Attached in `parse_rule_head_arg`, not in the
+/// `const` static `parse_aggr` returns, because an `Arc` cannot live in a
+/// `const`. `max_survivors` is `usize::MAX`: a skyline is never truncated
+/// (spec §4 — bounding an antichain is a *semantic* reduction, never arrival
+/// order), so the store's cap check never fires; the frontier is bounded by
+/// the group's own tuple count, like `collect`/`union`. The operand validator
+/// travels separately via [`builtin_skyline_validator`], so the public
+/// `RegisteredBoundedMeet` needs no extra field.
+pub(crate) fn builtin_skyline_dominance(name: &str) -> Option<RegisteredBoundedMeet> {
+    let minimize = match name {
+        n if n == AGGR_PARETO_MIN.name => true,
+        n if n == AGGR_PARETO_MAX.name => false,
+        _ => return None,
+    };
+    Some(RegisteredBoundedMeet {
+        dominates: std::sync::Arc::new(move |a: &DataValue, b: &DataValue| {
+            pareto_dominates(a, b, minimize)
+        }),
+        max_survivors: usize::MAX,
+    })
+}
+
+/// The per-candidate operand validator for a built-in skyline aggregate, keyed
+/// by aggregate name (mnestic fork). `None` for a host-registered dominance —
+/// its closure owns its operand shape. Attached to the `DominanceMeetStore` at
+/// construction, keeping the public `RegisteredBoundedMeet` API unchanged.
+pub(crate) fn builtin_skyline_validator(name: &str) -> Option<fn(&DataValue) -> Result<()>> {
+    match name {
+        n if n == AGGR_PARETO_MIN.name || n == AGGR_PARETO_MAX.name => Some(pareto_validate),
+        _ => None,
+    }
+}
+
 /// The two custom-aggregate registries threaded through parsing as one
 /// `Copy` bundle (mnestic fork): R0b meet registrations + dominance
 /// bounded-meet registrations. One bundle keeps every pass-through call
@@ -243,6 +350,34 @@ macro_rules! define_aggr {
 
 // provenance semirings R1: the bounded-meet category's shipped instance
 define_aggr!(AGGR_MIN_COST_K, false, true);
+
+// mnestic fork — built-in skyline (Pareto-frontier) aggregates. They ride the
+// `DominanceMeetStore` exactly like a host-registered dominance
+// (`is_bounded_meet` + `bounded_dominance: Some(..)`), but the dominance is a
+// native strict partial order (no closure, no GIL, reachable from every binding
+// via plain CozoScript). The `bounded_dominance` `Arc` cannot live in a `const`,
+// so `parse_rule_head_arg` attaches it via `builtin_skyline_dominance`; these
+// statics exist for name resolution (`parse_aggr`) and reservation (the
+// register_* guards). Hand-written rather than `define_aggr!` so `name` is the
+// user-facing spelling, giving clean error messages.
+const AGGR_PARETO_MIN: Aggregation = Aggregation {
+    name: "pareto_min",
+    is_meet: false,
+    is_bounded_meet: true,
+    meet_op: None,
+    normal_op: None,
+    meet_factory: None,
+    bounded_dominance: None,
+};
+const AGGR_PARETO_MAX: Aggregation = Aggregation {
+    name: "pareto_max",
+    is_meet: false,
+    is_bounded_meet: true,
+    meet_op: None,
+    normal_op: None,
+    meet_factory: None,
+    bounded_dominance: None,
+};
 
 define_aggr!(AGGR_AND, true);
 
@@ -1509,6 +1644,8 @@ pub(crate) fn parse_aggr(name: &str) -> Option<&'static Aggregation> {
         "smallest_by" => &AGGR_SMALLEST_BY,
         "choice_rand" => &AGGR_CHOICE_RAND,
         "min_cost_k" => &AGGR_MIN_COST_K,
+        "pareto_min" => &AGGR_PARETO_MIN,
+        "pareto_max" => &AGGR_PARETO_MAX,
         _ => return None,
     })
 }

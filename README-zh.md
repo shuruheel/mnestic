@@ -25,6 +25,11 @@
   （`Db::register_custom_aggr`）、返回前 *k* 条推导及其证据链的 `min_cost_k` 有界 meet 聚合，
   以及基于重算的信念修订 `:reconcile`。
   （[规格说明](docs/specs/provenance-semirings.md)）
+- **天际线 / Pareto 前沿聚合** —— `pareto_min` / `pareto_max` 按组保留数值向量上的
+  非支配集（原生逐分量支配），从而呈现一个*争议集*（contested set）—— 若干个彼此都不占优的
+  答案 —— 而非坍缩为单一赢家。可从任意绑定通过普通的 `run_script` 调用；任意调用方自定义的
+  支配关系则可在 Rust 中经 `register_bounded_meet_aggr` 使用。
+  （[规格说明](docs/specs/antichain-bounded-meet.md)）
 - **引擎内混合检索** —— 以单个可被 Datalog 组合的 fixed rule，对向量、全文与图三路结果做
   RRF 倒数排名融合，并支持 MMR 多样化。
 - **只读 Cypher** —— 将 openCypher 子集翻译为 CozoScript（alpha；`cypher` feature，默认关闭）。
@@ -41,39 +46,24 @@
 其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## 0.11.0 新增
+## 0.11.1 新增
 
-**图投影缓存。** 十二个图算法现在可以从一份具名、始终新鲜、常驻内存的投影中获取邻接结构，
-而不必每次调用都重新扫描边关系并重建 CSR：
+**天际线聚合，触达每一个绑定。** `pareto_min` / `pareto_max` 按组保留数值向量的
+Pareto 前沿 —— 不被任何其他点支配的那些点 —— 且是普通的 CozoScript 聚合：
 
 ```
-::graph create g { edges: knows, nodes: person }
-
-?[node, group] <~ ConnectedComponents(graph: 'g')
-?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
+?[frontier] := offer[price, quality], v = [price, -quality], frontier = pareto_min(v)
 ```
 
-在一张 400,000 条边的图上实测（*冷*即按位置传参的旧形式）：
+`pareto_min` 以更小为更优，`pareto_max` 以更大为更优；混合目标（最小化 price、
+最大化 quality）通过对被最大化的分量取负来表达，如上所示。由于是原生实现（乘积序，
+一个可证明的严格偏序），它们无需宿主注册 —— 不同于其所基于的、仅限 Rust 的
+`register_bounded_meet_aggr` 支配聚合 —— 因而可从每一个绑定面（PyPI wheel、`cozo-bin`、
+langchain、llama-index）通过普通的 `run_script` 调用。畸形操作数（非列表、非数值分量、
+NaN 或空向量）会明确报错。
 
-| 算法 | 冷 | 热 | |
-|---|---|---|---|
-| `ConnectedComponents` | 127 ms | 7.9 ms | **16×** |
-| `PageRank`（20 轮迭代） | 150 ms | 10 ms | **15×** |
-| `ClusteringCoefficients` | 169 ms | 56 ms | 3× |
-
-被缓存的是**准备开销** —— 扫描边关系并构建 CSR —— 因此当算法本身成为瓶颈时收益随之减小。
-在持续写入下，缓存退化为每次查询重建，但绝不会返回陈旧数据。投影仅存于内存，不做持久化。
-
-本版本另含：
-
-- **破坏性变更（结果）：** `PageRank` 的默认 `iterations` 由 10 改为 20。10 低于上游默认值，
-  且实测并未收敛。传入 `iterations: 10` 可恢复旧结果。
-- **修复：** 空边关系此前会令七个图算法直接终止进程；`multi_transaction` 会在事务的整个生命周期内
-  占用一个 `rayon` 工作线程，从而可能导致进程死锁。
-- `PageRank` 支持可选的节点关系，孤立顶点将参与排名，而不再被静默丢弃。
-
-完整内容（含升级说明与已知限制）见
-[`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
+这是一个非破坏性、纯新增的补丁（两个保留聚合名），不改变任何既有查询的结果。
+完整内容见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 
 
 ## 简介

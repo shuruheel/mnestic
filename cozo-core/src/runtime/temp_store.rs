@@ -406,6 +406,13 @@ pub(crate) struct DominanceMeetStore {
     /// no cap. The delta must stay a superset of what may still change the
     /// total store, mirroring `BoundedMeetStore`'s unbounded twin.
     dedup_only: bool,
+    /// Per-candidate operand validator for a built-in native-dominance
+    /// aggregate (mnestic fork — `pareto_min`/`pareto_max`). `None` for a
+    /// host-registered dominance, whose closure owns its operand shape. Kept
+    /// here rather than on the public `RegisteredBoundedMeet` so that struct's
+    /// API is unchanged. `dominates` returns `bool` and cannot report a
+    /// malformed operand; this does, loudly.
+    validate: Option<fn(&DataValue) -> Result<()>>,
 }
 
 impl std::fmt::Debug for DominanceMeetStore {
@@ -442,6 +449,7 @@ impl DominanceMeetStore {
             aggr_name: aggr.name,
             grouping_len: total_key_len - 1,
             dedup_only: false,
+            validate: crate::data::aggr::builtin_skyline_validator(aggr.name),
         })
     }
     /// An empty twin for the delta slot: equality-dedup only.
@@ -452,6 +460,7 @@ impl DominanceMeetStore {
             aggr_name: self.aggr_name,
             grouping_len: self.grouping_len,
             dedup_only: true,
+            validate: self.validate,
         }
     }
     pub(crate) fn exists(&self, key: &Tuple) -> bool {
@@ -466,6 +475,15 @@ impl DominanceMeetStore {
     pub(crate) fn meet_put(&mut self, tuple: Tuple) -> Result<bool> {
         let (key_part, val_part) = tuple.split_at(self.grouping_len);
         let c = &val_part[0];
+        // mnestic fork — built-in native-dominance aggregates (`pareto_*`)
+        // validate the operand loudly here, before any dedup/dominance work:
+        // `dominates` returns `bool` and cannot report a malformed operand.
+        // This runs on the dedup_only delta store too, so no unvalidated
+        // candidate can slip through to output. Host-registered dominances
+        // carry no validator (`None`) and keep their trust-the-closure contract.
+        if let Some(validate) = self.validate {
+            validate(c)?;
+        }
         let entry = self.inner.entry(key_part.to_vec()).or_default();
         // memcmp-order binary search: structural-equality dedup + insertion pos
         let pos = match entry.binary_search_by(|held| held[0].cmp(c)) {

@@ -5,9 +5,56 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.11.0 work not yet cut to a release. Keep this section current as
+Post-0.11.1 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
+
+_Nothing yet._
+
+## 0.11.1 — 2026-07-10
+
+**Built-in skyline aggregates, reachable from every binding.** The registered
+dominance aggregate `register_bounded_meet_aggr` (0.10.1) keeps a Pareto frontier
+per group, but is a host-Rust closure — unreachable from the PyPI wheel,
+`cozo-bin`, langchain or llama-index. `pareto_min` / `pareto_max` close that gap
+for the case that covers almost every real skyline — componentwise dominance over
+a numeric vector — as ordinary CozoScript aggregates callable through plain
+`run_script` with no registration and no FFI.
+
+Engine (`cozo-core`) only. The addition is two reserved aggregate names attached
+in `parse_rule_head_arg` (`builtin_skyline_dominance`) plus a per-candidate
+validator on the internal `DominanceMeetStore` (`builtin_skyline_validator`); the
+store, eval and stratifier are untouched, the public `RegisteredBoundedMeet` is
+byte-identical to 0.11.0, and no existing query changes result — a purely
+additive, non-breaking patch. No `cozorocks`/`mnestic-rocks` change.
+
+### Added
+
+- **Built-in skyline aggregates `pareto_min` / `pareto_max`.** They keep, per
+  group, the Pareto frontier of a numeric vector — the points not dominated by
+  any other, `pareto_min` treating smaller as better and `pareto_max` larger:
+
+  ```
+  ?[frontier] := offer[price, quality], v = [price, -quality], frontier = pareto_min(v)
+  ```
+
+  Use them to surface a *contested set* — several answers none of which beats
+  another — instead of collapsing to a single winner. Mixed objectives (minimize
+  price, maximize quality) are expressed by negating the maximized components, as
+  above. The dominance is native — the product order, a provable strict partial
+  order — so unlike a registered `antichain` these need no host registration and
+  are reachable from **every** binding (the PyPI wheel, `cozo-bin`, langchain,
+  llama-index) through plain `run_script`, and they stay correct in a release
+  build where the debug order-law probes are compiled out. They work in recursive
+  rules and inherit the confluence and cycle-pruning of the registered dominance
+  aggregate they build on. A malformed operand (non-list, non-numeric component,
+  NaN, or empty vector) is a loud error; two vectors of differing length are
+  treated as incomparable (both survive), since arity mismatch is not detectable
+  per candidate. There is no cap — the frontier is bounded by the group's own
+  tuple count, like `collect`, so keep the objective vector low-dimensional
+  (skyline cardinality grows with dimensionality). Tests:
+  `cozo-core/tests/pareto_skyline.rs` (9, sqlite). Spec:
+  [`docs/specs/antichain-bounded-meet.md`](docs/specs/antichain-bounded-meet.md) §10.
 
 ## 0.11.0 — 2026-07-10
 

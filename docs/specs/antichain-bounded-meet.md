@@ -101,6 +101,8 @@ The literature agrees from the other direction: skyline cardinality genuinely ex
 
 Host-closure registration is **Rust-embedded only**: unreachable from PyPI `mnestic`, `langchain-mnestic`, `llama-index-vector-stores-mnestic`, and `cozo-bin` — the same limit the semirings spec records for R0b ("registration is host-API/Rust-only"). A Python-callable dominance closure would mean per-pair FFI callbacks inside the fixpoint loop (GIL, purity, performance) — significant, unscoped, and not v1. For bound/served consumers the only honest route is the deferred in-language dominance. v1 ships with this limitation stated in the registration rustdoc and the public docs; the in-language variant's trigger is *the first bindings/server consumer who needs it*, at which point it gets its own spec (it changes the evaluator, not just registration).
 
+> **Update (2026-07-10).** §10 adds the built-in `pareto_min` / `pareto_max`, which resolve this for the *canonical* case — componentwise Pareto dominance over a numeric vector — for **every** binding at once, without touching the FFI. What stays Rust-only is *arbitrary caller-defined* dominance; the in-language route (still deferred) remains the answer for that. The Python-callable-closure route was considered again and re-rejected for the same three reasons, one of them now sharper: the release wheel compiles the debug irreflexivity/asymmetry probes out, so a lawless Python closure would silently corrupt the antichain with no runtime guard.
+
 ## 6. Test matrix (all sqlite backend per the repo test-backend rule; failing-test-first per house workflow)
 
 - (a) Non-recursive 2-D Pareto frontier over a stored relation with a known answer set — the A.1 contested-set scenario from `cozoscript-extensions.md`.
@@ -139,6 +141,75 @@ Inherit the R0b contract set wholesale: reserved/lowercase names, duplicate reje
 - Strict weak orderings (comparator-correctness literature) — lexicographic composition preserves strict-weak; incomparability-transitivity is the property a genuinely partial clause lacks — the formal basis of §3.4's tie-break recipe.
 - **Soufflé subsumption** (souffle-lang.github.io/subsumption; subsumption-stratified Datalog, Köstler et al.) — the closest engine analog: rule-level dominance deletion (`A(x) <= A(y) :- …`) during fixpoint. The instructive difference: rule-level deletion must confront dominated tuples having already fired downstream inferences (their stratification restrictions exist for this); the aggregate-store framing here confines dominance to the fold and inherits `min_cost_k`'s documented approximate-in-recursion semantics instead — no downstream retraction, by construction.
 
+## 10. Built-in native-dominance skyline aggregates — `pareto_min` / `pareto_max` (2026-07-10)
+
+The delivery-surface resolution §5 left open for bound/served consumers, for the
+case that covers almost every real skyline: **componentwise Pareto dominance over
+a numeric vector.** Two reserved built-in aggregates, `pareto_min(vec)` and
+`pareto_max(vec)`, keep per group the Pareto frontier of the aggregated vectors —
+`pareto_min` minimizing every component, `pareto_max` maximizing. Because they are
+ordinary CozoScript aggregates they reach **every** surface (PyPI wheel, cozo-bin,
+langchain/llama-index) through `run_script` with **zero per-binding code** — the
+answer to "wire the skyline into the Python wheels" without the closure-callback
+route §5 rejected.
+
+**Why this is sound where a Python closure is not.** The dominance is a *native*
+strict partial order (the product order: `a` dominates `b` iff `a ≤ b` in every
+component and `a < b` in at least one). Unlike a host- or Python-supplied closure
+it *cannot* violate irreflexivity/asymmetry/transitivity, so it is correct even in
+a release build where the debug probes (§3.4) are compiled out.
+
+**Mechanism — rides the existing store, changes nothing downstream.** A built-in
+Pareto is exactly a `RegisteredBoundedMeet` with a native `dominates`, so it flows
+through the same `DominanceMeetStore`, eval, stratifier, and `AggrKind::BoundedMeet`
+compile path as a *registered* dominance (decision 3), inheriting §3.3 confluence,
+§6(b) recursion admission, and cycle pruning verbatim. The only seam: the
+`bounded_dominance` `Arc` cannot live in the `const` static that `parse_aggr`
+returns, so `parse_rule_head_arg` attaches it (via `builtin_skyline_dominance`)
+when it recognizes the reserved name — the one new code path. Store/eval/stratify
+are untouched.
+
+**Decisions specific to the built-in.**
+- **Two names, not one with a direction argument.** `pareto_min` / `pareto_max`
+  mirror `min` / `max`; call-site arguments stay rejected (decision 2 parity).
+  **Mixed objectives** (minimize price *and* maximize quality) are the documented
+  sign-flip idiom: negate the maximized components and use `pareto_min`. This keeps
+  the comparator a provable strict partial order with no per-call-site plumbing.
+- **No cap.** `max_survivors = usize::MAX`; the store's overflow guard never fires.
+  A built-in has no registrant to choose a bound, and §4 already settled that
+  bounding a skyline is a *semantic* reduction (representative-k, k-dominant), never
+  arrival-order truncation — so silently capping would be wrong and erroring on a
+  legitimately large frontier would be hostile. The frontier is bounded by the
+  group's own tuple count, exactly like `collect` / `union`. Skyline cardinality
+  grows with dimensionality (the well-known curse) — the user controls it by
+  choosing few, low-correlation dimensions.
+- **A validation seam, because `dominates` returns `bool`.** A malformed operand
+  (non-list, non-numeric component, NaN, empty vector) has no error channel through
+  `dominates`. So `DominanceMeetStore` carries an optional validator (`None` for
+  host registrations — the closure owns its operand shape; `Some(pareto_validate)`
+  for the built-ins, keyed by aggregate name via `builtin_skyline_validator`), run
+  once per candidate at the top of `meet_put`, before dedup, so the dedup-only
+  delta store validates too and no unvalidated value reaches output. It lives on
+  the **internal** store, not the public `RegisteredBoundedMeet`, so that
+  re-exported struct is byte-identical to 0.11.0 — the change is purely additive
+  (two reserved names) and ships as a non-breaking **0.11.1** patch. Differing-length
+  vectors are treated as incomparable (both survive) rather than erroring, since
+  arity mismatch is not detectable per candidate.
+
+**Tests.** `cozo-core/tests/pareto_skyline.rs` (9 tests, sqlite): min/max frontiers
+with a known answer, 1-D reduces to min/max, per-group independence, 3-D pruning,
+the sign-flip idiom, recursive multi-objective reachability (recursion admission
+parity with §6(b)), the operand contract (non-list / non-numeric / empty), call-site
+args rejected, reserved-name-against-registration. Discrimination proven per house
+rule: neutralizing `pareto_dominates` (nothing dominates → the skyline degenerates
+to `collect`) turns the six frontier assertions red while the three contract tests
+stay green, confirming they bind on the comparator, not on parse/validation.
+
+**Not this.** Arbitrary *caller-defined* dominance from a binding is still the
+in-language route (deferred, named trigger unchanged). This resolves only the
+componentwise-numeric case — which is what "skyline" means to essentially every
+consumer.
+
 ---
 
 ## Changelog
@@ -148,3 +219,4 @@ Inherit the R0b contract set wholesale: reserved/lowercase names, duplicate reje
 | 2026-07-04 | First authoring, per `cozoscript-extensions.md` §3.1's disposition ("its own spec resolving Q1–Q4 before any build"). Q1–Q4 resolved as §8 decisions 1–7; store design, laws/probes, test matrix, and delivery-surface position stated. Literature grounding: BNL insert, no-truncation cap, strict-weak tie-break composition. Awaiting owner sign-off. |
 | 2026-07-04 | **Signed off** (owner-delegated, research-backed). Final prior-art check added: Soufflé subsumption as the closest engine analog, confirming the aggregate-store framing's retraction dodge (§9). Build begins. |
 | 2026-07-04 | **Implemented.** `register_bounded_meet_aggr` (Db + DbInstance), `RegisteredBoundedMeet`, `DominanceMeetStore` + `TempStore::DominanceMeet`, parser fallback, probes, cap error, trigger rejection, function-name reservation (retrofitted onto `register_custom_aggr`). §6 matrix green (a–k; (k) via (a)'s non-recursive path). **Build deviations, all narrowing:** (1) the two custom registries thread through parsing as one `Copy` bundle (`CustomAggrRegistries`) rather than a second parameter — same six outer call sites, zero pass-through churn; (2) store dispatch lives in `EpochStore::new_bounded_meet` + a `TempStore::new_bounded`/`bounded_meet_put` pair, so the two eval functions changed only their return type — smaller than the §3.2 "named dispatch surface" anticipated; (3) the §3.4 probes error via `Result` (mirroring the R0b probe) instead of panicking — strictly better than the spec's "panics (debug only)"; (4) call-site args are rejected at **parse** time (§3.1 promised init-time) — earlier and louder. |
+| 2026-07-10 | **§10 added + implemented** — built-in `pareto_min` / `pareto_max`. Native componentwise dominance riding the existing `DominanceMeetStore` (no store/eval/stratify change); reserved via `parse_aggr`; the native `Arc` is attached in `parse_rule_head_arg` (`builtin_skyline_dominance`). The per-candidate validator lives on the internal `DominanceMeetStore` (keyed by name via `builtin_skyline_validator`), run at the top of `meet_put` — so the public `RegisteredBoundedMeet` is unchanged and this ships as a non-breaking **0.11.1** patch. Resolves §5 for bound/served consumers in the componentwise-numeric case — reachable from every binding via `run_script` with no FFI. `cozo-core/tests/pareto_skyline.rs` (9, sqlite); discrimination proven by neutralizing the comparator. |

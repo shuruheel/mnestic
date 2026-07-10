@@ -52,19 +52,15 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-**New in 0.11.0: cached graph projections.** Run
-`db.run_script("::graph create g { edges: knows, nodes: person }", {}, False)` to
-name an in-memory adjacency that twelve graph algorithms reuse across queries:
-pass `graph: 'g'` in place of the positional edge relation
-(`ConnectedComponents(graph: 'g')`, `PageRank(graph: 'g', iterations: 20)`, …)
-and the setup — scanning the edges and rebuilding a CSR — is paid once instead of
-on every call (measured 15–16× on a 400,000-edge graph). A projection is always
-fresh: a write to a source relation frees what was built from it, and it lives
-only in memory. `::graph list` and `::graph drop` manage them, and
-`db.set_graph_projection_capacity(bytes)` sets the cache's ceiling (512 MiB by
-default; `0` disables caching while leaving `::graph create` working).
-**Breaking (results):** `PageRank`'s default `iterations` is now 20, up from 10;
-pass `iterations: 10` to restore the old numbers.
+**New in 0.11.1: skyline aggregates, no binding code.** `pareto_min` and
+`pareto_max` keep, per group, the Pareto frontier of a numeric vector — the points
+no other point dominates — and are ordinary CozoScript aggregates, so they run
+straight from the wheel through `run_script` with nothing to register:
+`db.run_script("?[f] := offer[p, q], v = [p, -q], f = pareto_min(v)", {}, False)`.
+`pareto_min` treats smaller as better and `pareto_max` larger; mix objectives
+(minimize price, maximize quality) by negating the maximized components, as above.
+A malformed operand (non-list, non-numeric component, NaN, or empty vector) raises.
+It is a non-breaking, purely additive patch — no existing query changes result.
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

@@ -859,7 +859,28 @@ fn parse_rule_head_arg(
                 .map(|v| -> Result<DataValue> { build_expr(v, param_pool)?.eval_to_const() })
                 .try_collect()?;
             let aggr = match parse_aggr(aggr_name) {
-                Some(builtin) => builtin.clone(),
+                Some(builtin) => {
+                    // mnestic fork — the built-in skyline aggregates
+                    // (`pareto_min`/`pareto_max`) resolve as reserved builtins
+                    // (`is_bounded_meet`), but their native dominance must be
+                    // attached here: an `Arc` cannot live in the `const` static
+                    // `parse_aggr` returns. With `bounded_dominance` populated
+                    // they route through the `DominanceMeetStore` exactly like a
+                    // host-registered dominance — no store/eval/stratify change.
+                    match crate::data::aggr::builtin_skyline_dominance(builtin.name) {
+                        Some(reg) => {
+                            ensure!(
+                                args.is_empty(),
+                                "the skyline aggregate '{}' takes no arguments: min-vs-max is the aggregate name, and mixed objectives are encoded by negating the maximised components",
+                                builtin.name
+                            );
+                            let mut owned = builtin.clone();
+                            owned.bounded_dominance = Some(reg);
+                            owned
+                        }
+                        None => builtin.clone(),
+                    }
+                }
                 None => match custom_aggrs.meet.get(aggr_name) {
                     // A user-registered aggregate (mnestic fork, R0b): an
                     // owned Aggregation carrying the ⊕ factory. The stratifier
