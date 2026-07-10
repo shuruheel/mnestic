@@ -909,10 +909,16 @@ impl DbInstance {
         let (app2db_send, app2db_recv) = bounded(1);
         let (db2app_send, db2app_recv) = bounded(1);
         let db = self.clone();
-        #[cfg(target_arch = "wasm32")]
+        // A dedicated thread, as documented — NOT `rayon::spawn` (which this
+        // used until 0.11.0): the transaction loop blocks in `recv` between
+        // scripts for the transaction's whole life, and parking a global-pool
+        // worker that long starves the pool. With `available_parallelism` open
+        // transactions — or one open transaction racing any parallel query on
+        // a single-core host — every rayon-using query in the process
+        // deadlocks. (mnestic fork; found by the graph-projection interleaving
+        // suite, where one open reader plus one par-sorted CSR build wedged a
+        // one-worker run.)
         std::thread::spawn(move || db.run_multi_transaction(write, app2db_recv, db2app_send));
-        #[cfg(not(target_arch = "wasm32"))]
-        rayon::spawn(move || db.run_multi_transaction(write, app2db_recv, db2app_send));
         MultiTransaction {
             sender: app2db_send,
             receiver: db2app_recv,
