@@ -34,8 +34,9 @@ impl FixedRule for MinimumSpanningForestKruskal {
         poison: Poison,
     ) -> Result<()> {
         let edges = payload.get_input(0)?;
-        let (graph, indices, _) = edges.as_directed_weighted_graph(true, true)?;
-        if graph.node_count() == 0 {
+        let (graph, indices, _) =
+            edges.as_directed_weighted_graph_checked(true, true, None, &poison)?;
+        if indices.is_empty() {
             return Ok(());
         }
         let msp = kruskal(&graph, poison)?;

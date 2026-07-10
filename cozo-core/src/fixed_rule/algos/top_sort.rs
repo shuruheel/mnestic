@@ -31,7 +31,10 @@ impl FixedRule for TopSort {
     ) -> Result<()> {
         let edges = payload.get_input(0)?;
 
-        let (graph, indices, _) = edges.as_directed_graph(false)?;
+        let (graph, indices, _) = edges.as_directed_graph_checked(false, None, &poison)?;
+        if indices.is_empty() {
+            return Ok(());
+        }
 
         let sorted = kahn_g(&graph, poison)?;
 

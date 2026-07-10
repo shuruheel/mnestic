@@ -25,7 +25,6 @@ use crate::runtime::temp_store::RegularTempStore;
 pub(crate) struct PageRank;
 
 impl FixedRule for PageRank {
-    #[allow(unused_variables)]
     fn run(
         &self,
         payload: FixedRulePayload<'_, '_>,
@@ -36,18 +35,32 @@ impl FixedRule for PageRank {
         let undirected = payload.bool_option("undirected", Some(false))?;
         let theta = payload.unit_interval_option("theta", Some(0.85))? as f32;
         let epsilon = payload.unit_interval_option("epsilon", Some(0.0001))? as f32;
-        let iterations = payload.pos_integer_option("iterations", Some(10))?;
+        let iterations = payload.pos_integer_option("iterations", Some(20))?;
 
-        let (graph, indices, _) = edges.as_directed_graph(undirected)?;
+        // The optional second input names the vertices. Vertices with no edge then take part in
+        // the ranking as isolated vertices, which also puts them into the `1/N` base score.
+        let nodes = payload.get_input(1).ok();
+        let (graph, indices, _) =
+            edges.as_directed_graph_checked(undirected, nodes.as_ref(), &poison)?;
 
         if indices.is_empty() {
             return Ok(());
         }
 
-        let (ranks, _n_run, _) = page_rank(
+        let (ranks, n_run, error) = page_rank(
             &graph,
             PageRankConfig::new(iterations, epsilon as f64, theta),
         );
+        // `page_rank` returns as soon as `error < epsilon`, so reaching here with a larger error
+        // means the `iterations` cap stopped it short of convergence. An `epsilon` of zero opts
+        // out of the convergence test altogether — run exactly `iterations` and stay quiet.
+        if epsilon > 0. && error >= epsilon as f64 {
+            log::warn!(
+                "PageRank stopped at its `iterations` cap ({n_run}) with a total error of \
+                 {error:.3e}, above the `epsilon` of {epsilon:.3e}: the ranks have not \
+                 converged. Raise `iterations` or `epsilon`."
+            );
+        }
 
         for (idx, score) in ranks.iter().enumerate() {
             out.put(vec![indices[idx].clone(), DataValue::from(*score as f64)]);

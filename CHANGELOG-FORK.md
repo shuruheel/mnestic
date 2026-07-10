@@ -9,7 +9,58 @@ Post-0.10.6 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
-_Nothing yet._
+Toward **0.11.0 — cached graph projection** (spec: `docs/specs/graph-projection.md`).
+Phase 0 of that build lands the graph-algorithm changes that stand on their own,
+ahead of the cache itself.
+
+- **BREAKING (results): `PageRank` accepts an optional second input relation
+  naming the vertices**, exactly as `ConnectedComponents` already did. Vertices
+  in it that appear in no edge become real degree-0 vertices: they are ranked
+  (an isolated vertex's rank is exactly the base score `(1 - theta) / N`) and,
+  because `N` grows, **every other rank changes too**. Without the second input
+  the vertex set is still exactly the set of edge endpoints, so existing
+  single-input queries are unaffected. Concretely: on LDBC SNB sf1, 694 of
+  10,620 persons have no `knows` edge and were silently absent from the ranking
+  (the old output had 9,926 rows where a graph-native engine emits 10,620).
+- **BREAKING (results): `PageRank`'s default `iterations` is now 20, up from
+  10.** 10 was a below-upstream override — the vendored `graph` crate's own
+  `PageRankConfig::DEFAULT_MAX_ITERATIONS` is 20 — and it is measurably
+  non-convergent: at sf1 the ranks still move by `2.1e-4` at iteration 10
+  against the default `epsilon` of `1e-4`, versus `1.6e-6` at iteration 20. Pass
+  `iterations: 10` to restore the old numbers.
+- **`PageRank` warns when the `iterations` cap stops it short of `epsilon`**
+  (`log::warn`), instead of silently returning unconverged ranks. `epsilon: 0.0`
+  opts out of the convergence test — it means "run exactly `iterations`" — and
+  stays quiet.
+- **Fix: building a graph algorithm's CSR is now interruptible.** The scan that
+  interns vertices and collects edges checks the poison flag every 4096 tuples,
+  so `::kill` and `:timeout` abort a large build instead of waiting for it to
+  finish. Previously the flag was only observed once the algorithm proper began
+  — on a 300k-edge graph, most of the query's time was un-interruptible.
+- **Fix: an oversized graph errors instead of silently wrapping.** The CSR
+  indexes vertices and edge offsets with `u32`; the vertex count and the
+  post-doubling (undirected) edge count are now checked before the build
+  (`algo::graph_too_large`).
+- **Fix: an empty edge relation no longer panics seven graph algorithms**
+  (`TopSort`, `ConnectedComponents`, `StronglyConnectedComponents`,
+  `ClusteringCoefficients`, `BetweennessCentrality`, `ClosenessCentrality`,
+  `LabelPropagation`); they now return no rows, as `PageRank` already did. The
+  vendored builder sizes a graph from its largest edge endpoint, and the `max`
+  reduce over an empty edge list returns `0` — so an empty relation produced a
+  **one-vertex** graph with an empty id map, and the first `indices[0]` aborted
+  the process. Four algorithms already carried a `node_count() == 0` guard for
+  exactly this case; it could never fire. The id map, not the graph, is now the
+  authority on emptiness. `ConnectedComponents` keeps emitting its optional node
+  relation in this case, and `MinimumSpanningTreePrim` keeps raising its
+  `starting_node_not_found`/`empty_starting` diagnostics when a starting
+  relation is supplied over an empty graph. Present in upstream CozoDB.
+- New public API on `FixedRuleInputRelation`: `as_directed_graph_checked` and
+  `as_directed_weighted_graph_checked`, which take the optional node relation
+  and a `Poison`. The existing `as_directed_graph` / `as_directed_weighted_graph`
+  are unchanged in signature and behaviour, and now delegate. Errors during the
+  scan (`algo::not_an_edge`, `algo::invalid_edge_weight`) are now raised eagerly
+  rather than after the graph has been built.
+- Tests: `cozo-core/tests/graph_algo_nodes.rs`.
 
 ## 0.10.7 — 2026-07-08
 

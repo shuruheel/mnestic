@@ -148,6 +148,9 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
     ///
     /// Returns the graph, the vertices in a vector with the index the same as used in the graph,
     /// and the inverse vertex mapping.
+    ///
+    /// Equivalent to [`Self::as_directed_graph_checked`] with no node relation and a poison that
+    /// never fires.
     #[cfg(feature = "graph-algo")]
     pub fn as_directed_graph(
         &self,
@@ -157,61 +160,58 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
         Vec<DataValue>,
         BTreeMap<DataValue, u32>,
     )> {
+        self.as_directed_graph_checked(undirected, None, &Poison::default())
+    }
+    /// Convert the input relation into a directed graph, checking `poison` as the tuples are
+    /// scanned so that a long build can be killed, and optionally registering the vertices of
+    /// `nodes` before the edges are read.
+    ///
+    /// A vertex that appears in `nodes` but in no edge becomes a real degree-0 vertex: it is
+    /// counted by `node_count` and enumerated by the algorithms. Without `nodes` the vertex set
+    /// is exactly the set of edge endpoints.
+    ///
+    /// Returns the graph, the vertices in a vector with the index the same as used in the graph,
+    /// and the inverse vertex mapping.
+    #[cfg(feature = "graph-algo")]
+    pub fn as_directed_graph_checked(
+        &self,
+        undirected: bool,
+        nodes: Option<&FixedRuleInputRelation<'_, '_>>,
+        poison: &Poison,
+    ) -> Result<(
+        DirectedCsrGraph<u32>,
+        Vec<DataValue>,
+        BTreeMap<DataValue, u32>,
+    )> {
         let mut indices: Vec<DataValue> = vec![];
         let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
-        let mut error: Option<Report> = None;
-        let it = self.iter()?.filter_map(|r_tuple| match r_tuple {
-            Ok(tuple) => {
-                let mut tuple = tuple.into_iter();
-                let from = match tuple.next() {
-                    None => {
-                        error = Some(NotAnEdgeError(self.span()).into());
-                        return None;
-                    }
-                    Some(f) => f,
-                };
-                let to = match tuple.next() {
-                    None => {
-                        error = Some(NotAnEdgeError(self.span()).into());
-                        return None;
-                    }
-                    Some(f) => f,
-                };
-                let from_idx = if let Some(idx) = inv_indices.get(&from) {
-                    *idx
-                } else {
-                    let idx = indices.len() as u32;
-                    inv_indices.insert(from.clone(), idx);
-                    indices.push(from.clone());
-                    idx
-                };
-                let to_idx = if let Some(idx) = inv_indices.get(&to) {
-                    *idx
-                } else {
-                    let idx = indices.len() as u32;
-                    inv_indices.insert(to.clone(), idx);
-                    indices.push(to.clone());
-                    idx
-                };
-                Some((from_idx, to_idx))
+        register_nodes(nodes, &mut indices, &mut inv_indices, poison)?;
+
+        let mut edges: Vec<(u32, u32)> = vec![];
+        for (i, r_tuple) in self.iter()?.enumerate() {
+            let mut tuple = r_tuple?.into_iter();
+            let from = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
+            let to = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
+            let from_idx = intern_node(&mut indices, &mut inv_indices, from);
+            let to_idx = intern_node(&mut indices, &mut inv_indices, to);
+            edges.push((from_idx, to_idx));
+            if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
+                poison.check()?;
             }
-            Err(err) => {
-                error = Some(err);
-                None
-            }
-        });
-        let it = if undirected {
-            Right(it.flat_map(|(f, t)| [(f, t), (t, f)]))
-        } else {
-            Left(it)
-        };
-        let graph: DirectedCsrGraph<u32> = GraphBuilder::new()
-            .csr_layout(CsrLayout::Sorted)
-            .edges(it)
-            .build();
-        if let Some(err) = error {
-            bail!(err)
         }
+        check_csr_capacity(edges.len(), undirected, indices.len(), self.span())?;
+
+        let node_count = nodes.map(|_| indices.len());
+        let it = if undirected {
+            Right(edges.into_iter().flat_map(|(f, t)| [(f, t), (t, f)]))
+        } else {
+            Left(edges.into_iter())
+        };
+        let builder = GraphBuilder::new().csr_layout(CsrLayout::Sorted).edges(it);
+        let graph: DirectedCsrGraph<u32> = match node_count {
+            Some(n) if n > 0 => builder.node_values(vec![(); n]).build(),
+            _ => builder.build(),
+        };
         Ok((graph, indices, inv_indices))
     }
     /// Convert the input relation into a directed weighted graph.
@@ -220,6 +220,9 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
     ///
     /// Returns the graph, the vertices in a vector with the index the same as used in the graph,
     /// and the inverse vertex mapping.
+    ///
+    /// Equivalent to [`Self::as_directed_weighted_graph_checked`] with no node relation and a
+    /// poison that never fires.
     #[cfg(feature = "graph-algo")]
     pub fn as_directed_weighted_graph(
         &self,
@@ -230,118 +233,176 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
         Vec<DataValue>,
         BTreeMap<DataValue, u32>,
     )> {
-        let mut indices: Vec<DataValue> = vec![];
-        let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
-        let mut error: Option<Report> = None;
-        let it = self.iter()?.filter_map(|r_tuple| match r_tuple {
-            Ok(tuple) => {
-                let mut tuple = tuple.into_iter();
-                let from = match tuple.next() {
-                    None => {
-                        error = Some(NotAnEdgeError(self.span()).into());
-                        return None;
-                    }
-                    Some(f) => f,
-                };
-                let to = match tuple.next() {
-                    None => {
-                        error = Some(NotAnEdgeError(self.span()).into());
-                        return None;
-                    }
-                    Some(f) => f,
-                };
-                let from_idx = if let Some(idx) = inv_indices.get(&from) {
-                    *idx
-                } else {
-                    let idx = indices.len() as u32;
-                    inv_indices.insert(from.clone(), idx);
-                    indices.push(from.clone());
-                    idx
-                };
-                let to_idx = if let Some(idx) = inv_indices.get(&to) {
-                    *idx
-                } else {
-                    let idx = indices.len() as u32;
-                    inv_indices.insert(to.clone(), idx);
-                    indices.push(to.clone());
-                    idx
-                };
-
-                let weight = match tuple.next() {
-                    None => 1.0,
-                    Some(d) => match d.get_float() {
-                        Some(f) => {
-                            if !f.is_finite() {
-                                error = Some(
-                                    BadEdgeWeightError(
-                                        d,
-                                        self.arg_manifest
-                                            .bindings()
-                                            .get(2)
-                                            .map(|s| s.span)
-                                            .unwrap_or_else(|| self.span()),
-                                    )
-                                    .into(),
-                                );
-                                return None;
-                            };
-
-                            if f < 0. && !allow_negative_weights {
-                                error = Some(
-                                    BadEdgeWeightError(
-                                        d,
-                                        self.arg_manifest
-                                            .bindings()
-                                            .get(2)
-                                            .map(|s| s.span)
-                                            .unwrap_or_else(|| self.span()),
-                                    )
-                                    .into(),
-                                );
-                                return None;
-                            }
-                            f
-                        }
-                        None => {
-                            error = Some(
-                                BadEdgeWeightError(
-                                    d,
-                                    self.arg_manifest
-                                        .bindings()
-                                        .get(2)
-                                        .map(|s| s.span)
-                                        .unwrap_or_else(|| self.span()),
-                                )
-                                .into(),
-                            );
-                            return None;
-                        }
-                    },
-                };
-
-                Some((from_idx, to_idx, weight as f32))
-            }
-            Err(err) => {
-                error = Some(err);
-                None
-            }
-        });
-        let it = if undirected {
-            Right(it.flat_map(|(f, t, w)| [(f, t, w), (t, f, w)]))
-        } else {
-            Left(it)
-        };
-        let graph: DirectedCsrGraph<u32, (), f32> = GraphBuilder::new()
-            .csr_layout(CsrLayout::Sorted)
-            .edges_with_values(it)
-            .build();
-
-        if let Some(err) = error {
-            bail!(err)
-        }
-
+        self.as_directed_weighted_graph_checked(
+            undirected,
+            allow_negative_weights,
+            None,
+            &Poison::default(),
+        )
+    }
+    /// The interruptible, optionally node-registering counterpart of
+    /// [`Self::as_directed_weighted_graph`]. See [`Self::as_directed_graph_checked`] for what
+    /// `nodes` and `poison` do.
+    #[cfg(feature = "graph-algo")]
+    pub fn as_directed_weighted_graph_checked(
+        &self,
+        undirected: bool,
+        allow_negative_weights: bool,
+        nodes: Option<&FixedRuleInputRelation<'_, '_>>,
+        poison: &Poison,
+    ) -> Result<(
+        DirectedCsrGraph<u32, (), f32>,
+        Vec<DataValue>,
+        BTreeMap<DataValue, u32>,
+    )> {
+        let (graph, indices, inv_indices, _has_negative) =
+            self.build_weighted_graph(undirected, allow_negative_weights, nodes, poison)?;
         Ok((graph, indices, inv_indices))
     }
+    /// The weighted builder proper. Additionally reports whether any edge weight was negative:
+    /// the graph projection cache builds permissively and records this, so that a strict
+    /// consumer of a shared variant can reject it (`docs/specs/graph-projection.md` §3.2.2).
+    #[cfg(feature = "graph-algo")]
+    pub(crate) fn build_weighted_graph(
+        &self,
+        undirected: bool,
+        allow_negative_weights: bool,
+        nodes: Option<&FixedRuleInputRelation<'_, '_>>,
+        poison: &Poison,
+    ) -> Result<(
+        DirectedCsrGraph<u32, (), f32>,
+        Vec<DataValue>,
+        BTreeMap<DataValue, u32>,
+        bool,
+    )> {
+        let mut indices: Vec<DataValue> = vec![];
+        let mut inv_indices: BTreeMap<DataValue, u32> = Default::default();
+        register_nodes(nodes, &mut indices, &mut inv_indices, poison)?;
+
+        let weight_span = || {
+            self.arg_manifest
+                .bindings()
+                .get(2)
+                .map(|s| s.span)
+                .unwrap_or_else(|| self.span())
+        };
+
+        let mut has_negative = false;
+        let mut edges: Vec<(u32, u32, f32)> = vec![];
+        for (i, r_tuple) in self.iter()?.enumerate() {
+            let mut tuple = r_tuple?.into_iter();
+            let from = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
+            let to = tuple.next().ok_or_else(|| NotAnEdgeError(self.span()))?;
+            let from_idx = intern_node(&mut indices, &mut inv_indices, from);
+            let to_idx = intern_node(&mut indices, &mut inv_indices, to);
+            let weight = match tuple.next() {
+                None => 1.0,
+                Some(d) => {
+                    let f = match d.get_float() {
+                        Some(f) if f.is_finite() => f,
+                        _ => bail!(BadEdgeWeightError(d, weight_span())),
+                    };
+                    if f < 0. {
+                        ensure!(allow_negative_weights, BadEdgeWeightError(d, weight_span()));
+                        has_negative = true;
+                    }
+                    f
+                }
+            };
+            edges.push((from_idx, to_idx, weight as f32));
+            if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
+                poison.check()?;
+            }
+        }
+        check_csr_capacity(edges.len(), undirected, indices.len(), self.span())?;
+
+        let node_count = nodes.map(|_| indices.len());
+        let it = if undirected {
+            Right(
+                edges
+                    .into_iter()
+                    .flat_map(|(f, t, w)| [(f, t, w), (t, f, w)]),
+            )
+        } else {
+            Left(edges.into_iter())
+        };
+        let builder = GraphBuilder::new()
+            .csr_layout(CsrLayout::Sorted)
+            .edges_with_values(it);
+        let graph: DirectedCsrGraph<u32, (), f32> = match node_count {
+            Some(n) if n > 0 => builder.node_values(vec![(); n]).build(),
+            _ => builder.build(),
+        };
+        Ok((graph, indices, inv_indices, has_negative))
+    }
+}
+
+/// Batched cadence for [`Poison`] checks while a fixed rule scans tuples into a CSR — the same
+/// power-of-two mask the relational-algebra pipeline uses (`query/ra.rs`).
+#[cfg(feature = "graph-algo")]
+const GRAPH_BUILD_POISON_INTERVAL: usize = 4096;
+
+/// Map a vertex value to its dense `u32` id, assigning the next id if it is new.
+#[cfg(feature = "graph-algo")]
+#[inline]
+fn intern_node(
+    indices: &mut Vec<DataValue>,
+    inv_indices: &mut BTreeMap<DataValue, u32>,
+    node: DataValue,
+) -> u32 {
+    if let Some(idx) = inv_indices.get(&node) {
+        *idx
+    } else {
+        let idx = indices.len() as u32;
+        inv_indices.insert(node.clone(), idx);
+        indices.push(node);
+        idx
+    }
+}
+
+/// Give every vertex of `nodes` an id before any edge is read, so that ids `0..nodes.len()`
+/// name exactly the declared vertices and the isolated ones survive into the CSR.
+#[cfg(feature = "graph-algo")]
+fn register_nodes(
+    nodes: Option<&FixedRuleInputRelation<'_, '_>>,
+    indices: &mut Vec<DataValue>,
+    inv_indices: &mut BTreeMap<DataValue, u32>,
+    poison: &Poison,
+) -> Result<()> {
+    let Some(nodes) = nodes else { return Ok(()) };
+    for (i, tuple) in nodes.iter()?.enumerate() {
+        let node = tuple?
+            .into_iter()
+            .next()
+            .ok_or_else(|| NotANodeError(nodes.span()))?;
+        intern_node(indices, inv_indices, node);
+        if i & (GRAPH_BUILD_POISON_INTERVAL - 1) == 0 {
+            poison.check()?;
+        }
+    }
+    Ok(())
+}
+
+/// `DirectedCsrGraph<u32>` indexes both its vertices and its CSR offsets with `u32`, so the
+/// post-doubling edge count and the vertex count must each stay below `u32::MAX`. Checked before
+/// the build rather than after, because the build allocates proportionally to both.
+#[cfg(feature = "graph-algo")]
+fn check_csr_capacity(
+    n_edges: usize,
+    undirected: bool,
+    n_nodes: usize,
+    span: SourceSpan,
+) -> Result<()> {
+    let n_edges = n_edges as u64 * if undirected { 2 } else { 1 };
+    ensure!(
+        n_edges < u32::MAX as u64,
+        GraphTooLargeError("edges", n_edges, span)
+    );
+    ensure!(
+        (n_nodes as u64) < u32::MAX as u64,
+        GraphTooLargeError("vertices", n_nodes as u64, span)
+    );
+    Ok(())
 }
 
 impl<'a, 'b> FixedRulePayload<'a, 'b> {
@@ -881,6 +942,22 @@ impl FixedRuleHandle {
 #[diagnostic(help("Edge relation requires tuples of length at least two"))]
 struct NotAnEdgeError(#[label] SourceSpan);
 
+#[cfg(feature = "graph-algo")]
+#[derive(Error, Diagnostic, Debug)]
+#[error("The relation cannot be interpreted as a relation of nodes")]
+#[diagnostic(code(algo::not_a_node))]
+#[diagnostic(help("A node relation requires tuples of length at least one"))]
+struct NotANodeError(#[label] SourceSpan);
+
+#[cfg(feature = "graph-algo")]
+#[derive(Error, Diagnostic, Debug)]
+#[error("The graph has too many {0} ({1}) to be represented")]
+#[diagnostic(code(algo::graph_too_large))]
+#[diagnostic(help(
+    "The compressed adjacency representation indexes vertices and edges with 32-bit integers"
+))]
+struct GraphTooLargeError(&'static str, u64, #[label] SourceSpan);
+
 #[derive(Error, Diagnostic, Debug)]
 #[error(
     "The value {0:?} at the third position in the relation cannot be interpreted as edge weights"
@@ -948,5 +1025,30 @@ impl MagicFixedRuleRuleArg {
                 handle.arity()
             }
         })
+    }
+}
+
+#[cfg(all(test, feature = "graph-algo"))]
+mod tests {
+    use super::check_csr_capacity;
+    use crate::parse::SourceSpan;
+
+    /// The u32 capacity guard is the only barrier against `indices.len() as u32` wrapping and
+    /// silently aliasing distinct vertices — the boundary is unreachable by any end-to-end test,
+    /// so it is pinned here at the exact edges.
+    #[test]
+    fn csr_capacity_guard_boundaries() {
+        let span = SourceSpan(0, 0);
+        let max = u32::MAX as usize;
+
+        assert!(check_csr_capacity(max, false, 0, span).is_err());
+        assert!(check_csr_capacity(max - 1, false, 0, span).is_ok());
+
+        // Undirected doubles the edge count before the check.
+        assert!(check_csr_capacity(max / 2 + 1, true, 0, span).is_err());
+        assert!(check_csr_capacity(max / 2, true, 0, span).is_ok());
+
+        assert!(check_csr_capacity(0, false, max, span).is_err());
+        assert!(check_csr_capacity(0, false, max - 1, span).is_ok());
     }
 }

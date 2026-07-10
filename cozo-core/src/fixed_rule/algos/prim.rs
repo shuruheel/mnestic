@@ -35,12 +35,18 @@ impl FixedRule for MinimumSpanningTreePrim {
         poison: Poison,
     ) -> Result<()> {
         let edges = payload.get_input(0)?;
-        let (graph, indices, inv_indices) = edges.as_directed_weighted_graph(true, true)?;
-        if graph.node_count() == 0 {
-            return Ok(());
-        }
+        let (graph, indices, inv_indices) =
+            edges.as_directed_weighted_graph_checked(true, true, None, &poison)?;
+        // The empty early-return sits inside the no-starting-input arm: a user who names a
+        // starting node (or supplies an empty starting relation) must still get the loud
+        // `starting_node_not_found` / `empty_starting` diagnostic, not a silent empty result.
         let starting = match payload.get_input(1) {
-            Err(_) => 0,
+            Err(_) => {
+                if indices.is_empty() {
+                    return Ok(());
+                }
+                0
+            }
             Ok(rel) => {
                 let tuple = rel.iter()?.next().ok_or_else(|| {
                     #[derive(Debug, Error, Diagnostic)]

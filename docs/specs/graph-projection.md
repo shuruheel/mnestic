@@ -1,0 +1,237 @@
+# Spec — Cached Graph Projection (named, write-invalidated CSR cache)
+
+_Created 2026-07-09. Status: **BUILD-READY — decisions 1–4 signed by owner 2026-07-09; adversarially reviewed same day.** Grounding: every `file:line` was re-verified against the working tree on 2026-07-09 by a five-dimension verification fleet (mutation paths, fixed-rule call sites, tx/snapshot/locking semantics, vendored graph crate, sysop grammar), and the resulting draft was then attacked by a five-lens adversarial review fleet (31 findings, 27 confirmed after per-finding refutation attempts — all incorporated). Two review blockers killed the draft's freshness protocol; §3.3 is the repaired **watermark protocol** and §6 records both dead designs so they are not re-litigated. Companion: `docs/plans/cached-graph-projection.md` (workspace repo — research trail + phases; **this spec supersedes it wherever they differ, including its `GraphSource` sketch**), `d3-canned-vs-canned-RESULTS.md` (the measurement), `antichain-bounded-meet.md` (the spec-discipline template)._
+
+> **Anti-overbuild guardrails.** One in-memory cache behind one named catalog object; no persistence of definitions or built CSRs; no incremental CSR maintenance; no TTLs; **no reorder/compile/magic/stratify or evaluator changes** — the only pipeline-adjacent edits are parse-level and enumerated (§3.1 sysop grammar; §3.5.4 `parse_fixed_rule` option guard). The invalidation substrate (per-tx dirty-set + watermark tokens) is deliberately generic: any future engine cache reuses it. **Zero planner changes ride in this release** (Tier-0 skip condition, signed 2026-07-09).
+
+---
+
+## 1. Why / what this buys
+
+Measured 2026-07-09 (LDBC SNB sf1: 10,620 persons / 438,900 directed edges; `verify.py --only breakdown`): canned `ConnectedComponents` ≈ 136 ms = scan `*knows` **54.1 ms** + CSR build **49.7 ms** + Tarjan + merge **~17.6 ms** — **~86% is setup, rebuilt every call**; 20 PageRank iterations cost 6.4 ms on the same setup. Neither competitor caches: Ladybug/Kùzu's `project_graph` is a 0.3 ms metadata binding (re-scans per algorithm call); Neo4j GDS materializes but never refreshes (immutable until manual drop). **Always-fresh + write-invalidated is open ground** and matches this engine's correctness positioning. Expected warm effect: CC ~136 → ~10–15 ms, PageRank ~120 → ~10 ms (vs Ladybug ~251 ms warm WCC). Louvain is exempt from the full claim — it rebuilds coarsened CSRs internally per level (`louvain.rs:81-90`); only its initial build is cacheable.
+
+Honesty note: mindgraph-rs calls none of these kernels today. This is (a) an OSS-community differentiator (legitimate roadmap input per the 2026-06-27 doctrine) and (b) **the substrate for the budgeted weighted traversal FixedRule** (roadmap item 9) — §3.5's accessor is `pub` precisely so that item's out-of-tree prototype consumes it.
+
+## 2. Verified baseline (load-bearing facts, re-checked 2026-07-09)
+
+| # | Fact | Where |
+|---|---|---|
+| 1 | Every CSR-building algo's preamble is `payload.get_input(0)` → `as_directed_graph*`; both build sites use `CsrLayout::Sorted` | `fixed_rule/mod.rs:152/:224` (methods), `:209/:335` (layout) |
+| 2 | **12 preamble call sites in 11 algo files** build a full CSR (porting matrix §3.5.3; Louvain's per-level internal rebuilds are a 13th, unportable, site); BFS/DFS/ShortestPathBFS/RandomWalk/ShortestPathAStar/DegreeCentrality **never build one** — they evaluate per-tuple condition/heuristic/weight expressions via `prefix_iter`, data a CSR does not carry → **structurally excluded** | e.g. `algos/bfs.rs:35-41,:60`, `algos/degree_centrality.rs:31` |
+| 3 | `DirectedCsrGraph` stores **both** out- and in-CSRs; immutable; `Send+Sync` by auto-derivation (Box-backed POD fields); weighted edge values are interleaved (`Target{target,value}`, repr(C)) so weighted/unweighted variants share nothing | graph_builder-0.4.0 `csr.rs:364-368`, `graph/mod.rs:5-9` |
+| 4 | `CsrLayout::Sorted` **keeps duplicate parallel edges**; `Deduplicated` also strips self-loops (a semantic change); "undirected" is emulated by doubling the edge stream. `node_count` derives from the **edge list's max endpoint id** (`csr.rs:522`) — but the `From<(NodeValues, E, CsrLayout)>` route (`csr.rs:544-547`) sizes the graph from supplied node values, which is how §3.2.4 makes isolated vertices real | graph_builder `csr.rs:36-45,:201-212,:522,:544-547`; `fixed_rule/mod.rs:203-207` |
+| 5 | Relation write locks are taken in **shared (read) mode by every script/imperative/import writer**; only index-create and `::repair_corrupt` take exclusive; the multi-transaction API takes **no relation locks at all** | `db.rs:1458-1459`, `imperative.rs:273`, `db.rs:2479-2536,:2444`; `db.rs:476-484` |
+| 6 | Two overlapping RocksDB pessimistic txns writing one shared key: the second **aborts `Resource busy`** unless the write bypasses snapshot validation under an external mutex — the 0.8.4 `avgdl` hot-key failure mode, with an in-repo rehearsal test | `tt_clock.rs:279-301`, `rocks.rs:282-293` |
+| 7 | **Opening a tx IS pinning its snapshot**: rocks read tx = `snapshot_read()` whose bridge constructor calls `GetSnapshot()` immediately (`cozorocks/bridge/db.h:44-48`); rocks write tx = pessimistic txn with `set_snapshot(true)`. mem: a write tx holds the store-wide write guard from `transact()` to drop (no reader coexists with a writer); sqlite: same guard discipline — writers excluded during any read tx; residual hazard is only another OS process on the same file | `rocks.rs:133-145`, `mem.rs:51-58`, `sqlite.rs:72-80,:120,:149-161` |
+| 8 | Zero-relation-arg fixed-rule calls **parse today** (`fixed_args_list` allows empty; `<-` const rules compile to `Constant` with `rule_args: vec![]`; magic/stratify only iterate). `Algo(graph: 'G')` fails only at runtime `get_input(0)` — exactly the call §3.5 replaces. No grammar or compile work is needed **for the call form itself**; this spec's own additions are the §3.1 sysop grammar and the §3.5.4 parse-level guard | `cozoscript.pest:75`, `parse/query.rs:252-254,:921-1116`, `data/program.rs:370-389` |
+| 9 | Unknown fixed-rule options are **silently ignored engine-wide** (no rejection path exists) | `parse/query.rs:1080-1086`, `fixed_rule/mod.rs:559-565` |
+| 10 | `SessionTx::commit_tx` (`transact.rs:192-206`) is the **single commit funnel** for every SessionTx path — script (`db.rs:1493`), imperative (`imperative.rs:337`), multi-tx (`db.rs:432`), sysop (`db.rs:2696`), imports (`db.rs:960,:1096-1097`); its only raw commits are `transact.rs:204` and `:267` (tt path). Sole bypass: `restore_backup`'s `batch_put` (`db.rs:1001`), guarded by an empty-DB precondition (`db.rs:991-996`) |  |
+| 11 | On TxTime relations the literal put/del lines are **never reached** — writes buffer via `pending_tt_writes` (**six** push sites: `stored.rs:1293/1301/1459/1600/1694/1803`, plus a seventh in `import_relations`, `db.rs:860-866`) and hit storage only in `stamp_pending_tt_writes` (`transact.rs:277-352`, put at `:348`); buffered writes are invisible to later reads in the same tx (`transact.rs:48-54`) |  |
+| 12 | `RelationId` is a bare u64. Persistent ids: process-wide `fetch_add`, never reused in-process even on abort (crash + restart can re-hand an uncommitted id — moot here: the cache dies with the process). **Temp relations allocate from a separate per-SessionTx counter that also yields 1,2,3…** — temp ids numerically collide with persistent ids and must be excluded everywhere (§3.4). `::rename` preserves the id, rewrites only the catalog row, and **only checks that the new name is free** — multi-pair renames can swap two relations' names with zero tuple movement | `relation.rs:51,:957-964,:983-993,:1976-2005`; `transact.rs:36`, `db.rs:1393/:1410`; `db.rs:2570-2588`, `db.rs:1832-1834` |
+| 13 | Index relations are **real, resolvable catalog relations named `{base}:{idx}`** (`get_relation` does not reject `:`), and their tuples are maintained inside the base relation's write functions and by index create/drop — they must be barred as projection sources (§3.1) | `relation.rs:1743,:1822-1831,:998-1017` |
+| 14 | Db-level cache precedent: `fts_doc_stats_cache` (`Arc<Mutex<BTreeMap>>`, cloned into every SessionTx). `FixedRulePayload` carries only `{manifest, stores, tx: &SessionTx}` and `SessionTx` has **no Db handle** — anything the cache needs must ride in via these cloned Arcs | `db.rs:170`, `transact.rs:32-74,:40`, `fixed_rule/mod.rs:47-51` |
+| 15 | The vendored crate's own PageRank defaults are `max_iterations=20, tolerance=1e-4, damping=0.85`; mnestic's `iterations:10` is a **below-upstream override**, measured non-convergent at ε=1e-4 (10 iters: max|Δ|=2.1e-4; 20: 1.6e-6 vs 50) | graph-0.3.1 `page_rank.rs:45-47`; `pagerank.rs:39,:47` |
+| 16 | Sysops can run **inside an imperative script's tx** (`run_sys_op_with_tx(tx, …, skip_locking=true)`) — sysop hooks live in the dispatch arms; flushes key off `commit_tx`, never off `run_sys_op` | `imperative.rs:123-124`, `cozoscript.pest:257` |
+| 17 | The `graph` dep is optional behind the `graph-algo` feature and **not re-exported** — §3.5.5 makes the consumer-facing types reachable | `Cargo.toml:48,:144` |
+
+## 3. Design
+
+### 3.1 Catalog and surface
+
+```
+::graph create G { edges: knows, nodes: person }   # nodes optional
+::graph drop G
+::graph list
+```
+
+- **Registry**: in-memory on `Db` (`graph_projections: Arc<…>` beside `fts_doc_stats_cache`, baseline row 14; cloned into every `SessionTx` — that Arc is the **only** plumbing the cache needs, §3.3 requires no fresh transactions). Definitions store relation **names**; every use re-resolves name → `RelationHandle`/`RelationId`. **Not persisted** — after restart, use errors loudly: *"graph projection 'G' not found — projections are in-memory and must be re-created after restart."*
+- **Grammar**: new `graph_op` alternative in **both** `sys_script` (pest:14-16) and `sys_script_inner` (pest:17-19; reachable from imperative scripts, baseline row 16). Existing create rules are relation-scoped, so `::graph` gets its own sub-rules (bare-name precedent: `repair_corrupt_op`, pest:40):
+  - `graph_create = {"create" ~ ident ~ "{" ~ (graph_opt_field ~ ",")* ~ graph_opt_field? ~ "}"}` with `graph_opt_field = {ident ~ ":" ~ expr}` — **mirroring `index_opt_field` (pest:54)** so the existing `Expr::Binding` name-extraction precedent applies (`parse/sys.rs:511-513`) and single-quoted strings work through the dialect's normal `string` rule (the draft's `quoted_string` was double-quote-only — wrong).
+  - `graph_drop = {"drop" ~ ident}`; `graph_list = {"list"}`.
+- **SysOp variants** `CreateGraph{name, edges, nodes}`, `DropGraph(name)`, `ListGraphs`; parse arm beside `Rule::fts_idx_op` (`parse/sys.rs:469`); dispatch arms in `run_sys_op_with_tx` (`db.rs:1961`), each opening with the per-arm `if read_only { bail!(…) }` convention (`db.rs:2469` et al.); **no AccessLevel check** (index-create precedent has none, `relation.rs:1756-1774`); **no relation locks** (registry mutex only) — trivially correct under `skip_locking=true`.
+- **Create-time validation** (loud, immediate): name unregistered; source relations resolve via `tx.get_relation`; `edges` arity ≥ 2; **reject sources containing `:`** ("cannot project from index relation 'X'; use its base relation" — baseline row 13; message precedent `db.rs:769`); **reject `_`-prefixed sources** (per-tx temp relations — baseline row 12). Create builds nothing (lazy, §3.2; one code path with post-invalidation rebuild).
+- `::graph drop` removes the definition and frees all cached variants. **`::graph list` emits one row per (projection, variant)**: columns `name, edges, nodes, variant` ("directed" / "undirected+weighted" / …), `est_bytes, built_at, last_used`; a projection with no built variants emits one row with null variant columns. (Template: `ListFixedRules`, `db.rs:1990-1996`.) LRU uses the per-variant `last_used`.
+- **Feature gating** (baseline row 17): the grammar parses unconditionally; the `CreateGraph`/`DropGraph`/`ListGraphs` dispatch arms, the cache, `ProjectionVariant`, and `graph_input` are `#[cfg(feature = "graph-algo")]`; non-feature builds `bail!` with "compiled without graph-algo".
+
+### 3.2 Variants and build semantics
+
+A projection names its **sources**; concrete CSRs materialize lazily per **variant key `(direction ∈ {directed, undirected}, weighted ∈ {false, true})`** on first algorithm use (a CC + PageRank workload materializes two variants — expected; per-variant rows in `::graph list`).
+
+1. **Edge ingestion** = first two columns; **weighted** variants read column 3, defaulting to **1.0 when absent** (`fixed_rule/mod.rs:270-271`).
+2. **Weighted variants build permissively** (`allow_negative_weights = true`) and record `has_negative: bool` during the scan. Strict algos (Dijkstra, Yen, Louvain, Betweenness, Closeness) consuming a `has_negative` variant **error loudly**; permissive algos (Prim, Kruskal, LabelPropagation) consume as-is. One weighted variant per direction, identical accept/reject semantics to today.
+3. **Duplicate edges are kept** (`CsrLayout::Sorted`, baseline row 4) — multiplicity semantics identical to today; documented (duplicates inflate memory *and* kernel results).
+4. **Nodes registration — the mechanism** (corrected by review): when the projection defines `nodes`, the builder first registers every node-relation id into the `DataValue↔u32` mapping, then scans edges, then builds via the **`From<(NodeValues, E, CsrLayout)>` route** — `.node_values(vec![(); indices.len()])` — which sizes `node_count` from the mapping (baseline row 4, `csr.rs:544-547`). Plain `.edges(…)` derives node_count from the max edge endpoint and would silently drop isolated vertices from the graph. Isolated vertices are thereby **real degree-0 vertices**: PageRank's N includes them (exact kernel math, no post-hoc correction), and Tarjan emits them as singleton components organically. **CC/SCC equivalence between projection and positional forms is partition-level, not label-level** — group ids are arbitrary labels and renumber under nodes-registered projections (isolated vertices interleave instead of appending); changelog-flagged like §3.7; equivalence tests compare partitions (§5).
+
+   **Two build-order constraints, learned in Phase 0 (2026-07-09) — both are panics, not errors, if violated:**
+   - `GraphBuilder::node_values` **materializes the edge list at call time** (`builder.rs:395`), and `From<(NodeValues, E, CsrLayout)>` then **`assert!`s** `node_values.len() ≥ max_edge_endpoint + 1` (`csr.rs:549-554`). So the edge stream must be **eagerly collected and every endpoint interned before `node_values` is called**. The lazy `filter_map`-over-the-scan shape the old builders used cannot be kept: besides failing the borrow check (the closure holds `&mut indices`), it would size `node_values` from the pre-edge-scan count and then panic on the first edge naming a vertex absent from the `nodes` relation — a **legal** input, since the vertex set is the union of the two. Eager collection is affordable, not free: the local `Vec` and the crate's boxed `EdgeList` copy coexist transiently (`edgelist.rs:148`), but the unchanged CSR-construction phase — which holds the `EdgeList` plus both direction's target arrays at once (`csr.rs:520-535`) — dominates peak memory in every configuration, so the collect-phase copy never sets the high-water mark (adversarially reviewed 2026-07-09).
+   - The `node_values` route must be **skipped when the id map is empty** (empty `nodes` ∧ empty edges): `max_node_id()` of an empty edge list is `0`, so `node_count_from_edge_list` is `1` and the assert reads `0 >= 1`.
+
+   Degree-0 vertices are safe in PageRank despite `out_scores[v] = init_score / 0 = +inf` (`page_rank.rs:78`): `out_scores[v]` is read only for `v ∈ in_neighbors(u)` (`page_rank.rs:143-146`), and a degree-0 vertex is nobody's in-neighbour. Its own rank is exactly the base score `(1−θ)/N`. (Sink vertices already hit this path today.)
+5. **Invariant (pinned)**: every build assigns dense sequential u32 ids via the mapping.
+6. **u32 ceiling**: the pre-build estimate hard-errors when the post-doubling edge count would reach `u32::MAX`.
+7. **Poison**: builds are killable. `Poison` isn't reachable from the `pub` `as_directed_graph*` (signature change would break out-of-tree callers). Ship **additive** `pub fn as_directed_graph_checked(&self, undirected: bool, nodes: Option<&FixedRuleInputRelation>, poison: &Poison)` (+ weighted twin) — the `nodes` parameter implements §3.2.4's registration for both the cached builder and PageRank's Phase-0 uncached path; old methods delegate with no-op poison and `nodes: None`.
+8. **Single-flight**: concurrent misses on one (entry, variant) coalesce behind a per-variant mutex. The winner builds **from its own snapshot** and may insert only under the §3.3 produce rule; waiters revalidate the inserted entry under **their own** watermarks (fail ⇒ ephemeral). If the winner itself fails the produce rule, its build is used ephemerally and the cache stays cold until a fresher transaction populates it (the next query, in practice).
+
+### 3.3 Freshness: the watermark protocol
+
+**Signed decision (2026-07-09): always-fresh** — a projection never serves data that differs from what the consuming transaction's own scan of the sources would return, **in either direction**: no stale entries to fresh snapshots, no fresh entries to stale snapshots. Under write churn it degrades to build-per-query, never worse than today.
+
+The draft protocol (lookup-time-only validation + a fresh-tx builder sandwich) was killed by adversarial review: (a) opening a tx *is* pinning (baseline row 7), so "read tokens, then pin" was unimplementable as written and a writer racing the builder's window produced a mis-tagged entry serving **stale** hits; (b) lookup-time-only validation served **too-new** entries to older pinned snapshots (long-lived read txs, the multi-tx API) — the draft's proof argued only one direction. Both die together under one addition: a per-transaction **watermark**.
+
+**State** (inside the cache object, cloned into every SessionTx): a global `bump_seq: AtomicU64`, and `rel_states: Mutex<HashMap<RelationId, RelState { token: u64, inflight: u32 }>>`. An absent entry reads as `{token: 0, inflight: 0}` ("never mutated this process" — sound because entries are validated against exact resolved ids, below, and destroyed ids are purged and never re-resolved). Token values are `bump_seq.fetch_add(1)+1` — process-unique and **monotone**, which is what makes them comparable to watermarks.
+
+**Watermark rule.** Every `SessionTx` captures `watermark: u64 = bump_seq.load()` in `Db::transact`/`transact_write` (`db.rs:1388/1405`) **strictly before** `self.db.transact(…)` opens the storage tx — i.e. before the snapshot pins (baseline row 7: pinning is a side effect of opening). One atomic load; no sandwich, no re-check — a bump landing between load and pin only makes that relation's token exceed the watermark, a conservative miss.
+
+**Writer rule** (dirty set per §3.4, temp relations excluded):
+- In `commit_tx`, before either commit branch: `inflight += 1` for each dirty relation.
+- After the storage commit returns — success **or** failure: `token = fresh()` then `inflight -= 1` for each. (Bump-on-failure is deliberate: mem's `del_range_from_persisted` mutates the persisted store outside the tx cache, `mem.rs:133-141`, so a failed destructive tx may still have changed state.)
+- `SessionTx::drop` without commit, dirty set non-empty: bump tokens (no inflight bookkeeping — it was never incremented). SessionTx has no `Drop` impl today; the added impl must be panic-safe (bump inside the drop, not in a skippable tail).
+- Retired ids (`:replace` old id, `::remove`): purge their `RelState` **after** the post-commit bump/decrement (or exclude them from the bump set) — a hook-site purge would be resurrected by the commit-time increment.
+
+**The freshness predicate.** For a transaction `T` and a resolved source relation id `R`, define
+`FRESH(T, R) ≜ inflight(R) == 0 ∧ token(R) ≤ T.watermark` (evaluated under the map mutex).
+
+- **Consume (HIT) rule**: re-resolve each definition slot's *name* → `id_now`; HIT iff for every slot: `id_now` **is present in the entry's slot bindings with the same id** (this is what defeats multi-pair `::rename` swaps and rename-away+recreate — baseline row 12; iterating the entry's recorded pairs instead is forbidden), ∧ `entry.tokens[id_now] == token(id_now)` ∧ `FRESH(T, id_now)` — plus the bypasses below.
+- **Produce (insert) rule**: a transaction that missed and built from its own snapshot may insert the entry iff `FRESH(T, R)` holds for every source **at insert time** (under the single-flight + map mutexes), tagging the entry with the current tokens. Otherwise its build is used ephemerally. No fresh transactions, no builder sandwich — population happens opportunistically by fresh-enough transactions, which is every transaction opened after the last relevant commit settled.
+
+**Correctness argument** (two-directional; restate as a code comment). Claim: `FRESH(T, R)` ⇒ R's content in T's snapshot equals R's content committed as of now (the moment of evaluation). Let W be any committed write to R.
+- *W committed before T's pin* (so W **is** in T's snapshot): W's bump either completed before T's watermark load — then its token value ≤ watermark and W is counted on both sides — or it had not completed by the load: then at evaluation either the bump has since run (`token > watermark` — fetch_add after the load returns a strictly larger value) or it still hasn't (`inflight ≥ 1`). Either way `FRESH` fails.
+- *W committed after T's pin* (so W is **not** in T's snapshot): its bump follows its commit, which follows the pin, which follows the load ⇒ `token > watermark` once bumped, `inflight ≥ 1` until then. `FRESH` fails.
+So under `FRESH`, the snapshot has exactly the committed state. **Produce** then tags the entry with tokens denoting exactly that content version; **consume** requires the same token *and* `FRESH` for the consumer, so entry content = current content = consumer-snapshot content — both staleness directions closed. Every race (bump between load and pin; commit racing lookup; writer racing the single-flight winner) fails `FRESH` on one side and degrades to a spurious miss. Failure/abort/drop bumps only add spurious misses. ∎
+
+**Bypasses** (build ephemeral; never consult or populate):
+1. **Historical reads** — the input carries `valid_at`/`tx_valid_at` (`data/program.rs:457-472`, consumed at `fixed_rule/mod.rs:94-137`).
+2. **Own uncommitted writes** — `T.dirty_relations ∩ sources ≠ ∅`. Hooks mark at mutation-function entry (§3.4), i.e. at statement time, so a later statement's lookup in the same imperative tx sees the mark. (Normal relations read-their-own-writes, `stored.rs:394`; tt relations buffer invisibly, `transact.rs:48-54` — covered conservatively.)
+3. **Backends**: protocol is backend-uniform; v1 enables **rocksdb, mem, sqlite**. On mem/sqlite the store-wide guards (baseline row 7) make most races unreachable anyway; rocksdb relies on the full argument above. Documented residual: a second OS process writing the same files is outside any in-process cache — an existing engine-wide caveat.
+
+### 3.4 The dirty-set: hooks and flush
+
+`SessionTx` gains `dirty_relations: BTreeSet<RelationId>`. There is **no existing complete touched-relations set** (`needs_write_lock` = single declared output, `data/program.rs:601-611`; `callback_collector` = callback targets only, `stored.rs:288-291`). Hooks sit at **mutation-function entry** — and **every hook no-ops for temp relations** (`relation_store.is_temp` / `is_temp_store_name()`): temp ids numerically collide with persistent ids (baseline row 12) and temps can never be projection sources.
+
+| # | Path | Hook site | Notes |
+|---|---|---|---|
+| 1 | `:put/:insert` | `put_into_relation` entry (`stored.rs:235`) | covers the tt `buffer_tt_puts` early-return (`stored.rs:265-266`) |
+| 2 | `:rm/:delete` | `remove_from_relation` entry (`stored.rs:1929`) | covers `buffer_tt_removals`/`buffer_bitemporal_rm` |
+| 3 | `:update` | `update_in_relation` entry (`stored.rs:564`) | covers `buffer_tt_update` and `update_in_index` (`stored.rs:839`) |
+| 4 | `:reconcile` | `reconcile_tt_relation` entry (`stored.rs:1121`) | buffers only; storage writes land at `stamp_pending_tt_writes` (`transact.rs:348`) |
+| 5 | **`:replace`** | the `Replace` branch (`stored.rs:126-133`) | destroy + `create_relation` mints a **new** id; old range deleted via caller `cleanups` (`db.rs:1490`, `imperative.rs:334`, `db.rs:427`). Mark old id dirty, **eagerly drop entries sourced on it**, purge its `RelState` per §3.3's retired-id rule. Skip when the name `is_temp_store_name()` |
+| 6 | trigger writes | none needed | put/rm/replace triggers (`stored.rs:754`, `:2069`, `:95`) run on the same SessionTx → rows 1–3 fire, including nested depth |
+| 7 | `import_relations` | mark at relation resolution (`db.rs:771`) | **all three modes**: put (`db.rs:946`), `-`-prefixed delete (`db.rs:934`), and the TT-buffered branch (`db.rs:822-869`, push at `:860`, stamped at `transact.rs:347`) |
+| 8 | `import_from_backup` | fn body (`db.rs:1092`) |  |
+| 9 | `::remove` | dispatch arm (`db.rs:2400`) | range delete `db.rs:2419`; mark dirty + eagerly drop dependent entries + purge `RelState` (post-bump, §3.3). Only a shared guard is held (`db.rs:2410`); on mem the range delete bypasses the tx cache — bump-on-failure covers the abort case |
+| 10 | `::repair_corrupt` | arm (`db.rs:2436`, dels `:2461`) |  |
+| 11 | `::history_gc` | arm (`db.rs:2116`, dels `:2234`) |  |
+| 12 | `::evict` | arm (`db.rs:2267`, dels `:2370`) | **also dirties `mnestic_evict_audit`** — the arm writes audit rows into a second stored relation (`db.rs:2389`) |
+| 13 | `restore_backup` | **excluded by precondition** (`db.rs:991-996`: empty store only ⇒ no projections can exist) | add a defensive whole-cache clear at fn entry (before the precondition check) anyway |
+
+Explicitly non-invalidating (verified): `:ensure/:ensure_not` (assertion-only, `stored.rs:859/:919`), `::rename` (catalog row only — **safety against swaps comes from the consume rule's slot-id binding, not from any hook**), `::compact` (`db.rs:1364-1368`), index create/drop (index keyspaces + catalog only; index relations are barred as sources, §3.1).
+
+**Flush**: the writer rule runs inside `commit_tx` (`transact.rs:192`) — before-commit increments, after-commit bumps — so every SessionTx path inherits it (baseline rows 10, 16). No storage writes are added at commit, so `commit_tx_with_tt`'s `clear_snapshot()` hazard (`rocks.rs:282-293`) is avoided entirely.
+
+### 3.5 Consumption API
+
+**3.5.1 Types** (all `#[cfg(feature = "graph-algo")]`):
+```rust
+pub enum GraphVariant {
+    Unweighted(Arc<DirectedCsrGraph<u32>>),
+    Weighted { graph: Arc<DirectedCsrGraph<u32, (), f32>>, has_negative: bool },
+}
+pub struct ProjectionVariant {
+    pub graph: GraphVariant,
+    pub indices: Arc<Vec<DataValue>>,
+    pub inv_indices: Arc<BTreeMap<DataValue, u32>>,
+}
+pub type GraphSource = Arc<ProjectionVariant>;   // cached AND ephemeral builds — one shape
+```
+The ephemeral/positional arm wraps its fresh build in the same `Arc<ProjectionVariant>` (an `Arc::new` costs nothing), so ported algos have exactly one downstream shape and `TarjanSccG`'s refactor (§3.7.3) borrows from it. Consumers treat `inv_indices` as read-only; CC's isolated-node overlay is a local `BTreeSet<DataValue>` — **empty only when the positional nodes input is covered by the projection's `nodes`**; it stays load-bearing for extra positional nodes and for projections created without `nodes`.
+
+**3.5.2 The helper** (on `FixedRulePayload`, `pub`):
+```rust
+pub fn graph_input(&self, idx: usize, spec: VariantSpec /* direction, weighted, strict_weights */)
+    -> Result<(GraphSource, usize /* input_base */)>
+```
+- `graph:` absent → today's path via `as_directed_graph_checked`, `input_base = idx + 1`.
+- `graph:` present → registry lookup → §3.3 consume rule or single-flight build → `input_base = idx`. Positional inputs shift down by one; **optional-trailing-input semantics are preserved** — a shifted `get_input` failure still reads as "absent optional" (the `fixed_rule::not_enough_args` pattern Dijkstra's `termination` matches on, `shortest_path_dijkstra.rs:41,:55`).
+- `strict_weights` ∧ `has_negative` ⇒ loud error naming algo, projection, and policy.
+- **Nodes composition**: for CC, a positional nodes input unions on top of the projection (projection-registered isolates come out of Tarjan; positional-only nodes go through the local overlay). For PageRank, a positional nodes input **combined with `graph:` is rejected loudly** (pre-build registration cannot apply to an already-cached variant; the fix is `nodes:` on the projection). For Prim under a nodes-bearing projection, the default start "node 0" may now be isolated: fall back to the lowest id with out-degree > 0 (empty MST only when the graph truly has no edges).
+
+**3.5.3 Porting matrix** (the 12 preamble sites; each port swaps the preamble for `graph_input`):
+
+| Algo (registered names) | Edges | Other inputs (shift-aware) | Direction | Weighted / neg policy |
+|---|---|---|---|---|
+| ConnectedComponents / SCC / StronglyConnectedComponents | 0 | optional nodes @1 | `!strong` | no |
+| PageRank | 0 | *(Phase 0 adds)* optional nodes @1 — rejected with `graph:` | option | no |
+| ClusteringCoefficients | 0 | — | always undirected | no |
+| TopSort | 0 | — | always directed | no |
+| BetweennessCentrality / ClosenessCentrality | 0 | — | option | yes / strict |
+| ShortestPathDijkstra | 0 | starting @1 (req), termination @2 (opt) | option | yes / strict |
+| KShortestPathYen | 0 | starting @1, termination @2 (req) | option | yes / strict |
+| MinimumSpanningTreePrim | 0 | starting @1 (opt; §3.5.2 fallback) | always undirected | yes / permissive |
+| MinimumSpanningForestKruskal | 0 | — | always undirected | yes / permissive |
+| LabelPropagation | 0 | — | option | yes / permissive |
+| CommunityDetectionLouvain | 0 | — | option | yes / strict |
+
+**3.5.4 The `graph:` guard.** Unknown options are silently ignored engine-wide (baseline row 9). Add `fn supports_projection(&self) -> bool { false }` to the `FixedRule` trait (defaulted ⇒ non-breaking for out-of-tree implementors); ported algos override to `true`; `parse_fixed_rule` (after `init_options`, where the resolved `Arc<Box<dyn FixedRule>>` is in hand) rejects a `graph` option on unsupported rules with a loud error. The lazy family (BFS/DFS/ShortestPathBFS/RandomWalk/ShortestPathAStar/DegreeCentrality) stays unsupported **by design** (baseline row 2); the budgeted-traversal FixedRule (item 9) is their cache-consuming successor.
+
+**3.5.5 Type reachability** (baseline row 17): under `graph-algo`, re-export the consumer-needed types from the crate root — `pub use graph::prelude::{DirectedCsrGraph, Graph, DirectedNeighbors, DirectedNeighborsWithValues}` (or a dedicated `pub mod graph_types`). A future bump of the `graph` dependency is thereby a **semver-major** event for mnestic — noted in the release checklist.
+
+### 3.6 Memory control (signed: 512 MiB, host API)
+
+- Per-variant estimate (shown in `::graph list`): `2·(V+1)·4 + 2·E·(4|8)` bytes (both CSR directions; `Target` interleaving), **E = post-doubling, duplicates-kept tuple count**, plus `indices` (Σ DataValue heap sizes) and `inv_indices` (entries × (key + ~48 B node overhead)) — the id map can rival the CSR for string keys.
+- `Db::set_graph_projection_capacity(bytes)`; default **512 MiB**. **The setter enforces immediately**: on set, evict LRU variants until usage ≤ ceiling; `0` evicts all, makes every lookup miss and every insert a no-op while `::graph create/list/drop` keep working. The ceiling is re-checked at insert time under the cache mutex, so a single-flight build completing after a shrink either fits post-eviction or is discarded — its result is still returned ephemerally to requester and waiters. An entry larger than the whole ceiling builds ephemeral + `log::warn`. The u32 edge guard (§3.2.6) is independent of the ceiling.
+
+### 3.7 Phase-0 ride-alongs (independent of caching; same release; all changelog-flagged)
+
+1. **PageRank optional nodes input** (input 1, `if let Ok` like CC) via `as_directed_graph_checked(…, nodes, …)` — isolated vertices enter N (exact kernel math; **694** of 10,620 sf1 persons are silently dropped today — the canned kernel emits 9,926 rows where Ladybug emits 10,620; corrected 2026-07-09, an earlier revision inverted the two numbers). Rank values change wherever isolates exist.
+2. **PageRank default `iterations` 10 → 20 + non-convergence warn**: stop discarding the third return value (`pagerank.rs:47`); `log::warn` when the cap is hit before ε. Changelog framing: matches the vendored crate's own default (baseline row 15); 10 is measured non-convergent. The non-convergence signal is the **returned error**, not `n_run`: `page_rank` returns the moment `error < tolerance` (`page_rank.rs:107-108`), so `error >= epsilon` at return *is* "the cap cut it short". Predicate: `epsilon > 0. && error >= epsilon` — `epsilon: 0.0` is a deliberate opt-out ("run exactly `iterations`") and must stay quiet.
+3. **TarjanSccG borrow refactor**: field + `new()` + `run(mut self)` all consume today (`strongly_connected_components.rs:89-110`); graph becomes a borrow of the `Arc`'d CSR, `run` keeps `mut self` over non-graph state.
+4. **`as_directed_graph_checked` (+ weighted twin)** with `nodes` + `Poison` (§3.2.7); in-tree algos migrate.
+5. **Empty-edge-relation panic fix** (found while building Phase 0; **load-bearing for Phase 3**, since `::graph create G { edges: knows }` over an empty `knows` feeds these same algos). An empty edge list has `max_node_id() == 0` (the `max`-reduce identity), so the builder emits a **one-vertex** graph against an empty id map and the first `indices[0]` aborts the process — in `TopSort`, `ConnectedComponents`, `StronglyConnectedComponents`, `ClusteringCoefficients`, `BetweennessCentrality`, `ClosenessCentrality`, `LabelPropagation`. Upstream *intended* to guard this: `prim.rs:40`, `kruskal.rs:39`, `all_pairs_shortest_path.rs:45,:114` all test `graph.node_count() == 0`, which can never hold. **`indices.is_empty()` is the emptiness test; `node_count()` is not.** The invariant `graph.node_count() == indices.len()` holds for every non-empty build and fails only here, because the vendored crate cannot express a 0-vertex CSR (`Csr::new` is `pub(crate)`) — Phase 2/3 must not assume otherwise. Two guard-placement constraints (both caught by review, both test-pinned): `ConnectedComponents` skips only its Tarjan call, never its node-relation overlay; and Prim's early-return lives inside the no-starting-input arm, so a user-supplied starting relation still raises `starting_node_not_found`/`empty_starting` instead of a silent empty result (never swallow a user-input diagnostic behind an emptiness guard).
+
+## 4. Non-goals (v1)
+
+- **Incremental CSR maintenance.** If telemetry ever shows rebuilds dominating despite caching: GraphBLAS-style pending-delta buffer (SuiteSparse zombies/pending tuples; FalkorDB's delta matrices) over the immutable CSR — **not** full dynamic structures (1.2–10.8× memory, measurable analytics slowdown; SIGMOD 2025, arXiv:2502.10959). The crate's mutable `DirectedALGraph` is the ready delta structure.
+- **Pinned immutable snapshots** (`pinned: true`) — additive later.
+- **Persistence**, **TTLs**, **transparent memoization** of raw relation inputs.
+- **Passthrough-rule streaming** stays a separate, live roadmap item — the natural-form 2.1× penalty still stands for non-projection users; this spec must not be cited as closing it.
+- **No planner/evaluator changes of any kind.**
+
+## 5. Test matrix (Phase 4; `cozo-core/tests/graph_projection.rs`)
+
+**Invalidation matrix** (table-driven; MISS-after-mutation for §3.4 rows 1–12; HIT for non-mutating paths): includes `:replace` (new-id miss + old-entry drop, asserted via `::graph list` like row 5), `::evict`'s audit-relation dirtying, `import_relations` all three modes (incl. **into a TxTime relation**), a sysop (`::remove`) inside an imperative script, rm- and replace-trigger writes, TxTime buffered writes, an aborted/dropped dirty tx (conservative bump — including aborted `::remove` on mem), **temp-relation put/rm/replace inside an imperative script preserving HIT on unrelated low-id projections**, `::rename`: (a) a projection on an *unrelated* renamed relation keeps HIT, (b) a renamed-away source errors loudly at resolution, (c) a **multi-pair swap-rename** of two sources ⇒ MISS via slot-id binding. Row 13: populate cache → `restore_backup` on a non-empty store → `Err` returned **and** next lookup is MISS (clear at fn entry). Then **prove the matrix discriminates**: comment out each hook class in turn and watch specific rows go red (`feedback_prove_tests_discriminate`); rows 5/9 discriminate via the `::graph list` eager-drop assertions.
+
+**Protocol interleaving tests** (rocksdb-scoped; mem/sqlite legs demoted to non-interleaved assertions): add a **test-only commit fence** — `#[cfg(any(test, feature = "test-hooks"))]` callback on the cache invoked inside `commit_tx` between the storage commit and the token bump. Tests: (a) writer parked at the fence post-commit ⇒ concurrent lookup MISSes via `inflight`; released ⇒ MISSes via token; (b) **fresh-entry/stale-snapshot**: reader pins, writer commits + bumps, another tx populates a fresh entry ⇒ the old reader must MISS via `token > watermark` and build ephemeral (this is the direction the draft protocol failed); (c) writer racing a single-flight winner ⇒ insert refused, result served ephemerally; (d) two lookups in one long-lived read tx across an interleaved commit return identical (snapshot-consistent) results. Discriminance: delete the pre-commit increment → (a) red; delete the bump → (a) red; delete the watermark capture → (b) red.
+
+**Equivalence suite**: for each of the 12 ported sites, `Algo(graph:'G', …)` vs positional form on a shared fixture — row-identical, except CC/SCC compared at **partition level** (§3.2.4); include one shift-sensitive case (Dijkstra **with** `termination` supplied, on a fixture where terminated vs unterminated results differ, so an `input_base` off-by-one goes red); Prim default-start fallback row (first nodes row isolated ⇒ non-empty MST identical to uncached).
+
+**Phase-0 oracle rows** — **landed 2026-07-09: 12 integration tests (`cozo-core/tests/graph_algo_nodes.rs`) + 1 unit test (`fixed_rule::tests::csr_capacity_guard_boundaries`), 11 mutations verified red** (5 in the initial round, 2 for the empty-edge fix, 4 from post-review remediation). The oracles: PageRank with isolated nodes (values change; an isolate's rank is exactly `(1−θ)/N`); edge endpoints outside the nodes relation survive (the union); the empty∧empty build does not panic; default `iterations` is 20 (equal to an explicit 20, ≠ 10 — under `epsilon: 0.0` so the run length is exact); the warn fires at the cap and stays silent when converged or opted out (assertions scoped to PageRank's own message — the capture buffer is process-global and other tests run concurrently); the 14-case empty-edge sweep over all 12 CSR call sites + DegreeCentrality (no rows, no panic; Dijkstra/Yen silently skip unresolvable starts — pre-existing, recorded); the CC nodes-overlay still emits on empty edges; Prim keeps `starting_node_not_found`/`empty_starting` over empty edges (the early-return sits in the no-input-1 arm only); the weighted builder registers isolates as real CSR vertices via a probe FixedRule through `register_fixed_rule` (the fixture must list edge endpoints before the isolate so the isolate takes the highest id — an isolate-only nodes relation is covered by accident and discriminates nothing); the weighted negative-weight policy; `:timeout` aborts both the unweighted (CC) and weighted (Kruskal) 300k-edge CSR builds in a fraction of uninterrupted time (self-calibrating); and the u32 capacity guard at its exact boundaries (unit test — the boundary is unreachable end-to-end). `has_negative` is not observable through any pub API — pinned by Phase 2's negative-weights policy row, not here. Fixture gotcha: the iteration-count path must be numbered **against** the edge direction — the vendored kernel sweeps ids ascending and writes in place, so a forward-numbered path settles in one sweep and 10 vs 20 agree. No existing test pinned the old PageRank defaults (checked).
+
+**Single-flight / memory**: N concurrent cold readers ⇒ exactly one build (build counter); waiter-revalidation forward-staleness red test; give-up ⇒ ephemeral when `FRESH` fails; ceiling: LRU eviction on insert, setter shrink-below-usage frees immediately, capacity-0 disables (create/list/drop still work; mid-build results not cached), oversize-entry ephemeral + warn; `::graph list` per-variant rows + `last_used` movement on hit. Negative-weights policy row (permissive build + strict consumer errors). Benches: `benches/graph_projection.rs` cold-vs-warm CC/PageRank; extend `docs/plans/d3-attachment/verify.py` with a warm-cache arm for the public number.
+
+## 6. Rejected alternatives (recorded so they are not re-litigated)
+
+1. **In-band per-relation generation key** (schema-cookie pattern). Snapshot-consistent by construction, but script writers hold only shared relation guards (baseline row 5) ⇒ the counter key is a hot key: overlapping same-relation committers on rocksdb abort `Resource busy` (baseline row 6; rehearsal `tt_clock.rs:279-301`). Every repair serializes commits or taxes the write path. Revisit only if the cache ever needs crash-persistent freshness (it doesn't — it is in-memory).
+2. **Draft v1 protocol: lookup-time-only token validation + fresh-tx builder sandwich.** Killed by adversarial review, two blockers: the sandwich's "pin" step doesn't exist separately from tx open (baseline row 7), letting a racing writer produce a mis-tagged entry (stale hits); and lookup-time-only validation serves too-new entries to older pinned snapshots (multi-tx API, long-lived read txs). Superseded by §3.3's watermark protocol; also removed the need for any fresh-tx plumbing (`FixedRulePayload`/`SessionTx` have no Db handle — baseline row 14).
+3. **Out-of-band epoch captured without a pin-ordering rule** — the pre-verification idea; unfixable snapshot/counter agreement races. The watermark protocol *is* this idea made sound: the capture is ordered before the pin, and both consume and produce sides check against it.
+4. **Reader snapshot sequence numbers via the RocksDB bridge** — precise but needs a `mnestic-rocks` API addition + release, still needs inflight marking, rocks-only. More moving parts, same guarantee.
+5. **`CsrLayout::Deduplicated`** as a memory knob — silently strips self-loops; semantic change.
+6. **TTL eviction** — byte-ceiling + LRU matches the actual failure mode (leaks); the token protocol owns staleness.
+
+## 7. Decision record
+
+| Decision | Status |
+|---|---|
+| Always-fresh auto-invalidation (vs pinned snapshots) | **Signed** 2026-07-09 (owner) |
+| 512 MiB default ceiling, host-API knob only | **Signed** 2026-07-09 |
+| PageRank default `iterations` 10→20 + warn | **Signed** 2026-07-09 |
+| 0.11.0 ships the projection alone (passthrough streaming next, not bundled) | **Signed** 2026-07-09 |
+| Freshness = watermark protocol (draft protocol + in-band key both rejected) | Resolved by verification + adversarial review 2026-07-09 (§3.3, §6.1–6.3) |
+| One weighted variant, permissive build + `has_negative` flag | Resolved 2026-07-09 (§3.2.2) |
+| Isolated vertices via `node_values` build route (not post-hoc correction) | Resolved by review 2026-07-09 (§3.2.4) |
+| Index relations and temp relations barred as sources | Resolved by review 2026-07-09 (§3.1, §3.4) |
+| `supports_projection` trait guard for the `graph:` option | Resolved 2026-07-09 (§3.5.4) |
+| Definitions in-memory only; loud restart error | Resolved 2026-07-09 (§3.1) |
+
+## 8. Build plan
+
+Phases live in `docs/plans/cached-graph-projection.md` §5 (workspace repo), updated for this spec: **Phase 0** ride-alongs (§3.7) → **Phase 1** dirty-set + watermark substrate (§3.3–3.4, incl. the test-only commit fence) → **Phase 2** cache + registry + single-flight + memory control (§3.1 registry, §3.2, §3.6) → **Phase 3** surface (§3.1 grammar/sysops, §3.5 helper + guard + re-exports + 12 ports) → **Phase 4** proof (§5) + docs + `CHANGELOG-FORK.md`. Bank as **mnestic 0.11.0**; normal cadence; immutable readmes at release; D3 warm-cache re-measure is the release's proof artifact; vendoring D3 into `mnestic-benchmarks` (LDBC-spec re-implementation, credit Matthias, no code copying — his repo has no LICENSE) queues immediately behind.

@@ -33,7 +33,10 @@ impl FixedRule for ClusteringCoefficients {
         poison: Poison,
     ) -> Result<()> {
         let edges = payload.get_input(0)?;
-        let (graph, indices, _) = edges.as_directed_graph(true)?;
+        let (graph, indices, _) = edges.as_directed_graph_checked(true, None, &poison)?;
+        if indices.is_empty() {
+            return Ok(());
+        }
         let coefficients = clustering_coefficients(&graph, poison)?;
         for (idx, (cc, n_triangles, degree)) in coefficients.into_iter().enumerate() {
             out.put(vec![

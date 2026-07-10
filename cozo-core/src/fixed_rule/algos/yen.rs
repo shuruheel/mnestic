@@ -39,7 +39,8 @@ impl FixedRule for KShortestPathYen {
         let undirected = payload.bool_option("undirected", Some(false))?;
         let k = payload.pos_integer_option("k", None)?;
 
-        let (graph, indices, inv_indices) = edges.as_directed_weighted_graph(undirected, false)?;
+        let (graph, indices, inv_indices) =
+            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
 
         let mut starting_nodes = BTreeSet::new();
         for tuple in starting.iter()? {

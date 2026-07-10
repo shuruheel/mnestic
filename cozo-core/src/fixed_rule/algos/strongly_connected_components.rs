@@ -47,9 +47,18 @@ impl FixedRule for StronglyConnectedComponent {
     ) -> Result<()> {
         let edges = payload.get_input(0)?;
 
-        let (graph, indices, mut inv_indices) = edges.as_directed_graph(!self.strong)?;
+        let (graph, indices, mut inv_indices) =
+            edges.as_directed_graph_checked(!self.strong, None, &poison)?;
 
-        let tarjan = TarjanSccG::new(graph).run(poison)?;
+        // An empty edge relation yields a graph with one phantom vertex (the vendored builder
+        // sizes it from the largest edge endpoint, and `max_node_id()` of an empty edge list is
+        // 0), which Tarjan would report as a component with no value behind it. The optional
+        // node relation below must still be emitted, so only the Tarjan call is skipped.
+        let tarjan = if indices.is_empty() {
+            vec![]
+        } else {
+            TarjanSccG::new(&graph).run(poison)?
+        };
         for (grp_id, cc) in tarjan.iter().enumerate() {
             for idx in cc {
                 let val = indices.get(*idx as usize).unwrap();
@@ -86,8 +95,10 @@ impl FixedRule for StronglyConnectedComponent {
     }
 }
 
-pub(crate) struct TarjanSccG {
-    graph: DirectedCsrGraph<u32>,
+/// Borrows the graph rather than owning it, so that the same CSR can be handed to Tarjan by an
+/// `Arc`'d graph projection without a copy (`docs/specs/graph-projection.md` §3.7.3).
+pub(crate) struct TarjanSccG<'a> {
+    graph: &'a DirectedCsrGraph<u32>,
     id: u32,
     ids: Vec<Option<u32>>,
     low: Vec<u32>,
@@ -95,8 +106,8 @@ pub(crate) struct TarjanSccG {
     stack: Vec<u32>,
 }
 
-impl TarjanSccG {
-    pub(crate) fn new(graph: DirectedCsrGraph<u32>) -> Self {
+impl<'a> TarjanSccG<'a> {
+    pub(crate) fn new(graph: &'a DirectedCsrGraph<u32>) -> Self {
         let graph_size = graph.node_count();
         Self {
             graph,

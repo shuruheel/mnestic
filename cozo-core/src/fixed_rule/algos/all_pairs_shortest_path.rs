@@ -38,12 +38,13 @@ impl FixedRule for BetweennessCentrality {
         let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
 
-        let (graph, indices, _inv_indices) = edges.as_directed_weighted_graph(undirected, false)?;
+        let (graph, indices, _inv_indices) =
+            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
 
-        let n = graph.node_count();
-        if n == 0 {
+        if indices.is_empty() {
             return Ok(());
         }
+        let n = graph.node_count();
 
         let it = (0..n).into_par_iter();
 
@@ -106,12 +107,13 @@ impl FixedRule for ClosenessCentrality {
         let edges = payload.get_input(0)?;
         let undirected = payload.bool_option("undirected", Some(false))?;
 
-        let (graph, indices, _inv_indices) = edges.as_directed_weighted_graph(undirected, false)?;
+        let (graph, indices, _inv_indices) =
+            edges.as_directed_weighted_graph_checked(undirected, false, None, &poison)?;
 
-        let n = graph.node_count();
-        if n == 0 {
+        if indices.is_empty() {
             return Ok(());
         }
+        let n = graph.node_count();
         let it = (0..n).into_par_iter();
 
         let res: Vec<_> = it
