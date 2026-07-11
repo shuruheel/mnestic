@@ -28,7 +28,7 @@ fixed-rule syntax, and the `graph:` arm rides the 0.11.0 projection cache.
   consumed *as costs* — monotone transforms like `−ln(weight)` are the caller's. An inadmissible
   node spends no budget and never bridges; gated `admit:` is existential over the node's gate
   rows; `max_cost` is finite-only; CSR-absent seeds emit as loose roots. Tests:
-  `cozo-core/tests/budgeted_traversal.rs` (37, sqlite), incl. a 7-mutation discrimination run
+  `cozo-core/tests/budgeted_traversal.rs` (38, sqlite), incl. an 8-mutation discrimination run
   recorded in the spec. Spec:
   [`docs/specs/budgeted-traversal.md`](docs/specs/budgeted-traversal.md) §11.
 

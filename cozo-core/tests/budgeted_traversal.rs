@@ -365,6 +365,34 @@ fn g1_depth_trap_layered_labels_not_depth_pruning() {
     );
 }
 
+/// The §8 "never re-count" discriminator (added after the pre-PR adversarial
+/// review found the re-COUNT half of "later states … without emitting or
+/// re-counting" unpinned): on the depth trap with `max_nodes: 4`, v settles
+/// TWICE — state (2.0, 2 hops) first, then the Pareto-incomparable
+/// (3.0, 1 hop) — before u's only depth-feasible admission (4.0 through v's
+/// 1-hop state). An implementation that counts every settled state against
+/// the budget (instead of first-per-node only) exhausts the budget on v's
+/// second settle and silently drops u.
+#[test]
+fn g4_second_settle_of_admitted_node_spends_no_budget() {
+    let (_dir, db) = open_db();
+    let res = run(
+        &db,
+        &format!(
+            "{DEPTH_TRAP}?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], max_nodes: 4, max_depth: 2)"
+        ),
+    );
+    assert_eq!(
+        res.rows,
+        vec![
+            row("a", 1.0, Some("s"), 1),
+            row("s", 0.0, None, 0),
+            row("u", 4.0, Some("v"), 2),
+            row("v", 2.0, Some("a"), 2),
+        ]
+    );
+}
+
 #[test]
 fn g2_unweighted_depth_agrees_with_datalog_hop_oracle() {
     let (_dir, db) = open_db();
@@ -677,6 +705,17 @@ fn i_loud_errors() {
         );
         assert!(m.contains("initial_cost"), "seeds {seeds}: {m}");
     }
+    // NaN / ±inf seed initial_cost, injected via params (the spec's finite-
+    // only rule; a NaN cost admitted as a heap key would poison total_cmp).
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        let m = err_with(
+            &db,
+            "e[f, t, w] <- [['s','a',1.0]]\ns[n, c] <- [['s', $c]]\n\
+             ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n, c], max_nodes: 5)",
+            BTreeMap::from([("c".to_string(), DataValue::from(bad))]),
+        );
+        assert!(m.contains("initial_cost"), "seed cost {bad}: {m}");
+    }
 
     // Missing max_nodes.
     let m = err(
@@ -710,7 +749,7 @@ fn i_loud_errors() {
          ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], max_nodes: 5, max_cost: -1.0)",
     );
     assert!(m.contains("max_cost") && m.contains("finite"), "{m}");
-    for bad in [f64::NAN, f64::INFINITY] {
+    for bad in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let m = err_with(
             &db,
             "e[f, t, w] <- [['a','b',1.0]]\ns[n] <- [['a']]\n\
@@ -721,6 +760,24 @@ fn i_loud_errors() {
             m.contains("max_cost") && m.contains("finite"),
             "max_cost {bad}: {m}"
         );
+    }
+
+    // Over-bound gate: more bindings than the gate relation has columns is
+    // rejected at input validation (spec §3.1's arity >= binding count),
+    // whether or not admit: reads the overflow binding — never a
+    // mid-traversal "tuple too short" or a silent run.
+    run(&db, ":create gnarrow {uid: String => ok: Int}");
+    run(&db, "?[uid, ok] <- [['a',1]] :put gnarrow {uid => ok}");
+    for admit in ["extra == 1", "ok == 1"] {
+        let m = err(
+            &db,
+            &format!(
+                "e[f, t, w] <- [['a','b',1.0]]\ns[n] <- [['a']]\n\
+                 ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], *gnarrow[uid, ok, extra], \
+                 max_nodes: 5, admit: {admit})"
+            ),
+        );
+        assert!(m.contains("arity"), "over-bound gate (admit: {admit}): {m}");
     }
 
     // admit: without a gate input is a bug, not a no-op.

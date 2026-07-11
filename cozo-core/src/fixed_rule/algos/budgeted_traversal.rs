@@ -150,7 +150,12 @@ impl FixedRule for BudgetedTraversal {
                 stack: vec![],
             },
             Ok(g) => {
-                let g = g.ensure_min_len(1)?;
+                // Arity >= the binding count (spec §3.1): an over-bound gate
+                // would otherwise surface mid-traversal as eval's "tuple too
+                // short — definitely a bug" when `admit:` reads the overflow
+                // binding, or run silently when it does not. Reject it here,
+                // at input validation, with the caller-facing arity error.
+                let g = g.ensure_min_len(g.get_binding_map(0).len().max(1))?;
                 let pred = match admit_expr {
                     None => None,
                     Some(mut e) => {
