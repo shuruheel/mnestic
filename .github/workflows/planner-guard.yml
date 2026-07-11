@@ -1,0 +1,68 @@
+# Nightly planner regression guard — the T1 execution tier.
+#
+# Design: docs/plans/planner-regression-suite.md (private overlay repo).
+#
+# NOTE ON WHAT IS *NOT* HERE. The actual gate — T0, `tests/planner_shape.rs` —
+# needs no workflow of its own: it is an ordinary integration test, so the
+# existing `cargo test -p mnestic` step in build.yml already runs it on every PR.
+# It asserts the committed join order (`::explain` load_stored sequence) over
+# EMPTY relations in ~50 ms, and it is what would have caught the 0.10.5 reorder
+# regression (verified: it goes red against the v0.10.5 tag).
+#
+# This workflow carries only the part that cannot run per-PR: executing the five
+# ported LSQB queries against real LDBC sf0.1 data (~3.5 min), which is where a
+# *correctness* break or a plan that is the right shape but the wrong speed would
+# surface. Real skew, real cardinalities — the thing a synthetic micro-bench
+# cannot show, and the reason 0.10.5 shipped in the first place.
+
+name: planner-guard
+
+on:
+  schedule:
+    - cron: "41 5 * * *"      # nightly 05:41 UTC (off the :00 mark)
+  workflow_dispatch:
+  pull_request:
+    # Re-run the full tier whenever the planner or the suite itself is touched,
+    # so a planner change is never merged on the strength of the 50 ms gate alone.
+    paths:
+      - "cozo-core/src/query/**"
+      - "cozo-core/tests/lsqb.rs"
+      - "cozo-core/tests/common/**"
+      - "cozo-core/tests/planner_shape.rs"
+      - "cozo-core/tests/planner_baseline.json"
+      - "scripts/fetch_lsqb.sh"
+      - ".github/workflows/planner-guard.yml"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lsqb:
+    name: LSQB sf0.1 (counts + reorder ratio)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # 6.1 MB, sha256-pinned. Cached on the pin, so a dataset re-cut upstream
+      # busts the cache rather than silently changing the expected counts.
+      - name: Cache LSQB sf0.1
+        uses: actions/cache@v4
+        with:
+          path: .lsqb
+          key: lsqb-sf01-${{ hashFiles('scripts/fetch_lsqb.sh') }}
+
+      - name: Fetch LSQB sf0.1
+        run: ./scripts/fetch_lsqb.sh
+
+      # --release is mandatory: this tier takes minutes optimized and would take
+      # tens of minutes in debug. A slow gate is a gate someone disables.
+      - name: LSQB execution tier
+        run: cargo test --release -p mnestic --test lsqb -- --ignored --nocapture --test-threads=1
+        env:
+          LSQB_SF01_DIR: .lsqb/social-network-sf0.1-projected-fk

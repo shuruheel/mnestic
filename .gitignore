@@ -48,3 +48,7 @@ flamegraph*.svg
 # Local-only working docs (not for the public repo)
 CLAUDE.md
 DEVELOPMENT.md
+
+# LSQB sf0.1 fixture for the planner regression suite (scripts/fetch_lsqb.sh).
+# 6.1 MB archive -> ~51 MB of CSVs. Fetched on demand, never committed.
+.lsqb/
