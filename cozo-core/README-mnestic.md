@@ -26,6 +26,14 @@ capabilities on top of it:
   differing from what the consuming transaction's own scan would return, and a
   write to a source frees what was built from it.
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/graph-projection.md))
+- **Budgeted weighted traversal** — `BudgetedTraversal` expands cheapest-first
+  from a set of seeds, over non-negative weights, under a global distinct-node
+  budget (plus optional cost ceiling and exact hop bound) and an in-expansion
+  admission gate, emitting each admitted node's `(cost, parent, depth)`.
+  Deterministic by construction, interruptible, and able to consume a cached
+  graph projection — the primitive for filling a fixed context window with the
+  cheapest graph neighborhood around a set of search hits.
+  ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/budgeted-traversal.md))
 - **Bitemporality** — a `TxTime` column type with a crash-safe monotone commit
   clock, `:as_of` reads, the two-level `(valid time, transaction time)`
   resolution, and `::history` / `::history_gc` / `::evict`.
@@ -62,27 +70,39 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.11.1
+## New in 0.12.0
 
-**Skyline aggregates in every binding.** `pareto_min` / `pareto_max` keep, per
-group, the Pareto frontier of a numeric vector — the points no other point
-dominates — as ordinary CozoScript aggregates:
+**Budgeted weighted traversal.** `BudgetedTraversal` is a new `graph-algo` fixed
+rule: cheapest-first expansion from a set of seeds, over non-negative edge
+weights, under a required global distinct-node budget — the missing primitive
+for filling a fixed context window with the cheapest graph neighborhood around
+what search found:
 
 ```
-?[frontier] := offer[price, quality], v = [price, -quality], frontier = pareto_min(v)
+context[node, cost, parent, depth] <~ BudgetedTraversal(
+    graph: 'knows', seeds[n], *live[uid, ok],
+    admit: ok, max_nodes: 200, max_cost: 12.0)
 ```
 
-`pareto_min` treats smaller as better and `pareto_max` larger; express mixed
-objectives (minimize price, maximize quality) by negating the maximized
-components, as above. Being native (the product order, a provable strict partial
-order), they need no host registration — unlike the Rust-only
-`register_bounded_meet_aggr` dominance aggregate they build on — and are reachable
-from every surface (the PyPI wheel, `cozo-bin`, langchain, llama-index) through
-plain `run_script`. A malformed operand (non-list, non-numeric component, NaN, or
-empty vector) is a loud error.
+It emits the `max_nodes` cheapest distinct admissible nodes reachable from the
+seed set, each with its cost, parent pointer, and depth — parent pointers
+reconstruct any path in plain Datalog. Admission is deterministic by
+construction (total-order tie-breaking) and identical between positional edges
+and a `graph:` cached projection; `max_cost` bounds path cost, `max_depth` is an
+**exact** hop bound (layered labels, never depth-pruned Dijkstra), and a
+gated-out node spends no budget and never bridges. Weights are consumed as costs
+— monotone transforms like `-ln(weight)` are yours to apply. Long expansions
+abort cleanly via `:timeout` / `::kill`. Measured at the release's merge gate
+against a production host-side BFS doing the same job in ~2·depth round-trips:
+one call over a cached projection runs **2–4× faster**; positional edges pay a
+per-call scan + CSR build, so at scale maintain a cost relation and a projection.
 
-This is a non-breaking, purely additive patch (two reserved aggregate names); no
-existing query changes result. Full detail is in
+Also in 0.12.0: the optional `rayon` dependency is bounded `<1.11` — rayon 1.11
+breaks the CSR-builder crate (`graph_builder` 0.4.x) that `graph-algo` pulls, so
+fresh downstream resolves now land on a working combination.
+
+Purely additive — one new reserved rule name; no existing query changes result.
+Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
 
@@ -93,7 +113,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.11.1"
+mnestic = "0.12.0"
 ```
 
 ```rust

@@ -52,15 +52,22 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-**New in 0.11.1: skyline aggregates, no binding code.** `pareto_min` and
-`pareto_max` keep, per group, the Pareto frontier of a numeric vector — the points
-no other point dominates — and are ordinary CozoScript aggregates, so they run
-straight from the wheel through `run_script` with nothing to register:
-`db.run_script("?[f] := offer[p, q], v = [p, -q], f = pareto_min(v)", {}, False)`.
-`pareto_min` treats smaller as better and `pareto_max` larger; mix objectives
-(minimize price, maximize quality) by negating the maximized components, as above.
-A malformed operand (non-list, non-numeric component, NaN, or empty vector) raises.
-It is a non-breaking, purely additive patch — no existing query changes result.
+**New in 0.12.0: budgeted weighted traversal, straight from the wheel.**
+`BudgetedTraversal` is a new fixed rule: cheapest-first expansion from a set of
+seed nodes, over non-negative edge weights, under a required global budget of
+distinct nodes (`max_nodes`), with an optional cost ceiling (`max_cost`), an
+exact hop bound (`max_depth`), and an optional admission gate (a gate relation
+plus an `admit:` predicate — a gated-out node spends no budget and is never a
+bridge). It emits each admitted node's cost, parent, and depth — parent pointers
+reconstruct any path in plain Datalog — and it runs from the wheel through
+`run_script` with nothing to register:
+`db.run_script("?[n, c, p, d] <~ BudgetedTraversal(*edge[f, t, w], seeds[n], max_nodes: 200)", {}, False)`.
+Admission is deterministic (total-order tie-breaking), long expansions abort
+cleanly via a query `timeout=`, and the rule can consume a cached `::graph`
+projection (`graph: 'g'`) instead of positional edges — measured 2–4× faster
+than an equivalent host-side BFS at the release's merge gate. Weights are
+consumed as costs (apply `-ln(weight)`-style transforms yourself). Purely
+additive — no existing query changes result.
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

@@ -18,6 +18,12 @@
   十二个图算法可跨查询复用，而不必每次调用都重新扫描边关系并重建 CSR。**始终新鲜**：
   投影绝不会返回与消费事务自身扫描不一致的数据；对源关系的写入会立即释放由它构建的邻接结构。
   （[规格说明](docs/specs/graph-projection.md)）
+- **预算加权遍历** —— `BudgetedTraversal` 从一组种子节点出发，按非负权重做
+  最廉价优先扩展，受**全局去重节点预算**约束（另有可选的代价上限与精确跳数上限），
+  并支持扩展过程中的准入门控，为每个被采纳的节点输出 `(cost, parent, depth)`。
+  构造即确定性、可中断，并可消费图投影缓存 —— 这是“用搜索命中周围最廉价的图邻域
+  填满固定上下文窗口”所需的原语。
+  （[规格说明](docs/specs/budgeted-traversal.md)）
 - **双时态（bitemporal）** —— `TxTime` 列类型与崩溃安全的单调提交时钟、`:as_of` 读取、
   两级 `(有效时间, 事务时间)` 解析，以及 `::history` / `::history_gc` / `::evict`。
   （[规格说明](docs/specs/bitemporality.md)）
@@ -46,23 +52,33 @@
 其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## 0.11.1 新增
+## 0.12.0 新增
 
-**天际线聚合，触达每一个绑定。** `pareto_min` / `pareto_max` 按组保留数值向量的
-Pareto 前沿 —— 不被任何其他点支配的那些点 —— 且是普通的 CozoScript 聚合：
+**预算加权遍历（budgeted weighted traversal）。** `BudgetedTraversal` 是新增的
+`graph-algo` fixed rule：从一组种子节点出发、按非负边权做最廉价优先扩展，
+受一个必填的全局去重节点预算（`max_nodes`）约束 —— 正是“用搜索命中周围最廉价的
+图邻域填满固定上下文窗口”所缺失的原语：
 
 ```
-?[frontier] := offer[price, quality], v = [price, -quality], frontier = pareto_min(v)
+context[node, cost, parent, depth] <~ BudgetedTraversal(
+    graph: 'knows', seeds[n], *live[uid, ok],
+    admit: ok, max_nodes: 200, max_cost: 12.0)
 ```
 
-`pareto_min` 以更小为更优，`pareto_max` 以更大为更优；混合目标（最小化 price、
-最大化 quality）通过对被最大化的分量取负来表达，如上所示。由于是原生实现（乘积序，
-一个可证明的严格偏序），它们无需宿主注册 —— 不同于其所基于的、仅限 Rust 的
-`register_bounded_meet_aggr` 支配聚合 —— 因而可从每一个绑定面（PyPI wheel、`cozo-bin`、
-langchain、llama-index）通过普通的 `run_script` 调用。畸形操作数（非列表、非数值分量、
-NaN 或空向量）会明确报错。
+它输出从种子集合可达的 `max_nodes` 个最廉价的不同可准入节点，每个节点带有
+代价、父指针与深度 —— 父指针可用纯 Datalog 重建任意路径。准入顺序由构造保证
+确定性（全序破平），且在位置边输入与 `graph:` 投影缓存两种形式下逐字节一致；
+`max_cost` 约束路径代价，`max_depth` 是**精确的**跳数上限（分层标签，绝不做
+深度剪枝的 Dijkstra），被门控排除的节点不消耗预算、也绝不充当桥梁。权重按
+代价消费 —— `-ln(weight)` 之类的单调变换由调用方自行施加。长时间扩展可经
+`:timeout` / `::kill` 干净中止。在本次发布的合并门禁上，与完成同一任务
+（约 2·depth 次引擎往返）的宿主端生产 BFS 实测对比：对投影缓存的单次调用
+**快 2–4×**；位置边形式每次调用都要付出扫描 + CSR 构建的代价，规模化时请维护
+代价关系并使用投影。
 
-这是一个非破坏性、纯新增的补丁（两个保留聚合名），不改变任何既有查询的结果。
+0.12.0 还将可选依赖 `rayon` 限定为 `<1.11` —— rayon 1.11 会破坏 `graph-algo`
+所拉取的 CSR 构建库（`graph_builder` 0.4.x），此约束让下游的全新依赖解析总能
+落在可用的组合上。纯新增 —— 一个新的保留规则名，不改变任何既有查询的结果。
 完整内容见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 
 

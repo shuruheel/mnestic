@@ -5,17 +5,39 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.11.1 work not yet cut to a release. Keep this section current as
+Post-0.12.0 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
+
+_Nothing yet._
+
+## 0.12.0 — 2026-07-11
 
 **Budgeted weighted traversal — the context-fill primitive.** `BudgetedTraversal` is a new
 `graph-algo` FixedRule: cheapest-first multi-seed expansion over non-negative weights under a
 required global distinct-node budget (`max_nodes`), an optional cost ceiling (`max_cost`) and an
 **exact** hop bound (`max_depth`, layered per-`(node, hops)` labels — never depth-pruned
-Dijkstra), with an optional in-expansion admission gate (`*gate[node, …]` + `admit:`). Engine
-(`cozo-core`) only; zero planner/grammar/projection changes — the call surface is the existing
-fixed-rule syntax, and the `graph:` arm rides the 0.11.0 projection cache.
+Dijkstra), with an optional in-expansion admission gate (`*gate[node, …]` + `admit:`):
+
+```
+context[node, cost, parent, depth] <~ BudgetedTraversal(
+    graph: 'knows', seeds[n], *live[uid, ok],
+    admit: ok, max_nodes: 200, max_cost: 12.0)
+```
+
+Validated at the release's merge gate against the flagship consumer's production host-side
+BFS (mindgraph-rs `traverse_reachable`) via a defined-equivalence oracle, green on
+mem/sqlite/rocksdb through the generic `admit:` gate. Measured there (release build, RocksDB,
+hub-degree-1000 fixtures at 4k nodes/21k edges and 20k/101k, budgets 100/500, gated,
+`max_depth: 10`): one call over a cached `graph:` projection replaces the host's ~2·depth
+engine round-trips and runs **2–4× faster** than that BFS; the positional form pays a per-call
+O(live edges) scan + CSR build and is slower than the host at those scales — at scale,
+maintain a derived cost relation and a projection (spec §10).
+
+Engine (`cozo-core`) only; zero planner/grammar/projection changes — the call surface is the
+existing fixed-rule syntax, and the `graph:` arm rides the 0.11.0 projection cache. No
+`cozorocks`/`mnestic-rocks` change, and no existing query changes result (one new reserved
+rule name behind `graph-algo`).
 
 ### Added
 
@@ -31,6 +53,16 @@ fixed-rule syntax, and the `graph:` arm rides the 0.11.0 projection cache.
   `cozo-core/tests/budgeted_traversal.rs` (38, sqlite), incl. an 8-mutation discrimination run
   recorded in the spec. Spec:
   [`docs/specs/budgeted-traversal.md`](docs/specs/budgeted-traversal.md) §11.
+
+### API and compatibility
+
+- **The optional `rayon` dependency is now bounded `>=1.10, <1.11`** (`rayon` is pulled by the
+  `graph-algo` and `rayon` features). rayon 1.11 breaks `graph_builder` 0.4.x — the CSR-builder
+  crate behind `graph-algo` — whose `edges()` par-iter no longer compiles, so a downstream crate
+  enabling `graph-algo` on a fresh resolve landed on a broken combination (mnestic's own
+  committed lockfile had masked it). The bound makes every fresh resolve land on a working
+  pair; it will be relaxed only after a verified fresh `graph-algo` build against a newer rayon
+  (`cozo-core/Cargo.toml`).
 
 ## 0.11.1 — 2026-07-10
 

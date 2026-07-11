@@ -24,6 +24,14 @@ capabilities on top of it:
   differing from what the consuming transaction's own scan would return, and a
   write to a source frees what was built from it.
   ([spec](docs/specs/graph-projection.md))
+- **Budgeted weighted traversal** — `BudgetedTraversal` expands cheapest-first
+  from a set of seeds, over non-negative weights, under a global distinct-node
+  budget (plus optional cost ceiling and exact hop bound) and an in-expansion
+  admission gate, emitting each admitted node's `(cost, parent, depth)`.
+  Deterministic by construction, interruptible, and able to consume a cached
+  graph projection — the primitive for filling a fixed context window with the
+  cheapest graph neighborhood around a set of search hits.
+  ([spec](docs/specs/budgeted-traversal.md))
 - **Bitemporality** — a `TxTime` column type with a crash-safe monotone commit
   clock, `:as_of` reads, the two-level `(valid time, transaction time)`
   resolution, and `::history` / `::history_gc` / `::evict`.
@@ -60,39 +68,37 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.11
+## New in 0.12.0
 
-**Cached graph projections.** `::graph create G { edges: knows, nodes: person }`
-names an in-memory adjacency over stored relations that twelve graph algorithms
-reuse across queries instead of rebuilding on every call:
+**Budgeted weighted traversal.** `BudgetedTraversal` is a new `graph-algo` fixed
+rule: cheapest-first expansion from a set of seeds, over non-negative edge
+weights, under a required global distinct-node budget — the missing primitive
+for filling a fixed context window with the cheapest graph neighborhood around
+what search found:
 
 ```
-::graph create g { edges: knows, nodes: person }
-
-?[node, group] <~ ConnectedComponents(graph: 'g')
-?[node, rank]  <~ PageRank(graph: 'g', iterations: 20)
+context[node, cost, parent, depth] <~ BudgetedTraversal(
+    graph: 'knows', seeds[n], *live[uid, ok],
+    admit: ok, max_nodes: 200, max_cost: 12.0)
 ```
 
-A projection is **always fresh**: it never serves a transaction data that differs
-from what that transaction's own scan of the sources would return, and writing to
-a source frees the adjacencies built from it. Under continuous write churn the
-cache degrades to build-per-query — it never goes stale. On a 400,000-edge graph,
-warming the cache cuts `ConnectedComponents` from 127 ms to 7.9 ms (16×) and a
-20-iteration `PageRank` from 150 ms to 10 ms (15×); what is cached is the *setup*
-— scanning the edge relation and building the CSR — so the gain shrinks as the
-kernel itself dominates.
+It emits the `max_nodes` cheapest distinct admissible nodes reachable from the
+seed set, each with its cost, parent pointer, and depth — parent pointers
+reconstruct any path in plain Datalog. Admission is deterministic by
+construction (total-order tie-breaking) and identical between positional edges
+and a `graph:` cached projection; `max_cost` bounds path cost, `max_depth` is an
+**exact** hop bound (layered labels, never depth-pruned Dijkstra), and a
+gated-out node spends no budget and never bridges. Weights are consumed as costs
+— monotone transforms like `-ln(weight)` are yours to apply. Long expansions
+abort cleanly via `:timeout` / `::kill`. Measured at the release's merge gate
+against a production host-side BFS doing the same job in ~2·depth round-trips:
+one call over a cached projection runs **2–4× faster**; positional edges pay a
+per-call scan + CSR build, so at scale maintain a cost relation and a projection.
 
-Twelve algorithms accept `graph: 'G'` in place of their positional edge relation,
-an optional `nodes:` makes isolated vertices real (counted and ranked), and a
-512 MiB LRU ceiling (tunable; `0` disables caching without disabling `::graph`)
-bounds memory. A database that defines no projections pays one atomic load per
-transaction and nothing extra on the read path. `PageRank`'s default `iterations`
-also rose from 10 to 20 (the non-converged old value); pass `iterations: 10` to
-restore the old numbers.
-
-The follow-up 0.11.1 patch added the built-in skyline aggregates `pareto_min` /
-`pareto_max` (see the feature list above) — reachable from every binding, no host
-registration. Full detail for both is in
+Also in 0.12.0: the optional `rayon` dependency is bounded `<1.11` — rayon 1.11
+breaks the CSR-builder crate (`graph_builder` 0.4.x) that `graph-algo` pulls, so
+fresh downstream resolves now land on a working combination. Purely additive —
+one new reserved rule name; no existing query changes result. Full detail is in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
 
