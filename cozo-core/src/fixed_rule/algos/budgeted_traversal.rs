@@ -675,7 +675,9 @@ fn traverse(
 #[derive(Error, Diagnostic, Debug)]
 #[error("Seed initial cost {value:?} is invalid")]
 #[diagnostic(code(algo::bad_seed_cost))]
-#[diagnostic(help("The optional `initial_cost` column (seeds column 1) must be a finite number >= 0"))]
+#[diagnostic(help(
+    "The optional `initial_cost` column (seeds column 1) must be a finite number >= 0"
+))]
 struct BadSeedCostError {
     value: DataValue,
     #[label]
