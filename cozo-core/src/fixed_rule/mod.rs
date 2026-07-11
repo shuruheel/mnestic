@@ -1021,6 +1021,11 @@ lazy_static! {
             ),
             #[cfg(feature = "graph-algo")]
             (
+                "BudgetedTraversal".to_string(),
+                Arc::<Box<dyn FixedRule>>::new(Box::new(BudgetedTraversal)),
+            ),
+            #[cfg(feature = "graph-algo")]
+            (
                 "ShortestPathBFS".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(ShortestPathBFS)),
             ),
