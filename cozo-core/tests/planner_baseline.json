@@ -1,0 +1,90 @@
+{
+  "_comment": "Committed plan-shape baseline for the T0 planner gate (cozo-core/tests/planner_shape.rs). The ordered `load_stored` relation sequence per query — i.e. the join order. Regenerate with: cargo test -p mnestic --test planner_shape -- --ignored regenerate. Refresh ONLY in a reviewed commit that explains why the plan changed; CI never writes this file.",
+  "engine_version": "0.11.1",
+  "queries": {
+    "lsqb_q1": {
+      "greedy": [
+        ":city_in_ctry",
+        ":p_loc_city",
+        ":f_has_member",
+        ":f_cont_post",
+        ":c_reply_post",
+        ":c_has_tag",
+        ":tag_type_tc"
+      ],
+      "written": [
+        ":city_in_ctry",
+        ":p_loc_city",
+        ":f_has_member",
+        ":f_cont_post",
+        ":c_reply_post",
+        ":c_has_tag",
+        ":tag_type_tc"
+      ]
+    },
+    "lsqb_q2": {
+      "greedy": [
+        ":knows",
+        ":c_creator_p",
+        ":c_reply_post",
+        ":post_creator_p"
+      ],
+      "written": [
+        ":knows",
+        ":c_creator_p",
+        ":c_reply_post",
+        ":post_creator_p"
+      ]
+    },
+    "lsqb_q3": {
+      "greedy": [
+        ":p_loc_city",
+        ":city_in_ctry",
+        ":city_in_ctry",
+        ":p_loc_city",
+        ":knows",
+        ":city_in_ctry",
+        ":p_loc_city",
+        ":knows",
+        ":knows"
+      ],
+      "written": [
+        ":p_loc_city",
+        ":city_in_ctry",
+        ":p_loc_city",
+        ":city_in_ctry",
+        ":p_loc_city",
+        ":city_in_ctry",
+        ":knows",
+        ":knows",
+        ":knows"
+      ]
+    },
+    "lsqb_q6": {
+      "greedy": [
+        ":knows",
+        ":knows",
+        ":p_int_tag"
+      ],
+      "written": [
+        ":knows",
+        ":knows",
+        ":p_int_tag"
+      ]
+    },
+    "lsqb_q9": {
+      "greedy": [
+        ":knows",
+        ":knows",
+        ":knows",
+        ":p_int_tag"
+      ],
+      "written": [
+        ":knows",
+        ":knows",
+        ":knows",
+        ":p_int_tag"
+      ]
+    }
+  }
+}
