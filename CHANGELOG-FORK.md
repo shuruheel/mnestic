@@ -9,7 +9,28 @@ Post-0.11.1 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
-_Nothing yet._
+**Budgeted weighted traversal — the context-fill primitive.** `BudgetedTraversal` is a new
+`graph-algo` FixedRule: cheapest-first multi-seed expansion over non-negative weights under a
+required global distinct-node budget (`max_nodes`), an optional cost ceiling (`max_cost`) and an
+**exact** hop bound (`max_depth`, layered per-`(node, hops)` labels — never depth-pruned
+Dijkstra), with an optional in-expansion admission gate (`*gate[node, …]` + `admit:`). Engine
+(`cozo-core`) only; zero planner/grammar/projection changes — the call surface is the existing
+fixed-rule syntax, and the `graph:` arm rides the 0.11.0 projection cache.
+
+### Added
+
+- **`BudgetedTraversal(edges | graph: 'G', seeds[node, initial_cost?], gate?, max_nodes: …)`** —
+  emits the settled shortest-path-tree fragment `(node, cost, parent, depth)`: the `max_nodes`
+  cheapest distinct admissible nodes reachable from the seed set, deterministic by construction
+  (admission by `(cost, node)` total order; the `(parent, depth)` witness by strict lexicographic
+  relaxation), form-independent (positional ≡ `graph:` byte-for-byte, tie rows included), and
+  interruptible (`:timeout` / `::kill`, every-4096 mask). Costs accumulate in f64; weights are
+  consumed *as costs* — monotone transforms like `−ln(weight)` are the caller's. An inadmissible
+  node spends no budget and never bridges; gated `admit:` is existential over the node's gate
+  rows; `max_cost` is finite-only; CSR-absent seeds emit as loose roots. Tests:
+  `cozo-core/tests/budgeted_traversal.rs` (37, sqlite), incl. a 7-mutation discrimination run
+  recorded in the spec. Spec:
+  [`docs/specs/budgeted-traversal.md`](docs/specs/budgeted-traversal.md) §11.
 
 ## 0.11.1 — 2026-07-10
 
