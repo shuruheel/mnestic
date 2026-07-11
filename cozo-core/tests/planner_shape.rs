@@ -87,9 +87,10 @@ fn lsqb_db(dir: &tempfile::TempDir) -> DbInstance {
 /// **THE GATE.** Every ported LSQB query's join order must match its committed
 /// signature, under both the greedy planner and the `written` control.
 ///
-/// This is the assertion that goes RED on 0.10.5 and green on 0.11.1. It is
-/// verified to do so — see `planner-guard.yml`, which runs the same assertion
-/// against the 0.10.5 tag as a negative control.
+/// This is the assertion that goes RED on 0.10.5 and green on 0.11.1. That was
+/// verified by hand, by running this test against the `v0.10.5` tag in a
+/// worktree — it is a one-off negative control, NOT a CI job. `planner-guard.yml`
+/// runs only the nightly LSQB execution tier; nothing re-checks the control.
 #[test]
 fn lsqb_join_order_matches_committed_baseline() {
     let dir = tempfile::tempdir().unwrap();
