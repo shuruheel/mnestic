@@ -9,6 +9,7 @@
 pub(crate) mod all_pairs_shortest_path;
 pub(crate) mod astar;
 pub(crate) mod bfs;
+pub(crate) mod budgeted_traversal;
 pub(crate) mod degree_centrality;
 pub(crate) mod dfs;
 pub(crate) mod kruskal;
@@ -27,6 +28,7 @@ pub(crate) mod yen;
 pub(crate) use all_pairs_shortest_path::{BetweennessCentrality, ClosenessCentrality};
 pub(crate) use astar::ShortestPathAStar;
 pub(crate) use bfs::Bfs;
+pub(crate) use budgeted_traversal::BudgetedTraversal;
 pub(crate) use degree_centrality::DegreeCentrality;
 pub(crate) use dfs::Dfs;
 pub(crate) use kruskal::MinimumSpanningForestKruskal;
