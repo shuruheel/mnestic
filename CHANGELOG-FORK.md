@@ -34,6 +34,20 @@ reconstruct them.
   on the committing thread over bounded channels, so a slow subscriber can stall
   writers.
 
+- **`import_from_backup` silently stranded HNSW/FTS/LSH indexes** (inherited
+  from upstream). It guarded only against *B-tree* indexes and then raw-put the
+  source's KV rows straight into the store, so an operator restored a backup and
+  hybrid retrieval quietly returned nothing for the restored rows — with no
+  signal anywhere. It now warns, as its sibling `import_relations` already did.
+  Neither path maintains those indexes (that is what makes bulk loading fast);
+  the bug was doing it silently. Both warnings now point at **`::reindex`**
+  instead of telling the user to drop and recreate the index by hand — which
+  meant reconstructing the original `::hnsw`/`::fts` creation script (extractor,
+  tokenizer, filters, `ef_construction`, `m_neighbours`…) from `::indices`
+  output. The two call sites now share one helper so they cannot drift apart
+  again. `runtime/db.rs`; guarded by
+  `cozo-core/tests/import_index_staleness.rs`.
+
 - **FTS postings leaked when a row was updated in place** (inherited from
   upstream; affects every release through 0.12.0). Deletion of a row's old
   postings was gated on `has_indices` — which counts only *plain B-tree secondary

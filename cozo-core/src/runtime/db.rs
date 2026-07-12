@@ -796,7 +796,9 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// Import relations. The argument `data` accepts data in the shape of
     /// what was returned by [Self::export_relations].
     /// The target stored relations must already exist in the database.
-    /// Any associated indices will be updated.
+    /// Any associated B-tree indices will be updated; HNSW/FTS/LSH indices are
+    /// **not** maintained — see the warning emitted per relation, and rebuild
+    /// them with `::reindex`.
     ///
     /// Note that triggers and callbacks are _not_ run for the relations, if any exists.
     /// If you need to activate triggers or callbacks, use queries with parameters.
@@ -842,28 +844,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // to vector/text/LSH search until the index is rebuilt. Warn
             // loudly rather than corrupt-silently; a hard error would break
             // legitimate import-then-reindex callers. (mnestic fork, hardening)
-            if !handle.hnsw_indices.is_empty()
-                || !handle.fts_indices.is_empty()
-                || !handle.lsh_indices.is_empty()
-            {
-                let mut kinds = vec![];
-                if !handle.hnsw_indices.is_empty() {
-                    kinds.push("HNSW");
-                }
-                if !handle.fts_indices.is_empty() {
-                    kinds.push("FTS");
-                }
-                if !handle.lsh_indices.is_empty() {
-                    kinds.push("LSH");
-                }
-                log::warn!(
-                    "bulk import into relation '{}' does not maintain its {} index(es); \
-                     rebuild them after the import (drop + recreate) or load via :put — \
-                     imported rows are otherwise invisible to those indices",
-                    relation,
-                    kinds.join("/")
-                );
-            }
+            warn_if_indexes_stranded(&handle, relation, "bulk import into");
 
             if handle.access_level < AccessLevel::Protected {
                 bail!(InsufficientAccessLevel(
@@ -1142,6 +1123,17 @@ impl<'s, S: Storage<'s>> Db<S> {
 
                     bail!(RestoreIntoRelWithIndices(dst_handle.name.to_string()))
                 }
+
+                // mnestic fork (0.12.1): the B-tree bail above is the only guard
+                // this path had. It then raw-puts the source's KV rows straight
+                // into the store, so a relation carrying HNSW/FTS/LSH indexes had
+                // its rows restored underneath them with **zero signal** — the
+                // operator restores a backup and hybrid retrieval silently returns
+                // nothing for the restored rows. `import_relations` has warned
+                // about exactly this since the fork's hardening pass; backup
+                // restore never did. Same warning, one shared helper, so they
+                // cannot drift apart again.
+                warn_if_indexes_stranded(&dst_handle, relation, "backup restore into");
 
                 if dst_handle.access_level < AccessLevel::Protected {
                     bail!(InsufficientAccessLevel(
@@ -3330,6 +3322,45 @@ pub struct Poison {
 }
 
 /// A monotonic clock reading for a wall-clock query budget, or `None` where no
+/// Warn when a bulk-load path is about to write rows underneath HNSW/FTS/LSH
+/// indexes it does not maintain (mnestic fork, hardening).
+///
+/// Both bulk paths — `import_relations` and `import_from_backup` — bypass the
+/// per-row `:put` path that maintains those indexes, so the imported rows are
+/// silently invisible to vector/text/LSH search until the index is rebuilt.
+/// `import_relations` has warned since the fork's early hardening pass;
+/// `import_from_backup` never did (0.12.1 fix), which is why this lives in one
+/// place: the two must not drift again. B-tree secondary indexes are unaffected
+/// — both paths maintain those.
+///
+/// A warning rather than a hard error, deliberately: import-then-rebuild is a
+/// legitimate and common flow, and refusing it would break the very callers who
+/// are doing the right thing. `verb` names the operation for the message
+/// ("bulk import into", "backup restore into").
+fn warn_if_indexes_stranded(handle: &RelationHandle, relation: &str, verb: &str) {
+    let mut kinds = vec![];
+    if !handle.hnsw_indices.is_empty() {
+        kinds.push("HNSW");
+    }
+    if !handle.fts_indices.is_empty() {
+        kinds.push("FTS");
+    }
+    if !handle.lsh_indices.is_empty() {
+        kinds.push("LSH");
+    }
+    if kinds.is_empty() {
+        return;
+    }
+    log::warn!(
+        "{} relation '{}' does not maintain its {} index(es); the imported rows are \
+         invisible to those indices until you rebuild them — run `::reindex {}`",
+        verb,
+        relation,
+        kinds.join("/"),
+        relation
+    );
+}
+
 /// monotonic clock is available: wasm has no `std` monotonic `Instant`, so on
 /// that target queries simply carry no time budget rather than panicking on
 /// `Instant::now()` (mnestic fork, query budget).
