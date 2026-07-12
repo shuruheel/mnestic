@@ -52,22 +52,35 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-**New in 0.12.0: budgeted weighted traversal, straight from the wheel.**
-`BudgetedTraversal` is a new fixed rule: cheapest-first expansion from a set of
-seed nodes, over non-negative edge weights, under a required global budget of
-distinct nodes (`max_nodes`), with an optional cost ceiling (`max_cost`), an
-exact hop bound (`max_depth`), and an optional admission gate (a gate relation
-plus an `admit:` predicate — a gated-out node spends no budget and is never a
-bridge). It emits each admitted node's cost, parent, and depth — parent pointers
-reconstruct any path in plain Datalog — and it runs from the wheel through
-`run_script` with nothing to register:
-`db.run_script("?[n, c, p, d] <~ BudgetedTraversal(*edge[f, t, w], seeds[n], max_nodes: 200)", {}, False)`.
-Admission is deterministic (total-order tie-breaking), long expansions abort
-cleanly via a query `timeout=`, and the rule can consume a cached `::graph`
-projection (`graph: 'g'`) instead of positional edges — measured 2–4× faster
-than an equivalent host-side BFS at the release's merge gate. Weights are
-consumed as costs (apply `-ln(weight)`-style transforms yourself). Purely
-additive — no existing query changes result.
+**New in 0.12.1: a correctness release — with one action to take if you use
+full-text search.** Six bugs inherited from upstream Cozo are fixed; none is a
+regression the fork introduced. The one that needs something from you: **full-text
+postings leaked whenever a row was updated in place** on a relation carrying
+*only* an FTS index. Deletion of the old postings was gated on the relation also
+having a plain secondary index, so a `:put` over an existing key never removed
+them — terms the document no longer contained kept matching it, the index grew
+without bound, and BM25 scores drifted (a measured **55% score error** on a
+two-document corpus). This affects every release through 0.12.0.
+
+**The fix stops new leakage but cannot evict postings already written.** If you
+have an FTS-only relation that has ever been updated in place, its index is
+affected today and upgrading alone will not repair it — rebuild it once with the
+new `::reindex`:
+
+```python
+db.run_script("::reindex docs", {}, False)
+```
+
+`::reindex` rebuilds a relation's HNSW / FTS / LSH indexes in place, in one write
+transaction, from the index configuration the database already stores. It is also
+the repair path after `import_relations` or a backup restore — neither maintains
+these indexes (that is what makes bulk loading fast), and both now warn and point
+at `::reindex` rather than leaving restored rows silently invisible to search.
+
+Also fixed, and visible from this binding: a **failed commit raised no exception**.
+`CozoDbMulTx.commit()` (from `db.multi_transact(True)`) returned normally even when
+the underlying commit had errored, so a caller believed its data was durable when
+it was not; change callbacks fired for those failed commits too. Both now behave.
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

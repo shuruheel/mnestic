@@ -5,9 +5,36 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.12.0 work not yet cut to a release. Keep this section current as
+Post-0.12.1 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
+
+_Nothing yet._
+
+## 0.12.1 — 2026-07-12
+
+**Six correctness bugs inherited from upstream Cozo, and the repair path for the worst
+of them.** None is a regression the fork introduced — every one predates the fork point,
+which is rather the point: nobody was auditing this code. Two are silent failures a caller
+cannot detect from the outside. `MultiTransaction::commit()` returned `Ok(())` for a commit
+that had *failed* — and `cozo-bin`'s HTTP `/transact` endpoint sat directly on top of it,
+answering `200 {"ok": true}` for transactions that never committed. And full-text postings
+leaked on every in-place `:put` update of a relation carrying only an FTS index: ghost hits,
+an index growing without bound, and BM25 statistics drifting far enough to measure a **55%
+score error** on a two-document corpus.
+
+**Upgrade action, if you use full-text search.** The write-path fix stops new leakage but
+**cannot evict postings that are already written**. A relation with only an FTS index that
+has ever been updated in place is affected *today*, and upgrading alone does not repair it.
+Rebuild it once with the new `::reindex`:
+
+```
+::reindex my_relation
+```
+
+Engine (`cozo-core`) only, plus CI. No `cozorocks`/`mnestic-rocks` change. No planner or
+query-plan change; the grammar gains exactly one system op (`::reindex`). Query results
+change only on relations affected by the FTS leak, where they were wrong — see that entry.
 
 ### Added
 
@@ -40,6 +67,33 @@ reconstruct them.
   separate, later piece of work; a full rebuild already cures that database.)*
 
 ### Fixed
+
+- **FTS postings leaked when a row was updated in place** (inherited from
+  upstream; affects every release through 0.12.0). Deletion of a row's old
+  postings was gated on `has_indices` — which counts only *plain B-tree secondary
+  indexes*. A relation carrying **only** an FTS index therefore never deleted the
+  old document's postings on a `:put` over an existing key: terms the document no
+  longer contained kept matching it, the index grew without bound, and the BM25
+  `df`/`avgdl` statistics drifted (measured: a **55% score error** on a
+  two-document corpus). `:rm` and the `update` op were unaffected — they always
+  deleted correctly. `query/stored.rs`; guarded by
+  `cozo-core/tests/fts_lsh_update_leak.rs`.
+
+  **Results change on an affected relation** — which is the point of the fix:
+  terms a document no longer contains stop matching it, and its BM25 scores move.
+  There is deliberately no flag to restore the old behaviour; the old behaviour
+  was a leak.
+
+  **The fix stops new leakage; it does not evict postings already written.** If
+  you have an FTS-only relation that has ever been updated in place, its index is
+  affected today — rebuild it with `::reindex` (this release). *(Historical
+  workaround, for the record: giving the relation any plain secondary index
+  re-armed the correct deletion path.)*
+
+  **LSH does not leak**, despite sitting behind the same gate: its write path is
+  self-cleaning (it removes the row's old bands before writing new ones), so the
+  gated deletion was only ever redundant for LSH. We first reported this as an
+  "FTS/LSH" leak and are correcting that here.
 
 - **`MultiTransaction::commit()` reported success for a failed commit.** It
   matched `Ok(_) => Ok(())` on the channel receive, discarding the
@@ -100,28 +154,6 @@ reconstruct them.
   output. The two call sites now share one helper so they cannot drift apart
   again. `runtime/db.rs`; guarded by
   `cozo-core/tests/import_index_staleness.rs`.
-
-- **FTS postings leaked when a row was updated in place** (inherited from
-  upstream; affects every release through 0.12.0). Deletion of a row's old
-  postings was gated on `has_indices` — which counts only *plain B-tree secondary
-  indexes*. A relation carrying **only** an FTS index therefore never deleted the
-  old document's postings on a `:put` over an existing key: terms the document no
-  longer contained kept matching it, the index grew without bound, and the BM25
-  `df`/`avgdl` statistics drifted (measured: a **55% score error** on a
-  two-document corpus). `:rm` and the `update` op were unaffected — they always
-  deleted correctly. `query/stored.rs`; guarded by
-  `cozo-core/tests/fts_lsh_update_leak.rs`.
-
-  **The fix stops new leakage; it does not evict postings already written.** If
-  you have an FTS-only relation that has ever been updated in place, its index is
-  affected today — rebuild it with `::reindex` (this release). *(Historical
-  workaround, for the record: giving the relation any plain secondary index
-  re-armed the correct deletion path.)*
-
-  **LSH does not leak**, despite sitting behind the same gate: its write path is
-  self-cleaning (it removes the row's old bands before writing new ones), so the
-  gated deletion was only ever redundant for LSH. We first reported this as an
-  "FTS/LSH" leak and are correcting that here.
 
 ## 0.12.0 — 2026-07-11
 

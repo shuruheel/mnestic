@@ -59,8 +59,12 @@ capabilities on top of it:
 - **Non-blocking vector index builds** — HNSW builds in RAM in parallel and no
   longer blocks reads for minutes; search-path neighbour vectors batch-fetch
   through RocksDB `MultiGet`.
-- **Operational recovery** — `::repair_corrupt` surgically deletes truncated
-  tuples instead of forcing you to drop a database that fails an integrity check.
+- **Operational recovery** — `::reindex` rebuilds a relation's HNSW / FTS / LSH
+  indexes in place from the configuration the database already stores, so a bulk
+  load or a backup restore (neither of which maintains those indexes) has a repair
+  path that is not "drop it and reconstruct the creation script by hand"; and
+  `::repair_corrupt` surgically deletes truncated tuples instead of forcing you to
+  drop a database that fails an integrity check.
 - **Interruptibility that works** — `::kill` and `:timeout` abort running
   queries, including long graph-adjacency builds.
 
@@ -68,37 +72,50 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.12.0
+## New in 0.12.1
 
-**Budgeted weighted traversal.** `BudgetedTraversal` is a new `graph-algo` fixed
-rule: cheapest-first expansion from a set of seeds, over non-negative edge
-weights, under a required global distinct-node budget — the missing primitive
-for filling a fixed context window with the cheapest graph neighborhood around
-what search found:
+**A correctness release: six bugs inherited from upstream Cozo — none a
+regression the fork introduced, all latent since before the fork point.** Two are
+silent failures a caller cannot detect from the outside:
+
+- **`MultiTransaction::commit()` reported success for a commit that failed.** It
+  discarded the `Result` the transaction thread sends back, returning `Ok(())`
+  even on error — and `cozo-bin`'s HTTP `/transact` endpoint sat directly on top
+  of it, answering `200 {"ok": true}` for transactions that never committed.
+  Change callbacks fired for those failed commits too, so anything syncing off
+  the change feed could silently diverge from the database.
+- **Full-text postings leaked when a row was updated in place.** Deletion of a
+  row's old postings was gated on the relation *also* carrying a plain B-tree
+  index, so a relation with **only** an FTS index never deleted them on a `:put`
+  over an existing key: terms the document no longer contained kept matching it,
+  the index grew without bound, and BM25 statistics drifted — a measured **55%
+  score error** on a two-document corpus. Affects every release through 0.12.0.
+
+**Upgrade action, if you use full-text search.** The write-path fix stops new
+leakage but **cannot evict postings that are already written**. An FTS-only
+relation that has ever been updated in place is affected *today*, and upgrading
+alone does not repair it. Rebuild it once with the new `::reindex`:
 
 ```
-context[node, cost, parent, depth] <~ BudgetedTraversal(
-    graph: 'knows', seeds[n], *live[uid, ok],
-    admit: ok, max_nodes: 200, max_cost: 12.0)
+::reindex my_relation
 ```
 
-It emits the `max_nodes` cheapest distinct admissible nodes reachable from the
-seed set, each with its cost, parent pointer, and depth — parent pointers
-reconstruct any path in plain Datalog. Admission is deterministic by
-construction (total-order tie-breaking) and identical between positional edges
-and a `graph:` cached projection; `max_cost` bounds path cost, `max_depth` is an
-**exact** hop bound (layered labels, never depth-pruned Dijkstra), and a
-gated-out node spends no budget and never bridges. Weights are consumed as costs
-— monotone transforms like `-ln(weight)` are yours to apply. Long expansions
-abort cleanly via `:timeout` / `::kill`. Measured at the release's merge gate
-against a production host-side BFS doing the same job in ~2·depth round-trips:
-one call over a cached projection runs **2–4× faster**; positional edges pay a
-per-call scan + CSR build, so at scale maintain a cost relation and a projection.
+`::reindex` rebuilds a relation's HNSW / FTS / LSH indexes in place, in one write
+transaction, from each index's **own stored manifest** rather than a
+reconstructed config — which matters for LSH, whose manifest keeps the derived
+band geometry but not the weights that produced it, so a drop-and-recreate would
+hand back an index with a different recall profile than the one you asked for. It
+is also the repair path for the bulk-load paths, which do not maintain these
+indexes: `import_from_backup` used to strand them in silence and now warns, as
+`import_relations` already did, and both warnings point at `::reindex` instead of
+telling you to reconstruct the original `::hnsw`/`::fts` creation script by hand.
 
-Also in 0.12.0: the optional `rayon` dependency is bounded `<1.11` — rayon 1.11
-breaks the CSR-builder crate (`graph_builder` 0.4.x) that `graph-algo` pulls, so
-fresh downstream resolves now land on a working combination. Purely additive —
-one new reserved rule name; no existing query changes result. Full detail is in
+Also fixed, in the two non-default storage backends: `newrocksdb` never armed its
+optimistic conflict detection (two transactions could read a key, both write it,
+and both commit — one acknowledged write silently lost), and `sled`'s `del()`
+never deleted (upstream #306). Both now run a transaction-contract suite in CI.
+
+Full detail, including the FTS entry's result-change note, is in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
 
