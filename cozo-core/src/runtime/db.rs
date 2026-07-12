@@ -190,6 +190,14 @@ pub struct Db<S> {
     /// `SessionTx`, which captures a watermark off it before its storage
     /// transaction pins and reports its dirty relations back at commit.
     pub(crate) graph_projections: Arc<ProjectionCache>,
+    /// Test-only: make the next multi-transaction commit fail without attempting
+    /// it (mnestic fork, 0.12.1). Commit failures are real but rare in
+    /// production — an I/O error, a backend conflict — and there is no portable
+    /// way to provoke one across `mem`/`sqlite`/`rocksdb`. The change-feed
+    /// contract ("callbacks fire only for rows that committed") needs one, so
+    /// this switch injects it. Set via [`Db::fail_next_commit_for_tests`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_commit: Arc<AtomicBool>,
 }
 
 impl<S> Debug for Db<S> {
@@ -386,6 +394,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             // line to `AtomicBool::new(true)` to make the rewrite default-on.
             enable_factorize: Arc::new(AtomicBool::new(false)),
             graph_projections: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_commit: Arc::new(AtomicBool::new(false)),
         };
         Ok(ret)
     }
@@ -437,9 +447,23 @@ impl<'s, S: Storage<'s>> Db<S> {
                         }
                     }
 
-                    let _ = results.send(tx.commit_tx().map(|_| NamedRows::default()));
+                    // mnestic fork (0.12.1): dispatch the change feed only when
+                    // the commit actually succeeded. This used to call
+                    // `send_callbacks` unconditionally after the commit, so a
+                    // failed commit still published `Put`/`Rm` events for rows
+                    // that were never durable — and anything syncing off the feed
+                    // (a search mirror, an audit log, a cache) would silently
+                    // diverge from the database. `register_callback`'s own
+                    // contract says "when the requested relation are
+                    // *successfully committed*", and the single-statement path
+                    // (`execute_single`) has always got this right by committing
+                    // with `?` before it dispatches. The `Abort` arm below is
+                    // likewise correct — it breaks without dispatching.
+                    let commit_result = self.commit_multi_tx(&mut tx);
+                    let committed = commit_result.is_ok();
+                    let _ = results.send(commit_result.map(|_| NamedRows::default()));
                     #[cfg(not(target_arch = "wasm32"))]
-                    if !callback_collector.is_empty() {
+                    if committed && !callback_collector.is_empty() {
                         self.send_callbacks(callback_collector)
                     }
 
@@ -646,6 +670,35 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
         }
         deadline
+    }
+
+    /// Commit a multi-transaction. Wraps `SessionTx::commit_tx` so the
+    /// `test-hooks` failure switch has one place to live (mnestic fork, 0.12.1;
+    /// see [`Db::fail_next_commit_for_tests`]). The injected failure returns
+    /// before the storage commit is attempted, so the transaction rolls back —
+    /// which is exactly the state a genuine commit failure leaves behind, and
+    /// the state the change-feed contract is about.
+    fn commit_multi_tx(&'s self, tx: &mut SessionTx<'_>) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_next_commit.swap(false, Ordering::SeqCst) {
+            miette::bail!("injected commit failure (test-hooks)");
+        }
+        tx.commit_tx()
+    }
+
+    /// Test-only: make the next multi-transaction commit fail (mnestic fork,
+    /// 0.12.1). One-shot — it clears itself when it fires.
+    ///
+    /// This is **not** a supported API: it is compiled only under the internal
+    /// `test-hooks` feature. It exists because the change-feed contract
+    /// ("subscribers receive events only for rows that actually committed")
+    /// cannot otherwise be tested — a real commit failure needs an I/O error or
+    /// a backend-specific conflict, and there is no portable way to provoke one
+    /// across `mem` / `sqlite` / `rocksdb`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn fail_next_commit_for_tests(&self) {
+        self.fail_next_commit.store(true, Ordering::SeqCst);
     }
 
     /// Set a Db-wide default per-query wall-clock budget in seconds (mnestic

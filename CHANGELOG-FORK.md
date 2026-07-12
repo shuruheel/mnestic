@@ -11,6 +11,29 @@ reconstruct them.
 
 ### Fixed
 
+- **`MultiTransaction::commit()` reported success for a failed commit.** It
+  matched `Ok(_) => Ok(())` on the channel receive, discarding the
+  `Result<NamedRows>` the transaction thread sends back — so a commit that
+  errored returned `Ok(())` and the caller believed its data was durable. The
+  HTTP server's `/transact` endpoint sat directly on top of this and answered
+  `200 {"ok": true}` for failed transactions. `abort()` had the same shape.
+  (`run_script` on the same type always propagated correctly.) `cozo-core/src/lib.rs`.
+
+- **Change callbacks fired after a *failed* commit** (inherited from upstream).
+  In the multi-statement transaction path (`run_multi_transaction`),
+  `send_callbacks` ran unconditionally after the commit, so subscribers received
+  `Put`/`Rm` events for rows that were never committed — anything syncing off the
+  change feed (a search mirror, an audit log, a cache) could silently diverge
+  from the database. `register_callback`'s own contract is "when the requested
+  relation are *successfully committed*"; the single-statement path always
+  honoured it. Callbacks now dispatch only on a successful commit; the abort path
+  was already correct. `runtime/db.rs`; guarded by
+  `cozo-core/tests/callback_commit_contract.rs`.
+
+  *Known limitation, unchanged:* `send_callbacks` still dispatches synchronously
+  on the committing thread over bounded channels, so a slow subscriber can stall
+  writers.
+
 - **FTS postings leaked when a row was updated in place** (inherited from
   upstream; affects every release through 0.12.0). Deletion of a row's old
   postings was gated on `has_indices` — which counts only *plain B-tree secondary
