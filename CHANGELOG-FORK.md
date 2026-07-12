@@ -34,6 +34,29 @@ reconstruct them.
   on the committing thread over bounded channels, so a slow subscriber can stall
   writers.
 
+- **The `newrocksdb` backend silently lost concurrent updates** (inherited from
+  upstream; `--features storage-new-rocksdb`, non-default). It ran an
+  `OptimisticTransactionDB` but discarded `for_update` on `get`/`exists` and the
+  `write` flag on `transact`, so conflict validation never armed: two
+  transactions could read a key, both write it, and **both commit** — one
+  acknowledged write silently vanished. `for_update` reads now register the key
+  via `get_for_update`, and writing transactions take a snapshot (matching the
+  pessimistic RocksDB backend). `storage/newrocks.rs`; guarded by
+  `cozo-core/tests/backend_transaction_contract.rs`, which reproduces the lost
+  update against the unfixed backend.
+
+- **The `sled` backend's `del()` never deleted** (upstream **#306**;
+  `--features storage-sled`, non-default). It wrote `PUT_MARKER` where
+  `DEL_MARKER` belonged, so a delete inside a transaction was recorded in the
+  changes overlay as a put-with-empty-value: `exists` kept answering `true` and
+  the commit re-inserted the key. Thanks to the issue reporter, who diagnosed
+  this precisely — and wrote a fix and tests upstream never merged.
+  `storage/sled.rs`. *(The issue's second half — `range_skip_scan_tuple` is
+  unimplemented, so time travel does not work on sled — remains open.)*
+
+  Both secondary backends now run their transaction-contract suite in CI; until
+  0.12.1 nothing in CI compiled them.
+
 - **`import_from_backup` silently stranded HNSW/FTS/LSH indexes** (inherited
   from upstream). It guarded only against *B-tree* indexes and then raw-put the
   source's KV rows straight into the store, so an operator restored a backup and

@@ -132,7 +132,12 @@ impl<'s> StoreTx<'s> for SledTx {
     #[inline]
     fn del(&mut self, key: &[u8]) -> Result<()> {
         self.ensure_changes_db()?;
-        let val_to_write = [PUT_MARKER];
+        // mnestic fork (0.12.1), upstream #306: this wrote PUT_MARKER, so a
+        // delete inside a transaction was recorded in the changes overlay as a
+        // *put* with an empty value — `exists` kept reporting `true` and the
+        // commit re-inserted the key instead of removing it. Deletes simply did
+        // not take. Reported upstream with a fix and tests; never merged there.
+        let val_to_write = [DEL_MARKER];
         self.changes
             .as_mut()
             .unwrap()

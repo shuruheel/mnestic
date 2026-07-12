@@ -5,7 +5,10 @@ use std::sync::Arc;
 use log::info;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
 
-use rocksdb::{OptimisticTransactionDB, Options, WriteBatchWithTransaction, DB};
+use rocksdb::{
+    OptimisticTransactionDB, OptimisticTransactionOptions, Options, WriteBatchWithTransaction,
+    WriteOptions, DB,
+};
 
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
@@ -95,9 +98,22 @@ impl<'s> Storage<'s> for NewRocksDbStorage {
         "rocksdb"
     }
 
-    fn transact(&'s self, _write: bool) -> Result<Self::Tx> {
+    fn transact(&'s self, write: bool) -> Result<Self::Tx> {
+        // mnestic fork (0.12.1): a writing transaction takes a snapshot, so
+        // conflict validation at commit is against the state the transaction
+        // *read*, not against whatever the store looked like at commit time.
+        // Without it, an optimistic transaction only detects conflicts on keys
+        // written after its first access — which is not the read-modify-write
+        // guarantee the engine's `for_update` reads are asking for. This
+        // mirrors the pessimistic RocksDB backend, which does
+        // `.set_snapshot(true)` on every write transaction (`storage/rocks.rs`).
+        let mut opts = OptimisticTransactionOptions::default();
+        opts.set_snapshot(write);
         Ok(NewRocksDbTx {
-            db_tx: Some(self.db.transaction()),
+            db_tx: Some(
+                self.db
+                    .transaction_opt(&WriteOptions::default(), &opts),
+            ),
         })
     }
 
@@ -129,16 +145,30 @@ pub struct NewRocksDbTx<'a> {
 unsafe impl<'a> Sync for NewRocksDbTx<'a> {}
 
 impl<'s> StoreTx<'s> for NewRocksDbTx<'s> {
-    fn get(&self, key: &[u8], _for_update: bool) -> Result<Option<Vec<u8>>> {
+    fn get(&self, key: &[u8], for_update: bool) -> Result<Option<Vec<u8>>> {
         let db_tx = self
             .db_tx
             .as_ref()
             .ok_or_else(|| miette!("Transaction already committed"))?;
 
-        db_tx
-            .get(key)
-            .into_diagnostic()
-            .wrap_err("failed to get value")
+        // mnestic fork (0.12.1): `for_update` was DISCARDED here (the parameter
+        // was `_for_update`). An OptimisticTransactionDB only validates keys the
+        // transaction registered for conflict checking, and registration happens
+        // through `get_for_update` — so the engine's read-modify-write paths,
+        // which pass `for_update: true` precisely to arm that validation, armed
+        // nothing. Two transactions could read the same key, both write it, and
+        // both commit: a silently lost update, on a publicly selectable backend.
+        if for_update {
+            db_tx
+                .get_for_update(key, true)
+                .into_diagnostic()
+                .wrap_err("failed to get value for update")
+        } else {
+            db_tx
+                .get(key)
+                .into_diagnostic()
+                .wrap_err("failed to get value")
+        }
     }
 
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
@@ -216,16 +246,28 @@ impl<'s> StoreTx<'s> for NewRocksDbTx<'s> {
     }
 
     #[inline]
-    fn exists(&self, key: &[u8], _for_update: bool) -> Result<bool> {
+    fn exists(&self, key: &[u8], for_update: bool) -> Result<bool> {
         let db_tx = self
             .db_tx
             .as_ref()
             .ok_or(miette!("Transaction already committed"))?;
-        db_tx
-            .get(key)
-            .into_diagnostic()
-            .wrap_err("Error during exists check")
-            .map(|opt| opt.is_some())
+        // Same fix as `get` above: an existence check taken `for_update` must
+        // register the key for conflict validation, or the "does this key exist?"
+        // decision a write is about to be based on is not protected against a
+        // concurrent writer creating it (mnestic fork, 0.12.1).
+        if for_update {
+            db_tx
+                .get_for_update(key, true)
+                .into_diagnostic()
+                .wrap_err("Error during exists check for update")
+                .map(|opt| opt.is_some())
+        } else {
+            db_tx
+                .get(key)
+                .into_diagnostic()
+                .wrap_err("Error during exists check")
+                .map(|opt| opt.is_some())
+        }
     }
 
     fn commit(&mut self) -> Result<()> {
