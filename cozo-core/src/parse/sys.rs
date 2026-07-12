@@ -51,6 +51,9 @@ pub enum SysOp {
     /// (truncated values from interrupted writes). Surgical alternative to
     /// dropping a database that fails integrity checks.
     RepairCorrupt(Symbol),
+    /// Rebuild a relation's HNSW/FTS/LSH indexes in place from their stored
+    /// manifests (mnestic fork, 0.12.1). See `runtime/reindex.rs`.
+    Reindex(Symbol),
     /// mnestic fork, bitemporality step 5: full belief timeline of the given
     /// keys of a tt-stamped relation — (relation, keys, limit, offset)
     TtHistory(Symbol, Vec<Vec<DataValue>>, Option<usize>, Option<usize>),
@@ -208,6 +211,10 @@ pub(crate) fn parse_sys(
         Rule::repair_corrupt_op => {
             let rels_p = inner.into_inner().next().unwrap();
             SysOp::RepairCorrupt(Symbol::new(rels_p.as_str(), rels_p.extract_span()))
+        }
+        Rule::reindex_op => {
+            let rels_p = inner.into_inner().next().unwrap();
+            SysOp::Reindex(Symbol::new(rels_p.as_str(), rels_p.extract_span()))
         }
         Rule::list_relations_op => SysOp::ListRelations,
         Rule::remove_relations_op => {

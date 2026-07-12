@@ -429,7 +429,7 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    fn put_in_fts(
+    pub(crate) fn put_in_fts(
         &mut self,
         rel_handle: &RelationHandle,
         stack: &mut Vec<DataValue>,
@@ -457,7 +457,7 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    fn put_in_lsh(
+    pub(crate) fn put_in_lsh(
         &mut self,
         rel_handle: &RelationHandle,
         stack: &mut Vec<DataValue>,
@@ -489,7 +489,7 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    fn update_in_hnsw(
+    pub(crate) fn update_in_hnsw(
         &mut self,
         relation_store: &RelationHandle,
         stack: &mut Vec<DataValue>,
@@ -510,7 +510,7 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    fn make_lsh_hash_perms(
+    pub(crate) fn make_lsh_hash_perms(
         &self,
         relation_store: &RelationHandle,
     ) -> BTreeMap<SmartString<LazyCompact>, HashPermutations> {
@@ -521,7 +521,7 @@ impl<'a> SessionTx<'a> {
         perms
     }
 
-    fn make_fts_lsh_processors(
+    pub(crate) fn make_fts_lsh_processors(
         &self,
         relation_store: &RelationHandle,
     ) -> Result<BTreeMap<SmartString<LazyCompact>, (Arc<TextAnalyzer>, Vec<Bytecode>)>> {
@@ -559,7 +559,7 @@ impl<'a> SessionTx<'a> {
         Ok(processors)
     }
 
-    fn make_hnsw_filters(
+    pub(crate) fn make_hnsw_filters(
         relation_store: &RelationHandle,
     ) -> Result<BTreeMap<SmartString<LazyCompact>, Vec<Bytecode>>> {
         let mut hnsw_filters = BTreeMap::new();

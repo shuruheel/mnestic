@@ -2550,6 +2550,43 @@ impl<'s, S: Storage<'s>> Db<S> {
                     vec![vec![DataValue::from(OK_STR)]],
                 ))
             }
+            SysOp::Reindex(rel_name) => {
+                if read_only {
+                    bail!("Cannot reindex a relation in read-only mode");
+                }
+                // The relation WRITE lock, held for the whole rebuild: every
+                // index row is deleted and re-derived, so a concurrent reader
+                // would otherwise see a half-built index. On a large relation
+                // this blocks that relation for the duration — `::reindex` is a
+                // maintenance operation, and its docs say so. (It is never
+                // auto-invoked: the import paths point at it, they do not run
+                // it.)
+                let lock = self
+                    .obtain_relation_locks(iter::once(&rel_name.name))
+                    .pop()
+                    .unwrap();
+                let _guard = lock.write().unwrap();
+
+                let handle = tx.get_relation(rel_name, true)?;
+                // Graph-projection dirty-set hook: the index rows below are
+                // rewritten under the projection cache's nose.
+                tx.mark_dirty(&handle);
+
+                let reports = tx.reindex_relation(&rel_name.name)?;
+                if reports.is_empty() {
+                    // Not an error: this keeps `::reindex` scriptable across a
+                    // set of relations without the caller having to know which
+                    // of them carry search indexes.
+                    return Ok(NamedRows::new(
+                        vec![STATUS_STR.to_string()],
+                        vec![vec![DataValue::from(
+                            "no HNSW/FTS/LSH index on this relation — nothing to rebuild",
+                        )]],
+                    ));
+                }
+                let (headers, rows) = crate::runtime::reindex::reindex_rows(reports);
+                Ok(NamedRows::new(headers, rows))
+            }
             SysOp::RepairCorrupt(rel_name) => {
                 if read_only {
                     bail!("Cannot repair relation in read-only mode");

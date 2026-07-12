@@ -9,6 +9,36 @@ Post-0.12.0 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
+### Added
+
+- **`::reindex <relation>`** — rebuild a relation's HNSW / FTS / LSH indexes in
+  place, from the index configuration the database already stores. It is the
+  repair path for three separate problems that all reduced to one missing
+  operation:
+  - **the FTS posting leak fixed below** — the write-path fix stops new leakage
+    but cannot evict postings already written, so every database that updated
+    rows in place on an FTS-only relation needs this once;
+  - **the bulk-load paths** (`import_relations`, `import_from_backup`), which do
+    not maintain these indexes and used to tell you to "drop + recreate" — i.e.
+    to reconstruct the original `::hnsw`/`::fts` creation script (extractor,
+    tokenizer, filters, `ef_construction`, `m_neighbours`…) by hand from
+    `::indices` output;
+  - any index whose contents have drifted from its base relation.
+
+  It runs in one write transaction (a crash rolls back to the intact old index;
+  re-running is always the cure) and holds the relation's write lock for the
+  duration — a maintenance operation, not an online one. Nothing auto-invokes
+  it. A relation with no HNSW/FTS/LSH index is a loud no-op, not an error, so it
+  stays scriptable across a set of relations.
+
+  Each index is rebuilt against its **own stored manifest**, not a reconstructed
+  config — which matters for LSH, whose manifest keeps the derived band geometry
+  (`n_bands`, `n_rows_in_band`, `perms`) but not the weights that produced it. A
+  drop-and-recreate would have silently recomputed that geometry from defaults
+  and returned an index with a different recall profile than the one you asked
+  for. *(The HNSW verify/repair pass for dangling keys — upstream #232 — is a
+  separate, later piece of work; a full rebuild already cures that database.)*
+
 ### Fixed
 
 - **`MultiTransaction::commit()` reported success for a failed commit.** It
