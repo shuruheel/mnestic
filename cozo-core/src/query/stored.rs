@@ -355,8 +355,22 @@ impl<'a> SessionTx<'a> {
                 if let Some(existing) = self.store_tx.get(&key, false)? {
                     let mut tup = extracted[0..relation_store.metadata.keys.len()].to_vec();
                     extend_tuple_from_v(&mut tup, &existing);
-                    if has_indices && extracted != tup {
-                        self.update_in_index(relation_store, &extracted, &tup)?;
+                    // mnestic fork (0.12.1): posting deletion must NOT be gated on
+                    // `has_indices` — that flag means *plain B-tree secondary
+                    // indexes only*. A relation carrying only an FTS index therefore
+                    // never deleted the old document's postings on a `:put` update:
+                    // terms it no longer contains kept matching (ghost hits), the
+                    // index grew without bound, and the BM25 df/avgdl statistics
+                    // skewed. (`rm` at the bottom of this file and the `update` op
+                    // above both always deleted; only `:put`-over-an-existing-key
+                    // leaked.) `del_in_fts`/`del_in_lsh` iterate the relation's own
+                    // index maps and are no-ops when those are empty, so each
+                    // concern gates itself. The value-unchanged skip stays: an
+                    // identical tuple derives identical postings.
+                    if extracted != tup {
+                        if has_indices {
+                            self.update_in_index(relation_store, &extracted, &tup)?;
+                        }
                         self.del_in_fts(relation_store, &mut stack, &fts_lsh_processors, &tup)?;
                         self.del_in_lsh(relation_store, &tup)?;
                     }

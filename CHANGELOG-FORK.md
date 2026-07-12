@@ -9,7 +9,29 @@ Post-0.12.0 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
-_Nothing yet._
+### Fixed
+
+- **FTS postings leaked when a row was updated in place** (inherited from
+  upstream; affects every release through 0.12.0). Deletion of a row's old
+  postings was gated on `has_indices` — which counts only *plain B-tree secondary
+  indexes*. A relation carrying **only** an FTS index therefore never deleted the
+  old document's postings on a `:put` over an existing key: terms the document no
+  longer contained kept matching it, the index grew without bound, and the BM25
+  `df`/`avgdl` statistics drifted (measured: a **55% score error** on a
+  two-document corpus). `:rm` and the `update` op were unaffected — they always
+  deleted correctly. `query/stored.rs`; guarded by
+  `cozo-core/tests/fts_lsh_update_leak.rs`.
+
+  **The fix stops new leakage; it does not evict postings already written.** If
+  you have an FTS-only relation that has ever been updated in place, its index is
+  affected today — rebuild it with `::reindex` (this release). *(Historical
+  workaround, for the record: giving the relation any plain secondary index
+  re-armed the correct deletion path.)*
+
+  **LSH does not leak**, despite sitting behind the same gate: its write path is
+  self-cleaning (it removes the row's old bands before writing new ones), so the
+  gated deletion was only ever redundant for LSH. We first reported this as an
+  "FTS/LSH" leak and are correcting that here.
 
 ## 0.12.0 — 2026-07-11
 
