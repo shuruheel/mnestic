@@ -9,7 +9,119 @@ Post-0.12.0 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
-_Nothing yet._
+### Added
+
+- **`::reindex <relation>`** — rebuild a relation's HNSW / FTS / LSH indexes in
+  place, from the index configuration the database already stores. It is the
+  repair path for three separate problems that all reduced to one missing
+  operation:
+  - **the FTS posting leak fixed below** — the write-path fix stops new leakage
+    but cannot evict postings already written, so every database that updated
+    rows in place on an FTS-only relation needs this once;
+  - **the bulk-load paths** (`import_relations`, `import_from_backup`), which do
+    not maintain these indexes and used to tell you to "drop + recreate" — i.e.
+    to reconstruct the original `::hnsw`/`::fts` creation script (extractor,
+    tokenizer, filters, `ef_construction`, `m_neighbours`…) by hand from
+    `::indices` output;
+  - any index whose contents have drifted from its base relation.
+
+  It runs in one write transaction (a crash rolls back to the intact old index;
+  re-running is always the cure) and holds the relation's write lock for the
+  duration — a maintenance operation, not an online one. Nothing auto-invokes
+  it. A relation with no HNSW/FTS/LSH index is a loud no-op, not an error, so it
+  stays scriptable across a set of relations.
+
+  Each index is rebuilt against its **own stored manifest**, not a reconstructed
+  config — which matters for LSH, whose manifest keeps the derived band geometry
+  (`n_bands`, `n_rows_in_band`, `perms`) but not the weights that produced it. A
+  drop-and-recreate would have silently recomputed that geometry from defaults
+  and returned an index with a different recall profile than the one you asked
+  for. *(The HNSW verify/repair pass for dangling keys — upstream #232 — is a
+  separate, later piece of work; a full rebuild already cures that database.)*
+
+### Fixed
+
+- **`MultiTransaction::commit()` reported success for a failed commit.** It
+  matched `Ok(_) => Ok(())` on the channel receive, discarding the
+  `Result<NamedRows>` the transaction thread sends back — so a commit that
+  errored returned `Ok(())` and the caller believed its data was durable. The
+  HTTP server's `/transact` endpoint sat directly on top of this and answered
+  `200 {"ok": true}` for failed transactions. `abort()` had the same shape.
+  (`run_script` on the same type always propagated correctly.) `cozo-core/src/lib.rs`.
+
+- **Change callbacks fired after a *failed* commit** (inherited from upstream).
+  In the multi-statement transaction path (`run_multi_transaction`),
+  `send_callbacks` ran unconditionally after the commit, so subscribers received
+  `Put`/`Rm` events for rows that were never committed — anything syncing off the
+  change feed (a search mirror, an audit log, a cache) could silently diverge
+  from the database. `register_callback`'s own contract is "when the requested
+  relation are *successfully committed*"; the single-statement path always
+  honoured it. Callbacks now dispatch only on a successful commit; the abort path
+  was already correct. `runtime/db.rs`; guarded by
+  `cozo-core/tests/callback_commit_contract.rs`.
+
+  *Known limitation, unchanged:* `send_callbacks` still dispatches synchronously
+  on the committing thread over bounded channels, so a slow subscriber can stall
+  writers.
+
+- **The `newrocksdb` backend silently lost concurrent updates** (inherited from
+  upstream; `--features storage-new-rocksdb`, non-default). It ran an
+  `OptimisticTransactionDB` but discarded `for_update` on `get`/`exists` and the
+  `write` flag on `transact`, so conflict validation never armed: two
+  transactions could read a key, both write it, and **both commit** — one
+  acknowledged write silently vanished. `for_update` reads now register the key
+  via `get_for_update`, and writing transactions take a snapshot (matching the
+  pessimistic RocksDB backend). `storage/newrocks.rs`; guarded by
+  `cozo-core/tests/backend_transaction_contract.rs`, which reproduces the lost
+  update against the unfixed backend.
+
+- **The `sled` backend's `del()` never deleted** (upstream **#306**;
+  `--features storage-sled`, non-default). It wrote `PUT_MARKER` where
+  `DEL_MARKER` belonged, so a delete inside a transaction was recorded in the
+  changes overlay as a put-with-empty-value: `exists` kept answering `true` and
+  the commit re-inserted the key. Thanks to the issue reporter, who diagnosed
+  this precisely — and wrote a fix and tests upstream never merged.
+  `storage/sled.rs`. *(The issue's second half — `range_skip_scan_tuple` is
+  unimplemented, so time travel does not work on sled — remains open.)*
+
+  Both secondary backends now run their transaction-contract suite in CI; until
+  0.12.1 nothing in CI compiled them.
+
+- **`import_from_backup` silently stranded HNSW/FTS/LSH indexes** (inherited
+  from upstream). It guarded only against *B-tree* indexes and then raw-put the
+  source's KV rows straight into the store, so an operator restored a backup and
+  hybrid retrieval quietly returned nothing for the restored rows — with no
+  signal anywhere. It now warns, as its sibling `import_relations` already did.
+  Neither path maintains those indexes (that is what makes bulk loading fast);
+  the bug was doing it silently. Both warnings now point at **`::reindex`**
+  instead of telling the user to drop and recreate the index by hand — which
+  meant reconstructing the original `::hnsw`/`::fts` creation script (extractor,
+  tokenizer, filters, `ef_construction`, `m_neighbours`…) from `::indices`
+  output. The two call sites now share one helper so they cannot drift apart
+  again. `runtime/db.rs`; guarded by
+  `cozo-core/tests/import_index_staleness.rs`.
+
+- **FTS postings leaked when a row was updated in place** (inherited from
+  upstream; affects every release through 0.12.0). Deletion of a row's old
+  postings was gated on `has_indices` — which counts only *plain B-tree secondary
+  indexes*. A relation carrying **only** an FTS index therefore never deleted the
+  old document's postings on a `:put` over an existing key: terms the document no
+  longer contained kept matching it, the index grew without bound, and the BM25
+  `df`/`avgdl` statistics drifted (measured: a **55% score error** on a
+  two-document corpus). `:rm` and the `update` op were unaffected — they always
+  deleted correctly. `query/stored.rs`; guarded by
+  `cozo-core/tests/fts_lsh_update_leak.rs`.
+
+  **The fix stops new leakage; it does not evict postings already written.** If
+  you have an FTS-only relation that has ever been updated in place, its index is
+  affected today — rebuild it with `::reindex` (this release). *(Historical
+  workaround, for the record: giving the relation any plain secondary index
+  re-armed the correct deletion path.)*
+
+  **LSH does not leak**, despite sitting behind the same gate: its write path is
+  self-cleaning (it removes the row's old bands before writing new ones), so the
+  gated deletion was only ever redundant for LSH. We first reported this as an
+  "FTS/LSH" leak and are correcting that here.
 
 ## 0.12.0 — 2026-07-11
 

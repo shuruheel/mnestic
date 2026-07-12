@@ -387,6 +387,25 @@ impl DbInstance {
             DbInstance::TiKv(db) => db.set_default_query_timeout(secs),
         }
     }
+    /// Test-only dispatcher. See [`crate::Db::fail_next_commit_for_tests`].
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn fail_next_commit_for_tests(&self) {
+        match self {
+            DbInstance::Mem(db) => db.fail_next_commit_for_tests(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.fail_next_commit_for_tests(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.fail_next_commit_for_tests(),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.fail_next_commit_for_tests(),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.fail_next_commit_for_tests(),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.fail_next_commit_for_tests(),
+        }
+    }
+
     /// The current Db-wide default per-query budget in seconds, or `None`
     /// (mnestic fork, query budget). See [`crate::Db::default_query_timeout`].
     pub fn default_query_timeout(&self) -> Option<f64> {
@@ -983,13 +1002,19 @@ impl MultiTransaction {
             Err(err) => bail!(err),
         }
     }
-    /// Commits the multi-transaction
+    /// Commits the multi-transaction.
+    ///
+    /// Returns the commit's own error if it failed — the caller must not treat a
+    /// failed commit as durable. (mnestic fork, 0.12.1: this used to match
+    /// `Ok(_) => Ok(())`, which discarded the `Result<NamedRows>` the
+    /// transaction thread sends back and so reported **success for a failed
+    /// commit**. `run_script` above has always propagated it correctly.)
     pub fn commit(&self) -> Result<()> {
         if let Err(err) = self.sender.send(TransactionPayload::Commit) {
             bail!(err);
         }
         match self.receiver.recv() {
-            Ok(_) => Ok(()),
+            Ok(r) => r.map(|_| ()),
             Err(err) => bail!(err),
         }
     }
@@ -999,7 +1024,7 @@ impl MultiTransaction {
             bail!(err);
         }
         match self.receiver.recv() {
-            Ok(_) => Ok(()),
+            Ok(r) => r.map(|_| ()),
             Err(err) => bail!(err),
         }
     }

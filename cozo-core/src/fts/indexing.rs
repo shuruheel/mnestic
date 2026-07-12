@@ -461,9 +461,12 @@ impl<'a> SessionTx<'a> {
         // so a seed-on-absent scan sees the pre-insert corpus and we add the new
         // document exactly once. `count == 0` (no tokens ⇒ no postings) is skipped,
         // matching the scan, which only counts documents that have postings.
-        // (The normal update path is del-then-put, so the old document is already
-        // subtracted; an FTS-only relation with no secondary index does not call
-        // `del` on update and can drift, mirroring upstream's posting leak there.)
+        // Every update path is del-then-put, so the old document is always
+        // subtracted before this runs. (Through 0.12.0 that was false for an
+        // FTS-only relation: `:put`-over-an-existing-key skipped the delete when
+        // the relation had no plain secondary index, so postings leaked and the
+        // counter drifted. Fixed in 0.12.1 — `query/stored.rs`, the `extracted !=
+        // tup` block; guarded by `tests/fts_lsh_update_leak.rs`.)
         if count > 0 {
             self.bump_fts_doc_stats(idx_handle, count, 1)?;
         }

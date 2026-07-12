@@ -23,10 +23,27 @@ jobs:
         run: cargo build -p mnestic --verbose
       - name: Test (lib + integration, incl. fork regressions)
         run: cargo test -p mnestic --verbose
-      # The `test-hooks` commit fence is only reachable from outside the crate
-      # when its feature is on, so the default job above never compiles it.
-      - name: Test (test-hooks commit fence)
-        run: cargo test -p mnestic --features test-hooks --test commit_fence --verbose
+      # `test-hooks` suites are `#![cfg(feature = "test-hooks")]`, so the default
+      # job above compiles them to zero tests. They must be named explicitly here
+      # or they silently never run.
+      - name: Test (test-hooks suites)
+        run: cargo test -p mnestic --features test-hooks --test commit_fence --test callback_commit_contract --verbose
+
+  # The secondary backends are non-default features, so nothing above compiles
+  # them. Both carried a silent transaction-contract bug until 0.12.1 (sled's
+  # `del()` never deleted — upstream #306; newrocksdb lost concurrent updates),
+  # and a backend nobody builds in CI is a backend nobody notices breaking.
+  secondary-backends:
+    name: test (sled + newrocksdb transaction contract)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (sled)
+        run: cargo test -p mnestic --features storage-sled --test backend_transaction_contract --verbose
+      - name: Test (newrocksdb)
+        run: cargo test -p mnestic --features storage-new-rocksdb --test backend_transaction_contract --verbose
 
   rocksdb:
     name: build (storage-rocksdb, C++ bridge)

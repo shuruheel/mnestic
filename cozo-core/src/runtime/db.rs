@@ -190,6 +190,14 @@ pub struct Db<S> {
     /// `SessionTx`, which captures a watermark off it before its storage
     /// transaction pins and reports its dirty relations back at commit.
     pub(crate) graph_projections: Arc<ProjectionCache>,
+    /// Test-only: make the next multi-transaction commit fail without attempting
+    /// it (mnestic fork, 0.12.1). Commit failures are real but rare in
+    /// production — an I/O error, a backend conflict — and there is no portable
+    /// way to provoke one across `mem`/`sqlite`/`rocksdb`. The change-feed
+    /// contract ("callbacks fire only for rows that committed") needs one, so
+    /// this switch injects it. Set via [`Db::fail_next_commit_for_tests`].
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_next_commit: Arc<AtomicBool>,
 }
 
 impl<S> Debug for Db<S> {
@@ -386,6 +394,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             // line to `AtomicBool::new(true)` to make the rewrite default-on.
             enable_factorize: Arc::new(AtomicBool::new(false)),
             graph_projections: Default::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_next_commit: Arc::new(AtomicBool::new(false)),
         };
         Ok(ret)
     }
@@ -437,9 +447,23 @@ impl<'s, S: Storage<'s>> Db<S> {
                         }
                     }
 
-                    let _ = results.send(tx.commit_tx().map(|_| NamedRows::default()));
+                    // mnestic fork (0.12.1): dispatch the change feed only when
+                    // the commit actually succeeded. This used to call
+                    // `send_callbacks` unconditionally after the commit, so a
+                    // failed commit still published `Put`/`Rm` events for rows
+                    // that were never durable — and anything syncing off the feed
+                    // (a search mirror, an audit log, a cache) would silently
+                    // diverge from the database. `register_callback`'s own
+                    // contract says "when the requested relation are
+                    // *successfully committed*", and the single-statement path
+                    // (`execute_single`) has always got this right by committing
+                    // with `?` before it dispatches. The `Abort` arm below is
+                    // likewise correct — it breaks without dispatching.
+                    let commit_result = self.commit_multi_tx(&mut tx);
+                    let committed = commit_result.is_ok();
+                    let _ = results.send(commit_result.map(|_| NamedRows::default()));
                     #[cfg(not(target_arch = "wasm32"))]
-                    if !callback_collector.is_empty() {
+                    if committed && !callback_collector.is_empty() {
                         self.send_callbacks(callback_collector)
                     }
 
@@ -648,6 +672,35 @@ impl<'s, S: Storage<'s>> Db<S> {
         deadline
     }
 
+    /// Commit a multi-transaction. Wraps `SessionTx::commit_tx` so the
+    /// `test-hooks` failure switch has one place to live (mnestic fork, 0.12.1;
+    /// see [`Db::fail_next_commit_for_tests`]). The injected failure returns
+    /// before the storage commit is attempted, so the transaction rolls back —
+    /// which is exactly the state a genuine commit failure leaves behind, and
+    /// the state the change-feed contract is about.
+    fn commit_multi_tx(&'s self, tx: &mut SessionTx<'_>) -> Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.fail_next_commit.swap(false, Ordering::SeqCst) {
+            miette::bail!("injected commit failure (test-hooks)");
+        }
+        tx.commit_tx()
+    }
+
+    /// Test-only: make the next multi-transaction commit fail (mnestic fork,
+    /// 0.12.1). One-shot — it clears itself when it fires.
+    ///
+    /// This is **not** a supported API: it is compiled only under the internal
+    /// `test-hooks` feature. It exists because the change-feed contract
+    /// ("subscribers receive events only for rows that actually committed")
+    /// cannot otherwise be tested — a real commit failure needs an I/O error or
+    /// a backend-specific conflict, and there is no portable way to provoke one
+    /// across `mem` / `sqlite` / `rocksdb`.
+    #[cfg(feature = "test-hooks")]
+    #[doc(hidden)]
+    pub fn fail_next_commit_for_tests(&self) {
+        self.fail_next_commit.store(true, Ordering::SeqCst);
+    }
+
     /// Set a Db-wide default per-query wall-clock budget in seconds (mnestic
     /// fork, query budget). `None` (or a non-positive value) disables it. The
     /// default is folded (via `min`) into every subsequent script's effective
@@ -743,7 +796,9 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// Import relations. The argument `data` accepts data in the shape of
     /// what was returned by [Self::export_relations].
     /// The target stored relations must already exist in the database.
-    /// Any associated indices will be updated.
+    /// Any associated B-tree indices will be updated; HNSW/FTS/LSH indices are
+    /// **not** maintained — see the warning emitted per relation, and rebuild
+    /// them with `::reindex`.
     ///
     /// Note that triggers and callbacks are _not_ run for the relations, if any exists.
     /// If you need to activate triggers or callbacks, use queries with parameters.
@@ -789,28 +844,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // to vector/text/LSH search until the index is rebuilt. Warn
             // loudly rather than corrupt-silently; a hard error would break
             // legitimate import-then-reindex callers. (mnestic fork, hardening)
-            if !handle.hnsw_indices.is_empty()
-                || !handle.fts_indices.is_empty()
-                || !handle.lsh_indices.is_empty()
-            {
-                let mut kinds = vec![];
-                if !handle.hnsw_indices.is_empty() {
-                    kinds.push("HNSW");
-                }
-                if !handle.fts_indices.is_empty() {
-                    kinds.push("FTS");
-                }
-                if !handle.lsh_indices.is_empty() {
-                    kinds.push("LSH");
-                }
-                log::warn!(
-                    "bulk import into relation '{}' does not maintain its {} index(es); \
-                     rebuild them after the import (drop + recreate) or load via :put — \
-                     imported rows are otherwise invisible to those indices",
-                    relation,
-                    kinds.join("/")
-                );
-            }
+            warn_if_indexes_stranded(&handle, relation, "bulk import into");
 
             if handle.access_level < AccessLevel::Protected {
                 bail!(InsufficientAccessLevel(
@@ -1089,6 +1123,17 @@ impl<'s, S: Storage<'s>> Db<S> {
 
                     bail!(RestoreIntoRelWithIndices(dst_handle.name.to_string()))
                 }
+
+                // mnestic fork (0.12.1): the B-tree bail above is the only guard
+                // this path had. It then raw-puts the source's KV rows straight
+                // into the store, so a relation carrying HNSW/FTS/LSH indexes had
+                // its rows restored underneath them with **zero signal** — the
+                // operator restores a backup and hybrid retrieval silently returns
+                // nothing for the restored rows. `import_relations` has warned
+                // about exactly this since the fork's hardening pass; backup
+                // restore never did. Same warning, one shared helper, so they
+                // cannot drift apart again.
+                warn_if_indexes_stranded(&dst_handle, relation, "backup restore into");
 
                 if dst_handle.access_level < AccessLevel::Protected {
                     bail!(InsufficientAccessLevel(
@@ -2505,6 +2550,43 @@ impl<'s, S: Storage<'s>> Db<S> {
                     vec![vec![DataValue::from(OK_STR)]],
                 ))
             }
+            SysOp::Reindex(rel_name) => {
+                if read_only {
+                    bail!("Cannot reindex a relation in read-only mode");
+                }
+                // The relation WRITE lock, held for the whole rebuild: every
+                // index row is deleted and re-derived, so a concurrent reader
+                // would otherwise see a half-built index. On a large relation
+                // this blocks that relation for the duration — `::reindex` is a
+                // maintenance operation, and its docs say so. (It is never
+                // auto-invoked: the import paths point at it, they do not run
+                // it.)
+                let lock = self
+                    .obtain_relation_locks(iter::once(&rel_name.name))
+                    .pop()
+                    .unwrap();
+                let _guard = lock.write().unwrap();
+
+                let handle = tx.get_relation(rel_name, true)?;
+                // Graph-projection dirty-set hook: the index rows below are
+                // rewritten under the projection cache's nose.
+                tx.mark_dirty(&handle);
+
+                let reports = tx.reindex_relation(&rel_name.name)?;
+                if reports.is_empty() {
+                    // Not an error: this keeps `::reindex` scriptable across a
+                    // set of relations without the caller having to know which
+                    // of them carry search indexes.
+                    return Ok(NamedRows::new(
+                        vec![STATUS_STR.to_string()],
+                        vec![vec![DataValue::from(
+                            "no HNSW/FTS/LSH index on this relation — nothing to rebuild",
+                        )]],
+                    ));
+                }
+                let (headers, rows) = crate::runtime::reindex::reindex_rows(reports);
+                Ok(NamedRows::new(headers, rows))
+            }
             SysOp::RepairCorrupt(rel_name) => {
                 if read_only {
                     bail!("Cannot repair relation in read-only mode");
@@ -3277,6 +3359,45 @@ pub struct Poison {
 }
 
 /// A monotonic clock reading for a wall-clock query budget, or `None` where no
+/// Warn when a bulk-load path is about to write rows underneath HNSW/FTS/LSH
+/// indexes it does not maintain (mnestic fork, hardening).
+///
+/// Both bulk paths — `import_relations` and `import_from_backup` — bypass the
+/// per-row `:put` path that maintains those indexes, so the imported rows are
+/// silently invisible to vector/text/LSH search until the index is rebuilt.
+/// `import_relations` has warned since the fork's early hardening pass;
+/// `import_from_backup` never did (0.12.1 fix), which is why this lives in one
+/// place: the two must not drift again. B-tree secondary indexes are unaffected
+/// — both paths maintain those.
+///
+/// A warning rather than a hard error, deliberately: import-then-rebuild is a
+/// legitimate and common flow, and refusing it would break the very callers who
+/// are doing the right thing. `verb` names the operation for the message
+/// ("bulk import into", "backup restore into").
+fn warn_if_indexes_stranded(handle: &RelationHandle, relation: &str, verb: &str) {
+    let mut kinds = vec![];
+    if !handle.hnsw_indices.is_empty() {
+        kinds.push("HNSW");
+    }
+    if !handle.fts_indices.is_empty() {
+        kinds.push("FTS");
+    }
+    if !handle.lsh_indices.is_empty() {
+        kinds.push("LSH");
+    }
+    if kinds.is_empty() {
+        return;
+    }
+    log::warn!(
+        "{} relation '{}' does not maintain its {} index(es); the imported rows are \
+         invisible to those indices until you rebuild them — run `::reindex {}`",
+        verb,
+        relation,
+        kinds.join("/"),
+        relation
+    );
+}
+
 /// monotonic clock is available: wasm has no `std` monotonic `Instant`, so on
 /// that target queries simply carry no time budget rather than panicking on
 /// `Instant::now()` (mnestic fork, query budget).
