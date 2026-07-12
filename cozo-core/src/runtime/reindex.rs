@@ -182,7 +182,7 @@ impl SessionTx<'_> {
         // a repaired single-document index scored 0.349 against a clean index's
         // 0.288 without this line. `tests/reindex.rs::reindex_evicts_ghost_postings`
         // pins it (and needs documents of *unequal* length to see it at all).
-        for (_, (idx_handle, _)) in rel_handle.fts_indices.iter() {
+        for (idx_handle, _) in rel_handle.fts_indices.values() {
             self.rebuild_fts_doc_stats(idx_handle)?;
         }
 
