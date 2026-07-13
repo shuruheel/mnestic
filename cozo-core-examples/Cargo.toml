@@ -4,6 +4,6 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-cozo = { package = "mnestic", version = "0.12.1", path = "../cozo-core", default-features = false, features = [
+cozo = { package = "mnestic", version = "0.12.2", path = "../cozo-core", default-features = false, features = [
     "rayon",
 ] }

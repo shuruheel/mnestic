@@ -520,6 +520,20 @@ impl Num {
             }
         }
     }
+    /// Integer with **no float coercion**: `Some` only for [`Num::Int`].
+    ///
+    /// Use this, never [`Num::get_int`], wherever the integer carries a *unit*.
+    /// Validity and transaction-time stamps are microseconds since the epoch,
+    /// while `now()` and `parse_timestamp()` return float *seconds* — so
+    /// coercing an integral float there silently denominates the value 1e6 too
+    /// small and lands in 1970, before any row was asserted. `get_int` cannot
+    /// tell the two apart; refusing the float is the only way to say so.
+    pub(crate) fn get_int_strict(&self) -> Option<i64> {
+        match self {
+            Num::Int(i) => Some(*i),
+            Num::Float(_) => None,
+        }
+    }
     pub(crate) fn get_float(&self) -> f64 {
         match self {
             Num::Int(i) => *i as f64,
@@ -674,6 +688,13 @@ impl DataValue {
     pub fn get_int(&self) -> Option<i64> {
         match self {
             DataValue::Num(n) => n.get_int(),
+            _ => None,
+        }
+    }
+    /// Integer with no float coercion — see [`Num::get_int_strict`].
+    pub(crate) fn get_int_strict(&self) -> Option<i64> {
+        match self {
+            DataValue::Num(n) => n.get_int_strict(),
             _ => None,
         }
     }

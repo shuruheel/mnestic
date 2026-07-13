@@ -74,50 +74,55 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.12.1
+## New in 0.12.2
 
-**A correctness release: six bugs inherited from upstream Cozo — none a
-regression the fork introduced, all of them latent since before the fork point.**
-Two are silent failures a caller cannot detect from the outside:
+**A float in a validity position was silently read — and written — one million
+times too small, landing in 1970.**
 
-- **`MultiTransaction::commit()` reported success for a commit that failed.** It
-  discarded the `Result` the transaction thread sends back, returning `Ok(())`
-  even on error — and `cozo-bin`'s HTTP `/transact` endpoint sat directly on top
-  of it, answering `200 {"ok": true}` for transactions that never committed.
-  Change callbacks fired for those failed commits too, so anything syncing off
-  the change feed could silently diverge from the database.
-- **Full-text postings leaked when a row was updated in place.** Deletion of a
-  row's old postings was gated on the relation *also* carrying a plain B-tree
-  index, so a relation with **only** an FTS index never deleted them on a `:put`
-  over an existing key: terms the document no longer contained kept matching it,
-  the index grew without bound, and BM25 statistics drifted — a measured **55%
-  score error** on a two-document corpus. Affects every release through 0.12.0.
+Validity and transaction-time stamps are integer *microseconds* since the epoch.
+`now()` and `parse_timestamp()` return float *seconds*. The engine coerced one
+into the other without a word, so:
 
-**Upgrade action, if you use full-text search.** The write-path fix stops new
-leakage but **cannot evict postings that are already written**. An FTS-only
-relation that has ever been updated in place is affected *today*, and upgrading
-alone does not repair it. Rebuild it once with the new `::reindex`:
+- `@ parse_timestamp('2024-06-01T00:00:00Z')` returned **zero rows and no error**
+  — the misread lands *before* any row was asserted, which is indistinguishable
+  from "no data yet".
+- A `:put` of `[parse_timestamp(…), true]` into a `Validity` column **succeeded**
+  and stamped the row at 1970. The row reads back correctly on an ordinary query;
+  the damage is visible only under time travel — precisely where a bitemporal
+  database is meant to be trustworthy.
 
+All four affected paths — the `@` selector, `@ (tt: …)` / `:as_of`, the
+`validity(...)` constructor, and the write path — now reject a float and say what
+to write instead.
+
+**Upgrade action — and note carefully *where* it bites.** The schema still compiles; it is
+the next **write** that now fails. The idiom `Validity default [floor(now()), true]` — and any
+spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`, or
+`parse_timestamp(...)` on a whole second — has been silently writing 1970 into your valid-time
+axis. It now errors on write. (Bare `[now(), true]` already errored before this release, but
+only by luck: `now()` returns a *fractional* float, and the coercion only ever accepted
+whole-numbered ones.) Write instead:
 ```
-::reindex my_relation
+last_seen: Validity default [to_int(now() * 1000000), true]
 ```
 
-`::reindex` rebuilds a relation's HNSW / FTS / LSH indexes in place, in one write
-transaction, from each index's **own stored manifest** rather than a
-reconstructed config — which matters for LSH, whose manifest keeps the derived
-band geometry but not the weights that produced it, so a drop-and-recreate would
-hand back an index with a different recall profile than the one you asked for. It
-is also the repair path for the bulk-load paths, which do not maintain these
-indexes: `import_from_backup` used to strand them in silence and now warns, as
-`import_relations` already did, and both warnings point at `::reindex` instead of
-telling you to reconstruct the original `::hnsw`/`::fts` creation script by hand.
+We found exactly one caller of the broken idiom anywhere, and it was **our own
+HNSW test**, inherited from upstream, which had been stamping every row it wrote
+at 1970 for as long as the test existed. It never asserted on the value, so it
+never noticed. If it was in our test suite, it is in someone's schema.
 
-Also fixed, in the two non-default storage backends: `newrocksdb` never armed its
-optimistic conflict detection (two transactions could read a key, both write it,
-and both commit — one acknowledged write silently lost), and `sled`'s `del()`
-never deleted (upstream #306). Both now run a transaction-contract suite in CI.
+**What this deliberately does *not* fix.** An integer in *seconds* (`@ 1704067200`)
+is still accepted and still silently returns nothing. Valid time is an abstract,
+user-settable logical clock — the tutorial itself queries `@ 2019` — so no
+magnitude check can distinguish a wrong-unit timestamp from a legitimate small
+one, and any such check would be wrong. The real answer is a typed conversion,
+which lands with the datetime library. Until then: integer microseconds is the
+low-level form, and the string forms (`@ '2024-06-01'`,
+`@ '2024-06-01T12:00:00Z'`) are the safe ones.
 
-Full detail, including the FTS entry's result-change note, is in
+Public Rust API is byte-identical to 0.12.1.
+
+Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
 
@@ -128,7 +133,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.12.1"
+mnestic = "0.12.2"
 ```
 
 ```rust

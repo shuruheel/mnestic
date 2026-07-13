@@ -359,6 +359,22 @@ impl NullableColType {
                 #[diagnostic(code(eval::invalid_validity))]
                 struct InvalidValidity(DataValue);
 
+                // Split out from InvalidValidity on purpose: "cannot be coerced" tells a
+                // caller nothing about the *unit*, and the unit is the entire bug.
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("a Validity column stores an integer timestamp, got the float {0}")]
+                #[diagnostic(code(eval::float_validity))]
+                #[diagnostic(help(
+                    "Validity timestamps are integer MICROSECONDS since the Unix epoch. A \
+                     float here is almost always float SECONDS from now()/parse_timestamp(), \
+                     and would have been stored about 1,000,000x too small — a permanently \
+                     wrong valid time (1970), invisible to an ordinary query and visible only \
+                     under time travel.\n\
+                     Write [to_int(<expr> * 1000000), true], or use the string forms \
+                     '2024-06-01T12:00:00Z' / 'ASSERT' / 'RETRACT'."
+                ))]
+                struct FloatValidity(f64);
+
                 match data {
                     vld @ DataValue::Validity(_) => vld,
                     DataValue::Str(s) => match &s as &str {
@@ -392,8 +408,18 @@ impl NullableColType {
                         }
                     },
                     DataValue::List(l) => {
+                        // The WRITE path. `get_int` here used to coerce an integral float
+                        // (float SECONDS from now()/parse_timestamp()) into a microsecond
+                        // stamp 1e6 too small, permanently stamping the row at 1970 — a
+                        // corruption invisible to an ordinary read and visible only under
+                        // time travel. Reject the float and say why.
                         if l.len() == 2 {
-                            let o_ts = l[0].get_int();
+                            if let DataValue::Num(n) = &l[0] {
+                                if n.get_int_strict().is_none() {
+                                    bail!(FloatValidity(n.get_float()));
+                                }
+                            }
+                            let o_ts = l[0].get_int_strict();
                             let o_is_assert = l[1].get_bool();
                             if let (Some(ts), Some(is_assert)) = (o_ts, o_is_assert) {
                                 if ts == i64::MAX || ts == i64::MIN {

@@ -5,11 +5,61 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.12.1 work not yet cut to a release. Keep this section current as
+Post-0.12.2 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
 _Nothing yet._
+
+## 0.12.2 — 2026-07-13
+
+### Fixed — the validity float channel (a silent temporal corruption)
+
+**A float in a validity or transaction-time position was silently denominated one million
+times too small, landing in 1970.** Validity timestamps are integer *microseconds* since the
+epoch, while `now()` and `parse_timestamp()` return float *seconds* — and `Num::get_int`
+accepted any integral float, coercing one into the other without a word. It is one bug,
+reachable from four places: the `@` valid-time selector, the `@ (tt: …)` / `:as_of`
+transaction-time selector, the `validity(...)` constructor, and — worst — the write path.
+
+The write path is why this is a correctness release and not an ergonomics one. A `:put` of
+`[parse_timestamp('2024-06-01T00:00:00Z'), true]` into a `Validity` column **succeeded** and
+stamped the row at 1970-01-20. The row reads back correctly on an ordinary query; the damage
+is visible only under time travel, which is precisely where a bitemporal database is supposed
+to be trustworthy. On the read side the failure is equally quiet: `@ parse_timestamp(…)`
+returned **zero rows and no error**, because the misread always lands *before* any row was
+asserted — indistinguishable from "no data yet". `@ 1e300` was accepted too, saturating to
+`i64::MAX`, i.e. silently querying the end of time.
+
+All four sites now reject a float and say what to write instead
+(`parser::float_validity_spec`, `eval::float_validity`).
+
+**Upgrade action — and note carefully *where* it bites.** The schema still compiles; it
+is the next **write** that now fails. The idiom `Validity default [floor(now()), true]` —
+and any spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`,
+or `parse_timestamp(...)` on a whole second — has been silently writing 1970 into your
+valid-time axis. It now errors on write. (Bare `[now(), true]` already errored before this
+release, but only by luck: `now()` returns a *fractional* float, and the coercion only ever
+accepted whole-numbered ones.) Write instead:
+```
+last_seen: Validity default [to_int(now() * 1000000), true]
+```
+
+We found exactly one caller of the broken idiom anywhere: **our own HNSW test**, inherited
+from upstream, which had been stamping every row it wrote at 1970 for as long as the test has
+existed. It never asserted on the value, so it never noticed. If it was in our test suite, it
+is in someone's schema.
+
+**What this does *not* fix, deliberately.** An integer in *seconds* (`@ 1704067200`) is still
+accepted and still silently returns nothing. That is not an oversight: valid time is an
+abstract, user-settable logical clock — the tutorial itself queries `@ 2019` — so no
+magnitude check can tell a wrong-unit timestamp from a legitimate small one, and any such
+check would be wrong. The real answer is a *typed* path (`dt_to_validity` + `@ <Validity>`),
+which lands with the datetime library. Until then, integer microseconds remain the low-level
+form, and the string forms (`@ '2024-06-01'`, `@ '2024-06-01T12:00:00Z'`) remain the safe ones.
+
+Public Rust API is byte-identical. Guard: `cozo-core/tests/validity_units.rs` (14 tests; each
+of the four sites has a test that goes red when that site alone is reverted).
 
 ## 0.12.1 — 2026-07-12
 

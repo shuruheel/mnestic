@@ -105,7 +105,12 @@ def main() -> int:
           f"want {eng}, got {toml_version(ROOT/'cozo-lib-python/Cargo.toml')}")
 
     # workspace dependents pin the engine via the `package = "mnestic"` rename idiom.
-    for sub in ("cozo-bin", "cozo-core-examples"):
+    # cozo-lib-python is in `[workspace] exclude`, so a stale pin there is invisible to
+    # the workspace build AND to both version gates — it first fails inside
+    # python-publish.yml's maturin build, i.e. AFTER the py-v* tag is pushed (which also
+    # publishes langchain-mnestic and llama-index-vector-stores-mnestic). bump.py already
+    # rewrites it; this closes the hand-edit path.
+    for sub in ("cozo-bin", "cozo-core-examples", "cozo-lib-python"):
         req = norm(cargo_dep_req(ROOT / sub / "Cargo.toml", "mnestic"))
         check(req == eng, f"{sub} cozo-dep pin", f"want {eng}, got {req}")
 

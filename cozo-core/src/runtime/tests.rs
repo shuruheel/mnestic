@@ -1534,6 +1534,12 @@ fn crashy_imperative() {
 
 #[test]
 fn hnsw_index() {
+    // NOTE (mnestic 0.12.2): the inherited schema below used
+    // `last_accessed_at: Validity default [floor(now()), true]`. `floor(now())` is a float in
+    // SECONDS, and a Validity timestamp is an integer in MICROSECONDS — so every row this test
+    // wrote was stamped at 1970, ~1e6x too small. The test never asserted on the value, so it
+    // never noticed. It was the ONLY caller of the validity float channel in the entire tree,
+    // and it was in our own suite. See docs/plans/mnestic-0121-0130/design-0122.md.
     let db = DbInstance::default();
     db.run_default(
         r#"
@@ -1541,7 +1547,7 @@ fn hnsw_index() {
             belief_id: Uuid,
             character_id: Uuid,
             belief: String,
-            last_accessed_at: Validity default [floor(now()), true],
+            last_accessed_at: Validity default [to_int(now() * 1000000), true],
             =>
             details: String default "",
             parent_belief_id: Uuid? default null,

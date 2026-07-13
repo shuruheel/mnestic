@@ -2725,9 +2725,20 @@ pub(crate) fn op_ulid_timestamp(args: &[DataValue]) -> Result<DataValue> {
 
 define_op!(OP_VALIDITY, 1, true);
 pub(crate) fn op_validity(args: &[DataValue]) -> Result<DataValue> {
-    let ts = args[0]
-        .get_int()
-        .ok_or_else(|| miette!("'validity' expects an integer"))?;
+    // `get_int_strict`, not `get_int`: an integral float here is almost always float
+    // SECONDS from now()/parse_timestamp(), which get_int would silently coerce into a
+    // microsecond stamp 1e6 too small (1970). The message below already promised an
+    // integer; this is the line that finally means it.
+    let ts = args[0].get_int_strict().ok_or_else(|| match &args[0] {
+        DataValue::Num(n) => miette!(
+            "'validity' expects an integer number of MICROSECONDS since the Unix epoch, \
+             got the float {}. now() and parse_timestamp() return float SECONDS: write \
+             validity(to_int(<expr> * 1000000)). (round() returns a float and will not \
+             convert it.)",
+            n.get_float()
+        ),
+        _ => miette!("'validity' expects an integer"),
+    })?;
     let is_assert = if args.len() == 1 {
         true
     } else {

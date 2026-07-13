@@ -939,6 +939,45 @@ fn parse_rule_head_arg(
 #[diagnostic(code(parser::bad_validity_spec))]
 struct BadValiditySpecification(#[label] SourceSpan);
 
+/// Which temporal axis a rejected timestamp was destined for. Only used to make
+/// [`FloatValiditySpecification`] name the right one.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TemporalAxis {
+    Valid,
+    Transaction,
+}
+
+impl Display for TemporalAxis {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TemporalAxis::Valid => write!(f, "valid-time"),
+            TemporalAxis::Transaction => write!(f, "transaction-time"),
+        }
+    }
+}
+
+/// A float in a validity/tx-time selector is *always* a units bug, so it is worth
+/// its own diagnostic rather than folding into [`BadValiditySpecification`]: the
+/// float is nearly always `now()`/`parse_timestamp()` seconds, and the whole point
+/// of rejecting it is to say what to write instead.
+#[derive(Debug, Error, Diagnostic)]
+#[error("{1} timestamp must be an integer, got the float {2}")]
+#[diagnostic(code(parser::float_validity_spec))]
+#[diagnostic(help(
+    "{1} timestamps are integer MICROSECONDS since the Unix epoch. `now()` and \
+     `parse_timestamp()` return float SECONDS, so a float here would be read about \
+     1,000,000x too small — i.e. 1970, before your data exists.\n\
+     If the value is in seconds:      to_int(<expr> * 1000000)\n\
+     If it is already microseconds:   to_int(<expr>)\n\
+     Note that `round()` returns a float and will NOT convert it.\n\
+     Non-numeric forms also work: '2024-06-01', '2024-06-01T12:00:00Z', 'NOW', 'END'."
+))]
+struct FloatValiditySpecification(
+    #[label("this must be an integer, not a float")] SourceSpan,
+    TemporalAxis,
+    f64,
+);
+
 fn parse_fixed_rule(
     src: Pair<'_>,
     param_pool: &BTreeMap<String, DataValue>,
@@ -1208,7 +1247,9 @@ fn expr2tt_spec(expr: Expr) -> Result<ValidityTs> {
     let vld_span = expr.span();
     match expr.eval_to_const()? {
         DataValue::Num(n) => {
-            let microseconds = n.get_int().ok_or(BadValiditySpecification(vld_span))?;
+            let microseconds = n.get_int_strict().ok_or_else(|| {
+                FloatValiditySpecification(vld_span, TemporalAxis::Transaction, n.get_float())
+            })?;
             Ok(ValidityTs(Reverse(microseconds)))
         }
         DataValue::Str(s) => match &s as &str {
@@ -1272,7 +1313,9 @@ fn expr2vld_spec(expr: Expr, cur_vld: ValidityTs) -> Result<ValidityTs> {
     let vld_span = expr.span();
     match expr.eval_to_const()? {
         DataValue::Num(n) => {
-            let microseconds = n.get_int().ok_or(BadValiditySpecification(vld_span))?;
+            let microseconds = n.get_int_strict().ok_or_else(|| {
+                FloatValiditySpecification(vld_span, TemporalAxis::Valid, n.get_float())
+            })?;
             Ok(ValidityTs(Reverse(microseconds)))
         }
         DataValue::Str(s) => match &s as &str {

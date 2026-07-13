@@ -52,35 +52,36 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-**New in 0.12.1: a correctness release — with one action to take if you use
-full-text search.** Six bugs inherited from upstream Cozo are fixed; none is a
-regression the fork introduced. The one that needs something from you: **full-text
-postings leaked whenever a row was updated in place** on a relation carrying
-*only* an FTS index. Deletion of the old postings was gated on the relation also
-having a plain secondary index, so a `:put` over an existing key never removed
-them — terms the document no longer contained kept matching it, the index grew
-without bound, and BM25 scores drifted (a measured **55% score error** on a
-two-document corpus). This affects every release through 0.12.0.
+**New in 0.12.2: a float in a validity position was silently read — and written —
+one million times too small, landing in 1970.**
 
-**The fix stops new leakage but cannot evict postings already written.** If you
-have an FTS-only relation that has ever been updated in place, its index is
-affected today and upgrading alone will not repair it — rebuild it once with the
-new `::reindex`:
+Validity timestamps are integer *microseconds* since the epoch. `now()` and
+`parse_timestamp()` return float *seconds*. The engine coerced one into the other
+without a word, so a `:put` of `[parse_timestamp(…), true]` into a `Validity`
+column **succeeded** and stamped the row at 1970 — a row that reads back correctly
+on an ordinary query, with the damage visible only under time travel. On the read
+side, `@ parse_timestamp(…)` returned **zero rows and no error**.
 
-```python
-db.run_script("::reindex docs", {}, False)
+This is especially easy to hit from Python, because a Python `float` reaches the
+engine as a float: passing `time.time() * 1_000_000` as a bound parameter worked
+only by luck (whenever the product happened to land on a whole number) and is now
+a clear error. Pass an `int`.
+
+**Upgrade action — and note carefully *where* it bites.** The schema still compiles; it is
+the next **write** that now fails. The idiom `Validity default [floor(now()), true]` — and any
+spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`, or
+`parse_timestamp(...)` on a whole second — has been silently writing 1970 into your valid-time
+axis. It now errors on write. (Bare `[now(), true]` already errored before this release, but
+only by luck: `now()` returns a *fractional* float, and the coercion only ever accepted
+whole-numbered ones.) Write instead:
+```
+last_seen: Validity default [to_int(now() * 1000000), true]
 ```
 
-`::reindex` rebuilds a relation's HNSW / FTS / LSH indexes in place, in one write
-transaction, from the index configuration the database already stores. It is also
-the repair path after `import_relations` or a backup restore — neither maintains
-these indexes (that is what makes bulk loading fast), and both now warn and point
-at `::reindex` rather than leaving restored rows silently invisible to search.
-
-Also fixed, and visible from this binding: a **failed commit raised no exception**.
-`CozoDbMulTx.commit()` (from `db.multi_transact(True)`) returned normally even when
-the underlying commit had errored, so a caller believed its data was durable when
-it was not; change callbacks fired for those failed commits too. Both now behave.
+An integer in *seconds* (`@ 1704067200`) is still accepted and still silently
+returns nothing — valid time is an abstract logical clock (the tutorial queries
+`@ 2019`), so no magnitude check can tell a wrong unit from a legitimate small
+value. Use integer microseconds, or the string forms (`@ '2024-06-01'`).
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).
