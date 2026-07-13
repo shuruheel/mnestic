@@ -55,6 +55,59 @@ no configured block cache.
 Inherited from upstream Cozo; present since the options-file path was introduced. Requires a
 `mnestic-rocks` release, which must publish **before** the `mnestic` crate that pins it.
 
+### Fixed
+
+- **BM25 counted the wrong corpus, by re-scanning the whole relation on every
+  query.** Okapi BM25's IDF is `ln(1 + (N − df + 0.5) / (df + 0.5))`. `df` is
+  counted from the full-text index and `avgdl` is averaged over the full-text
+  index — but `N` was counted over the **base relation**, by a `range_count`
+  over its entire key range, **on every FTS query**. (The 0.8.4 work made
+  `avgdl` an O(1) read off a process-level doc-stats cache and left `N` behind;
+  the cache that would have served it sits ten lines away in the same file.)
+
+  Two consequences, both measured:
+
+  - **Wrong scores.** A row whose extracted text yields no tokens is a row in
+    the relation but *not a document in the collection being searched* — it
+    carries no postings and can never be a hit, yet it enlarged `N`. Rows loaded
+    by `import_relations` (which maintains no FTS index) did the same, at
+    arbitrary magnitude. Measured: **200 empty-body rows beside 3 real documents
+    moved a BM25 score from 0.1335 to 4.065 — a 30× error.** (The FTS posting
+    leak fixed in 0.12.1 was, for comparison, a 55% error.)
+  - **Ruinous latency at scale.** O(corpus) per query — and in practice
+    O(corpus *bytes*), because counting rows drags the relation's whole value
+    payload through the block cache. On the first-ever `medium`-scale run of
+    `hybrid-recall-bench` (RocksDB, real embeddings, 384-d): at 400k chunks the
+    **FTS leg cost 2,621 ms against 350 ms for the HNSW leg**, and hybrid p50
+    went from 150 ms at 40k chunks to **3,396 ms** at 400k (p99: 201 ms →
+    10,358 ms) while recall, ingest rate and disk all scaled linearly.
+
+  `N` now comes from the same doc-stats cache as `avgdl` — the number of
+  documents carrying at least one posting — so it is both correct and free:
+  the cache is already seeded and already maintained on every write. The
+  per-query scan is *deleted*, not memoized (`FtsCache` is now stateless).
+  `fts/indexing.rs`; `docs/specs/fts-corpus-stats.md`; guarded by
+  `cozo-core/tests/fts_corpus_stats.rs`.
+
+- **The FTS doc-count drifted upward on every no-op write.** A value-unchanged
+  `:put` skips the posting delete (an identical tuple derives identical
+  postings — `query/stored.rs`), but the put still bumped the doc-stats counter
+  `+1` with no matching `−1`. This was invisible for as long as
+  `avgdl = total / n` was the counter's only consumer — a re-put inflates both
+  terms together and the ratio barely moves — but BM25's `N` reads `n` directly.
+  Measured: **ten identical re-puts moved a score from 0.1335 to 2.27 (17×).**
+  `put_fts_index_item` now probes whether the document is already indexed before
+  counting it, mirroring the probe `del_fts_index_item` already performs.
+
+### Changed
+
+- **BM25 scores change on corpora containing rows that are not documents** —
+  rows whose extracted text is empty, whitespace-only or `Null`, and rows
+  bulk-loaded via `import_relations`. Their presence no longer inflates `N`, so
+  IDF (and therefore ranking, for multi-term queries) shifts. On a corpus in
+  which every row is a document — the ordinary case — scores are unchanged, and
+  the existing `bm25.rs` / `fts_avgdl.rs` suites pass byte-identically.
+
 ## 0.12.2 — 2026-07-13
 
 ### Fixed — the validity float channel (a silent temporal corruption)
