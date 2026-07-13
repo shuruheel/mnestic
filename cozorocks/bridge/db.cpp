@@ -60,7 +60,10 @@ shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
     shared_ptr<Cache> cache = nullptr;
 
     if (opts.block_cache_size > 0) {
-        cache = NewLRUCache(1 * 1024 * 1024 * 1024);
+        // Honour the size the caller asked for. This used to hardcode 1 GiB and ignore
+        // `block_cache_size` entirely, so a caller requesting 64 MB silently got sixteen
+        // times that.
+        cache = NewLRUCache(opts.block_cache_size);
     }
 
     if (!opts.options_path.empty()) {
@@ -107,10 +110,39 @@ shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
 
         options.enable_blob_garbage_collection = opts.enable_blob_garbage_collection;
     }
-    if (opts.use_bloom_filter) {
+    if (opts.use_bloom_filter || cache != nullptr) {
+        // Start from the table options ALREADY IN EFFECT, never from a default-constructed
+        // BlockBasedTableOptions.
+        //
+        // By this point `options.table_factory` carries everything an options file supplied
+        // (block_cache, block_size, cache_index_and_filter_blocks, checksum, ...) plus the
+        // defaults set in default_db_options(). Default-constructing here and then
+        // reset()-ing the factory silently threw ALL of it away and kept only the two fields
+        // assigned below — so a caller who configured a 128 MB block cache and a 16 KB block
+        // size in an options file got RocksDB's 8 MB / 4 KB defaults instead, with no error
+        // and no way to find out. `use_bloom_filter` is set unconditionally by
+        // cozo-core's rocksdb backend, so this fired on every open.
+        //
+        // GetOptions<BlockBasedTableOptions>() is the same idiom already used above for the
+        // block_cache_size path; it returns null if the factory is not block-based, in which
+        // case a fresh default really is the right starting point.
         BlockBasedTableOptions table_options;
-        table_options.filter_policy.reset(NewBloomFilterPolicy(opts.bloom_filter_bits_per_key, false));
-        table_options.whole_key_filtering = opts.bloom_filter_whole_key_filtering;
+        if (options.table_factory != nullptr) {
+            auto *existing = options.table_factory->GetOptions<BlockBasedTableOptions>();
+            if (existing != nullptr) {
+                table_options = *existing;
+            }
+        }
+        if (opts.use_bloom_filter) {
+            table_options.filter_policy.reset(
+                    NewBloomFilterPolicy(opts.bloom_filter_bits_per_key, false));
+            table_options.whole_key_filtering = opts.bloom_filter_whole_key_filtering;
+        }
+        if (cache != nullptr) {
+            // Without this the cache built above was allocated and then dropped on the floor
+            // whenever no options file was supplied.
+            table_options.block_cache = cache;
+        }
         options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     }
     if (opts.use_capped_prefix_extractor) {

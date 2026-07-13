@@ -9,7 +9,51 @@ Post-0.12.2 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
-_Nothing yet._
+### Fixed — RocksDB table options were silently discarded on every open (`mnestic-rocks`)
+
+**Any `BlockBasedTableOptions` you configured — block cache, block size, index/filter caching —
+never reached RocksDB.** `open_db` loaded your options file, then a few lines later
+default-constructed a fresh `BlockBasedTableOptions`, set exactly two fields on it
+(`filter_policy`, `whole_key_filtering`), and **reset the table factory with it**
+(`cozorocks/bridge/db.cpp`). Everything the options file supplied — and everything
+`default_db_options()` had set — was thrown away. The block cache reverted to RocksDB's 8 MB
+default, `block_size` to 4 KB, `cache_index_and_filter_blocks` to `false`. Silently: no error, no
+warning, and nothing in the API to observe it with.
+
+It fired on **every** open, because `cozo-core`'s RocksDB backend sets `use_bloom_filter`
+unconditionally (`cozo-core/src/storage/rocks.rs`). An embedded engine was quietly running with a
+read cache two orders of magnitude smaller than its host had asked for.
+
+Measured against RocksDB's own effective-options dump (the `OPTIONS-######` file it writes on open),
+with an options file requesting `block_size=16384` and `cache_index_and_filter_blocks=true`:
+
+| | before | after |
+|---|---|---|
+| `block_size` | 4096 *(default)* | **16384** |
+| `cache_index_and_filter_blocks` | false *(default)* | **true** |
+
+Fixed by seeding the table options from the factory **already in effect** rather than from a
+default-constructed one — the same `GetOptions<BlockBasedTableOptions>()` idiom the function already
+used correctly for its `block_cache_size` path.
+
+Two adjacent bugs in the same function, fixed with it:
+- **`block_cache_size` was ignored.** It hardcoded a 1 GiB LRU cache regardless of the value passed,
+  so a caller asking for 64 MB silently got sixteen times that.
+- **That cache was then dropped on the floor** unless an options file was also supplied — it was only
+  ever installed inside the options-file branch.
+
+⚠️ **This changes what RocksDB *writes*, not only what it caches.** With the table options now
+honoured, newly written SSTs pick up the configured `block_size` (and any `checksum` /
+`format_version` the options file sets). Existing SSTs record their own settings and stay readable —
+RocksDB handles the mix — so this is forward-compatible and needs no migration. But a store upgraded
+in place will begin emitting differently-formatted blocks as it compacts.
+
+⚠️ **Performance numbers taken before this fix measured a slower engine than mnestic actually is.**
+Any read-path benchmark run against a RocksDB store — ours included — ran with a 4 KB block size and
+no configured block cache.
+
+Inherited from upstream Cozo; present since the options-file path was introduced. Requires a
+`mnestic-rocks` release, which must publish **before** the `mnestic` crate that pins it.
 
 ## 0.12.2 — 2026-07-13
 
