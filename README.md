@@ -96,6 +96,18 @@ One bug, four reachable sites — the `@` valid-time selector, the `@ (tt: …)`
 `:as_of` transaction-time selector, the `validity(...)` constructor, and the write
 path. All four now reject a float and name the unit, the factor, and the fix.
 
+**The bug is inherited, and it is as old as Cozo's time travel.** Three of the
+four sites are verbatim upstream code at the fork point (`481af05`, 2024-12-04):
+the `@` selector (`expr2vld_spec`), the `validity(...)` constructor (`op_validity`),
+and — worst — the write path itself, whose `DataValue::List` arm of
+`ColType::Validity` is byte-identical to upstream's. So is the accessor all three
+funnel through: `Num::get_int`, which coerces any whole-numbered float to an
+`i64`. Only the transaction-time
+selector is ours, and it inherited the coercion rather than introducing it — 0.10.0
+extended the same accessor onto a new axis. `Validity` columns and `@` time travel
+predate the fork by years; this is not something bitemporality broke. Every CozoDB
+database with a `Validity` column has it.
+
 **Upgrade action — and note carefully *where* it bites.** The schema still compiles; it is
 the next **write** that now fails. The idiom `Validity default [floor(now()), true]` — and any
 spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`, or
@@ -107,11 +119,12 @@ whole-numbered ones.) Write instead:
 last_seen: Validity default [to_int(now() * 1000000), true]
 ```
 
-We found exactly one caller of the broken idiom anywhere, and it was **our own
-HNSW test** (`cozo-core/src/runtime/tests.rs`), inherited from upstream, which had
-been stamping every row it wrote at 1970 for as long as the test existed. It never
-asserted on the value, so it never noticed. If it was in our test suite, it is in
-someone's schema.
+We found exactly one caller of the broken idiom anywhere, and it was **upstream's
+own HNSW test** ([`cozo-core/src/runtime/tests.rs`](cozo-core/src/runtime/tests.rs)),
+which we inherited unchanged and which upstream still ships. It had been writing 1970
+into upstream's own valid-time axis for as long as the test existed. It never asserted
+on the value, so nothing ever went red. If it was in the test suite we inherited, it is
+in someone's schema.
 
 **What this deliberately does *not* fix.** An integer in *seconds* (`@ 1704067200`)
 is still accepted and still silently returns nothing. Valid time is an abstract,

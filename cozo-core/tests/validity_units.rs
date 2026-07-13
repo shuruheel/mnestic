@@ -51,8 +51,8 @@ fn seeded() -> DbInstance {
 // ─────────────────────────── site 4: THE WRITE PATH (the important one) ───────────────────────────
 
 /// The corruption that nobody had named. Before the fix this returned `Ok` and stored the row
-/// at valid-time 1_717_200_000 µs — 1970-01-20, not 2024 — which reads back fine on an ordinary
-/// query and is visible only under time travel.
+/// at valid-time 1_717_200_000 µs — 1970-01-01T00:28:37Z, not 2024 — which reads back fine on an
+/// ordinary query and is visible only under time travel.
 ///
 /// Deliberately a *bare list literal into a Validity column*: it must not route through
 /// `validity(...)` (site 3 would catch it) and must not sit in an `@` clause (site 1 would).

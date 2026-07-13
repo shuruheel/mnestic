@@ -24,12 +24,25 @@ transaction-time selector, the `validity(...)` constructor, and — worst — th
 
 The write path is why this is a correctness release and not an ergonomics one. A `:put` of
 `[parse_timestamp('2024-06-01T00:00:00Z'), true]` into a `Validity` column **succeeded** and
-stamped the row at 1970-01-20. The row reads back correctly on an ordinary query; the damage
+stamped the row at 1970-01-01T00:28:37Z — 1,717 seconds past the epoch. The row reads back
+correctly on an ordinary query; the damage
 is visible only under time travel, which is precisely where a bitemporal database is supposed
 to be trustworthy. On the read side the failure is equally quiet: `@ parse_timestamp(…)`
 returned **zero rows and no error**, because the misread always lands *before* any row was
 asserted — indistinguishable from "no data yet". `@ 1e300` was accepted too, saturating to
 `i64::MAX`, i.e. silently querying the end of time.
+
+**The bug is inherited, and it is as old as Cozo's time travel.** Three of the four sites
+are verbatim upstream code at the fork point (`481af05`, 2024-12-04): the `@` valid-time
+selector (`expr2vld_spec`, `parse/query.rs`), the `validity(...)` constructor (`op_validity`,
+`data/functions.rs`), and — worst, and byte-identical to upstream's — the write path, the
+`DataValue::List` arm of `ColType::Validity` in `data/relation.rs`. So is the accessor all
+three funnel through: `Num::get_int` (`data/value.rs`), which coerces any whole-numbered
+float to an `i64`. Only the fourth site, the transaction-time selector (`expr2tt_spec`), is ours —
+and it did not introduce the coercion, it inherited it: 0.10.0 extended the same accessor
+onto a new axis. `Validity` columns and `@` time travel are a Cozo feature that predates the
+fork by years. This is not something bitemporality broke; every CozoDB database with a
+`Validity` column has it.
 
 All four sites now reject a float and say what to write instead
 (`parser::float_validity_spec`, `eval::float_validity`).
@@ -45,10 +58,11 @@ accepted whole-numbered ones.) Write instead:
 last_seen: Validity default [to_int(now() * 1000000), true]
 ```
 
-We found exactly one caller of the broken idiom anywhere: **our own HNSW test**, inherited
-from upstream, which had been stamping every row it wrote at 1970 for as long as the test has
-existed. It never asserted on the value, so it never noticed. If it was in our test suite, it
-is in someone's schema.
+We found exactly one caller of the broken idiom anywhere: **upstream's own HNSW test**
+(`runtime/tests.rs`), which we inherited unchanged and which is still in upstream today. It
+had been writing 1970 into upstream's own valid-time axis for as long as the test has
+existed. It never asserted on the value, so nothing ever went red. If it was in the test
+suite we inherited, it is in someone's schema.
 
 **What this does *not* fix, deliberately.** An integer in *seconds* (`@ 1704067200`) is still
 accepted and still silently returns nothing. That is not an oversight: valid time is an
