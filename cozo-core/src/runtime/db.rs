@@ -1052,16 +1052,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             let iter = s_tx.store_tx.total_scan();
             self.db.batch_put(iter)?;
             s_tx.commit_tx()?;
-            // Re-seed the tt commit clock from the restored high-water mark
-            // (mnestic fork, bitemporality): the backup carries the TT_HWM
-            // system key, and "persisted HWM >= every committed tt" holds
-            // inside any consistent backup, so the persisted mark alone
-            // suffices — no row scan. fetch_max seeding cannot regress.
-            {
-                let tx = self.transact()?;
-                let persisted = tx.read_persisted_tt_hwm()?;
-                self.tt_clock.seed(persisted);
-            }
+            // Raw restore bypasses SessionTx, so re-seed every in-memory
+            // high-water mark, not only the transaction-time clock.
+            self.load_last_ids()?;
             Ok(())
         }
         #[cfg(not(feature = "storage-sqlite"))]
@@ -1437,8 +1430,18 @@ impl<'s, S: Storage<'s>> Db<S> {
 
     fn load_last_ids(&'s self) -> Result<()> {
         let mut tx = self.transact_write()?;
+        let persisted = tx.init_storage()?.0;
+        let (observed, collisions) = tx.relation_id_census()?;
         self.relation_store_id
-            .store(tx.init_storage()?.0, Ordering::Release);
+            .store(persisted.max(observed), Ordering::Release);
+        for (id, names) in collisions {
+            log::error!(
+                "relation-id collision detected at open: id {id} is shared by {}; \
+                 do NOT run ::repair_corrupt on these relations because it can delete valid rows; \
+                 restore the original backup into a fresh store with a fixed mnestic build",
+                names.join(", ")
+            );
+        }
         // Seed the tt commit clock (mnestic fork, bitemporality step 2):
         // max(persisted high-water mark, wall clock).
         self.tt_clock.seed(tx.read_persisted_tt_hwm()?);

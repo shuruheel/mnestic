@@ -18,7 +18,7 @@ use thiserror::Error;
 
 use crate::data::tuple::TupleT;
 use crate::data::value::DataValue;
-use crate::data::value::{Validity, ValidityTs};
+use crate::data::value::{Validity, ValidityTs, LARGEST_UTF_CHAR};
 use crate::fts::TokenizerCache;
 use crate::parse::SourceSpan;
 use crate::runtime::callback::CallbackCollector;
@@ -136,6 +136,32 @@ impl Drop for SessionTx<'_> {
 }
 
 impl<'a> SessionTx<'a> {
+    /// Highest relation id observed in relation metadata, plus duplicate-id groups.
+    /// Corrupt metadata is skipped so opening a damaged store remains possible.
+    pub(crate) fn relation_id_census(&self) -> Result<(u64, BTreeMap<u64, Vec<String>>)> {
+        let lower = vec![DataValue::from("")].encode_as_key(RelationId::SYSTEM);
+        let upper =
+            vec![DataValue::from(String::from(LARGEST_UTF_CHAR))].encode_as_key(RelationId::SYSTEM);
+        let mut max_id = 0;
+        let mut by_id: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+        for pair in self.store_tx.range_scan(&lower, &upper) {
+            let (key, value) = pair?;
+            if key >= upper {
+                break;
+            }
+            let Ok(handle) = RelationHandle::decode(&value) else {
+                continue;
+            };
+            max_id = max_id.max(handle.id.0);
+            by_id
+                .entry(handle.id.0)
+                .or_default()
+                .push(handle.name.to_string());
+        }
+        by_id.retain(|_, names| names.len() > 1);
+        Ok((max_id, by_id))
+    }
+
     pub(crate) fn get_returning_rows(
         &self,
         callback_collector: &mut CallbackCollector,

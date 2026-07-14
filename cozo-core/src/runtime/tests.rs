@@ -1987,6 +1987,82 @@ fn txtime_restore_backup_reseeds_clock() {
 }
 
 #[test]
+fn restore_backup_reseeds_relation_store_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src-relid.db");
+    let backup_path = dir.path().join("backup-relid.db");
+    let dst_path = dir.path().join("dst-relid.db");
+
+    {
+        let src = DbInstance::new("sqlite", src_path.to_str().unwrap(), "").unwrap();
+        src.run_default(":create alpha {k: Int => v: String}")
+            .unwrap();
+        src.run_default(":create beta {k: Int => v: String}")
+            .unwrap();
+        src.run_default("?[k, v] <- [[1, 'alpha-one']] :put alpha {k => v}")
+            .unwrap();
+        src.backup_db(backup_path.to_str().unwrap()).unwrap();
+    }
+
+    let dst = DbInstance::new("sqlite", dst_path.to_str().unwrap(), "").unwrap();
+    dst.restore_backup(backup_path.to_str().unwrap()).unwrap();
+    dst.run_default(":create gamma {k: Int => v: String}")
+        .unwrap();
+    dst.run_default("?[k, v] <- [[1, 'gamma-one']] :put gamma {k => v}")
+        .unwrap();
+
+    let alpha = dst
+        .run_default("?[k, v] := *alpha{k, v}")
+        .unwrap()
+        .into_json();
+    assert_eq!(alpha["rows"], json!([[1, "alpha-one"]]));
+    let gamma = dst
+        .run_default("?[k, v] := *gamma{k, v}")
+        .unwrap()
+        .into_json();
+    assert_eq!(gamma["rows"], json!([[1, "gamma-one"]]));
+}
+
+#[test]
+fn poisoned_relation_counter_is_repaired_on_open() {
+    use crate::data::tuple::TupleT;
+    use crate::runtime::relation::RelationId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("poisoned-relid.db");
+    {
+        let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+        db.run_default(":create alpha {k: Int => v: String}")
+            .unwrap();
+        db.run_default(":create beta {k: Int => v: String}")
+            .unwrap();
+        db.run_default("?[k, v] <- [[1, 'beta-one']] :put beta {k => v}")
+            .unwrap();
+
+        let DbInstance::Sqlite(inner) = &db else {
+            panic!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let counter_key = vec![DataValue::Null].encode_as_key(RelationId::SYSTEM);
+        tx.store_tx
+            .put(&counter_key, &RelationId::new(1).raw_encode())
+            .unwrap();
+        tx.commit_tx().unwrap();
+    }
+
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create gamma {k: Int => v: String}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 'gamma-one']] :put gamma {k => v}")
+        .unwrap();
+    let beta = db
+        .run_default("?[k, v] := *beta{k, v}")
+        .unwrap()
+        .into_json();
+    assert_eq!(beta["rows"], json!([[1, "beta-one"]]));
+}
+
+#[test]
 fn txtime_cross_statement_conflicts_rejected() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default(":create belief_ms {e, v: Validity, tt: TxTime => x: Int}")
