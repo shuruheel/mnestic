@@ -28,13 +28,10 @@
 //! - a node never links to itself even if a concurrent insertion has already
 //!   back-linked it into a neighbour list it then searches.
 //!
-//! One further on-disk divergence: when shrinking prunes an edge, the
-//! incremental path tombstones the row (keeps it with the deleted flag set,
-//! for `hnsw_remove`'s degree bookkeeping) while this builder simply omits it.
-//! Search reads with `include_deleted=false`, so the two are indistinguishable
-//! to queries; the degree counter was already approximate upstream (shrink
-//! never decrements the far endpoint's degree), and degree is only consulted
-//! by future incremental puts to decide whether to shrink a neighbour.
+//! When shrinking prunes one direction of an edge, the incremental path keeps a
+//! tombstoned row. The bulk builder reconstructs those rows from the finished
+//! adjacency so removal can always find and delete both directions. Search
+//! ignores the tombstones, so the live graph is unchanged.
 //!
 //! Thread count: `MNESTIC_INDEX_BUILD_THREADS` (0 or unset = all available
 //! cores; 1 = serial insertion in scan order, matching the old build).
@@ -51,7 +48,9 @@ use rustc_hash::FxHashSet;
 use crate::data::relation::VecElementType;
 use crate::data::value::Vector;
 use crate::parse::sys::HnswDistance;
-use crate::runtime::hnsw::HnswIndexManifest;
+use crate::runtime::hnsw::{
+    cosine_distance, distance_is_closer, distance_is_farther, HnswIndexManifest,
+};
 
 /// One indexed vector: its owning row's key part plus the field/sub-field that
 /// held it, and the SHA-256 the self-row stores for change detection.
@@ -148,6 +147,8 @@ pub(crate) struct FlatHnswGraph {
     pub(crate) metas: Vec<NodeMeta>,
     /// towers[i][d] = outgoing neighbours of node i at level `-(d as i64)`
     pub(crate) towers: Vec<Vec<Vec<(u32, f64)>>>,
+    /// Tombstoned rows that restore the paired-row invariant after neighbour pruning.
+    pub(crate) dead: Vec<Vec<Vec<(u32, f64)>>>,
     /// (node, topmost level) — the entry point a search will discover
     pub(crate) entry: Option<(u32, i64)>,
 }
@@ -222,9 +223,11 @@ impl FlatHnswBuilder {
         let (i, j) = (i as usize, j as usize);
         match self.distance {
             HnswDistance::L2 => self.slab.l2(i, j, self.dim),
-            HnswDistance::Cosine => {
-                1.0 - self.slab.dot(i, j, self.dim) / (self.norms_sq[i] * self.norms_sq[j]).sqrt()
-            }
+            HnswDistance::Cosine => cosine_distance(
+                self.norms_sq[i],
+                self.norms_sq[j],
+                self.slab.dot(i, j, self.dim),
+            ),
             HnswDistance::InnerProduct => 1.0 - self.slab.dot(i, j, self.dim),
         }
     }
@@ -273,13 +276,31 @@ impl FlatHnswBuilder {
         }
 
         let entry = *self.entry.read().unwrap();
+        let towers: Vec<Vec<Vec<(u32, f64)>>> = self
+            .towers
+            .into_iter()
+            .map(|m| m.into_inner().unwrap())
+            .collect();
+
+        let mut dead: Vec<Vec<Vec<(u32, f64)>>> =
+            towers.iter().map(|t| vec![Vec::new(); t.len()]).collect();
+        for (i, tower) in towers.iter().enumerate() {
+            for (depth, list) in tower.iter().enumerate() {
+                for &(j, dist) in list {
+                    let linked_back = towers[j as usize]
+                        .get(depth)
+                        .map(|back| back.iter().any(|&(other, _)| other == i as u32))
+                        .unwrap_or(true);
+                    if !linked_back {
+                        dead[j as usize][depth].push((i as u32, dist));
+                    }
+                }
+            }
+        }
         FlatHnswGraph {
             metas: self.metas,
-            towers: self
-                .towers
-                .into_iter()
-                .map(|m| m.into_inner().unwrap())
-                .collect(),
+            towers,
+            dead,
             entry,
         }
     }
@@ -371,7 +392,7 @@ impl FlatHnswBuilder {
         }
         while let Some((cand, Reverse(OrderedFloat(cand_dist)))) = bufs.candidates.pop() {
             let (_, OrderedFloat(furthest)) = bufs.found.peek().expect("found is never empty");
-            if cand_dist > *furthest {
+            if distance_is_farther(cand_dist, *furthest) {
                 break;
             }
             bufs.neigh.clear();
@@ -388,7 +409,7 @@ impl FlatHnswBuilder {
                 }
                 let nb_dist = self.dist(q, nb);
                 let (_, OrderedFloat(furthest)) = bufs.found.peek().expect("found is never empty");
-                if bufs.found.len() < ef || nb_dist < *furthest {
+                if bufs.found.len() < ef || distance_is_closer(nb_dist, *furthest) {
                     bufs.candidates.push(nb, Reverse(OrderedFloat(nb_dist)));
                     bufs.found.push(nb, OrderedFloat(nb_dist));
                     if bufs.found.len() > ef {
@@ -470,7 +491,7 @@ impl FlatHnswBuilder {
             };
             let mut should_add = true;
             for &(existing, _) in ret.iter() {
-                if self.dist(existing, cand) < cand_dist {
+                if distance_is_closer(self.dist(existing, cand), cand_dist) {
                     should_add = false;
                     break;
                 }

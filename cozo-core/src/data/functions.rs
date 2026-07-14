@@ -33,6 +33,7 @@ use crate::data::relation::VecElementType;
 use crate::data::value::{
     DataValue, JsonData, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs, Vector,
 };
+use crate::runtime::hnsw::cosine_distance;
 
 macro_rules! define_op {
     ($name:ident, $min_arity:expr, $vararg:expr) => {
@@ -2233,11 +2234,13 @@ pub(crate) fn op_l2_normalize(args: &[DataValue]) -> Result<DataValue> {
     match a {
         DataValue::Vec(Vector::F32(a)) => {
             let norm = a.dot(a).sqrt();
-            Ok(DataValue::Vec(Vector::F32(a / norm)))
+            let normalized = if norm > 0.0 { a / norm } else { a.clone() };
+            Ok(DataValue::Vec(Vector::F32(normalized)))
         }
         DataValue::Vec(Vector::F64(a)) => {
             let norm = a.dot(a).sqrt();
-            Ok(DataValue::Vec(Vector::F64(a / norm)))
+            let normalized = if norm > 0.0 { a / norm } else { a.clone() };
+            Ok(DataValue::Vec(Vector::F64(normalized)))
         }
         _ => bail!("'l2_normalize' requires a vector"),
     }
@@ -2301,7 +2304,7 @@ pub(crate) fn op_cos_dist(args: &[DataValue]) -> Result<DataValue> {
             let a_norm = a.dot(a) as f64;
             let b_norm = b.dot(b) as f64;
             let dot = a.dot(b) as f64;
-            Ok(DataValue::from(1. - dot / (a_norm * b_norm).sqrt()))
+            Ok(DataValue::from(cosine_distance(a_norm, b_norm, dot)))
         }
         (DataValue::Vec(Vector::F64(a)), DataValue::Vec(Vector::F64(b))) => {
             if a.len() != b.len() {
@@ -2310,7 +2313,7 @@ pub(crate) fn op_cos_dist(args: &[DataValue]) -> Result<DataValue> {
             let a_norm = a.dot(a);
             let b_norm = b.dot(b);
             let dot = a.dot(b);
-            Ok(DataValue::from(1. - dot / (a_norm * b_norm).sqrt()))
+            Ok(DataValue::from(cosine_distance(a_norm, b_norm, dot)))
         }
         _ => bail!("'cos_dist' requires two vectors of the same type"),
     }
