@@ -17,7 +17,7 @@ use sled::{Batch, Config, Db, IVec, Iter, Mode};
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::decode_tuple_from_kv;
+use crate::runtime::relation::try_decode_tuple_from_kv;
 use crate::storage::{Storage, StoreTx};
 use crate::utils::{swap_option_result, TempCollector};
 
@@ -209,7 +209,10 @@ impl<'s> StoreTx<'s> for SledTx {
                 self.db
                     .range(lower.to_vec()..upper.to_vec())
                     .map(|d| d.into_diagnostic())
-                    .map_ok(|(k, v)| decode_tuple_from_kv(&k, &v, None)),
+                    .map(|pair| {
+                        let (k, v) = pair?;
+                        try_decode_tuple_from_kv(&k, &v, None)
+                    }),
             )
         }
     }
@@ -390,12 +393,12 @@ impl SledIter {
                     if cv[0] == DEL_MARKER {
                         continue;
                     } else {
-                        return Ok(Some(decode_tuple_from_kv(&k, &cv[1..], None)));
+                        return try_decode_tuple_from_kv(&k, &cv[1..], None).map(Some);
                     }
                 }
                 (None, Some(_)) => {
                     let (k, v) = self.db_cache.take().unwrap();
-                    return Ok(Some(decode_tuple_from_kv(&k, &v, None)));
+                    return try_decode_tuple_from_kv(&k, &v, None).map(Some);
                 }
                 (Some((ck, _)), Some((dk, _))) => match ck.cmp(dk) {
                     Ordering::Less => {
@@ -403,12 +406,12 @@ impl SledIter {
                         if sv[0] == DEL_MARKER {
                             continue;
                         } else {
-                            return Ok(Some(decode_tuple_from_kv(&k, &sv[1..], None)));
+                            return try_decode_tuple_from_kv(&k, &sv[1..], None).map(Some);
                         }
                     }
                     Ordering::Greater => {
                         let (k, v) = self.db_cache.take().unwrap();
-                        return Ok(Some(decode_tuple_from_kv(&k, &v, None)));
+                        return try_decode_tuple_from_kv(&k, &v, None).map(Some);
                     }
                     Ordering::Equal => {
                         self.db_cache.take();

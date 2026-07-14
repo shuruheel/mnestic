@@ -53,7 +53,7 @@ use miette::{bail, Result};
 use crate::data::memcmp::{order_decode_i64, order_encode_i64, VLD_TAG};
 use crate::data::tuple::{decode_tuple_from_key, Tuple, DEFAULT_SIZE_HINT};
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::extend_tuple_from_v;
+use crate::runtime::relation::try_extend_tuple_from_v;
 
 /// A pinned, forward-only cursor over one bound range — the backend surface
 /// the step-6 seek overrides plug into `HybridProbe`.
@@ -207,10 +207,10 @@ impl Landing {
         &self.raw_key[..self.plain_len]
     }
 
-    fn into_row(self) -> Tuple {
+    fn into_row(self) -> Result<Tuple> {
         let mut out = decode_tuple_from_key(&self.raw_key, DEFAULT_SIZE_HINT);
-        extend_tuple_from_v(&mut out, &self.v_bytes);
-        out
+        try_extend_tuple_from_v(&mut out, &self.v_bytes)?;
+        Ok(out)
     }
 }
 
@@ -361,7 +361,7 @@ where
                         // Range exhausted: a held assert candidate still wins.
                         let prev = std::mem::replace(&mut self.phase, Phase::Done);
                         if let Phase::ProbeRetract { cand: Some(c), .. } = prev {
-                            return Ok(Some(c.into_row()));
+                            return c.into_row().map(Some);
                         }
                         return Ok(None);
                     }
@@ -389,7 +389,7 @@ where
                                     // the group's belief is this retraction
                                     self.advance(&plain, g);
                                     if self.vt_at_raw.is_none() {
-                                        return Ok(Some(landing.into_row()));
+                                        return landing.into_row().map(Some);
                                     }
                                 } else {
                                     // newest retract is beyond T: probe at T
@@ -427,12 +427,12 @@ where
                         if assert_wins {
                             let c = cand.expect("assert_wins");
                             self.advance(&key, group);
-                            return Ok(Some(c.into_row()));
+                            return c.into_row().map(Some);
                         }
                         // retraction wins
                         self.advance(&key, group);
                         if self.vt_at_raw.is_none() {
-                            return Ok(Some(landing.into_row()));
+                            return landing.into_row().map(Some);
                         }
                     } else {
                         // no retract ≤ T in the group
@@ -442,7 +442,7 @@ where
                                 // the landing (often the next key's first
                                 // row) usually answers the advance bound
                                 self.pending = Some(landing);
-                                return Ok(Some(c.into_row()));
+                                return c.into_row().map(Some);
                             }
                             None => {
                                 // group empty at T → fall through to whatever

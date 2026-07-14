@@ -214,6 +214,9 @@ impl ImperativeStmt {
                     // evict also writes the reserved audit relation
                     collector.insert(SmartString::from("mnestic_evict_audit"));
                 }
+                SysOp::Reindex(rel) | SysOp::RepairCorrupt(rel) => {
+                    collector.insert(rel.name.clone());
+                }
                 _ => {}
             },
         }

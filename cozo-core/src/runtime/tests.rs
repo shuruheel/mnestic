@@ -2063,6 +2063,53 @@ fn poisoned_relation_counter_is_repaired_on_open() {
 }
 
 #[test]
+fn corrupt_value_rows_error_and_can_be_repaired() {
+    use crate::data::tuple::TupleT;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-value.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create damaged {k: Int => v: String}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 'intact']] :put damaged {k => v}")
+        .unwrap();
+
+    let DbInstance::Sqlite(inner) = &db else {
+        panic!()
+    };
+    let mut tx = inner.transact_write().unwrap();
+    let handle = tx.get_relation("damaged", false).unwrap();
+    let key = vec![DataValue::from(1)].encode_as_key(handle.id);
+    tx.store_tx.put(&key, &[0x91, 0x01, 0x02]).unwrap();
+    tx.commit_tx().unwrap();
+    drop(tx);
+
+    let scan_error = db
+        .run_default("?[k, v] := *damaged{k, v}")
+        .expect_err("a corrupt row must fail a full scan without panicking");
+    assert!(
+        format!("{scan_error:?}").contains("eval::corrupt_value_blob"),
+        "{scan_error:?}"
+    );
+
+    let lookup_error = db
+        .run_default("wanted[k] <- [[1]] ?[v] := wanted[k], *damaged{k, v}")
+        .expect_err("a fully-bound point lookup must not swallow decode errors");
+    assert!(
+        format!("{lookup_error:?}").contains("eval::corrupt_value_blob"),
+        "{lookup_error:?}"
+    );
+
+    let repaired = db.run_default("::repair_corrupt damaged").unwrap();
+    assert_eq!(repaired.rows, vec![vec![DataValue::from(1)]]);
+    assert!(db
+        .run_default("?[k, v] := *damaged{k, v}")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[test]
 fn txtime_cross_statement_conflicts_rejected() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default(":create belief_ms {e, v: Validity, tt: TxTime => x: Int}")

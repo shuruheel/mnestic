@@ -99,6 +99,42 @@ Inherited from upstream Cozo; present since the options-file path was introduced
   `put_fts_index_item` now probes whether the document is already indexed before
   counting it, mirroring the probe `del_fts_index_item` already performs.
 
+- **Pre-epoch timestamps no longer panic or poison an in-memory/SQLite
+  database.** Conversion between `SystemTime` and signed microseconds now
+  handles dates before 1970, validity strings can round-trip those values, and
+  the affected store/pool locks recover after a panic instead of making every
+  later operation fail. Guard: `cozo-core/tests/pre_epoch_validity.rs`.
+
+- **HNSW rebuilds and updates preserve their graph invariants for invalid and
+  removed vectors.** Zero-vector cosine distance is finite, `NaN` candidates
+  use a total order instead of panicking in heaps, bulk builds restore paired
+  tombstoned edges, and updates that null or remove a vector delete its stale
+  HNSW slot. Guards: `hnsw_correctness.rs`, `hnsw_build.rs`, plus the exact
+  total-order unit test.
+
+- **Hybrid search keeps fusion legs and graph seeds distinct.** Generated
+  relation labels are unique across semantic, text, extra and graph legs, and
+  a graph seed is no longer reported as its own graph-derived contribution.
+  Guard: `cozo-core/tests/hybrid_graph_leg.rs`.
+
+- **Restore/open cannot silently reuse a live relation id.** The persisted
+  counter is reconciled with the highest id observed in relation metadata after
+  restore and at open; duplicate ids are diagnosed instead of being hidden by
+  the counter. Internal backup/restore regressions cover both paths.
+
+- **Corrupt value blobs are ordinary query errors, not process panics.** All
+  built-in storage backends now use the additive fallible decoder
+  `try_decode_tuple_from_kv`; point joins preserve nested read errors, and
+  `::repair_corrupt` treats an undecodable value as a row to remove. The
+  existing `decode_tuple_from_kv` signature remains available for source
+  compatibility. The SQLite regression corrupts a real row, verifies scan and
+  point-lookup errors, repairs it, and reads the relation again.
+
+- **`::reindex` and `::repair_corrupt` participate in imperative-program lock
+  planning.** They request a write transaction and relation lock up front, then
+  skip their local lock when the program already owns it, avoiding an unlocked
+  mutation on some backends and a recursive-lock deadlock on others.
+
 ### Changed
 
 - **BM25 scores change on corpora containing rows that are not documents** —

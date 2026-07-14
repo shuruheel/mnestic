@@ -454,6 +454,28 @@ fn reindex_without_search_indexes_is_a_loud_noop() {
     );
 }
 
+/// An imperative program takes all relation locks up front. `::reindex` must
+/// reuse that ownership rather than trying to acquire the same write lock a
+/// second time after another statement mutates the relation.
+#[test]
+fn reindex_in_a_mutating_imperative_program_does_not_relock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = new_db(&dir.path().join("imperative-lock.db"));
+
+    create_doc(&db);
+    let res = run(
+        &db,
+        r#"
+        { ?[k, body] <- [['k1', 'hello']] :put doc {k => body} }
+        { ::reindex doc }
+        "#,
+    );
+    assert!(res.rows[0][0]
+        .get_str()
+        .unwrap()
+        .contains("nothing to rebuild"));
+}
+
 /// A relation that does not exist is an error, not a silent success.
 #[test]
 fn reindex_of_a_missing_relation_errors() {

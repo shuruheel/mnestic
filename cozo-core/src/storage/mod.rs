@@ -6,12 +6,11 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-use itertools::Itertools;
 use miette::{bail, Result};
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
-use crate::decode_tuple_from_kv;
+use crate::try_decode_tuple_from_kv;
 
 pub(crate) mod mem;
 #[cfg(feature = "storage-new-rocksdb")]
@@ -145,8 +144,9 @@ pub trait StoreTx<'s>: Sync {
     /// Scan on a range. `lower` is inclusive whereas `upper` is exclusive.
     /// The default implementation calls [`range_scan_owned`](Self::range_scan) and converts the results.
     ///
-    /// The implementation must call [`decode_tuple_from_kv`](crate::decode_tuple_from_kv) to obtain
-    /// a decoded tuple in the loop of the iterator.
+    /// The implementation must call
+    /// [`try_decode_tuple_from_kv`](crate::try_decode_tuple_from_kv) to obtain a decoded tuple in
+    /// the loop of the iterator.
     fn range_scan_tuple<'a>(
         &'a self,
         lower: &[u8],
@@ -156,7 +156,10 @@ pub trait StoreTx<'s>: Sync {
         's: 'a,
     {
         let it = self.range_scan(lower, upper);
-        Box::new(it.map_ok(|(k, v)| decode_tuple_from_kv(&k, &v, None)))
+        Box::new(it.map(|pair| {
+            let (key, value) = pair?;
+            try_decode_tuple_from_kv(&key, &value, None)
+        }))
     }
 
     /// Scan on a range with a certain validity.

@@ -667,15 +667,17 @@ impl RelationHandle {
     pub(crate) fn get(&self, tx: &SessionTx<'_>, key: &[DataValue]) -> Result<Option<Tuple>> {
         let key_data = key.encode_as_key(self.id);
         if self.is_temp {
-            Ok(tx
+            tx
                 .temp_store_tx
                 .get(&key_data, false)?
-                .map(|val_data| decode_tuple_from_kv(&key_data, &val_data, Some(self.arity()))))
+                .map(|val_data| try_decode_tuple_from_kv(&key_data, &val_data, Some(self.arity())))
+                .transpose()
         } else {
-            Ok(tx
+            tx
                 .store_tx
                 .get(&key_data, false)?
-                .map(|val_data| decode_tuple_from_kv(&key_data, &val_data, Some(self.arity()))))
+                .map(|val_data| try_decode_tuple_from_kv(&key_data, &val_data, Some(self.arity())))
+                .transpose()
         }
     }
 
@@ -694,11 +696,14 @@ impl RelationHandle {
         } else {
             tx.store_tx.multi_get(&encoded, false)?
         };
-        Ok(raw
+        raw
             .into_iter()
             .zip(encoded.iter())
-            .map(|(v, k)| v.map(|val| decode_tuple_from_kv(k, &val, Some(self.arity()))))
-            .collect())
+            .map(|(v, k)| {
+                v.map(|val| try_decode_tuple_from_kv(k, &val, Some(self.arity())))
+                    .transpose()
+            })
+            .collect()
     }
 
     pub(crate) fn get_val_only(
@@ -708,15 +713,17 @@ impl RelationHandle {
     ) -> Result<Option<Tuple>> {
         let key_data = key.encode_as_key(self.id);
         if self.is_temp {
-            Ok(tx
+            tx
                 .temp_store_tx
                 .get(&key_data, false)?
-                .map(|val_data| rmp_serde::from_slice(&val_data[ENCODED_KEY_MIN_LEN..]).unwrap()))
+                .map(|val_data| try_decode_val_only(&key_data, &val_data))
+                .transpose()
         } else {
-            Ok(tx
+            tx
                 .store_tx
                 .get(&key_data, false)?
-                .map(|val_data| rmp_serde::from_slice(&val_data[ENCODED_KEY_MIN_LEN..]).unwrap()))
+                .map(|val_data| try_decode_val_only(&key_data, &val_data))
+                .transpose()
         }
     }
 
@@ -849,19 +856,71 @@ impl RelationHandle {
 
 const DEFAULT_SIZE_HINT: usize = 16;
 
+#[derive(Debug, Error, Diagnostic)]
+#[error("corrupt value blob for key {key}: {reason}")]
+#[diagnostic(
+    code(eval::corrupt_value_blob),
+    help("run `::repair_corrupt <relation>` to remove unreadable rows, then `::reindex <relation>` for indexed relations; if startup logged a relation-id collision, do NOT repair those relations — restore the original backup into a fresh store")
+)]
+struct CorruptValueBlob {
+    key: String,
+    reason: String,
+}
+
+fn decode_val_blob(val: &[u8], key: String) -> Result<Vec<DataValue>> {
+    let encoded = val.get(ENCODED_KEY_MIN_LEN..).ok_or_else(|| {
+        CorruptValueBlob {
+            key: key.clone(),
+            reason: format!(
+                "value is {} bytes; expected at least {ENCODED_KEY_MIN_LEN}",
+                val.len()
+            ),
+        }
+    })?;
+    rmp_serde::from_slice(encoded).map_err(|error| {
+        CorruptValueBlob {
+            key,
+            reason: error.to_string(),
+        }
+        .into()
+    })
+}
+
+fn encoded_key_label(key: &[u8]) -> String {
+    key.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
 /// Decode tuple from key-value pairs. Used for customizing storage
 /// in trait [`StoreTx`](crate::StoreTx).
 #[inline]
 pub fn decode_tuple_from_kv(key: &[u8], val: &[u8], size_hint: Option<usize>) -> Tuple {
+    try_decode_tuple_from_kv(key, val, size_hint).expect("stored value blob must decode")
+}
+
+/// Fallible decoder for storage implementations and engine read paths.
+pub fn try_decode_tuple_from_kv(key: &[u8], val: &[u8], size_hint: Option<usize>) -> Result<Tuple> {
     let mut tup = decode_tuple_from_key(key, size_hint.unwrap_or(DEFAULT_SIZE_HINT));
-    extend_tuple_from_v(&mut tup, val);
-    tup
+    try_extend_tuple_from_v(&mut tup, val)?;
+    Ok(tup)
 }
 
 pub fn extend_tuple_from_v(key: &mut Tuple, val: &[u8]) {
+    try_extend_tuple_from_v(key, val).expect("stored value blob must decode");
+}
+
+pub(crate) fn try_extend_tuple_from_v(key: &mut Tuple, val: &[u8]) -> Result<()> {
     if !val.is_empty() {
-        let vals: Vec<DataValue> = rmp_serde::from_slice(&val[ENCODED_KEY_MIN_LEN..]).unwrap();
+        let vals = decode_val_blob(val, format!("tuple {key:?}"))?;
         key.extend(vals);
+    }
+    Ok(())
+}
+
+pub(crate) fn try_decode_val_only(key: &[u8], val: &[u8]) -> Result<Tuple> {
+    if val.is_empty() {
+        Ok(Vec::new())
+    } else {
+        decode_val_blob(val, encoded_key_label(key))
     }
 }
 

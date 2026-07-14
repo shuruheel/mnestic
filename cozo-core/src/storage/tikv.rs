@@ -18,7 +18,7 @@ use tokio::runtime::Runtime;
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::decode_tuple_from_kv;
+use crate::runtime::relation::try_decode_tuple_from_kv;
 use crate::storage::{Storage, StoreTx};
 use crate::utils::{swap_option_result, TempCollector};
 use crate::Db;
@@ -314,7 +314,10 @@ impl Iterator for BatchScanner {
         swap_option_result(
             self.raw
                 .next_inner()
-                .map(|mkv| mkv.map(|(k, v)| decode_tuple_from_kv(k, v, None))),
+                .and_then(|mkv| {
+                    mkv.map(|(k, v)| try_decode_tuple_from_kv(k, v, None))
+                        .transpose()
+                }),
         )
     }
 }

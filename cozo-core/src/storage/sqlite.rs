@@ -17,7 +17,7 @@ use sqlite::{ConnectionThreadSafe, State, Statement};
 
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::{decode_tuple_from_kv, extend_tuple_from_v};
+use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
 use crate::storage::{Storage, StoreTx};
 use crate::utils::swap_option_result;
 
@@ -385,8 +385,7 @@ impl<'l> Iterator for TupleIter<'l> {
             Ok(State::Row) => {
                 let k = self.0.read::<Vec<u8>, _>(0).unwrap();
                 let v = self.0.read::<Vec<u8>, _>(1).unwrap();
-                let tuple = decode_tuple_from_kv(&k, &v, None);
-                Some(Ok(tuple))
+                Some(try_decode_tuple_from_kv(&k, &v, None))
             }
             Err(err) => Some(Err(miette!(err))),
         }
@@ -470,7 +469,7 @@ impl<'l> SkipIter<'l> {
                     self.next_bound = nxt_bound;
                     if let Some(mut tup) = ret {
                         let v = self.stmt.read::<Vec<u8>, _>(1).unwrap();
-                        extend_tuple_from_v(&mut tup, &v);
+                        try_extend_tuple_from_v(&mut tup, &v)?;
                         return Ok(Some(tup));
                     }
                 }

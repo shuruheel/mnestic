@@ -19,7 +19,7 @@ use crate::data::expr::{Bytecode, Expr};
 use crate::data::program::{FixedRuleApply, InputInlineRulesOrFixed, InputProgram, RelationOp};
 use crate::data::relation::{ColumnDef, NullableColType, StoredRelationMetadata};
 use crate::data::symb::Symbol;
-use crate::data::tuple::{Tuple, ENCODED_KEY_MIN_LEN};
+use crate::data::tuple::Tuple;
 use crate::data::value::{DataValue, ValidityTs};
 use crate::fixed_rule::utilities::constant::Constant;
 use crate::fixed_rule::FixedRuleHandle;
@@ -29,7 +29,8 @@ use crate::parse::{parse_script, CozoScriptParser, Rule};
 use crate::runtime::callback::{CallbackCollector, CallbackOp};
 use crate::runtime::minhash_lsh::HashPermutations;
 use crate::runtime::relation::{
-    extend_tuple_from_v, AccessLevel, InputRelationHandle, InsufficientAccessLevel, RelationHandle,
+    try_decode_val_only, try_extend_tuple_from_v, AccessLevel, InputRelationHandle,
+    InsufficientAccessLevel, RelationHandle,
 };
 use crate::runtime::transact::{PendingTtWrite, SessionTx};
 use crate::storage::Storage;
@@ -354,7 +355,7 @@ impl<'a> SessionTx<'a> {
             {
                 if let Some(existing) = self.store_tx.get(&key, false)? {
                     let mut tup = extracted[0..relation_store.metadata.keys.len()].to_vec();
-                    extend_tuple_from_v(&mut tup, &existing);
+                    try_extend_tuple_from_v(&mut tup, &existing)?;
                     // mnestic fork (0.12.1): posting deletion must NOT be gated on
                     // `has_indices` — that flag means *plain B-tree secondary
                     // indexes only*. A relation carrying only an FTS index therefore
@@ -672,7 +673,7 @@ impl<'a> SessionTx<'a> {
                         notice: "key to update does not exist".to_string()
                     })
                 }
-                Some(v) => rmp_serde::from_slice(&v[ENCODED_KEY_MIN_LEN..]).unwrap(),
+                Some(v) => try_decode_val_only(&key, &v)?,
             };
             let mut old_kv = Vec::with_capacity(relation_store.arity());
             old_kv.extend_from_slice(&new_kv);
@@ -2044,7 +2045,7 @@ impl<'a> SessionTx<'a> {
             {
                 if let Some(existing) = self.store_tx.get(&key, false)? {
                     let mut tup = extracted.clone();
-                    extend_tuple_from_v(&mut tup, &existing);
+                    try_extend_tuple_from_v(&mut tup, &existing)?;
                     self.del_in_fts(relation_store, &mut stack, &fts_processors, &tup)?;
                     self.del_in_lsh(relation_store, &tup)?;
                     if has_indices {
