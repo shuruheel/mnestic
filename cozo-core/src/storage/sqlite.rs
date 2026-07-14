@@ -64,15 +64,15 @@ impl<'s> Storage<'s> for SqliteStorage {
 
     fn transact(&'s self, write: bool) -> Result<Self::Tx> {
         let conn = {
-            match self.pool.lock().unwrap().pop() {
+            match self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                 None => Connection::open_thread_safe(&self.name).into_diagnostic()?,
                 Some(conn) => conn,
             }
         };
         let lock = if write {
-            Right(self.lock.write().unwrap())
+            Right(self.lock.write().unwrap_or_else(|e| e.into_inner()))
         } else {
-            Left(self.lock.read().unwrap())
+            Left(self.lock.read().unwrap_or_else(|e| e.into_inner()))
         };
         if write {
             let mut stmt = conn.prepare("begin;").into_diagnostic()?;
@@ -106,7 +106,7 @@ impl<'s> Storage<'s> for SqliteStorage {
     }
 
     fn range_compact(&'_ self, _lower: &[u8], _upper: &[u8]) -> Result<()> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         while pool.pop().is_some() {}
         Ok(())
     }
@@ -154,7 +154,7 @@ impl Drop for SqliteTx<'_> {
                 let _ = self.conn.as_ref().unwrap().execute(query);
             }
         }
-        let mut pool = self.storage.pool.lock().unwrap();
+        let mut pool = self.storage.pool.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.take().unwrap();
         pool.push(conn)
     }

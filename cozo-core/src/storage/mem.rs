@@ -50,10 +50,10 @@ impl<'s> Storage<'s> for MemStorage {
 
     fn transact(&'s self, write: bool) -> Result<Self::Tx> {
         Ok(if write {
-            let wtr = self.store.write().unwrap();
+            let wtr = self.store.write().unwrap_or_else(|e| e.into_inner());
             MemTx::Writer(wtr, Default::default())
         } else {
-            let rdr = self.store.read().unwrap();
+            let rdr = self.store.read().unwrap_or_else(|e| e.into_inner());
             MemTx::Reader(rdr)
         })
     }
@@ -66,7 +66,7 @@ impl<'s> Storage<'s> for MemStorage {
         &'a self,
         data: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
     ) -> Result<()> {
-        let mut store = self.store.write().unwrap();
+        let mut store = self.store.write().unwrap_or_else(|e| e.into_inner());
         for pair in data {
             let (k, v) = pair?;
             store.insert(k, v);

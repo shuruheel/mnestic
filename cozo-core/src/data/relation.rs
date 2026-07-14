@@ -9,7 +9,7 @@
 use std::cmp::Reverse;
 use std::fmt::{Display, Formatter};
 use std::mem;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
@@ -21,6 +21,7 @@ use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
 use crate::data::expr::Expr;
+use crate::data::functions::system_time_to_micros;
 use crate::data::value::{DataValue, JsonData, UuidWrapper, Validity, ValidityTs, Vector};
 use crate::Num;
 
@@ -394,8 +395,8 @@ impl NullableColType {
                             let dt = DateTime::parse_from_rfc3339(ts_str)
                                 .map_err(|_| InvalidValidity(DataValue::Str(s.into())))?;
                             let st: SystemTime = dt.into();
-                            let microseconds =
-                                st.duration_since(UNIX_EPOCH).unwrap().as_micros() as i64;
+                            let microseconds = system_time_to_micros(st)
+                                .map_err(|_| InvalidValidity(DataValue::Str(s.into())))?;
 
                             if microseconds == i64::MAX || microseconds == i64::MIN {
                                 bail!(InvalidValidity(DataValue::Str(s.into())))
