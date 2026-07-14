@@ -137,7 +137,11 @@ fn graph_leg_surfaces_unmatched_neighbor() {
     );
     // The seed itself is the query anchor and is not scored by the graph leg,
     // but it still wins via the vector + keyword legs.
-    assert_eq!(order.first().map(String::as_str), Some("d1"), "order = {order:?}");
+    assert_eq!(
+        order.first().map(String::as_str),
+        Some("d1"),
+        "order = {order:?}"
+    );
 }
 
 /// Closer nodes outrank farther ones: with the graph leg dominating, a 1-hop
@@ -146,7 +150,9 @@ fn graph_leg_surfaces_unmatched_neighbor() {
 #[test]
 fn graph_leg_closer_outranks_farther() {
     let (db, _dir) = make_db();
-    let order = ids(&db.hybrid_search(&graph_dominated(&["d1"], 2, false)).unwrap());
+    let order = ids(&db
+        .hybrid_search(&graph_dominated(&["d1"], 2, false))
+        .unwrap());
     let p2 = pos(&order, "d2").expect("d2 (1 hop) should be present");
     let p4 = pos(&order, "d4").expect("d4 (2 hops) should be present");
     assert!(
@@ -160,7 +166,9 @@ fn graph_leg_closer_outranks_farther() {
 #[test]
 fn graph_leg_respects_hop_bound() {
     let (db, _dir) = make_db();
-    let order = ids(&db.hybrid_search(&graph_dominated(&["d1"], 1, false)).unwrap());
+    let order = ids(&db
+        .hybrid_search(&graph_dominated(&["d1"], 1, false))
+        .unwrap());
     assert!(
         pos(&order, "d2").is_some() && pos(&order, "d3").is_some(),
         "1-hop neighbours d2, d3 should be present; got {order:?}"
@@ -180,13 +188,17 @@ fn graph_leg_respects_hop_bound() {
 fn graph_leg_undirected_follows_reverse_edges() {
     let (db, _dir) = make_db();
 
-    let directed = ids(&db.hybrid_search(&graph_dominated(&["d3"], 1, false)).unwrap());
+    let directed = ids(&db
+        .hybrid_search(&graph_dominated(&["d3"], 1, false))
+        .unwrap());
     assert!(
         pos(&directed, "d2").is_none(),
         "directed 1-hop from d3 must not reach d2 (edge is d2→d3); got {directed:?}"
     );
 
-    let undirected = ids(&db.hybrid_search(&graph_dominated(&["d3"], 1, true)).unwrap());
+    let undirected = ids(&db
+        .hybrid_search(&graph_dominated(&["d3"], 1, true))
+        .unwrap());
     assert!(
         pos(&undirected, "d2").is_some(),
         "undirected 1-hop from d3 should reach d2 via the reverse edge; got {undirected:?}"
@@ -198,7 +210,9 @@ fn graph_leg_undirected_follows_reverse_edges() {
 #[test]
 fn graph_leg_multiple_seeds_union() {
     let (db, _dir) = make_db();
-    let order = ids(&db.hybrid_search(&graph_dominated(&["d1", "d5"], 1, false)).unwrap());
+    let order = ids(&db
+        .hybrid_search(&graph_dominated(&["d1", "d5"], 1, false))
+        .unwrap());
     for id in ["d2", "d3", "d4"] {
         assert!(
             pos(&order, id).is_some(),
@@ -229,14 +243,35 @@ fn graph_leg_script_is_recursive_and_parametrised() {
     };
     let (script, params) = build_hybrid_query(&q).unwrap();
 
-    assert!(script.contains("hg0_reach[__to, min(__d)]"), "no recursive min-rule:\n{script}");
-    assert!(script.contains("__pd < 3.0"), "no hop-bound guard:\n{script}");
-    assert!(script.contains("__lid = 'graph'"), "graph leg not fused:\n{script}");
+    assert!(
+        script.contains("hg0_reach[__to, min(__d)]"),
+        "no recursive min-rule:\n{script}"
+    );
+    assert!(
+        script.contains("__pd < 3.0"),
+        "no hop-bound guard:\n{script}"
+    );
+    assert!(
+        script.contains("__lid = 'graph'"),
+        "graph leg not fused:\n{script}"
+    );
     // Seeds are params, never string-interpolated into the script body.
-    assert!(script.contains("$hg0_seed0") && script.contains("$hg0_seed1"), "seeds not params:\n{script}");
-    assert!(!script.contains("'d1'"), "seed value leaked into script text:\n{script}");
-    assert_eq!(params.get("hg0_seed0").and_then(|v| v.get_str()), Some("d1"));
-    assert_eq!(params.get("hg0_seed1").and_then(|v| v.get_str()), Some("d2"));
+    assert!(
+        script.contains("$hg0_seed0") && script.contains("$hg0_seed1"),
+        "seeds not params:\n{script}"
+    );
+    assert!(
+        !script.contains("'d1'"),
+        "seed value leaked into script text:\n{script}"
+    );
+    assert_eq!(
+        params.get("hg0_seed0").and_then(|v| v.get_str()),
+        Some("d1")
+    );
+    assert_eq!(
+        params.get("hg0_seed1").and_then(|v| v.get_str()),
+        Some("d2")
+    );
 }
 
 /// Validation rejects an empty seed set and a zero hop bound.
@@ -257,7 +292,10 @@ fn graph_leg_validates_inputs() {
         seeds: vec![],
         ..GraphLeg::default()
     }];
-    assert!(build_hybrid_query(&empty_seeds).is_err(), "empty seeds must be rejected");
+    assert!(
+        build_hybrid_query(&empty_seeds).is_err(),
+        "empty seeds must be rejected"
+    );
 
     let mut zero_hops = base;
     zero_hops.graph_legs = vec![GraphLeg {
@@ -266,5 +304,45 @@ fn graph_leg_validates_inputs() {
         max_hops: 0,
         ..GraphLeg::default()
     }];
-    assert!(build_hybrid_query(&zero_hops).is_err(), "max_hops=0 must be rejected");
+    assert!(
+        build_hybrid_query(&zero_hops).is_err(),
+        "max_hops=0 must be rejected"
+    );
+}
+
+#[test]
+fn graph_leg_labels_must_be_unique() {
+    let mut query = graph_dominated(&["d1"], 2, false);
+    query.graph_legs.push(GraphLeg {
+        edge_relation: "edges".into(),
+        seeds: vec!["d2".into()],
+        ..GraphLeg::default()
+    });
+    let err = build_hybrid_query(&query).unwrap_err();
+    assert!(
+        format!("{err:?}").contains("distinct label"),
+        "unexpected error: {err:?}"
+    );
+}
+
+#[test]
+fn graph_leg_never_scores_its_own_seed() {
+    let (db, _dir) = make_db();
+    let mut query = graph_dominated(&["d1"], 3, true);
+    query.detailed = true;
+    let result = db.hybrid_search(&query).unwrap();
+    assert!(
+        !result
+            .rows
+            .iter()
+            .any(|row| { row[0].get_str() == Some("d1") && row[2].get_str() == Some("graph") }),
+        "the graph leg re-scored its own seed: {:?}",
+        result.rows
+    );
+
+    let script = db.hybrid_search_script(&query).unwrap();
+    assert!(
+        script.contains("not hg0_seed[id]"),
+        "generated graph leg lacks the seed-membership exclusion:\n{script}"
+    );
 }
