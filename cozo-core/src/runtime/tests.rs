@@ -871,7 +871,7 @@ fn test_lsh_indexing2() {
         let res = db
             .run_default("?[k] := ~a:lsh{k | query: 'ewiygfspeoighjsfcfxzdfncalsdf', k: 1}")
             .unwrap();
-        assert!(res.rows.len() > 0);
+        assert!(!res.rows.is_empty());
     }
 }
 
@@ -905,7 +905,7 @@ fn test_lsh_indexing3() {
     ~text:lsh{id: id, dup_for: dup_for, | query: "This function first generates 32 random bytes using the os.urandom function. It then base64 encodes these bytes using base64.urlsafe_b64encode, removes the padding, and decodes the result to a string.", }"#,
             )
             .unwrap();
-        assert!(res.rows.len() > 0);
+        assert!(!res.rows.is_empty());
         println!("{}", res.into_json());
     }
 }
@@ -965,7 +965,7 @@ fn test_lsh_indexing4() {
         let res = db
             .run_default("?[k] := ~a:lsh{k | query: 'ewiygfspeoighjsfcfxzdfncalsdf', k: 1}")
             .unwrap();
-        assert!(res.rows.len() == 0);
+        assert!(res.rows.is_empty());
     }
 }
 
@@ -2109,6 +2109,86 @@ fn corrupt_value_rows_error_and_can_be_repaired() {
         .is_empty());
 }
 
+#[cfg(feature = "storage-sqlite")]
+fn corrupt_all_index_values(db: &DbInstance, relation: &str, index: &str, hnsw: bool) {
+    let DbInstance::Sqlite(inner) = db else {
+        panic!("corruption fixture requires sqlite")
+    };
+    let mut tx = inner.transact_write().unwrap();
+    let relation_handle = tx.get_relation(relation, false).unwrap();
+    let index_handle = if hnsw {
+        &relation_handle.hnsw_indices[index].0
+    } else {
+        &relation_handle.fts_indices[index].0
+    };
+    let start = index_handle.encode_partial_key_for_store(&[]);
+    let end = index_handle.encode_partial_key_for_store(&[DataValue::Bot]);
+    let keys = tx
+        .store_tx
+        .range_scan(&start, &end)
+        .map(|item| item.unwrap().0)
+        .collect_vec();
+    assert!(!keys.is_empty(), "fixture must create index rows");
+    for key in keys {
+        tx.store_tx.put(&key, &[0x91, 0x01, 0x02]).unwrap();
+    }
+    tx.commit_tx().unwrap();
+}
+
+#[test]
+#[cfg(feature = "storage-sqlite")]
+fn corrupt_fts_postings_return_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-fts.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create docs {id: Int => body: String}")
+        .unwrap();
+    db.run_default(
+        "::fts create docs:search { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+    )
+    .unwrap();
+    db.run_default("?[id, body] <- [[1, 'needle text']] :put docs {id => body}")
+        .unwrap();
+    corrupt_all_index_values(&db, "docs", "search", false);
+
+    let error = db
+        .run_default("?[id] := ~docs:search{id | query: 'needle', k: 10}")
+        .expect_err("a corrupt FTS posting must return an error without panicking");
+    assert!(
+        format!("{error:?}").contains("eval::corrupt_value_blob"),
+        "{error:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "storage-sqlite")]
+fn corrupt_hnsw_rows_return_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-hnsw.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create pts {id: Int => emb: <F32; 2>}")
+        .unwrap();
+    db.run_default(
+        "::hnsw create pts:search { dim: 2, m: 8, dtype: F32, fields: [emb], \
+         distance: L2, ef_construction: 32 }",
+    )
+    .unwrap();
+    db.run_default(
+        "?[id, emb] <- [[1, vec([1.0, 0.0])], [2, vec([0.0, 1.0])]] \
+         :put pts {id => emb}",
+    )
+    .unwrap();
+    corrupt_all_index_values(&db, "pts", "search", true);
+
+    let error = db
+        .run_default("?[id] := ~pts:search{id | query: vec([1.0, 0.0]), k: 10, ef: 32}")
+        .expect_err("a corrupt HNSW row must return an error without panicking");
+    assert!(
+        format!("{error:?}").contains("eval::corrupt_value_blob"),
+        "{error:?}"
+    );
+}
+
 #[test]
 fn txtime_cross_statement_conflicts_rejected() {
     let db = DbInstance::new("mem", "", "").unwrap();
@@ -2614,6 +2694,9 @@ fn bitemporal_fixture(engine: &str, path: &str) -> (DbInstance, [i64; 4]) {
     db.run_default(":create hist {k, v: Validity, tt: TxTime => x: Int}")
         .unwrap();
     fn peek(db: &DbInstance) -> i64 {
+        // The wildcard is reachable when optional storage features add variants, but not in the
+        // default all-targets gate where only mem + sqlite are compiled.
+        #[allow(unreachable_patterns)]
         match db {
             DbInstance::Mem(i) => i.tt_clock().peek(),
             #[cfg(feature = "storage-sqlite")]

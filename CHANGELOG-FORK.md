@@ -130,10 +130,33 @@ Inherited from upstream Cozo; present since the options-file path was introduced
   compatibility. The SQLite regression corrupts a real row, verifies scan and
   point-lookup errors, repairs it, and reads the relation again.
 
+- **Corrupt HNSW and FTS index rows also return ordinary errors.** The original
+  fallible-decoder pass stopped at base relations: three HNSW mutation paths and
+  the FTS posting reader still sliced and deserialized index values with
+  `unwrap()`, while the HNSW neighbour iterator unwrapped the newly reachable
+  scan error. Index value decoding now uses the same checked value-blob path,
+  HNSW row shapes are validated before indexing into them, and iterator errors
+  propagate instead of being swallowed or panicking. Rebuild an affected index
+  with `::reindex <relation>`. SQLite regressions corrupt real HNSW and FTS index
+  rows and assert `eval::corrupt_value_blob` errors.
+
 - **`::reindex` and `::repair_corrupt` participate in imperative-program lock
   planning.** They request a write transaction and relation lock up front, then
   skip their local lock when the program already owns it, avoiding an unlocked
   mutation on some backends and a recursive-lock deadlock on others.
+
+### Verification and release gates
+
+- **Continuous FTS/HNSW maintenance is now a release regression.** A persistent
+  SQLite test creates both indexes over an empty relation, performs 64 indexed
+  writes across a database reopen, repeatedly verifies exact-vector HNSW recall,
+  and replaces FTS documents while asserting that old postings disappear. No
+  `::reindex` is used. Guard: `cozo-core/tests/index_continuous_writes.rs`.
+- **Clippy now covers every target.** CI and both publish workflows run
+  `cargo clippy -p mnestic --all-targets -- -D warnings`, so integration tests
+  and registered benchmarks cannot silently rot outside the release gate. The
+  stale `read_path` benchmark call to `parse_script` was repaired, and
+  `cargo check -p mnestic --benches --release` is green.
 
 ### Changed
 

@@ -125,6 +125,91 @@ Public Rust API is byte-identical to 0.12.1.
 Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
+### Upgrading to 0.13.0
+
+**Pre-1970 timestamps.** mnestic now accepts a date before the Unix epoch
+wherever it accepts a timestamp string. It used to panic — and on the `mem` and
+`sqlite` backends the panic happened while the store's write guard was held,
+poisoning the lock and killing the database. Pre-epoch writes that previously
+panicked were never committed, so **no stored data is affected; simply re-run
+them.** No action is required on upgrade.
+
+**HNSW indexes may need one rebuild.** Three separate bugs left stale data in
+HNSW indexes built by any release through 0.12.2:
+
+- A `:put` or `update` that set a row's vector column to `null` (or shortened a
+  list-of-vectors column) left the row's old graph nodes behind. This is not a
+  stale-result bug — the search reads a node's vector back from the base row, so
+  a single stranded node makes **every** vector query on that relation fail with
+  `Cannot interpret null as vector`, or panic.
+- `::hnsw create` over a relation that **already had rows** wrote one-directional
+  edges. A later `:rm` — or a re-`:put` that changes a vector, i.e. re-embedding —
+  can then strand an orphan edge, and a search may fail with `Cannot find
+  compound key for HNSW`.
+- An all-zero vector (what a failed or absent embedding produces) made cosine
+  distance `NaN`, which wedged the search heap and silently degraded results.
+
+Upgrading alone restores **correct query results** for the zero-vector case. For
+the other two, the stale rows are on disk. Rebuild once, per affected relation:
+
+```text
+::reindex <relation>
+```
+
+Your rows are untouched and nothing is deleted; `::reindex` rebuilds index
+relations only. It is safe to run on an index that is already failing. An index
+created on an **empty** relation and populated only with non-null vectors by
+`:put`, without later nulling or shortening a vector field, is unaffected by the
+two on-disk bugs.
+
+**`::repair_corrupt` does not fix any of the above** and will report `removed: 0`.
+
+**Corrupt value blobs are now an error, not a panic.** A corrupt value in a
+stored relation used to panic the process — through the Python wheel that was a
+`PanicException`, a `BaseException` subclass that `except Exception:` does not
+catch. It is now an ordinary query error (`eval::corrupt_value_blob`, naming the
+key). If you hit it, run `::repair_corrupt <relation>` to drop the unreadable
+rows, **then** `::reindex <relation>` if that relation carries an HNSW/FTS/LSH
+index — repair cannot evict the dead row's index postings, because it cannot
+decode the row to know what they were.
+
+**`restore_backup` could mint colliding relation ids.** In any release through
+0.12.2, a relation created **after** a `restore_backup` into a fresh store could
+be given an id a restored relation already owned — silently sharing one
+keyspace, so reads of either returned both. **On upgrade, opening the store stops
+any further collisions with no action on your part**, and logs an error naming
+any relations that are already entangled.
+
+**If that error fires, the entangled rows cannot be separated.** The store never
+recorded which relation wrote which row. **Do not run `::repair_corrupt` on them
+— it deletes the narrower relation's rows.** Recover by restoring the
+**original** backup into a **fresh** store with this build. (If your only backup
+was taken *from* the already-damaged store, it carries the entanglement.) Stores
+where `restore_backup` was never called, or where no relation was created
+afterwards, are unaffected.
+
+**`hybrid_search`: every fusion leg now needs a distinct label.** Two graph legs
+sharing a label were never fused as two lists — reciprocal-rank fusion groups by
+the label, so the second was silently merged into the first.
+**`GraphLeg::default()` labels every leg `"graph"`, so two defaulted legs collided
+by construction**; in Python, `label` is optional and defaults to `"graph"`, so
+the same applies. This now **errors at build time** instead of returning a wrong
+ranking. Give each leg its own label (`"semantic"` and `"text"` are reserved). A
+single graph leg is unaffected.
+
+**`GraphLeg` no longer re-scores its own seeds.** A seed reachable from itself —
+guaranteed at hop 2 whenever `undirected: true`, and possible at hop 1 via a
+self-loop or an edge from a second seed — was re-entering its own ranked list.
+Seeds that legitimately match the vector or keyword query are still returned
+and still rank where those legs put them; only the spurious graph-leg
+contribution is gone. Rankings will shift. No migration.
+
+**One query that used to return zero rows now raises.** A query reading a stored
+relation by a **fully-bound key**, with a filter that errors at evaluation time,
+silently returned `Ok([])`; it now raises that error. (The same query with an
+unbound key already raised — the engine was giving two different answers to the
+same logical query depending on the plan it chose.)
+
 
 ## Importable name
 

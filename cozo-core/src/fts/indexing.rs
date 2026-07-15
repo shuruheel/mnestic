@@ -8,12 +8,12 @@
 
 use crate::data::expr::{eval_bytecode, eval_bytecode_pred, Bytecode};
 use crate::data::program::{FtsScoreKind, FtsSearch};
-use crate::data::tuple::{decode_tuple_from_key, Tuple, ENCODED_KEY_MIN_LEN};
+use crate::data::tuple::{decode_tuple_from_key, Tuple};
 use crate::data::value::LARGEST_UTF_CHAR;
 use crate::fts::ast::{FtsExpr, FtsLiteral, FtsNear};
 use crate::fts::tokenizer::TextAnalyzer;
 use crate::parse::fts::parse_fts_query;
-use crate::runtime::relation::RelationHandle;
+use crate::runtime::relation::{try_decode_val_only, RelationHandle};
 use crate::runtime::transact::SessionTx;
 use crate::{DataValue, SourceSpan};
 use itertools::Itertools;
@@ -137,9 +137,12 @@ impl<'a> SessionTx<'a> {
             let (kvec, vvec) = item?;
             let key_tuple = decode_tuple_from_key(&kvec, idx.metadata.keys.len());
             if seen.insert(key_tuple[1..].to_vec()) {
-                let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..])
-                    .map_err(|e| miette!("corrupt FTS posting value: {e}"))?;
-                total += vals[3].get_int().unwrap_or(0).max(0) as u64;
+                let vals = try_decode_val_only(&kvec, &vvec)?;
+                let doc_len = vals
+                    .get(3)
+                    .and_then(DataValue::get_int)
+                    .ok_or_else(|| miette!("corrupt FTS posting value: missing document length"))?;
+                total += doc_len.max(0) as u64;
             }
         }
         Ok((total, seen.len() as u64))
@@ -199,21 +202,37 @@ impl<'a> SessionTx<'a> {
                 break;
             }
 
-            let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..]).unwrap();
-            let froms = vals[0].get_slice().unwrap();
-            let tos = vals[1].get_slice().unwrap();
-            let positions = vals[2].get_slice().unwrap();
-            let total_length = vals[3].get_int().unwrap();
+            let vals = try_decode_val_only(&kvec, &vvec)?;
+            let froms = vals
+                .first()
+                .and_then(DataValue::get_slice)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing start offsets"))?;
+            let tos = vals
+                .get(1)
+                .and_then(DataValue::get_slice)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing end offsets"))?;
+            let positions = vals
+                .get(2)
+                .and_then(DataValue::get_slice)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing positions"))?;
+            let total_length = vals
+                .get(3)
+                .and_then(DataValue::get_int)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing document length"))?;
             let position_info = froms
                 .iter()
                 .zip(tos.iter())
                 .zip(positions.iter())
-                .map(|(_, p)| PositionInfo {
-                    // from: f.get_int().unwrap() as u32,
-                    // to: t.get_int().unwrap() as u32,
-                    position: p.get_int().unwrap() as u32,
+                .map(|(_, p)| {
+                    Ok(PositionInfo {
+                        // from: f.get_int().unwrap() as u32,
+                        // to: t.get_int().unwrap() as u32,
+                        position: p.get_int().ok_or_else(|| {
+                            miette!("corrupt FTS posting value: position is not an integer")
+                        })? as u32,
+                    })
                 })
-                .collect_vec();
+                .collect::<Result<Vec<_>>>()?;
             results.push(LiteralStats {
                 key: key_tuple[1..].to_vec(),
                 position_info,

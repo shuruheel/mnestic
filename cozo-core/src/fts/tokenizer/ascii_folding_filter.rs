@@ -1578,6 +1578,8 @@ mod tests {
     }
 
     #[test]
+    // `std::iter::repeat_n` would raise this fork's MSRV; keep the inherited spelling.
+    #[allow(clippy::manual_repeat_n)]
     fn test_latin1_characters() {
         let latin1_string = "Des mot clés À LA CHAÎNE À Á Â Ã Ä Å Æ Ç È É Ê Ë Ì Í Î Ï Ĳ Ð Ñ
                    Ò Ó Ô Õ Ö Ø Œ Þ Ù Ú Û Ü Ý Ÿ à á â ã ä å æ ç è é ê ë ì í î ï ĳ

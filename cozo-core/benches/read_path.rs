@@ -7,19 +7,20 @@
  */
 
 //! Read-path latency baseline for DEVELOPMENT.md **Item 9** (compiled-plan cache
-//! + read-only snapshot path). Grounds *where* a read query's per-call cost goes
+//! and read-only snapshot path). Grounds *where* a read query's per-call cost goes
 //! before any caching work — per the fork's "baseline-first" rule.
 //!
 //! For each query shape it times two things on the SQLite backend:
-//!   - `parse_only`: `parse::parse_script(...)` alone — parse + compile-to-AST.
-//!     This is the work a compiled-plan cache would eliminate on a cache hit.
-//!   - `full_run`:   `run_script(...)` end-to-end — parse + compile + open the
-//!     (pessimistic) transaction + execute.
+//!
+//! - `parse_only`: `parse::parse_script(...)` alone — parse + compile-to-AST.
+//!   This is the work a compiled-plan cache would eliminate on a cache hit.
+//! - `full_run`: `run_script(...)` end-to-end — parse + compile + open the
+//!   (pessimistic) transaction + execute.
 //!
 //! `full_run − parse_only` ≈ transaction-open + execution. The split tells us
 //! how much a plan cache could save (the `parse_only` fraction) versus what only
 //! a read-snapshot execution path can touch (the remainder). Run:
-//!   cargo bench -p mnestic --bench read_path
+//! `cargo bench -p mnestic --bench read_path`
 //!
 //! Caveat (the reason this is a *baseline*, not a fix): the public API offers no
 //! way to execute a pre-compiled plan twice — `CozoScript` is not `Clone` and
@@ -30,7 +31,7 @@
 use std::collections::BTreeMap;
 
 use cozo::data::functions::current_validity;
-use cozo::{parse::parse_script, DataValue, DbInstance, ScriptMutability};
+use cozo::{parse::parse_script, CustomAggrRegistries, DataValue, DbInstance, ScriptMutability};
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
 const N: usize = 5000;
@@ -69,6 +70,8 @@ fn make_db() -> (tempfile::TempDir, DbInstance) {
 fn bench_read_path(c: &mut Criterion) {
     let (_dir, db) = make_db();
     let fixed_rules = db.get_fixed_rules();
+    let custom_aggrs = db.get_custom_aggrs();
+    let custom_bounded_meets = db.get_custom_bounded_meets();
 
     let mut params = BTreeMap::new();
     params.insert(
@@ -97,7 +100,10 @@ fn bench_read_path(c: &mut Criterion) {
                     q,
                     &params,
                     &fixed_rules,
-                    &Default::default(),
+                    CustomAggrRegistries {
+                        meet: &custom_aggrs,
+                        bounded: &custom_bounded_meets,
+                    },
                     current_validity(),
                 )
                 .unwrap();

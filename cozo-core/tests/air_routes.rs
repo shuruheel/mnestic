@@ -6,6 +6,8 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 #![cfg(feature = "graph-algo")]
+// Inherited fixture style; the release gate compiles this target but does not modernize it.
+#![allow(clippy::get_first, clippy::unnecessary_operation)]
 
 use std::env;
 use std::str::FromStr;

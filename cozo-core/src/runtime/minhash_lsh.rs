@@ -349,8 +349,7 @@ impl HashValues {
             .zip_eq(&other_minhash.0)
             .filter(|(left, right)| left == right)
             .count();
-        let result = matches as f32 / self.0.len() as f32;
-        result
+        matches as f32 / self.0.len() as f32
     }
     pub(crate) fn get_bytes(&self) -> &[u8] {
         unsafe {
