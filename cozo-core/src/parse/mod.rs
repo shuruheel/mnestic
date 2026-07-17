@@ -280,6 +280,77 @@ impl From<SourceSpan> for miette::SourceSpan {
 pub(crate) struct ParseError {
     #[label]
     pub(crate) span: SourceSpan,
+    #[help]
+    pub(crate) expected: Option<String>,
+}
+
+/// Past this many surviving candidate tokens the hint stops identifying a
+/// defect and becomes a grammar dump, which is worse than no hint at all.
+const MAX_EXPECTED_TOKENS_IN_HINT: usize = 24;
+
+/// Convert a pest failure into our [`ParseError`], using pest's parse-attempts
+/// tracking (the literal tokens the grammar would have accepted at the deepest
+/// position reached) to point the span at the real defect and name the tokens
+/// that would fix it. `err.location` alone is often wrong — for `?[a] a = 1` it
+/// points inside the rule head while the defect (the missing `:=`) is later.
+fn pest_error_to_parse_error(src: &str, err: pest::error::Error<Rule>) -> ParseError {
+    let mut span = match err.location {
+        InputLocation::Pos(p) => SourceSpan(p, 0),
+        InputLocation::Span((start, end)) => SourceSpan(start, end - start),
+    };
+    let mut expected = None;
+    if let Some(attempts) = err.parse_attempts() {
+        span = SourceSpan(attempts.max_position, 0);
+        // `ParsingToken` is not nameable outside pest (private module), so the
+        // variants are distinguished through their Display forms: `Sensitive`
+        // renders the literal itself, `Range` renders `a..z`, `BuiltInRule`
+        // renders `BUILTIN_RULE`. Whitespace/comment openers and ranges are
+        // insertable almost anywhere and carry no diagnostic value.
+        let mut tokens: Vec<String> = attempts
+            .expected_tokens()
+            .iter()
+            .map(|t| t.to_string())
+            .filter(|t| {
+                !t.chars().all(|c| matches!(c, ' ' | '\t' | '\r' | '\n'))
+                    && t != "#"
+                    && t != "/*"
+                    && t != "BUILTIN_RULE"
+                    && !is_char_range_token(t)
+            })
+            .collect();
+        // Mixed-context positions (e.g. after a mistyped `:limi`, where the
+        // grammar could continue an expression OR start an option) produce a
+        // dump of unrelated candidates. The tokens the user actually meant
+        // start with the character sitting at the error position — narrow to
+        // those whenever that subset is non-empty (`:limi` → the `:option`
+        // keywords; `::index crate` → `create`).
+        if let Some(next_char) = src.get(attempts.max_position..).and_then(|r| r.chars().next()) {
+            let narrowed: Vec<String> = tokens
+                .iter()
+                .filter(|t| t.starts_with(next_char))
+                .cloned()
+                .collect();
+            if !narrowed.is_empty() {
+                tokens = narrowed;
+            }
+        }
+        if !tokens.is_empty() && tokens.len() <= MAX_EXPECTED_TOKENS_IN_HINT {
+            let quoted: Vec<String> = tokens.iter().map(|t| format!("`{t}`")).collect();
+            expected = Some(if quoted.len() == 1 {
+                format!("expected token: {}", quoted[0])
+            } else {
+                format!("expected one of: {}", quoted.join(", "))
+            });
+        }
+    }
+    ParseError { span, expected }
+}
+
+/// A pest `Range` token displays as `a..z` (single char on each side). A
+/// literal `..` token would display as exactly `..` and is not caught here.
+fn is_char_range_token(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    chars.len() == 4 && chars[1] == '.' && chars[2] == '.'
 }
 
 pub(crate) fn parse_type(src: &str) -> Result<NullableColType> {
@@ -295,13 +366,7 @@ pub(crate) fn parse_expressions(
     param_pool: &BTreeMap<String, DataValue>,
 ) -> Result<Expr> {
     let parsed = CozoScriptParser::parse(Rule::expression_script, src)
-        .map_err(|err| {
-            let span = match err.location {
-                InputLocation::Pos(p) => SourceSpan(p, 0),
-                InputLocation::Span((start, end)) => SourceSpan(start, end - start),
-            };
-            ParseError { span }
-        })?
+        .map_err(|err| pest_error_to_parse_error(src, err))?
         .next()
         .unwrap();
 
@@ -327,13 +392,7 @@ pub fn parse_script(
     cur_vld: ValidityTs,
 ) -> Result<CozoScript> {
     let parsed = CozoScriptParser::parse(Rule::script, src)
-        .map_err(|err| {
-            let span = match err.location {
-                InputLocation::Pos(p) => SourceSpan(p, 0),
-                InputLocation::Span((start, end)) => SourceSpan(start, end - start),
-            };
-            ParseError { span }
-        })?
+        .map_err(|err| pest_error_to_parse_error(src, err))?
         .next()
         .unwrap();
     Ok(match parsed.as_rule() {
@@ -373,5 +432,78 @@ impl ExtractSpan for Pair<'_> {
         let start = span.start();
         let end = span.end();
         SourceSpan(start, end - start)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_err(src: &str) -> ParseError {
+        match CozoScriptParser::parse(Rule::script, src) {
+            Ok(_) => panic!("script unexpectedly parsed: {src}"),
+            Err(err) => pest_error_to_parse_error(src, err),
+        }
+    }
+
+    fn help(src: &str) -> String {
+        parse_err(src).expected.unwrap_or_default()
+    }
+
+    // The single most common agent mistake: a rule head with no arrow. The
+    // hint must name the actual missing tokens, not a grammar rule name
+    // (`err.variant.positives` would have said `aggr_arg` here).
+    #[test]
+    fn parse_error_names_the_missing_arrow() {
+        let e = parse_err("?[a] a = 1");
+        let h = e.expected.clone().unwrap();
+        for tok in ["`:=`", "`<-`", "`<~`"] {
+            assert!(h.contains(tok), "missing {tok} in {h:?}");
+        }
+        assert!(!h.contains("aggr"), "rule-name leak in {h:?}");
+        // ... and the caret lands on the defect (position 5), not on
+        // `err.location`'s position inside the rule head (2).
+        assert_eq!(e.span.0, 5);
+
+        // same class: a fixed-rule application without its `<~`
+        let h = help("?[a] BudgetedTraversal(e[f, t, w], s[n], max_nodes: 10)");
+        assert!(h.contains("`<~`"), "missing `<~` in {h:?}");
+    }
+
+    // A mistyped option keyword names the real candidates: the raw expected
+    // set at this position is a 40-token dump of operators AND options, and
+    // the next-char narrowing is what reduces it to the `:`-keywords.
+    #[test]
+    fn parse_error_names_the_mistyped_option() {
+        let h = help("?[a] <- [[1]]\n:limi 5");
+        assert!(h.contains("`:limit`"), "missing `:limit` in {h:?}");
+        assert!(
+            !h.contains("`&&`"),
+            "operator soup leaked past the narrowing: {h:?}"
+        );
+    }
+
+    // A mistyped sysop keyword narrows to the intended token alone.
+    #[test]
+    fn parse_error_names_the_mistyped_sysop() {
+        let h = help("::index crate rel:idx {a}");
+        assert_eq!(h, "expected token: `create`");
+    }
+
+    // Structural omissions name the delimiters.
+    #[test]
+    fn parse_error_names_the_missing_delimiter() {
+        let h = help("?[a] <~ BudgetedTraversal(e[f, t, w] s[n])");
+        assert!(h.contains("`,`") && h.contains("`)`"), "{h:?}");
+    }
+
+    // When the candidate set is a mixed dump too large to identify a defect
+    // (here: `:limitt` parses as `:limit t`, failing later at `5` where
+    // dozens of unrelated continuations are legal and none starts with `5`),
+    // the hint is suppressed entirely — an unactionable hint is the failure
+    // mode this feature exists to kill.
+    #[test]
+    fn parse_error_suppresses_grammar_dumps() {
+        assert_eq!(parse_err("?[a] <- [[1]]\n:limitt 5").expected, None);
     }
 }
