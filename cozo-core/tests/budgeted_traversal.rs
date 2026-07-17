@@ -814,6 +814,43 @@ fn j1_gate_zero_budget_starvation() {
     );
 }
 
+// The named `*gate{col}` fixed-rule input form: parsing it used to PANIC
+// unconditionally (`strip_prefix(':')` on a `*`-prefixed `relation_ident` —
+// inherited upstream bug, present at fork-base), which is why no test in the
+// tree exercised it. It now parses, and binds by NAME in schema order (keys
+// then non-keys), so brace order cannot misbind.
+#[test]
+fn j1b_named_gate_binding_parses_and_binds_by_name() {
+    let (_dir, db) = open_db();
+    run(&db, ":create g {uid: String => ok: Int}");
+    run(
+        &db,
+        "?[uid, ok] <- [['a',1],['t',0],['b',1]] :put g {uid => ok}",
+    );
+    for gate in ["*g{uid, ok}", "*g{ok, uid}"] {
+        let res = run(
+            &db,
+            &format!(
+                "e[f, t, w] <- [['a','t',1.0],['a','b',1.0]]\ns[n] <- [['a']]\n\
+                 ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], {gate}, \
+                 max_nodes: 10, admit: ok == 1)"
+            ),
+        );
+        assert_eq!(
+            res.rows,
+            vec![row("a", 0.0, None, 0), row("b", 1.0, Some("a"), 1)],
+            "gate form {gate} misbound"
+        );
+    }
+    // A misspelled braced name is the loud schema error, not a silent misbind.
+    let m = err(
+        &db,
+        "e[f, t, w] <- [['a','b',1.0]]\ns[n] <- [['a']]\n\
+         ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], *g{nosuch}, max_nodes: 5)",
+    );
+    assert!(m.contains("nosuch"), "{m}");
+}
+
 #[test]
 fn j2_gate_not_a_bridge() {
     let (_dir, db) = open_db();

@@ -46,9 +46,12 @@
 //! predicate; without `admit:`, bare row-presence admits. An inadmissible or
 //! gate-absent node spends no budget and never relays expansion (it cannot be
 //! a bridge). Footgun: `admit:` bindings resolve *positionally* against the
-//! gate relation's own column list, so a binding name that does not match any
-//! gate column silently never binds — keep gate column names and the `admit:`
-//! expression aligned.
+//! gate input's declared binding list (the Nth binding reads tuple column N).
+//! A name that appears in `admit:` but not in the binding list errors loudly
+//! (`Cannot find binding`); the real hazard is a correctly-spelled column name
+//! in the wrong slot, which silently reads the wrong column — declare the gate
+//! bindings in schema order (keys then non-keys), or use the named
+//! `*gate{col}` form, which binds by name.
 //!
 //! `max_depth` switches the engine to layered per-`(node, hops)` labels so the
 //! depth bound is *exact* on weighted graphs (a depth-pruned single-label

@@ -1124,8 +1124,13 @@ fn parse_fixed_rule(
                         }
 
                         rule_args.push(FixedRuleArg::NamedStored {
+                            // mnestic fork: this stripped ':' — but the grammar
+                            // (`relation_ident = @{"*" ~ …}`) always prefixes
+                            // '*', so the unwrap ALWAYS panicked and the named
+                            // `*rel{col}` fixed-rule input form was unusable.
+                            // Inherited upstream bug, present at fork-base.
                             name: Symbol::new(
-                                name.as_str().strip_prefix(':').unwrap(),
+                                name.as_str().strip_prefix('*').unwrap(),
                                 name.extract_span(),
                             ),
                             bindings,
