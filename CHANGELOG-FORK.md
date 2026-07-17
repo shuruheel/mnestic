@@ -263,6 +263,17 @@ failure mode this exists to kill. Built on pest's parse-attempts tracking; no
 grammar change, and `ParseError` stays crate-private (the improved text flows
 to every surface — Rust, Python wheel, REPL — for free).
 
+In the same agent-actionable-errors spirit, **index-search diagnostics now
+carry the code of the index kind that actually failed** (upstream #231/#257):
+an FTS search with a missing `query:` no longer says "required for HNSW
+search" under an `hnsw_query_required` code (now `fts_query_required`, and
+the same for a missing `k`); the LSH normalizer's two reused HNSW codes are
+now `lsh_query_required`/`expected_int_for_lsh_k`; FTS `k` gets
+`expected_int_for_fts_k`; and the generic index-not-found fall-through —
+which fires when *no* index of any kind matched — is `eval::index_not_found`
+instead of `eval::hnsw_index_not_found`. User-visible error **codes** change;
+no consumer in the ecosystem asserts on the old ones (verified).
+
 ### Verification and release gates
 
 - **Continuous FTS/HNSW maintenance is now a release regression.** A persistent
