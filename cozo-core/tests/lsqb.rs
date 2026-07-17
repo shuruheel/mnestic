@@ -266,6 +266,28 @@ fn lsqb_counts_match_the_published_oracle() {
             got.count
         );
     }
+
+    // mnestic fork (0.14.0): q6 again with the factorized-count rewrite forced
+    // ON. Without this arm the whole tier exercises only the default-OFF path,
+    // and a broken `!=` inclusion–exclusion would ship behind a green gate (the
+    // toggle is not reachable from CI config — only from test code). The oracle
+    // is toggle-agnostic: 55,607,896 is correct whether or not the rewrite
+    // fires. Measured 2026-07-17 (sqlite, M-series, release): OFF ~41.7 s,
+    // ON ~0.30 s — ~140×.
+    db.set_query_factorization(true);
+    let on = timed_count(&db, Q6, cap_for("lsqb_q6"));
+    db.set_query_factorization(false);
+    println!(
+        "  q6(on)  {:>9.1} ms  count={}",
+        on.elapsed.as_secs_f64() * 1000.0,
+        on.count
+    );
+    assert_eq!(
+        on.count,
+        oracle["lsqb_q6"],
+        "q6 with the factorized-count rewrite forced ON miscounts — the `!=` \
+         inclusion–exclusion is wrong (this is the a60a8013 class of failure)"
+    );
 }
 
 /// The reorder must still be worth having on q3 — the shape it was written for.

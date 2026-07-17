@@ -184,6 +184,44 @@ only by hand-writing Datalog around a FixedRule.
   `edge_relation`/`seeds`/`max_hops` — the builder's validation owns the
   invariants) — existing dicts parse unchanged.
 
+### Added — the `!=` inclusion–exclusion count rewrite is restored, behind a type gate (default OFF)
+
+The factorized-count pass's `!=` extension — built in 0.10.5 and cut 34
+minutes later (`a60a8013`) for a silent Int/Float miscount — is back, sound
+this time. The miscount class: the correction term implements "equals" as a
+**join** (under which `Int(1)` and `Float(1.0)` are distinct) while `!=` is
+evaluated by `op_neq` (under which they are numerically equal), so a
+cross-variant pair escaped both terms. The restore adds a **type gate**: the
+rewrite fires only when every binding occurrence of both operands of every
+inequality is a declared non-nullable, non-`Any` stored column and all
+occurrences agree on one type — then both operands are variant-identical at
+rest and the divergent arm is unreachable (soundness argument written down in
+`docs/specs/cardinality-algebra.md` §3.3a; gate discrimination proven by
+bypass — the mixed-type suite miscounts 4-for-3 without it).
+
+- **Default stays OFF** (`Db::set_query_factorization`); the default-on flip
+  waits for a nightly soak on the restored path, per the 0.10.5→0.10.7
+  planner lesson.
+- **Measured** (2026-07-17, LSQB sf0.1, sqlite, M-series, release): q6
+  41.7 s → **0.30 s (~140×)** with the rewrite on, count exactly LSQB's
+  published oracle either way. The nightly LSQB tier now runs q6 with the
+  toggle forced on, so the rewrite can never again ship behind a green gate
+  that only exercised the default-off path.
+- The pass now takes catalog access (`&SessionTx`) for the gate; with no
+  inequality present it stays purely syntactic.
+
+### Changed — `import_from_backup` refuses mismatched schemas
+
+The backup-import path raw-puts the source's rows after a key rewrite — no
+type coercion — so it was the one user-reachable way to put a value at rest
+that violates its column's declared type (a backed-up `Float` restored into a
+declared-`Int` column), which is exactly the invariant the `!=` type gate
+rests on. It now requires the source and destination schemas to match
+(column names, types and defaults — deliberately stricter than the type
+argument needs: a restore across renamed columns is ambiguous about intent,
+and refusing loudly beats guessing). Error → error for the corrupting case;
+a same-schema restore is unchanged. Code: `tx::import_schema_mismatch`.
+
 ### Fixed — a bare `minimal` build did not compile (ungated `rayon`)
 
 `query/eval.rs` imported `rayon` gated only on `not(wasm32)`, while `rayon`

@@ -249,15 +249,14 @@ fn check_targeted(db: &DbInstance) {
     assert_eq!(scalar(db, STAR_TUP), 15);
     assert_fires_and_matches(db, STAR_TUP);
 
-    // Pattern P3 — a `!=` body now DECLINES. The inclusion–exclusion extension
-    // was removed (it over-counted numerically-equal Int/Float pairs); any `!=`
-    // predicate falls back to the exact naive evaluation. §3.3 value (18) still.
+    // Pattern P3 — `!=` inclusion–exclusion. §3.3 value (18), the headline case.
     db.set_query_factorization(false);
     assert_eq!(scalar(db, IE_NEQ), 18);
-    assert_declines(db, IE_NEQ);
+    assert_fires_and_matches(db, IE_NEQ);
 
-    // Two inequalities likewise decline; the naive result is still correct.
-    assert_declines(
+    // Two inequalities → the four-term inclusion–exclusion (capped case). A
+    // star on `x` with two cross `!=`s; neither pair co-occurs in an atom.
+    assert_fires_and_matches(
         db,
         "?[count(x)] := *knows[a, x], *knows[b, x], *knows[c, x], a != b, a != c",
     );
@@ -279,53 +278,6 @@ fn targeted_patterns_sqlite() {
     let db = sqlite_db(&dir, "targeted.db");
     populate_toy(&db);
     check_targeted(&db);
-}
-
-// ------------------------------------------------------------------------
-// Regression: `!=` over numerically-equal Int/Float pairs. The removed
-// inclusion–exclusion extension over-counted here — `count(x != y)` was rewritten
-// as `count(all) − count(x = y)`, but `op_neq` compares numerically (`1 != 1.0`
-// is false) while the `x = y` correction term is built by JOINING the vars, and
-// `Int(1)`/`Float(1.0)` never join under `Num::cmp`. So `(Int 1, Float 1.0)`
-// satisfied neither term and the rewrite over-counted (naive 2, factorized 4 for
-// {1,2}/{1.0,2.0}). Now a `!=` body declines, so both paths run naive and agree.
-// ------------------------------------------------------------------------
-
-fn check_int_float_neq(db: &DbInstance) {
-    run_mut(db, ":create a { x: Int }");
-    run_mut(db, ":create b { y: Float }");
-    run_mut(db, "?[x] <- [[1], [2]] :put a { x }");
-    run_mut(db, "?[y] <- [[1.0], [2.0]] :put b { y }");
-
-    // `!=` declines → factorized == naive == 2 (NOT the 4 the I-E rewrite gave).
-    let q = "?[count(x)] := *a[x], *b[y], x != y";
-    db.set_query_factorization(false);
-    assert_eq!(scalar(db, q), 2, "naive count for Int/Float !=");
-    assert_declines(db, q);
-
-    // Minimal single-pair case: `(Int 1, Float 1.0)` is numerically equal, so
-    // `x != y` is false and the count is 0 (the I-E rewrite would have said 1).
-    run_mut(db, ":create a1 { x: Int }");
-    run_mut(db, ":create b1 { y: Float }");
-    run_mut(db, "?[x] <- [[1]] :put a1 { x }");
-    run_mut(db, "?[y] <- [[1.0]] :put b1 { y }");
-    let q1 = "?[count(x)] := *a1[x], *b1[y], x != y";
-    db.set_query_factorization(false);
-    assert_eq!(scalar(db, q1), 0, "naive count for single Int/Float pair");
-    assert_declines(db, q1);
-}
-
-#[test]
-fn int_float_neq_no_miscount_mem() {
-    let db = mem_db();
-    check_int_float_neq(&db);
-}
-
-#[test]
-fn int_float_neq_no_miscount_sqlite() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = sqlite_db(&dir, "intfloat.db");
-    check_int_float_neq(&db);
 }
 
 // ------------------------------------------------------------------------
@@ -360,8 +312,7 @@ fn check_non_firing(db: &DbInstance) {
          reach[a, b] := reach[a, c], *knows[c, b]\n\
          ?[count(b)] := reach[1, b], *member[group, b]",
     );
-    // Any `!=` predicate declines (the inclusion–exclusion extension was
-    // removed); here three of them, but even one is enough to fall back to naive.
+    // More than two inequalities (inclusion–exclusion capped at 2).
     assert_declines(
         db,
         "?[count(p2)] := *knows[p1, p2], *knows[p2, p3], *knows[p3, p4], \
@@ -617,7 +568,7 @@ fn differential_naive_equals_factorized() {
 
     let mut rng = Lcg::new(0x_D1FF_ACE5_1234_5678);
     let mut fired_count = 0usize;
-    let mut neq_cases = 0usize;
+    let mut ie_fired = 0usize;
     let mut nonzero_count = 0usize;
 
     for id in 0..N_CASES {
@@ -660,16 +611,9 @@ fn differential_naive_equals_factorized() {
         // bookkeeping to prove the suite actually exercises the rewrite
         if fired(&mem, &case.query) {
             fired_count += 1;
-        }
-        // `!=` cases must now DECLINE (the rewrite never fires on them); the
-        // per-case naive == factorized assertions above still guard correctness.
-        if case.query.contains("!=") {
-            neq_cases += 1;
-            assert!(
-                !fired(&mem, &case.query),
-                "a `!=` body must decline, but the rewrite fired (case): {}",
-                case.query
-            );
+            if case.query.contains("!=") {
+                ie_fired += 1;
+            }
         }
         if naive_mem
             .iter()
@@ -680,21 +624,125 @@ fn differential_naive_equals_factorized() {
     }
 
     eprintln!(
-        "DIFFERENTIAL STATS: {N_CASES} cases, fired={fired_count}, neq_cases={neq_cases} (all declined), count>1 in {nonzero_count}"
+        "DIFFERENTIAL STATS: {N_CASES} cases, fired={fired_count}, ie_fired={ie_fired}, count>1 in {nonzero_count}"
     );
-    // The suite must genuinely fire the PURE rewrite on a substantial fraction of
-    // cases, exercise the `!=` decline path, and produce counts that exceed
-    // trivial small values — otherwise it would not be testing what it claims.
+    // The suite must genuinely fire the rewrite (and its `!=` branch) on a
+    // substantial fraction of cases, and produce counts that exceed trivial
+    // small values — otherwise it would not be testing what it claims.
     assert!(
         fired_count >= N_CASES / 5,
         "rewrite fired on only {fired_count}/{N_CASES} cases — suite not exercising it"
     );
     assert!(
-        neq_cases >= 5,
-        "only {neq_cases} `!=` cases generated — decline path under-exercised"
+        ie_fired >= 5,
+        "inclusion–exclusion path fired on only {ie_fired} cases"
     );
     assert!(
         nonzero_count >= N_CASES / 5,
         "only {nonzero_count}/{N_CASES} cases produced a count > 1"
+    );
+}
+
+// ------------------------------------------------------------------------
+// The `!=` type gate (0.14.0). The inclusion–exclusion correction term JOINS
+// the operands while `!=` compares them with `op_neq`, and the two disagree on
+// numerically-equal cross-variant pairs (`Int(1)` vs `Float(1.0)`: distinct
+// under the engine total order, equal under `op_neq`). The gate admits the
+// rewrite only when every binding occurrence of both operands is a declared
+// non-nullable, non-`Any` stored column and all occurrences agree on ONE type.
+//
+// Discrimination (run manually, recorded in the commit): with the gate call in
+// `maybe_rewrite_and_advise` replaced by `true`, `ie_neq_mixed_types_declines`
+// goes red with count 4 (the smuggled pair survives) instead of declining.
+// ------------------------------------------------------------------------
+
+fn populate_mixed(db: &DbInstance) {
+    // knows_i: Int endpoints; knows_f: Float endpoints. The values coincide
+    // numerically (1 vs 1.0) so op_neq and the join disagree about them.
+    run_mut(db, ":create knows_i { c0: Int, c1: Int }");
+    run_mut(db, "?[c0, c1] <- [[1, 100], [2, 100]] :put knows_i {c0, c1}");
+    run_mut(db, ":create knows_f { c0: Float, c1: Int }");
+    run_mut(
+        db,
+        "?[c0, c1] <- [[1.0, 100], [3.0, 100]] :put knows_f {c0, c1}",
+    );
+}
+
+/// Cross-variant operands (Int vs Float) — the exact miscount class the 2026-07
+/// cut removed — must DECLINE, and the declined (naive) answer stands. Naive:
+/// pairs (a, b) over the star join with a != b under op_neq — (1, 1.0) is
+/// numerically equal, so 3 of the 4 pairs survive. A fired rewrite would count
+/// 4 (the correction join never matches across variants).
+#[test]
+fn ie_neq_mixed_types_declines() {
+    let db = mem_db();
+    populate_mixed(&db);
+    let q = "?[count(x)] := *knows_i[a, x], *knows_f[b, x], a != b";
+    db.set_query_factorization(false);
+    assert_eq!(scalar(&db, q), 3, "naive baseline");
+    assert_declines(&db, q);
+}
+
+/// An `Any`-typed operand column is not variant-stable and must decline even
+/// though both sides declare the same (`Any`) type.
+#[test]
+fn ie_neq_any_typed_operand_declines() {
+    let db = mem_db();
+    run_mut(&db, ":create ka { c0: Any, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[1, 100], [2.0, 100]] :put ka {c0, c1}");
+    run_mut(&db, ":create kb { c0: Any, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[1.0, 100], [3, 100]] :put kb {c0, c1}");
+    assert_declines(&db, "?[count(x)] := *ka[a, x], *kb[b, x], a != b");
+}
+
+/// A nullable operand column declines.
+#[test]
+fn ie_neq_nullable_operand_declines() {
+    let db = mem_db();
+    run_mut(&db, ":create kn { c0: Int?, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[1, 100], [2, 100]] :put kn {c0, c1}");
+    run_mut(&db, ":create km { c0: Int, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[1, 100], [3, 100]] :put km {c0, c1}");
+    assert_declines(&db, "?[count(x)] := *kn[a, x], *km[b, x], a != b");
+}
+
+/// Same non-numeric declared type (String) is admissible — the divergent
+/// `op_neq` arm only exists for the (Int, Float) pair.
+#[test]
+fn ie_neq_same_string_type_fires() {
+    let db = mem_db();
+    run_mut(&db, ":create sa { c0: String, c1: Int }");
+    run_mut(
+        &db,
+        "?[c0, c1] <- [['x', 100], ['y', 100]] :put sa {c0, c1}",
+    );
+    run_mut(&db, ":create sb { c0: String, c1: Int }");
+    run_mut(
+        &db,
+        "?[c0, c1] <- [['x', 100], ['z', 100]] :put sb {c0, c1}",
+    );
+    let q = "?[count(x)] := *sa[a, x], *sb[b, x], a != b";
+    db.set_query_factorization(false);
+    assert_eq!(scalar(&db, q), 3, "naive baseline");
+    assert_fires_and_matches(&db, q);
+}
+
+/// An operand bound by TWO atoms must agree at EVERY occurrence —
+/// first-occurrence-wins would be unsound. Here `a` occurs as Int in one atom
+/// and Float in another (zero rows can ever join, but the GATE must not even
+/// consult the data).
+#[test]
+fn ie_neq_disagreeing_occurrences_decline() {
+    let db = mem_db();
+    run_mut(&db, ":create oa { c0: Int, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[1, 100]] :put oa {c0, c1}");
+    run_mut(&db, ":create ob { c0: Float, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[1.0, 100]] :put ob {c0, c1}");
+    run_mut(&db, ":create oc { c0: Int, c1: Int }");
+    run_mut(&db, "?[c0, c1] <- [[2, 100]] :put oc {c0, c1}");
+    // `a` is bound by both oa.c0 (Int) and ob.c0 (Float); `b` by oc.c0 (Int).
+    assert_declines(
+        &db,
+        "?[count(x)] := *oa[a, x], *ob[a, x], *oc[b, x], a != b",
     );
 }

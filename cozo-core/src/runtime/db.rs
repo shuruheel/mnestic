@@ -2082,6 +2082,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let (normalized_program, advisory) =
                     crate::query::factorize::maybe_rewrite_and_advise(
                         normalized_program,
+                        &*tx,
                         self.enable_factorize.load(Ordering::Relaxed),
                     );
                 let (stratified_program, _) = normalized_program.into_stratified_program()?;
@@ -2946,6 +2947,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         // the original program), so the rewrite never changes the result schema.
         let (normalized_program, _advisory) = crate::query::factorize::maybe_rewrite_and_advise(
             normalized_program,
+            &*tx,
             self.enable_factorize.load(Ordering::Relaxed),
         );
         let (stratified_program, store_lifetimes) = normalized_program.into_stratified_program()?;
