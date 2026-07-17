@@ -18,7 +18,7 @@ use cozorocks::{DbBuilder, DbIter, RocksDb, SnapReader, Tx};
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
 use crate::runtime::db::{BadDbInit, DbManifest};
-use crate::runtime::relation::{decode_tuple_from_kv, extend_tuple_from_v};
+use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
 use crate::storage::{Storage, StoreTx};
 use crate::utils::swap_option_result;
 use crate::Db;
@@ -478,7 +478,7 @@ impl RocksDbIterator {
                     None
                 } else {
                     // upper bound is exclusive
-                    Some(decode_tuple_from_kv(k_slice, v_slice, None))
+                    Some(try_decode_tuple_from_kv(k_slice, v_slice, None)?)
                 }
             }
         })
@@ -551,7 +551,7 @@ impl RocksDbSkipIterator {
                     let (ret, nxt_bound) = check_key_for_validity(k_slice, self.valid_at, None);
                     self.next_bound = nxt_bound;
                     if let Some(mut tup) = ret {
-                        extend_tuple_from_v(&mut tup, v_slice);
+                        try_extend_tuple_from_v(&mut tup, v_slice)?;
                         return Ok(Some(tup));
                     }
                 }

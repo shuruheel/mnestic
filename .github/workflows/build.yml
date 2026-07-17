@@ -79,5 +79,5 @@ jobs:
       # catches NEW clippy issues. `cargo fmt --check` is intentionally NOT part
       # of the gate yet: the inherited tree isn't rustfmt-clean and reformatting
       # ~178 mostly-upstream files is deferred to a dedicated pass.
-      - name: Clippy
-        run: cargo clippy -p mnestic -- -D warnings
+      - name: Clippy (all targets)
+        run: cargo clippy -p mnestic --all-targets -- -D warnings

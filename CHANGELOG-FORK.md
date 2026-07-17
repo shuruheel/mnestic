@@ -55,6 +55,118 @@ no configured block cache.
 Inherited from upstream Cozo; present since the options-file path was introduced. Requires a
 `mnestic-rocks` release, which must publish **before** the `mnestic` crate that pins it.
 
+### Fixed
+
+- **BM25 counted the wrong corpus, by re-scanning the whole relation on every
+  query.** Okapi BM25's IDF is `ln(1 + (N − df + 0.5) / (df + 0.5))`. `df` is
+  counted from the full-text index and `avgdl` is averaged over the full-text
+  index — but `N` was counted over the **base relation**, by a `range_count`
+  over its entire key range, **on every FTS query**. (The 0.8.4 work made
+  `avgdl` an O(1) read off a process-level doc-stats cache and left `N` behind;
+  the cache that would have served it sits ten lines away in the same file.)
+
+  Two consequences, both measured:
+
+  - **Wrong scores.** A row whose extracted text yields no tokens is a row in
+    the relation but *not a document in the collection being searched* — it
+    carries no postings and can never be a hit, yet it enlarged `N`. Rows loaded
+    by `import_relations` (which maintains no FTS index) did the same, at
+    arbitrary magnitude. Measured: **200 empty-body rows beside 3 real documents
+    moved a BM25 score from 0.1335 to 4.065 — a 30× error.** (The FTS posting
+    leak fixed in 0.12.1 was, for comparison, a 55% error.)
+  - **Ruinous latency at scale.** O(corpus) per query — and in practice
+    O(corpus *bytes*), because counting rows drags the relation's whole value
+    payload through the block cache. On the first-ever `medium`-scale run of
+    `hybrid-recall-bench` (RocksDB, real embeddings, 384-d): at 400k chunks the
+    **FTS leg cost 2,621 ms against 350 ms for the HNSW leg**, and hybrid p50
+    went from 150 ms at 40k chunks to **3,396 ms** at 400k (p99: 201 ms →
+    10,358 ms) while recall, ingest rate and disk all scaled linearly.
+
+  `N` now comes from the same doc-stats cache as `avgdl` — the number of
+  documents carrying at least one posting — so it is both correct and free:
+  the cache is already seeded and already maintained on every write. The
+  per-query scan is *deleted*, not memoized (`FtsCache` is now stateless).
+  `fts/indexing.rs`; `docs/specs/fts-corpus-stats.md`; guarded by
+  `cozo-core/tests/fts_corpus_stats.rs`.
+
+- **The FTS doc-count drifted upward on every no-op write.** A value-unchanged
+  `:put` skips the posting delete (an identical tuple derives identical
+  postings — `query/stored.rs`), but the put still bumped the doc-stats counter
+  `+1` with no matching `−1`. This was invisible for as long as
+  `avgdl = total / n` was the counter's only consumer — a re-put inflates both
+  terms together and the ratio barely moves — but BM25's `N` reads `n` directly.
+  Measured: **ten identical re-puts moved a score from 0.1335 to 2.27 (17×).**
+  `put_fts_index_item` now probes whether the document is already indexed before
+  counting it, mirroring the probe `del_fts_index_item` already performs.
+
+- **Pre-epoch timestamps no longer panic or poison an in-memory/SQLite
+  database.** Conversion between `SystemTime` and signed microseconds now
+  handles dates before 1970, validity strings can round-trip those values, and
+  the affected store/pool locks recover after a panic instead of making every
+  later operation fail. Guard: `cozo-core/tests/pre_epoch_validity.rs`.
+
+- **HNSW rebuilds and updates preserve their graph invariants for invalid and
+  removed vectors.** Zero-vector cosine distance is finite, `NaN` candidates
+  use a total order instead of panicking in heaps, bulk builds restore paired
+  tombstoned edges, and updates that null or remove a vector delete its stale
+  HNSW slot. Guards: `hnsw_correctness.rs`, `hnsw_build.rs`, plus the exact
+  total-order unit test.
+
+- **Hybrid search keeps fusion legs and graph seeds distinct.** Generated
+  relation labels are unique across semantic, text, extra and graph legs, and
+  a graph seed is no longer reported as its own graph-derived contribution.
+  Guard: `cozo-core/tests/hybrid_graph_leg.rs`.
+
+- **Restore/open cannot silently reuse a live relation id.** The persisted
+  counter is reconciled with the highest id observed in relation metadata after
+  restore and at open; duplicate ids are diagnosed instead of being hidden by
+  the counter. Internal backup/restore regressions cover both paths.
+
+- **Corrupt value blobs are ordinary query errors, not process panics.** All
+  built-in storage backends now use the additive fallible decoder
+  `try_decode_tuple_from_kv`; point joins preserve nested read errors, and
+  `::repair_corrupt` treats an undecodable value as a row to remove. The
+  existing `decode_tuple_from_kv` signature remains available for source
+  compatibility. The SQLite regression corrupts a real row, verifies scan and
+  point-lookup errors, repairs it, and reads the relation again.
+
+- **Corrupt HNSW and FTS index rows also return ordinary errors.** The original
+  fallible-decoder pass stopped at base relations: three HNSW mutation paths and
+  the FTS posting reader still sliced and deserialized index values with
+  `unwrap()`, while the HNSW neighbour iterator unwrapped the newly reachable
+  scan error. Index value decoding now uses the same checked value-blob path,
+  HNSW row shapes are validated before indexing into them, and iterator errors
+  propagate instead of being swallowed or panicking. Rebuild an affected index
+  with `::reindex <relation>`. SQLite regressions corrupt real HNSW and FTS index
+  rows and assert `eval::corrupt_value_blob` errors.
+
+- **`::reindex` and `::repair_corrupt` participate in imperative-program lock
+  planning.** They request a write transaction and relation lock up front, then
+  skip their local lock when the program already owns it, avoiding an unlocked
+  mutation on some backends and a recursive-lock deadlock on others.
+
+### Verification and release gates
+
+- **Continuous FTS/HNSW maintenance is now a release regression.** A persistent
+  SQLite test creates both indexes over an empty relation, performs 64 indexed
+  writes across a database reopen, repeatedly verifies exact-vector HNSW recall,
+  and replaces FTS documents while asserting that old postings disappear. No
+  `::reindex` is used. Guard: `cozo-core/tests/index_continuous_writes.rs`.
+- **Clippy now covers every target.** CI and both publish workflows run
+  `cargo clippy -p mnestic --all-targets -- -D warnings`, so integration tests
+  and registered benchmarks cannot silently rot outside the release gate. The
+  stale `read_path` benchmark call to `parse_script` was repaired, and
+  `cargo check -p mnestic --benches --release` is green.
+
+### Changed
+
+- **BM25 scores change on corpora containing rows that are not documents** —
+  rows whose extracted text is empty, whitespace-only or `Null`, and rows
+  bulk-loaded via `import_relations`. Their presence no longer inflates `N`, so
+  IDF (and therefore ranking, for multi-term queries) shifts. On a corpus in
+  which every row is a document — the ordinary case — scores are unchanged, and
+  the existing `bm25.rs` / `fts_avgdl.rs` suites pass byte-identically.
+
 ## 0.12.2 — 2026-07-13
 
 ### Fixed — the validity float channel (a silent temporal corruption)

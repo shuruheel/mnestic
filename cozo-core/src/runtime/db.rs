@@ -54,13 +54,13 @@ use crate::runtime::callback::{
 use crate::runtime::graph_projection;
 use crate::runtime::graph_projection::ProjectionCache;
 use crate::runtime::relation::{
-    extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
+    try_extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
 };
 use crate::runtime::transact::SessionTx;
 use crate::runtime::tt_clock::{wall_clock_micros, TtClock};
 use crate::storage::temp::TempStorage;
 use crate::storage::{Storage, StoreTx};
-use crate::{decode_tuple_from_kv, FixedRule, Symbol};
+use crate::{try_decode_tuple_from_kv, FixedRule, Symbol};
 
 pub(crate) struct RunningQueryHandle {
     pub(crate) started_at: f64,
@@ -785,7 +785,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             let mut rows = vec![];
             for data in tx.store_tx.range_scan(&start, &end) {
                 let (k, v) = data?;
-                let tuple = decode_tuple_from_kv(&k, &v, Some(size_hint));
+                let tuple = try_decode_tuple_from_kv(&k, &v, Some(size_hint))?;
                 rows.push(tuple);
             }
             let headers = cols.iter().map(|col| col.to_string()).collect_vec();
@@ -964,7 +964,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 if has_indices {
                     if let Some(existing) = tx.store_tx.get(&k_store, false)? {
                         let mut old = keys.clone();
-                        extend_tuple_from_v(&mut old, &existing);
+                        try_extend_tuple_from_v(&mut old, &existing)?;
                         if is_delete || old != row {
                             for (idx_rel, extractor) in handle.indices.values() {
                                 let idx_tup =
@@ -1052,16 +1052,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             let iter = s_tx.store_tx.total_scan();
             self.db.batch_put(iter)?;
             s_tx.commit_tx()?;
-            // Re-seed the tt commit clock from the restored high-water mark
-            // (mnestic fork, bitemporality): the backup carries the TT_HWM
-            // system key, and "persisted HWM >= every committed tt" holds
-            // inside any consistent backup, so the persisted mark alone
-            // suffices — no row scan. fetch_max seeding cannot regress.
-            {
-                let tx = self.transact()?;
-                let persisted = tx.read_persisted_tt_hwm()?;
-                self.tt_clock.seed(persisted);
-            }
+            // Raw restore bypasses SessionTx, so re-seed every in-memory
+            // high-water mark, not only the transaction-time clock.
+            self.load_last_ids()?;
             Ok(())
         }
         #[cfg(not(feature = "storage-sqlite"))]
@@ -1437,8 +1430,18 @@ impl<'s, S: Storage<'s>> Db<S> {
 
     fn load_last_ids(&'s self) -> Result<()> {
         let mut tx = self.transact_write()?;
+        let persisted = tx.init_storage()?.0;
+        let (observed, collisions) = tx.relation_id_census()?;
         self.relation_store_id
-            .store(tx.init_storage()?.0, Ordering::Release);
+            .store(persisted.max(observed), Ordering::Release);
+        for (id, names) in collisions {
+            log::error!(
+                "relation-id collision detected at open: id {id} is shared by {}; \
+                 do NOT run ::repair_corrupt on these relations because it can delete valid rows; \
+                 restore the original backup into a fresh store with a fixed mnestic build",
+                names.join(", ")
+            );
+        }
         // Seed the tt commit clock (mnestic fork, bitemporality step 2):
         // max(persisted high-water mark, wall clock).
         self.tt_clock.seed(tx.read_persisted_tt_hwm()?);
@@ -2561,11 +2564,15 @@ impl<'s, S: Storage<'s>> Db<S> {
                 // maintenance operation, and its docs say so. (It is never
                 // auto-invoked: the import paths point at it, they do not run
                 // it.)
-                let lock = self
-                    .obtain_relation_locks(iter::once(&rel_name.name))
-                    .pop()
-                    .unwrap();
-                let _guard = lock.write().unwrap();
+                let locks = if skip_locking {
+                    vec![]
+                } else {
+                    self.obtain_relation_locks(iter::once(&rel_name.name))
+                };
+                let _guards = locks
+                    .iter()
+                    .map(|lock| lock.write().unwrap())
+                    .collect_vec();
 
                 let handle = tx.get_relation(rel_name, true)?;
                 // Graph-projection dirty-set hook: the index rows below are
@@ -2591,11 +2598,15 @@ impl<'s, S: Storage<'s>> Db<S> {
                 if read_only {
                     bail!("Cannot repair relation in read-only mode");
                 }
-                let lock = self
-                    .obtain_relation_locks(iter::once(&rel_name.name))
-                    .pop()
-                    .unwrap();
-                let _guard = lock.write().unwrap();
+                let locks = if skip_locking {
+                    vec![]
+                } else {
+                    self.obtain_relation_locks(iter::once(&rel_name.name))
+                };
+                let _guards = locks
+                    .iter()
+                    .map(|lock| lock.write().unwrap())
+                    .collect_vec();
                 let handle = tx.get_relation(rel_name, true)?;
                 // Graph-projection dirty-set hook (spec §3.4 row 10).
                 tx.mark_dirty(&handle);
@@ -2608,7 +2619,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let mut bad_keys: Vec<Vec<u8>> = vec![];
                 for kv in tx.store_tx.range_scan(&lower, &upper) {
                     let (k, v) = kv?;
-                    if decode_tuple_from_kv(&k, &v, None).len() < expected {
+                    if try_decode_tuple_from_kv(&k, &v, None)
+                        .map(|tuple| tuple.len() < expected)
+                        .unwrap_or(true)
+                    {
                         bad_keys.push(k);
                     }
                 }

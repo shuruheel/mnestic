@@ -44,8 +44,8 @@ jobs:
         run: cargo build -p mnestic --verbose
       - name: Test (lib + integration, incl. fork regressions)
         run: cargo test -p mnestic --verbose
-      - name: Clippy (-D warnings)
-        run: cargo clippy -p mnestic -- -D warnings
+      - name: Clippy (all targets, -D warnings)
+        run: cargo clippy -p mnestic --all-targets -- -D warnings
 
   # --- mnestic binding: cross-platform abi3 wheels via maturin ---
   build-mnestic:

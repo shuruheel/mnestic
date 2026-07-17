@@ -9,10 +9,10 @@
 use crate::data::expr::{eval_bytecode_pred, Bytecode};
 use crate::data::program::HnswSearch;
 use crate::data::relation::VecElementType;
-use crate::data::tuple::{Tuple, ENCODED_KEY_MIN_LEN};
+use crate::data::tuple::Tuple;
 use crate::data::value::Vector;
 use crate::parse::sys::HnswDistance;
-use crate::runtime::relation::RelationHandle;
+use crate::runtime::relation::{try_decode_val_only, RelationHandle};
 use crate::runtime::transact::SessionTx;
 use crate::storage::StoreTx;
 use crate::{DataValue, SourceSpan};
@@ -55,6 +55,40 @@ impl HnswIndexManifest {
 
 type CompoundKey = (Tuple, usize, i32);
 
+#[inline]
+pub(crate) fn cosine_distance(a_norm_sq: f64, b_norm_sq: f64, dot: f64) -> f64 {
+    let denominator = (a_norm_sq * b_norm_sq).sqrt();
+    if denominator > 0.0 {
+        1.0 - dot / denominator
+    } else {
+        // A zero/invalid embedding must be maximally distant, finite, and JSON-safe.
+        2.0
+    }
+}
+
+#[inline]
+pub(crate) fn distance_is_closer(candidate: f64, current_furthest: f64) -> bool {
+    OrderedFloat(candidate) < OrderedFloat(current_furthest)
+}
+
+#[inline]
+pub(crate) fn distance_is_farther(candidate: f64, current_furthest: f64) -> bool {
+    OrderedFloat(candidate) > OrderedFloat(current_furthest)
+}
+
+#[cfg(test)]
+mod distance_order_tests {
+    use super::{distance_is_closer, distance_is_farther};
+
+    #[test]
+    fn heap_comparisons_use_one_total_order_for_nan() {
+        assert!(distance_is_closer(0.25, f64::NAN));
+        assert!(distance_is_farther(f64::NAN, 0.25));
+        assert!(!distance_is_closer(f64::NAN, 0.25));
+        assert!(!distance_is_farther(0.25, f64::NAN));
+    }
+}
+
 struct VectorCache {
     cache: FxHashMap<CompoundKey, Vector>,
     distance: HnswDistance,
@@ -82,13 +116,13 @@ impl VectorCache {
                     let a_norm = a.dot(a) as f64;
                     let b_norm = b.dot(b) as f64;
                     let dot = a.dot(b) as f64;
-                    1.0 - dot / (a_norm * b_norm).sqrt()
+                    cosine_distance(a_norm, b_norm, dot)
                 }
                 (Vector::F64(a), Vector::F64(b)) => {
                     let a_norm = a.dot(a);
                     let b_norm = b.dot(b);
                     let dot = a.dot(b);
-                    1.0 - dot / (a_norm * b_norm).sqrt()
+                    cosine_distance(a_norm, b_norm, dot)
                 }
                 _ => panic!(
                     "Cannot compute cosine distance between {:?} and {:?}",
@@ -407,10 +441,15 @@ impl<'a> SessionTx<'a> {
                         Some(bytes) => bytes,
                         None => bail!("Indexed vector not found, this signifies a bug in the index implementation"),
                     };
-                    let mut target_self_val: Vec<DataValue> =
-                        rmp_serde::from_slice(&target_self_val_bytes[ENCODED_KEY_MIN_LEN..])
-                            .unwrap();
-                    let mut target_degree = target_self_val[0].get_float().unwrap() as usize + 1;
+                    let mut target_self_val =
+                        try_decode_val_only(&target_self_key_bytes, &target_self_val_bytes)?;
+                    let mut target_degree = target_self_val
+                        .first()
+                        .and_then(DataValue::get_float)
+                        .ok_or_else(|| {
+                        miette!("corrupt HNSW self-row: missing numeric degree")
+                    })? as usize
+                        + 1;
                     if target_degree > m_max {
                         // shrink links
                         target_degree = self.hnsw_shrink_neighbour(
@@ -525,9 +564,12 @@ impl<'a> SessionTx<'a> {
                         bail!("Indexed vector not found, this signifies a bug in the index implementation")
                     }
                 };
-                let old_existing_val: Vec<DataValue> =
-                    rmp_serde::from_slice(&old_existing_val[ENCODED_KEY_MIN_LEN..]).unwrap();
-                if old_existing_val[2].get_bool().unwrap() {
+                let old_existing_val = try_decode_val_only(&old_key_bytes, &old_existing_val)?;
+                let is_deleted = old_existing_val
+                    .get(2)
+                    .and_then(DataValue::get_bool)
+                    .ok_or_else(|| miette!("corrupt HNSW edge row: missing deletion marker"))?;
+                if is_deleted {
                     self.idx_del(idx_table, &old_key_bytes)?;
                 } else {
                     let old_val = vec![
@@ -593,7 +635,7 @@ impl<'a> SessionTx<'a> {
                 vec_cache.ensure_key(&cand_key, orig_table, self)?;
                 vec_cache.ensure_key(existing, orig_table, self)?;
                 let dist_to_existing = vec_cache.k_dist(existing, &cand_key);
-                if dist_to_existing < cand_dist_to_q {
+                if distance_is_closer(dist_to_existing, cand_dist_to_q) {
                     should_add = false;
                     break;
                 }
@@ -634,9 +676,8 @@ impl<'a> SessionTx<'a> {
         }
 
         while let Some((candidate, Reverse(OrderedFloat(candidate_dist)))) = candidates.pop() {
-            let (_, OrderedFloat(furtherest_dist)) = found_nn.peek().unwrap();
-            let furtherest_dist = *furtherest_dist;
-            if candidate_dist > furtherest_dist {
+            let (_, OrderedFloat(furthest_dist)) = found_nn.peek().unwrap();
+            if distance_is_farther(candidate_dist, *furthest_dist) {
                 break;
             }
             // Fetch all unvisited neighbours' vectors in one batched read
@@ -652,8 +693,10 @@ impl<'a> SessionTx<'a> {
                     continue;
                 }
                 let neighbour_dist = vec_cache.v_dist(q, &neighbour_key);
-                let (_, OrderedFloat(cand_furtherest_dist)) = found_nn.peek().unwrap();
-                if found_nn.len() < ef || neighbour_dist < *cand_furtherest_dist {
+                let (_, OrderedFloat(candidate_furthest_dist)) = found_nn.peek().unwrap();
+                if found_nn.len() < ef
+                    || distance_is_closer(neighbour_dist, *candidate_furthest_dist)
+                {
                     candidates.push(neighbour_key.clone(), Reverse(OrderedFloat(neighbour_dist)));
                     found_nn.push(neighbour_key.clone(), OrderedFloat(neighbour_dist));
                     if found_nn.len() > ef {
@@ -679,34 +722,41 @@ impl<'a> SessionTx<'a> {
         start_tuple.push(DataValue::from(cand_key.1 as i64));
         start_tuple.push(DataValue::from(cand_key.2 as i64));
         let key_len = cand_key.0.len();
-        Ok(idx_handle
+        let neighbours = idx_handle
             .scan_prefix(self, &start_tuple)
-            .filter_map(move |res| {
-                let tuple = res.unwrap();
-
-                let key_idx = tuple[2 * key_len + 3].get_int().unwrap() as usize;
-                let key_subidx = tuple[2 * key_len + 4].get_int().unwrap() as i32;
+            .map(|res| {
+                let tuple = res?;
+                let expected_len = 2 * key_len + 8;
+                if tuple.len() < expected_len {
+                    bail!(
+                        "corrupt HNSW edge row: expected at least {expected_len} fields, got {}",
+                        tuple.len()
+                    );
+                }
+                let key_idx = tuple[2 * key_len + 3].get_int().ok_or_else(|| {
+                    miette!("corrupt HNSW edge row: vector index is not an integer")
+                })? as usize;
+                let key_subidx = tuple[2 * key_len + 4].get_int().ok_or_else(|| {
+                    miette!("corrupt HNSW edge row: vector sub-index is not an integer")
+                })? as i32;
                 let key_tup = tuple[key_len + 3..2 * key_len + 3].to_vec();
                 if key_tup == cand_key.0 {
-                    None
-                } else {
-                    if include_deleted {
-                        return Some((
-                            (key_tup, key_idx, key_subidx),
-                            tuple[2 * key_len + 5].get_float().unwrap(),
-                        ));
-                    }
-                    let is_deleted = tuple[2 * key_len + 7].get_bool().unwrap();
-                    if is_deleted {
-                        None
-                    } else {
-                        Some((
-                            (key_tup, key_idx, key_subidx),
-                            tuple[2 * key_len + 5].get_float().unwrap(),
-                        ))
-                    }
+                    return Ok(None);
                 }
-            }))
+                let distance = tuple[2 * key_len + 5]
+                    .get_float()
+                    .ok_or_else(|| miette!("corrupt HNSW edge row: distance is not numeric"))?;
+                if include_deleted {
+                    return Ok(Some(((key_tup, key_idx, key_subidx), distance)));
+                }
+                let is_deleted = tuple[2 * key_len + 7].get_bool().ok_or_else(|| {
+                    miette!("corrupt HNSW edge row: deletion marker is not boolean")
+                })?;
+                Ok((!is_deleted).then_some(((key_tup, key_idx, key_subidx), distance)))
+            })
+            .filter_map(|res| res.transpose())
+            .collect::<Result<Vec<_>>>()?;
+        Ok(neighbours.into_iter())
     }
     fn hnsw_put_fresh_at_levels(
         &mut self,
@@ -867,7 +917,11 @@ impl<'a> SessionTx<'a> {
                 let v = idx_table.encode_val_only_for_store(&self_val, Default::default())?;
                 self.idx_put(idx_table, &k, &v)?;
 
-                for &(nb, dist) in list {
+                for (nb, dist, ignore_link) in list
+                    .iter()
+                    .map(|&(nb, dist)| (nb, dist, false))
+                    .chain(graph.dead[i][d].iter().map(|&(nb, dist)| (nb, dist, true)))
+                {
                     let nb_meta = &graph.metas[nb as usize];
                     key_buf.clear();
                     key_buf.push(DataValue::from(level));
@@ -880,7 +934,7 @@ impl<'a> SessionTx<'a> {
                     let edge_val = [
                         DataValue::from(dist),
                         DataValue::Null,
-                        DataValue::from(false),
+                        DataValue::from(ignore_link),
                     ];
                     let k = idx_table.encode_key_for_store(&key_buf, Default::default())?;
                     let v = idx_table.encode_val_only_for_store(&edge_val, Default::default())?;
@@ -958,6 +1012,11 @@ impl<'a> SessionTx<'a> {
                 }
             }
         }
+        let keep: FxHashSet<(usize, i32)> = extracted_vectors
+            .iter()
+            .map(|(_, idx, sub)| (*idx, *sub))
+            .collect();
+        self.hnsw_remove_except(orig_table, idx_table, tuple, &keep)?;
         if extracted_vectors.is_empty() {
             return Ok(false);
         }
@@ -974,23 +1033,43 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         tuple: &[DataValue],
     ) -> Result<()> {
+        self.hnsw_remove_except(orig_table, idx_table, tuple, &FxHashSet::default())
+    }
+
+    fn hnsw_remove_except(
+        &mut self,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        tuple: &[DataValue],
+        keep: &FxHashSet<(usize, i32)>,
+    ) -> Result<()> {
         let mut prefix = vec![DataValue::from(0)];
         prefix.extend_from_slice(&tuple[0..orig_table.metadata.keys.len()]);
         let candidates: FxHashSet<_> = idx_table
             .scan_prefix(self, &prefix)
-            .filter_map(|t| match t {
-                Ok(t) => Some({
-                    (
-                        t[1..orig_table.metadata.keys.len() + 1].to_vec(),
-                        t[orig_table.metadata.keys.len() + 1].get_int().unwrap() as usize,
-                        t[orig_table.metadata.keys.len() + 2].get_int().unwrap() as i32,
-                    )
-                }),
-                Err(_) => None,
+            .map(|t| {
+                let t = t?;
+                let key_len = orig_table.metadata.keys.len();
+                if t.len() < key_len + 3 {
+                    bail!(
+                        "corrupt HNSW self-row: expected at least {} fields, got {}",
+                        key_len + 3,
+                        t.len()
+                    );
+                }
+                let idx = t[key_len + 1].get_int().ok_or_else(|| {
+                    miette!("corrupt HNSW self-row: vector index is not an integer")
+                })? as usize;
+                let subidx = t[key_len + 2].get_int().ok_or_else(|| {
+                    miette!("corrupt HNSW self-row: vector sub-index is not an integer")
+                })? as i32;
+                Ok((t[1..key_len + 1].to_vec(), idx, subidx))
             })
-            .collect();
+            .collect::<Result<_>>()?;
         for (tuple_key, idx, subidx) in candidates {
-            self.hnsw_remove_vec(&tuple_key, idx, subidx, orig_table, idx_table)?;
+            if !keep.contains(&(idx, subidx)) {
+                self.hnsw_remove_vec(&tuple_key, idx, subidx, orig_table, idx_table)?;
+            }
         }
         Ok(())
     }
@@ -1053,11 +1132,16 @@ impl<'a> SessionTx<'a> {
                 }
                 let neighbour_self_key_bytes =
                     idx_table.encode_key_for_store(&neighbour_self_key, Default::default())?;
-                let neighbour_val_bytes =
-                    self.idx_get(idx_table, &neighbour_self_key_bytes)?.unwrap();
-                let mut neighbour_val: Vec<DataValue> =
-                    rmp_serde::from_slice(&neighbour_val_bytes[ENCODED_KEY_MIN_LEN..]).unwrap();
-                neighbour_val[0] = DataValue::from(neighbour_val[0].get_float().unwrap() - 1.);
+                let neighbour_val_bytes = self
+                    .idx_get(idx_table, &neighbour_self_key_bytes)?
+                    .ok_or_else(|| miette!("corrupt HNSW index: neighbour self-row is missing"))?;
+                let mut neighbour_val =
+                    try_decode_val_only(&neighbour_self_key_bytes, &neighbour_val_bytes)?;
+                let degree = neighbour_val
+                    .first()
+                    .and_then(DataValue::get_float)
+                    .ok_or_else(|| miette!("corrupt HNSW self-row: missing numeric degree"))?;
+                neighbour_val[0] = DataValue::from(degree - 1.);
                 let neighbour_val_bytes_new =
                     idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?;
                 self.idx_put(

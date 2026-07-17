@@ -91,7 +91,7 @@ pub use runtime::graph_projection::{
 };
 pub use runtime::db::NamedRows;
 pub use runtime::hybrid::{build_hybrid_query, GraphLeg, HybridList, HybridSearch, MmrParams};
-pub use runtime::relation::decode_tuple_from_kv;
+pub use runtime::relation::{decode_tuple_from_kv, try_decode_tuple_from_kv};
 pub use runtime::temp_store::RegularTempStore;
 pub use storage::mem::{new_cozo_mem, MemStorage};
 #[cfg(feature = "storage-new-rocksdb")]

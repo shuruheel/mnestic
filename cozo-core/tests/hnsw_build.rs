@@ -36,7 +36,10 @@ fn build_then_query_is_correct() {
     let rows: Vec<String> = (0..200).map(|i| format!("[{i},[{}.0,0.0]]", i)).collect();
     run(
         &db,
-        &format!("?[id, emb] <- [{}] :put pts {{ id => emb }}", rows.join(",")),
+        &format!(
+            "?[id, emb] <- [{}] :put pts {{ id => emb }}",
+            rows.join(",")
+        ),
     );
     run(
         &db,
@@ -86,7 +89,10 @@ fn list_of_vectors_build_and_query() {
         .collect();
     run(
         &db,
-        &format!("?[id, segs] <- [{}] :put docs {{ id => segs }}", rows.join(",")),
+        &format!(
+            "?[id, segs] <- [{}] :put docs {{ id => segs }}",
+            rows.join(",")
+        ),
     );
     run(
         &db,
@@ -105,10 +111,18 @@ fn list_of_vectors_build_and_query() {
         run(&db, &q).rows[0][0].get_int().unwrap()
     };
     // Segment 0 of every doc — the branch every build handles.
-    assert_eq!(indexed_docs(0), 100, "every doc's first segment must be indexed");
+    assert_eq!(
+        indexed_docs(0),
+        100,
+        "every doc's first segment must be indexed"
+    );
     // Segment 1 of every doc — the list-element branch this test guards. A build
     // that indexed only `sub_idx == 0` would leave this at 0.
-    assert_eq!(indexed_docs(1), 100, "every doc's second segment must be indexed");
+    assert_eq!(
+        indexed_docs(1),
+        100,
+        "every doc's second segment must be indexed"
+    );
 
     // Smoke-test the list-of-vectors search path itself: a query near a second
     // segment returns neighbours without error. Recall/rank is not asserted (see
@@ -117,7 +131,58 @@ fn list_of_vectors_build_and_query() {
         &db,
         "?[id, dist] := ~docs:idx{ id | query: vec([50.0, 100.0]), k: 5, ef: 64, bind_distance: dist } :order dist",
     );
-    assert!(!res.rows.is_empty(), "list-of-vectors search returned no neighbours");
+    assert!(
+        !res.rows.is_empty(),
+        "list-of-vectors search returned no neighbours"
+    );
+}
+
+/// Bulk construction must preserve a stored row for both directions of every
+/// edge. Pruned directions are tombstoned, not omitted, because removal walks
+/// those rows to find and delete their mirrors.
+#[test]
+fn bulk_build_preserves_paired_edge_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new("sqlite", dir.path().join("paired.db").to_str().unwrap(), "").unwrap();
+    run(&db, ":create pts { id: Int => emb: <F32; 8> }");
+
+    let mut state = 0xD1B54A32D192ED03u64;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+    };
+    let rows: Vec<String> = (0..300)
+        .map(|id| {
+            let values = (0..8)
+                .map(|_| format!("{:.6}", next()))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("[{id},[{values}]]")
+        })
+        .collect();
+    run(
+        &db,
+        &format!("?[id, emb] <- [{}] :put pts {{id => emb}}", rows.join(",")),
+    );
+    run(
+        &db,
+        "::hnsw create pts:idx { dim: 8, m: 4, dtype: F32, fields: [emb], \
+         distance: L2, ef_construction: 32 }",
+    );
+
+    let result = run(
+        &db,
+        "edge[fr, to] := *pts:idx{fr_id: fr, to_id: to}, fr != to\n\
+         unpaired[fr, to] := edge[fr, to], not edge[to, fr]\n\
+         ?[count(fr)] := unpaired[fr, to]",
+    );
+    assert_eq!(
+        result.rows[0][0].get_int(),
+        Some(0),
+        "every bulk-built edge row must have a stored reverse row"
+    );
 }
 
 /// F64 dtype + Cosine distance through the flat build: recall agreement
@@ -127,7 +192,9 @@ fn list_of_vectors_build_and_query() {
 fn f64_cosine_build_recall() {
     let mut state: u64 = 0x9E3779B97F4A7C15;
     let mut next = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         let raw = ((state >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
         // Round to the 6 decimals we serialise, so brute force sees the exact
         // stored values.
@@ -147,13 +214,18 @@ fn f64_cosine_build_recall() {
     let vectors: Vec<Vec<f64>> = (0..N)
         .map(|i| {
             let c = &centroids[i % CLUSTERS];
-            c.iter().map(|x| ((x + next()) * 1e6).round() / 1e6).collect()
+            c.iter()
+                .map(|x| ((x + next()) * 1e6).round() / 1e6)
+                .collect()
         })
         .collect();
 
     let dir = tempfile::tempdir().unwrap();
     let db = DbInstance::new("sqlite", dir.path().join("c.db").to_str().unwrap(), "").unwrap();
-    run(&db, &format!(":create pts {{ id: Int => emb: <F64; {DIM}> }}"));
+    run(
+        &db,
+        &format!(":create pts {{ id: Int => emb: <F64; {DIM}> }}"),
+    );
     for (ci, rows) in vectors.chunks(200).enumerate() {
         let body: Vec<String> = rows
             .iter()
@@ -165,7 +237,10 @@ fn f64_cosine_build_recall() {
             .collect();
         run(
             &db,
-            &format!("?[id, emb] <- [{}] :put pts {{ id => emb }}", body.join(",")),
+            &format!(
+                "?[id, emb] <- [{}] :put pts {{ id => emb }}",
+                body.join(",")
+            ),
         );
     }
     run(
@@ -190,8 +265,7 @@ fn f64_cosine_build_recall() {
         let mut scored: Vec<(usize, f64)> =
             vectors.iter().map(|v| cosine(q, v)).enumerate().collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let truth: std::collections::HashSet<usize> =
-            scored[..K].iter().map(|(i, _)| *i).collect();
+        let truth: std::collections::HashSet<usize> = scored[..K].iter().map(|(i, _)| *i).collect();
 
         let qs: Vec<String> = q.iter().map(|x| format!("{x:.6}")).collect();
         let res = run(
@@ -225,7 +299,9 @@ fn parallel_build_recall_agreement() {
     // Deterministic LCG so the test needs no rand dev-dependency.
     let mut state: u64 = 0x2545F4914F6CDD1D;
     let mut next_f32 = || {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         ((state >> 33) as f32 / (1u64 << 31) as f32) - 1.0
     };
 
@@ -246,7 +322,10 @@ fn parallel_build_recall_agreement() {
 
     let dir = tempfile::tempdir().unwrap();
     let db = DbInstance::new("sqlite", dir.path().join("r.db").to_str().unwrap(), "").unwrap();
-    run(&db, &format!(":create pts {{ id: Int => emb: <F32; {DIM}> }}"));
+    run(
+        &db,
+        &format!(":create pts {{ id: Int => emb: <F32; {DIM}> }}"),
+    );
     for chunk in vectors.chunks(500).enumerate().collect::<Vec<_>>() {
         let (ci, rows) = chunk;
         let body: Vec<String> = rows
@@ -259,7 +338,10 @@ fn parallel_build_recall_agreement() {
             .collect();
         run(
             &db,
-            &format!("?[id, emb] <- [{}] :put pts {{ id => emb }}", body.join(",")),
+            &format!(
+                "?[id, emb] <- [{}] :put pts {{ id => emb }}",
+                body.join(",")
+            ),
         );
     }
     run(
@@ -271,10 +353,7 @@ fn parallel_build_recall_agreement() {
     );
 
     let l2 = |a: &[f32], b: &[f32]| -> f64 {
-        a.iter()
-            .zip(b)
-            .map(|(x, y)| ((x - y) as f64).powi(2))
-            .sum()
+        a.iter().zip(b).map(|(x, y)| ((x - y) as f64).powi(2)).sum()
     };
 
     let mut hits = 0usize;
@@ -284,8 +363,7 @@ fn parallel_build_recall_agreement() {
         // brute-force top-K ids
         let mut scored: Vec<(usize, f64)> = vectors.iter().map(|v| l2(q, v)).enumerate().collect();
         scored.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
-        let truth: std::collections::HashSet<usize> =
-            scored[..K].iter().map(|(i, _)| *i).collect();
+        let truth: std::collections::HashSet<usize> = scored[..K].iter().map(|(i, _)| *i).collect();
 
         let qs: Vec<String> = q.iter().map(|x| format!("{x:.6}")).collect();
         let res = run_params(

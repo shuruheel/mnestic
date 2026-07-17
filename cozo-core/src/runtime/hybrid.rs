@@ -37,7 +37,7 @@
 //! let rows = db.hybrid_search(&q)?;
 //! ```
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
 use miette::{ensure, Result};
@@ -256,11 +256,22 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         q.rrf_k.is_finite() && q.rrf_k >= 0.0,
         "hybrid_search: rrf_k must be finite and >= 0"
     );
+    let mut labels = BTreeSet::from(["semantic", "text"]);
     for l in &q.extra_lists {
         validate_ident(&l.label, "extra_lists.label")?;
+        ensure!(
+            labels.insert(l.label.as_str()),
+            "hybrid_search: every fusion leg needs a distinct label; duplicate '{}'",
+            l.label
+        );
     }
     for g in &q.graph_legs {
         validate_ident(&g.label, "graph_legs.label")?;
+        ensure!(
+            labels.insert(g.label.as_str()),
+            "hybrid_search: every fusion leg needs a distinct label; duplicate '{}'",
+            g.label
+        );
         validate_ident(&g.edge_relation, "graph_legs.edge_relation")?;
         validate_ident(&g.from_col, "graph_legs.from_col")?;
         validate_ident(&g.to_col, "graph_legs.to_col")?;
@@ -391,7 +402,7 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         // higher-is-better orientation; RRF only uses the within-list rank.
         writeln!(
             s,
-            "combined[__lid, id, score] := hg{i}_reach[id, __gd], score = -__gd, __lid = '{label}'",
+            "combined[__lid, id, score] := hg{i}_reach[id, __gd], not hg{i}_seed[id], score = -__gd, __lid = '{label}'",
             label = g.label,
         )
         .unwrap();

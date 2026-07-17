@@ -13,7 +13,7 @@ use rocksdb::{
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
 use crate::runtime::db::{BadDbInit, DbManifest};
-use crate::runtime::relation::{decode_tuple_from_kv, extend_tuple_from_v};
+use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
 use crate::storage::{Storage, StoreTx};
 use crate::Db;
 
@@ -400,7 +400,7 @@ impl<'a> Iterator for NewRocksDbIterator<'a> {
                     if k.as_ref() >= self.upper_bound.as_slice() {
                         return None;
                     }
-                    return Some(Ok(decode_tuple_from_kv(&k, &v, None)));
+                    return Some(try_decode_tuple_from_kv(&k, &v, None));
                 }
                 Err(e) => return Some(Err(miette!("Iterator error: {}", e))),
             }
@@ -436,8 +436,9 @@ impl<'a> Iterator for NewRocksDbSkipIterator<'a> {
                         check_key_for_validity(k_slice.as_ref(), self.valid_at, None);
                     self.next_bound = nxt_bound;
                     if let Some(mut tup) = ret {
-                        extend_tuple_from_v(&mut tup, v_slice.as_ref());
-                        return Some(Ok(tup));
+                        return Some(
+                            try_extend_tuple_from_v(&mut tup, v_slice.as_ref()).map(|()| tup),
+                        );
                     }
                 }
                 Some(Err(e)) => return Some(Err(miette!("Iterator Error: {}", e))),

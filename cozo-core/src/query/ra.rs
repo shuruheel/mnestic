@@ -1685,7 +1685,7 @@ impl StoredRA {
                     }
                 }
             })
-            .flatten_ok()
+            .map(flatten_err)
             .filter_map(invert_option_err);
         Ok(if eliminate_indices.is_empty() {
             Box::new(it)

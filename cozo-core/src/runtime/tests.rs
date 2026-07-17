@@ -871,7 +871,7 @@ fn test_lsh_indexing2() {
         let res = db
             .run_default("?[k] := ~a:lsh{k | query: 'ewiygfspeoighjsfcfxzdfncalsdf', k: 1}")
             .unwrap();
-        assert!(res.rows.len() > 0);
+        assert!(!res.rows.is_empty());
     }
 }
 
@@ -905,7 +905,7 @@ fn test_lsh_indexing3() {
     ~text:lsh{id: id, dup_for: dup_for, | query: "This function first generates 32 random bytes using the os.urandom function. It then base64 encodes these bytes using base64.urlsafe_b64encode, removes the padding, and decodes the result to a string.", }"#,
             )
             .unwrap();
-        assert!(res.rows.len() > 0);
+        assert!(!res.rows.is_empty());
         println!("{}", res.into_json());
     }
 }
@@ -965,7 +965,7 @@ fn test_lsh_indexing4() {
         let res = db
             .run_default("?[k] := ~a:lsh{k | query: 'ewiygfspeoighjsfcfxzdfncalsdf', k: 1}")
             .unwrap();
-        assert!(res.rows.len() == 0);
+        assert!(res.rows.is_empty());
     }
 }
 
@@ -1987,6 +1987,209 @@ fn txtime_restore_backup_reseeds_clock() {
 }
 
 #[test]
+fn restore_backup_reseeds_relation_store_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_path = dir.path().join("src-relid.db");
+    let backup_path = dir.path().join("backup-relid.db");
+    let dst_path = dir.path().join("dst-relid.db");
+
+    {
+        let src = DbInstance::new("sqlite", src_path.to_str().unwrap(), "").unwrap();
+        src.run_default(":create alpha {k: Int => v: String}")
+            .unwrap();
+        src.run_default(":create beta {k: Int => v: String}")
+            .unwrap();
+        src.run_default("?[k, v] <- [[1, 'alpha-one']] :put alpha {k => v}")
+            .unwrap();
+        src.backup_db(backup_path.to_str().unwrap()).unwrap();
+    }
+
+    let dst = DbInstance::new("sqlite", dst_path.to_str().unwrap(), "").unwrap();
+    dst.restore_backup(backup_path.to_str().unwrap()).unwrap();
+    dst.run_default(":create gamma {k: Int => v: String}")
+        .unwrap();
+    dst.run_default("?[k, v] <- [[1, 'gamma-one']] :put gamma {k => v}")
+        .unwrap();
+
+    let alpha = dst
+        .run_default("?[k, v] := *alpha{k, v}")
+        .unwrap()
+        .into_json();
+    assert_eq!(alpha["rows"], json!([[1, "alpha-one"]]));
+    let gamma = dst
+        .run_default("?[k, v] := *gamma{k, v}")
+        .unwrap()
+        .into_json();
+    assert_eq!(gamma["rows"], json!([[1, "gamma-one"]]));
+}
+
+#[test]
+fn poisoned_relation_counter_is_repaired_on_open() {
+    use crate::data::tuple::TupleT;
+    use crate::runtime::relation::RelationId;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("poisoned-relid.db");
+    {
+        let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+        db.run_default(":create alpha {k: Int => v: String}")
+            .unwrap();
+        db.run_default(":create beta {k: Int => v: String}")
+            .unwrap();
+        db.run_default("?[k, v] <- [[1, 'beta-one']] :put beta {k => v}")
+            .unwrap();
+
+        let DbInstance::Sqlite(inner) = &db else {
+            panic!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let counter_key = vec![DataValue::Null].encode_as_key(RelationId::SYSTEM);
+        tx.store_tx
+            .put(&counter_key, &RelationId::new(1).raw_encode())
+            .unwrap();
+        tx.commit_tx().unwrap();
+    }
+
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create gamma {k: Int => v: String}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 'gamma-one']] :put gamma {k => v}")
+        .unwrap();
+    let beta = db
+        .run_default("?[k, v] := *beta{k, v}")
+        .unwrap()
+        .into_json();
+    assert_eq!(beta["rows"], json!([[1, "beta-one"]]));
+}
+
+#[test]
+fn corrupt_value_rows_error_and_can_be_repaired() {
+    use crate::data::tuple::TupleT;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-value.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create damaged {k: Int => v: String}")
+        .unwrap();
+    db.run_default("?[k, v] <- [[1, 'intact']] :put damaged {k => v}")
+        .unwrap();
+
+    let DbInstance::Sqlite(inner) = &db else {
+        panic!()
+    };
+    let mut tx = inner.transact_write().unwrap();
+    let handle = tx.get_relation("damaged", false).unwrap();
+    let key = vec![DataValue::from(1)].encode_as_key(handle.id);
+    tx.store_tx.put(&key, &[0x91, 0x01, 0x02]).unwrap();
+    tx.commit_tx().unwrap();
+    drop(tx);
+
+    let scan_error = db
+        .run_default("?[k, v] := *damaged{k, v}")
+        .expect_err("a corrupt row must fail a full scan without panicking");
+    assert!(
+        format!("{scan_error:?}").contains("eval::corrupt_value_blob"),
+        "{scan_error:?}"
+    );
+
+    let lookup_error = db
+        .run_default("wanted[k] <- [[1]] ?[v] := wanted[k], *damaged{k, v}")
+        .expect_err("a fully-bound point lookup must not swallow decode errors");
+    assert!(
+        format!("{lookup_error:?}").contains("eval::corrupt_value_blob"),
+        "{lookup_error:?}"
+    );
+
+    let repaired = db.run_default("::repair_corrupt damaged").unwrap();
+    assert_eq!(repaired.rows, vec![vec![DataValue::from(1)]]);
+    assert!(db
+        .run_default("?[k, v] := *damaged{k, v}")
+        .unwrap()
+        .rows
+        .is_empty());
+}
+
+#[cfg(feature = "storage-sqlite")]
+fn corrupt_all_index_values(db: &DbInstance, relation: &str, index: &str, hnsw: bool) {
+    let DbInstance::Sqlite(inner) = db else {
+        panic!("corruption fixture requires sqlite")
+    };
+    let mut tx = inner.transact_write().unwrap();
+    let relation_handle = tx.get_relation(relation, false).unwrap();
+    let index_handle = if hnsw {
+        &relation_handle.hnsw_indices[index].0
+    } else {
+        &relation_handle.fts_indices[index].0
+    };
+    let start = index_handle.encode_partial_key_for_store(&[]);
+    let end = index_handle.encode_partial_key_for_store(&[DataValue::Bot]);
+    let keys = tx
+        .store_tx
+        .range_scan(&start, &end)
+        .map(|item| item.unwrap().0)
+        .collect_vec();
+    assert!(!keys.is_empty(), "fixture must create index rows");
+    for key in keys {
+        tx.store_tx.put(&key, &[0x91, 0x01, 0x02]).unwrap();
+    }
+    tx.commit_tx().unwrap();
+}
+
+#[test]
+#[cfg(feature = "storage-sqlite")]
+fn corrupt_fts_postings_return_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-fts.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create docs {id: Int => body: String}")
+        .unwrap();
+    db.run_default(
+        "::fts create docs:search { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+    )
+    .unwrap();
+    db.run_default("?[id, body] <- [[1, 'needle text']] :put docs {id => body}")
+        .unwrap();
+    corrupt_all_index_values(&db, "docs", "search", false);
+
+    let error = db
+        .run_default("?[id] := ~docs:search{id | query: 'needle', k: 10}")
+        .expect_err("a corrupt FTS posting must return an error without panicking");
+    assert!(
+        format!("{error:?}").contains("eval::corrupt_value_blob"),
+        "{error:?}"
+    );
+}
+
+#[test]
+#[cfg(feature = "storage-sqlite")]
+fn corrupt_hnsw_rows_return_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("corrupt-hnsw.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    db.run_default(":create pts {id: Int => emb: <F32; 2>}")
+        .unwrap();
+    db.run_default(
+        "::hnsw create pts:search { dim: 2, m: 8, dtype: F32, fields: [emb], \
+         distance: L2, ef_construction: 32 }",
+    )
+    .unwrap();
+    db.run_default(
+        "?[id, emb] <- [[1, vec([1.0, 0.0])], [2, vec([0.0, 1.0])]] \
+         :put pts {id => emb}",
+    )
+    .unwrap();
+    corrupt_all_index_values(&db, "pts", "search", true);
+
+    let error = db
+        .run_default("?[id] := ~pts:search{id | query: vec([1.0, 0.0]), k: 10, ef: 32}")
+        .expect_err("a corrupt HNSW row must return an error without panicking");
+    assert!(
+        format!("{error:?}").contains("eval::corrupt_value_blob"),
+        "{error:?}"
+    );
+}
+
+#[test]
 fn txtime_cross_statement_conflicts_rejected() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default(":create belief_ms {e, v: Validity, tt: TxTime => x: Int}")
@@ -2491,6 +2694,9 @@ fn bitemporal_fixture(engine: &str, path: &str) -> (DbInstance, [i64; 4]) {
     db.run_default(":create hist {k, v: Validity, tt: TxTime => x: Int}")
         .unwrap();
     fn peek(db: &DbInstance) -> i64 {
+        // The wildcard is reachable when optional storage features add variants, but not in the
+        // default all-targets gate where only mem + sqlite are compiled.
+        #[allow(unreachable_patterns)]
         match db {
             DbInstance::Mem(i) => i.tt_clock().peek(),
             #[cfg(feature = "storage-sqlite")]

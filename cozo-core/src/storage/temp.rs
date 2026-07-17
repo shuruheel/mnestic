@@ -13,7 +13,7 @@ use miette::Result;
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::decode_tuple_from_kv;
+use crate::runtime::relation::try_decode_tuple_from_kv;
 use crate::storage::mem::SkipIterator;
 use crate::storage::{Storage, StoreTx};
 
@@ -91,7 +91,7 @@ impl<'s> StoreTx<'s> for TempTx {
         Box::new(
             self.store
                 .range(lower.to_vec()..upper.to_vec())
-                .map(|(k, v)| Ok(decode_tuple_from_kv(k, v, None))),
+                .map(|(k, v)| try_decode_tuple_from_kv(k, v, None)),
         )
     }
 
@@ -108,8 +108,7 @@ impl<'s> StoreTx<'s> for TempTx {
                 valid_at,
                 next_bound: lower.to_vec(),
                 size_hint: None,
-            }
-            .map(Ok),
+            },
         )
     }
 

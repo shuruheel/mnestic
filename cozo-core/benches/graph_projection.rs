@@ -16,11 +16,12 @@
 //! query.
 //!
 //! Four groups:
-//!   - `cold`:       positional form, i.e. today's behaviour (scan + build + kernel)
-//!   - `warm`:       `graph: 'g'` against a resident, unchanged variant
-//!   - `invalidated`: `graph: 'g'` with a one-row write before every call —
-//!                    the "never worse than today" bound, in the worst case
-//!   - `list`:       `::graph list`, so the observability surface is not free-riding
+//!
+//! - `cold`: positional form, i.e. today's behaviour (scan + build + kernel)
+//! - `warm`: `graph: 'g'` against a resident, unchanged variant
+//! - `invalidated`: `graph: 'g'` with a one-row write before every call —
+//!   the "never worse than today" bound, in the worst case
+//! - `list`: `::graph list`, so the observability surface is not free-riding
 //!
 //! Run: `cargo bench -p mnestic --bench graph_projection`
 

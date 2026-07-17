@@ -17,7 +17,7 @@ use sqlite::{ConnectionThreadSafe, State, Statement};
 
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::{decode_tuple_from_kv, extend_tuple_from_v};
+use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
 use crate::storage::{Storage, StoreTx};
 use crate::utils::swap_option_result;
 
@@ -64,15 +64,15 @@ impl<'s> Storage<'s> for SqliteStorage {
 
     fn transact(&'s self, write: bool) -> Result<Self::Tx> {
         let conn = {
-            match self.pool.lock().unwrap().pop() {
+            match self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
                 None => Connection::open_thread_safe(&self.name).into_diagnostic()?,
                 Some(conn) => conn,
             }
         };
         let lock = if write {
-            Right(self.lock.write().unwrap())
+            Right(self.lock.write().unwrap_or_else(|e| e.into_inner()))
         } else {
-            Left(self.lock.read().unwrap())
+            Left(self.lock.read().unwrap_or_else(|e| e.into_inner()))
         };
         if write {
             let mut stmt = conn.prepare("begin;").into_diagnostic()?;
@@ -106,7 +106,7 @@ impl<'s> Storage<'s> for SqliteStorage {
     }
 
     fn range_compact(&'_ self, _lower: &[u8], _upper: &[u8]) -> Result<()> {
-        let mut pool = self.pool.lock().unwrap();
+        let mut pool = self.pool.lock().unwrap_or_else(|e| e.into_inner());
         while pool.pop().is_some() {}
         Ok(())
     }
@@ -154,7 +154,7 @@ impl Drop for SqliteTx<'_> {
                 let _ = self.conn.as_ref().unwrap().execute(query);
             }
         }
-        let mut pool = self.storage.pool.lock().unwrap();
+        let mut pool = self.storage.pool.lock().unwrap_or_else(|e| e.into_inner());
         let conn = self.conn.take().unwrap();
         pool.push(conn)
     }
@@ -385,8 +385,7 @@ impl<'l> Iterator for TupleIter<'l> {
             Ok(State::Row) => {
                 let k = self.0.read::<Vec<u8>, _>(0).unwrap();
                 let v = self.0.read::<Vec<u8>, _>(1).unwrap();
-                let tuple = decode_tuple_from_kv(&k, &v, None);
-                Some(Ok(tuple))
+                Some(try_decode_tuple_from_kv(&k, &v, None))
             }
             Err(err) => Some(Err(miette!(err))),
         }
@@ -470,7 +469,7 @@ impl<'l> SkipIter<'l> {
                     self.next_bound = nxt_bound;
                     if let Some(mut tup) = ret {
                         let v = self.stmt.read::<Vec<u8>, _>(1).unwrap();
-                        extend_tuple_from_v(&mut tup, &v);
+                        try_extend_tuple_from_v(&mut tup, &v)?;
                         return Ok(Some(tup));
                     }
                 }

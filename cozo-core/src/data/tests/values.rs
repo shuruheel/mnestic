@@ -43,7 +43,7 @@ fn display_datavalues() {
     println!("{}", DataValue::Null);
     println!("{}", DataValue::from(true));
     println!("{}", DataValue::from(-1));
-    println!("{}", DataValue::from(-1121212121.331212121));
+    println!("{}", DataValue::from(-1_121_212_121.331_212));
     println!("{}", DataValue::from(f64::NAN));
     println!("{}", DataValue::from(f64::NEG_INFINITY));
     println!("{}", DataValue::from(vec![10, 20]));

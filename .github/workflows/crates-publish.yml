@@ -43,7 +43,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build -p mnestic --verbose
       - run: cargo test -p mnestic --verbose
-      - run: cargo clippy -p mnestic -- -D warnings
+      - run: cargo clippy -p mnestic --all-targets -- -D warnings
 
   publish:
     name: publish to crates.io

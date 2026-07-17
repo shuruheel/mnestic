@@ -227,9 +227,9 @@ fn describe_relation_is_rejected_in_read_only_mode() {
 
 /// `::repair_corrupt` parses, runs against a healthy relation (reporting 0
 /// removed), respects read-only mode, and errors on a missing relation.
-/// True-corruption repair (truncated value bytes) is exercised against
-/// production data — crafting a short tuple requires raw store access the
-/// public API deliberately does not expose.
+/// True-corruption repair and ordinary-error behavior are exercised by the
+/// internal SQLite regression, where raw store access can safely craft a
+/// truncated value blob.
 #[test]
 fn repair_corrupt_basics() {
     let dir = tempfile::tempdir().unwrap();
@@ -251,6 +251,15 @@ fn repair_corrupt_basics() {
         ScriptMutability::Mutable,
     )
     .unwrap();
+
+    let imperative = db
+        .run_script(
+            "{?[k, a, b] <- [[1, 2, 3]] :put t {k => a, b}} {::repair_corrupt t}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+    assert_eq!(imperative.rows[0][0].get_int(), Some(0));
 
     let res = db
         .run_script("::repair_corrupt t", BTreeMap::new(), ScriptMutability::Mutable)

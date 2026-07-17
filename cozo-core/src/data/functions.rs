@@ -33,6 +33,7 @@ use crate::data::relation::VecElementType;
 use crate::data::value::{
     DataValue, JsonData, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs, Vector,
 };
+use crate::runtime::hnsw::cosine_distance;
 
 macro_rules! define_op {
     ($name:ident, $min_arity:expr, $vararg:expr) => {
@@ -2233,11 +2234,13 @@ pub(crate) fn op_l2_normalize(args: &[DataValue]) -> Result<DataValue> {
     match a {
         DataValue::Vec(Vector::F32(a)) => {
             let norm = a.dot(a).sqrt();
-            Ok(DataValue::Vec(Vector::F32(a / norm)))
+            let normalized = if norm > 0.0 { a / norm } else { a.clone() };
+            Ok(DataValue::Vec(Vector::F32(normalized)))
         }
         DataValue::Vec(Vector::F64(a)) => {
             let norm = a.dot(a).sqrt();
-            Ok(DataValue::Vec(Vector::F64(a / norm)))
+            let normalized = if norm > 0.0 { a / norm } else { a.clone() };
+            Ok(DataValue::Vec(Vector::F64(normalized)))
         }
         _ => bail!("'l2_normalize' requires a vector"),
     }
@@ -2301,7 +2304,7 @@ pub(crate) fn op_cos_dist(args: &[DataValue]) -> Result<DataValue> {
             let a_norm = a.dot(a) as f64;
             let b_norm = b.dot(b) as f64;
             let dot = a.dot(b) as f64;
-            Ok(DataValue::from(1. - dot / (a_norm * b_norm).sqrt()))
+            Ok(DataValue::from(cosine_distance(a_norm, b_norm, dot)))
         }
         (DataValue::Vec(Vector::F64(a)), DataValue::Vec(Vector::F64(b))) => {
             if a.len() != b.len() {
@@ -2310,7 +2313,7 @@ pub(crate) fn op_cos_dist(args: &[DataValue]) -> Result<DataValue> {
             let a_norm = a.dot(a);
             let b_norm = b.dot(b);
             let dot = a.dot(b);
-            Ok(DataValue::from(1. - dot / (a_norm * b_norm).sqrt()))
+            Ok(DataValue::from(cosine_distance(a_norm, b_norm, dot)))
         }
         _ => bail!("'cos_dist' requires two vectors of the same type"),
     }
@@ -2568,15 +2571,31 @@ pub(crate) fn op_format_timestamp(args: &[DataValue]) -> Result<DataValue> {
 }
 
 define_op!(OP_PARSE_TIMESTAMP, 1, false);
+/// Convert a `SystemTime` to the signed microsecond clock used by validity values.
+/// Pre-epoch instants carry their magnitude in `SystemTimeError::duration()`.
+pub(crate) fn system_time_to_micros(st: SystemTime) -> Result<i64> {
+    let micros: i128 = match st.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_micros() as i128,
+        Err(e) => -(e.duration().as_micros() as i128),
+    };
+    i64::try_from(micros)
+        .map_err(|_| miette!("timestamp out of range: {micros} microseconds from Unix epoch"))
+}
+
+fn system_time_to_secs_f64(st: SystemTime) -> f64 {
+    match st.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_secs_f64(),
+        Err(e) => -e.duration().as_secs_f64(),
+    }
+}
+
 pub(crate) fn op_parse_timestamp(args: &[DataValue]) -> Result<DataValue> {
     let s = args[0]
         .get_str()
         .ok_or_else(|| miette!("'parse_timestamp' expects a string"))?;
     let dt = DateTime::parse_from_rfc3339(s).map_err(|_| miette!("bad datetime: {}", s))?;
     let st: SystemTime = dt.into();
-    Ok(DataValue::from(
-        st.duration_since(UNIX_EPOCH).unwrap().as_secs_f64(),
-    ))
+    Ok(DataValue::from(system_time_to_secs_f64(st)))
 }
 
 pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
@@ -2591,8 +2610,7 @@ pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
             dt.into()
         }
     };
-    let microseconds = st.duration_since(UNIX_EPOCH).unwrap().as_micros();
-    Ok(ValidityTs(Reverse(microseconds as i64)))
+    Ok(ValidityTs(Reverse(system_time_to_micros(st)?)))
 }
 
 define_op!(OP_RAND_UUID_V1, 0, false);

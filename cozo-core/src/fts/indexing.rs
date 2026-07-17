@@ -8,12 +8,12 @@
 
 use crate::data::expr::{eval_bytecode, eval_bytecode_pred, Bytecode};
 use crate::data::program::{FtsScoreKind, FtsSearch};
-use crate::data::tuple::{decode_tuple_from_key, Tuple, ENCODED_KEY_MIN_LEN};
+use crate::data::tuple::{decode_tuple_from_key, Tuple};
 use crate::data::value::LARGEST_UTF_CHAR;
 use crate::fts::ast::{FtsExpr, FtsLiteral, FtsNear};
 use crate::fts::tokenizer::TextAnalyzer;
 use crate::parse::fts::parse_fts_query;
-use crate::runtime::relation::RelationHandle;
+use crate::runtime::relation::{try_decode_val_only, RelationHandle};
 use crate::runtime::transact::SessionTx;
 use crate::{DataValue, SourceSpan};
 use itertools::Itertools;
@@ -22,30 +22,19 @@ use ordered_float::OrderedFloat;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smartstring::{LazyCompact, SmartString};
 use std::cmp::Reverse;
-use std::collections::hash_map::Entry;
 use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Default)]
 pub(crate) struct FtsCache {
-    total_n_cache: FxHashMap<SmartString<LazyCompact>, usize>,
+    // Deliberately stateless. Both BM25 corpus statistics — the document count `N` and the
+    // average document length `avgdl` — now come from the process-level doc-stats cache on the
+    // `Db` (see `get_doc_stats_for_index`), so there is nothing left to memoize per query. It is
+    // kept as a type so the `fts_search` signature and the `query/ra.rs` plumbing stay stable.
 }
 
 impl FtsCache {
-    fn get_n_for_relation(&mut self, rel: &RelationHandle, tx: &SessionTx<'_>) -> Result<usize> {
-        Ok(match self.total_n_cache.entry(rel.name.clone()) {
-            Entry::Vacant(v) => {
-                let start = rel.encode_partial_key_for_store(&[]);
-                let end = rel.encode_partial_key_for_store(&[DataValue::Bot]);
-                let val = tx.store_tx.range_count(&start, &end)?;
-                v.insert(val);
-                val
-            }
-            Entry::Occupied(o) => *o.get(),
-        })
-    }
-    /// Average document length (in tokens) over the indexed corpus — the BM25
-    /// length-normalization denominator (mnestic fork, DEVELOPMENT.md Bet 1b).
+    /// The BM25 corpus statistics for an index: `(total_tokens, n_docs)`.
     ///
     /// **O(1)** per query: reads the process-level doc-stats cache on the `Db`,
     /// seeding it with one deduplicated full scan of the index the first time it
@@ -55,15 +44,28 @@ impl FtsCache {
     /// storage key (a durable counter written from every document transaction
     /// makes all concurrent writers conflict on one RocksDB lock; that was the
     /// 0.8.3 design, reverted).
-    fn get_avgdl_for_index(&mut self, idx: &RelationHandle, tx: &SessionTx<'_>) -> Result<f64> {
-        let avgdl = |total: u64, n: u64| if n > 0 { total as f64 / n as f64 } else { 0.0 };
+    ///
+    /// `n_docs` is the number of documents **carrying at least one posting** — the
+    /// population that `df` and `avgdl` are also measured against, and therefore the
+    /// `N` Okapi BM25's IDF term is defined over. It is *not* the base relation's row
+    /// count: a row whose extracted text yields no tokens is in the relation but is not
+    /// a document in the collection being searched, and rows loaded by `import_relations`
+    /// (which maintains no FTS index) are not documents either. Sourcing `N` from the
+    /// relation instead was both wrong (it mixes a relation-derived `N` into an IDF whose
+    /// `df` is index-derived) and ruinously slow (a full relation scan on every query).
+    /// See `docs/specs/fts-corpus-stats.md`.
+    fn get_doc_stats_for_index(
+        &mut self,
+        idx: &RelationHandle,
+        tx: &SessionTx<'_>,
+    ) -> Result<(u64, u64)> {
         let mut cache = tx.fts_doc_stats_cache.lock().unwrap();
-        if let Some((total, n)) = cache.get(&idx.name).copied() {
-            return Ok(avgdl(total, n));
+        if let Some(stats) = cache.get(&idx.name).copied() {
+            return Ok(stats);
         }
-        let (total, n) = tx.scan_fts_doc_stats(idx)?;
-        cache.insert(idx.name.clone(), (total, n));
-        Ok(avgdl(total, n))
+        let stats = tx.scan_fts_doc_stats(idx)?;
+        cache.insert(idx.name.clone(), stats);
+        Ok(stats)
     }
 }
 
@@ -135,9 +137,12 @@ impl<'a> SessionTx<'a> {
             let (kvec, vvec) = item?;
             let key_tuple = decode_tuple_from_key(&kvec, idx.metadata.keys.len());
             if seen.insert(key_tuple[1..].to_vec()) {
-                let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..])
-                    .map_err(|e| miette!("corrupt FTS posting value: {e}"))?;
-                total += vals[3].get_int().unwrap_or(0).max(0) as u64;
+                let vals = try_decode_val_only(&kvec, &vvec)?;
+                let doc_len = vals
+                    .get(3)
+                    .and_then(DataValue::get_int)
+                    .ok_or_else(|| miette!("corrupt FTS posting value: missing document length"))?;
+                total += doc_len.max(0) as u64;
             }
         }
         Ok((total, seen.len() as u64))
@@ -197,21 +202,37 @@ impl<'a> SessionTx<'a> {
                 break;
             }
 
-            let vals: Vec<DataValue> = rmp_serde::from_slice(&vvec[ENCODED_KEY_MIN_LEN..]).unwrap();
-            let froms = vals[0].get_slice().unwrap();
-            let tos = vals[1].get_slice().unwrap();
-            let positions = vals[2].get_slice().unwrap();
-            let total_length = vals[3].get_int().unwrap();
+            let vals = try_decode_val_only(&kvec, &vvec)?;
+            let froms = vals
+                .first()
+                .and_then(DataValue::get_slice)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing start offsets"))?;
+            let tos = vals
+                .get(1)
+                .and_then(DataValue::get_slice)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing end offsets"))?;
+            let positions = vals
+                .get(2)
+                .and_then(DataValue::get_slice)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing positions"))?;
+            let total_length = vals
+                .get(3)
+                .and_then(DataValue::get_int)
+                .ok_or_else(|| miette!("corrupt FTS posting value: missing document length"))?;
             let position_info = froms
                 .iter()
                 .zip(tos.iter())
                 .zip(positions.iter())
-                .map(|(_, p)| PositionInfo {
-                    // from: f.get_int().unwrap() as u32,
-                    // to: t.get_int().unwrap() as u32,
-                    position: p.get_int().unwrap() as u32,
+                .map(|(_, p)| {
+                    Ok(PositionInfo {
+                        // from: f.get_int().unwrap() as u32,
+                        // to: t.get_int().unwrap() as u32,
+                        position: p.get_int().ok_or_else(|| {
+                            miette!("corrupt FTS posting value: position is not an integer")
+                        })? as u32,
+                    })
                 })
-                .collect_vec();
+                .collect::<Result<Vec<_>>>()?;
             results.push(LiteralStats {
                 key: key_tuple[1..].to_vec(),
                 position_info,
@@ -401,16 +422,24 @@ impl<'a> SessionTx<'a> {
         if ast.is_empty() {
             return Ok(vec![]);
         }
-        let n = match config.score_kind {
-            FtsScoreKind::TfIdf | FtsScoreKind::Bm25 => {
-                cache.get_n_for_relation(&config.base_handle, self)?
+        // One cache read serves both IDF's `N` and BM25's `avgdl`; neither touches storage on a
+        // warm index. `Tf` scoring uses neither, so it does not seed the cache at all.
+        let (n, avgdl) = match config.score_kind {
+            FtsScoreKind::Tf => (0, 0.0),
+            FtsScoreKind::TfIdf => {
+                let (_, n_docs) = cache.get_doc_stats_for_index(&config.idx_handle, self)?;
+                (n_docs as usize, 0.0)
             }
-            FtsScoreKind::Tf => 0,
-        };
-        let avgdl = if config.score_kind == FtsScoreKind::Bm25 {
-            cache.get_avgdl_for_index(&config.idx_handle, self)?
-        } else {
-            0.0
+            FtsScoreKind::Bm25 => {
+                let (total_tokens, n_docs) =
+                    cache.get_doc_stats_for_index(&config.idx_handle, self)?;
+                let avgdl = if n_docs > 0 {
+                    total_tokens as f64 / n_docs as f64
+                } else {
+                    0.0
+                };
+                (n_docs as usize, avgdl)
+            }
         };
         let mut result: Vec<_> = self
             .fts_search_impl(&ast, config, n, avgdl)?
@@ -457,18 +486,29 @@ impl<'a> SessionTx<'a> {
         let (rows, count) =
             encode_fts_rows_for_tuple(tuple, extractor, stack, tokenizer, rel_handle, idx_handle)?;
         // Maintain the process-level doc-stats cache (mnestic fork, Bet 1b) so
-        // `avgdl` is an O(1) read. Done *before* writing this document's postings
-        // so a seed-on-absent scan sees the pre-insert corpus and we add the new
-        // document exactly once. `count == 0` (no tokens ⇒ no postings) is skipped,
-        // matching the scan, which only counts documents that have postings.
-        // Every update path is del-then-put, so the old document is always
-        // subtracted before this runs. (Through 0.12.0 that was false for an
-        // FTS-only relation: `:put`-over-an-existing-key skipped the delete when
-        // the relation had no plain secondary index, so postings leaked and the
-        // counter drifted. Fixed in 0.12.1 — `query/stored.rs`, the `extracted !=
-        // tup` block; guarded by `tests/fts_lsh_update_leak.rs`.)
+        // `avgdl` and BM25's `N` are O(1) reads. Done *before* writing this document's
+        // postings so a seed-on-absent scan sees the pre-insert corpus. `count == 0`
+        // (no tokens ⇒ no postings) is skipped, matching the scan, which only counts
+        // documents that have postings.
+        //
+        // Count the document only if it is not *already* in the index. Most update paths
+        // are del-then-put, so the old document has been subtracted by the time we get
+        // here — but a **value-unchanged `:put` is not**: `query/stored.rs` skips the
+        // delete when `extracted == tup` (an identical tuple derives identical postings,
+        // so there is nothing to rewrite). Without this probe that path bumps `+1`
+        // with no matching `-1`, and the document count drifts up on every no-op write.
+        // That drift was invisible while `avgdl = total / n` was the counter's only
+        // consumer — both terms inflate together and the ratio barely moves — but BM25's
+        // `N` reads `n` directly, so it must be exact. `del_fts_index_item` makes the
+        // mirror-image probe for the same reason.
         if count > 0 {
-            self.bump_fts_doc_stats(idx_handle, count, 1)?;
+            let already_indexed = match rows.first() {
+                Some((key_bytes, _)) => self.store_tx.exists(key_bytes, false)?,
+                None => false,
+            };
+            if !already_indexed {
+                self.bump_fts_doc_stats(idx_handle, count, 1)?;
+            }
         }
         for (key_bytes, val_bytes) in rows {
             self.store_tx.put(&key_bytes, &val_bytes)?;
