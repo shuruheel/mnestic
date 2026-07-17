@@ -226,47 +226,63 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
         let mut legs = Vec::with_capacity(items.len());
         for it in items {
             let gd = it.downcast::<PyDict>()?;
-            let edge_relation = gd
-                .get_item("edge_relation")?
-                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'edge_relation'"))?
-                .extract()?;
-            let seeds_list = gd
-                .get_item("seeds")?
-                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'seeds'"))?
-                .downcast::<PyList>()?;
-            let mut seeds = Vec::with_capacity(seeds_list.len());
-            for s in seeds_list {
-                seeds.push(py_to_value(s)?);
+            // Every key is optional and defaults like the Rust struct; the
+            // builder's validation owns the invariants (which fields each
+            // mode requires) so the rules live in exactly one place.
+            let mut leg = GraphLeg::default();
+            if let Some(x) = gd.get_item("label")? {
+                leg.label = x.extract()?;
             }
-            let max_hops = gd
-                .get_item("max_hops")?
-                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'max_hops'"))?
-                .extract()?;
-            let label = match gd.get_item("label")? {
-                Some(x) => x.extract()?,
-                None => "graph".to_string(),
-            };
-            let from_col = match gd.get_item("from_col")? {
-                Some(x) => x.extract()?,
-                None => "from".to_string(),
-            };
-            let to_col = match gd.get_item("to_col")? {
-                Some(x) => x.extract()?,
-                None => "to".to_string(),
-            };
-            let undirected = match gd.get_item("undirected")? {
-                Some(x) => x.extract()?,
-                None => false,
-            };
-            legs.push(GraphLeg {
-                label,
-                edge_relation,
-                from_col,
-                to_col,
-                seeds,
-                max_hops,
-                undirected,
-            });
+            if let Some(x) = gd.get_item("edge_relation")? {
+                leg.edge_relation = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("from_col")? {
+                leg.from_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("to_col")? {
+                leg.to_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("seeds")? {
+                let seeds_list = x.downcast::<PyList>()?;
+                let mut seeds = Vec::with_capacity(seeds_list.len());
+                for s in seeds_list {
+                    seeds.push(py_to_value(s)?);
+                }
+                leg.seeds = seeds;
+            }
+            if let Some(x) = gd.get_item("max_hops")? {
+                leg.max_hops = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("undirected")? {
+                leg.undirected = x.extract()?;
+            }
+            // Budgeted-expansion mode (0.14.0): presence of max_nodes
+            // switches the leg; the rest configure it.
+            if let Some(x) = gd.get_item("max_nodes")? {
+                leg.max_nodes = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("max_cost")? {
+                leg.max_cost = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("weight_col")? {
+                leg.weight_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("graph")? {
+                leg.graph = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("seed_from_legs")? {
+                leg.seed_from_legs = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("gate_relation")? {
+                leg.gate_relation = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("gate_cols")? {
+                leg.gate_cols = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("admit")? {
+                leg.admit = x.extract()?;
+            }
+            legs.push(leg);
         }
         q.graph_legs = legs;
     }

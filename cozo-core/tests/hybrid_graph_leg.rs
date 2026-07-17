@@ -15,8 +15,18 @@
 //! nodes by their minimum hop distance, and contributes that ranked list to the
 //! same Reciprocal Rank Fusion — in one call, no second `run_script`.
 //!
+//! This file is deliberately **ungated**: everything here (including the
+//! recursive `GraphLeg`) must work in a `minimal` build, and the one
+//! `cfg(not(feature = "graph-algo"))` test at the bottom is the only guard on
+//! the budgeted-leg feature seam's loud error.
+//!
 //! Uses the **sqlite** backend (real stored-relation / index path) per the
 //! fork's testing convention.
+//!
+//! `HybridSearch`/`GraphLeg` are `#[non_exhaustive]`, so struct literals are
+//! not constructible outside the defining crate — these tests build queries
+//! the way downstream users do: `Default` + field mutation.
+#![allow(clippy::field_reassign_with_default)]
 
 use cozo::{build_hybrid_query, DbInstance, GraphLeg, HybridSearch, NamedRows, ScriptMutability};
 use std::collections::BTreeMap;
@@ -89,28 +99,30 @@ fn pos(order: &[String], id: &str) -> Option<usize> {
     order.iter().position(|x| x == id)
 }
 
+fn edges_leg(seeds: &[&str], max_hops: usize, undirected: bool) -> GraphLeg {
+    let mut g = GraphLeg::default();
+    g.edge_relation = "edges".into();
+    g.seeds = seeds.iter().map(|s| (*s).into()).collect();
+    g.max_hops = max_hops;
+    g.undirected = undirected;
+    g
+}
+
 /// A baseline query that only `d1` can satisfy on the vector + keyword legs
 /// (`vector_k`/`fts_k` = 1 ⇒ each fixed leg returns just `d1`), so the fused
 /// output beyond `d1` is entirely the graph leg's doing.
 fn graph_dominated(seeds: &[&str], max_hops: usize, undirected: bool) -> HybridSearch {
-    HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 1,
-        fts_index: "fts".into(),
-        query_text: "alpha".into(),
-        fts_k: 1,
-        graph_legs: vec![GraphLeg {
-            edge_relation: "edges".into(),
-            seeds: seeds.iter().map(|s| (*s).into()).collect(),
-            max_hops,
-            undirected,
-            ..GraphLeg::default()
-        }],
-        limit: 10,
-        ..HybridSearch::default()
-    }
+    let mut q = HybridSearch::default();
+    q.relation = "docs".into();
+    q.vector_index = Some("vec".into());
+    q.query_vector = vec![1.0, 0.0];
+    q.vector_k = 1;
+    q.fts_index = Some("fts".into());
+    q.query_text = "alpha".into();
+    q.fts_k = 1;
+    q.graph_legs = vec![edges_leg(seeds, max_hops, undirected)];
+    q.limit = 10;
+    q
 }
 
 /// The graph leg must surface a neighbour (`d4`, 2 hops from `d1`) that is poor
@@ -226,21 +238,13 @@ fn graph_leg_multiple_seeds_union() {
 /// interpolated), and tag the fusion list with the leg label.
 #[test]
 fn graph_leg_script_is_recursive_and_parametrised() {
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        fts_index: "fts".into(),
-        query_text: "alpha".into(),
-        graph_legs: vec![GraphLeg {
-            label: "graph".into(),
-            edge_relation: "edges".into(),
-            seeds: vec!["d1".into(), "d2".into()],
-            max_hops: 3,
-            ..GraphLeg::default()
-        }],
-        ..HybridSearch::default()
-    };
+    let mut q = HybridSearch::default();
+    q.relation = "docs".into();
+    q.vector_index = Some("vec".into());
+    q.query_vector = vec![1.0, 0.0];
+    q.fts_index = Some("fts".into());
+    q.query_text = "alpha".into();
+    q.graph_legs = vec![edges_leg(&["d1", "d2"], 3, false)];
     let (script, params) = build_hybrid_query(&q).unwrap();
 
     assert!(
@@ -277,33 +281,25 @@ fn graph_leg_script_is_recursive_and_parametrised() {
 /// Validation rejects an empty seed set and a zero hop bound.
 #[test]
 fn graph_leg_validates_inputs() {
-    let base = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        fts_index: "fts".into(),
-        query_text: "alpha".into(),
-        ..HybridSearch::default()
+    let base = || {
+        let mut q = HybridSearch::default();
+        q.relation = "docs".into();
+        q.vector_index = Some("vec".into());
+        q.query_vector = vec![1.0, 0.0];
+        q.fts_index = Some("fts".into());
+        q.query_text = "alpha".into();
+        q
     };
 
-    let mut empty_seeds = base.clone();
-    empty_seeds.graph_legs = vec![GraphLeg {
-        edge_relation: "edges".into(),
-        seeds: vec![],
-        ..GraphLeg::default()
-    }];
+    let mut empty_seeds = base();
+    empty_seeds.graph_legs = vec![edges_leg(&[], 2, false)];
     assert!(
         build_hybrid_query(&empty_seeds).is_err(),
         "empty seeds must be rejected"
     );
 
-    let mut zero_hops = base;
-    zero_hops.graph_legs = vec![GraphLeg {
-        edge_relation: "edges".into(),
-        seeds: vec!["d1".into()],
-        max_hops: 0,
-        ..GraphLeg::default()
-    }];
+    let mut zero_hops = base();
+    zero_hops.graph_legs = vec![edges_leg(&["d1"], 0, false)];
     assert!(
         build_hybrid_query(&zero_hops).is_err(),
         "max_hops=0 must be rejected"
@@ -313,11 +309,7 @@ fn graph_leg_validates_inputs() {
 #[test]
 fn graph_leg_labels_must_be_unique() {
     let mut query = graph_dominated(&["d1"], 2, false);
-    query.graph_legs.push(GraphLeg {
-        edge_relation: "edges".into(),
-        seeds: vec!["d2".into()],
-        ..GraphLeg::default()
-    });
+    query.graph_legs.push(edges_leg(&["d2"], 2, false));
     let err = build_hybrid_query(&query).unwrap_err();
     assert!(
         format!("{err:?}").contains("distinct label"),
@@ -344,5 +336,22 @@ fn graph_leg_never_scores_its_own_seed() {
     assert!(
         script.contains("not hg0_seed[id]"),
         "generated graph leg lacks the seed-membership exclusion:\n{script}"
+    );
+}
+
+/// The feature-seam guard (design §a0): in a build without `graph-algo` —
+/// where the `BudgetedTraversal` fixed rule does not exist — configuring a
+/// budgeted leg must be a loud, actionable **builder** error, not an opaque
+/// runtime "fixed rule not found". This test only exists (and only runs) in
+/// such builds; CI's `minimal` job is what exercises it.
+#[cfg(not(feature = "graph-algo"))]
+#[test]
+fn budgeted_leg_errors_loudly_without_graph_algo() {
+    let mut q = graph_dominated(&["d1"], 2, false);
+    q.graph_legs[0].max_nodes = Some(8);
+    let e = format!("{:?}", build_hybrid_query(&q).unwrap_err());
+    assert!(
+        e.contains("graph-algo"),
+        "the error must name the missing feature: {e}"
     );
 }

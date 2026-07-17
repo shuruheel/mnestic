@@ -145,6 +145,64 @@ Inherited from upstream Cozo; present since the options-file path was introduced
   skip their local lock when the program already owns it, avoiding an unlocked
   mutation on some backends and a recursive-lock deadlock on others.
 
+### Added — `HybridSearch` budgeted-expansion mode and optional legs
+
+The 0.12.0 headline (`BudgetedTraversal`) is now reachable from the one-call
+`hybrid_search` surface — the dict the PyPI wheel already exposes — instead of
+only by hand-writing Datalog around a FixedRule.
+
+- **Budgeted graph legs** (spec §9, resolved): setting `GraphLeg::max_nodes`
+  switches the leg from the recursive min-hop rule to a generated
+  `BudgetedTraversal` call — cheapest-first weighted expansion under a global
+  distinct-node budget, with optional `max_cost`, an exact layered-label depth
+  bound (`max_hops` → `max_depth`), optional `weight_col`, an optional
+  liveness gate (`gate_relation`/`gate_cols`/`admit` — emitted in the named,
+  order-independent binding form), and `graph:` naming a pre-created cached
+  projection (**the production path**: the positional edge input pays a full
+  scan + CSR build before any budget applies). Seeds default to the union of
+  the configured vector/FTS legs' own top-k (`seed_from_legs`), plus explicit
+  `seeds`; seed roots are excluded from the fusion contribution. With
+  `detailed: true`, the output head gains the cheapest-path witness
+  (`parent`, `depth`) — opt-in: without a budgeted leg every existing shape
+  is byte-identical (snapshot-guarded).
+- **Optional legs**: `vector_index`/`fts_index` are now `Option<String>` —
+  configure any non-empty subset of {vector, FTS, graph legs, extra lists}
+  and only those are generated and fused. A payload without its leg
+  (`query_vector` with no `vector_index`, and vice versa) is a loud error,
+  never a silently dropped signal.
+- **`GraphLeg` in recursive mode is unchanged** — the generated script is
+  byte-identical to 0.13 (snapshot-guarded), and it remains the only graph
+  leg in a `minimal` build (`BudgetedTraversal` registers under `graph-algo`);
+  a budgeted leg configured without the feature errors loudly at build time.
+- **Source-breaking (the honest minor):** `HybridSearch` and `GraphLeg` are
+  now `#[non_exhaustive]` — construct with `Default` + field mutation. This
+  is deliberately paid once, in the same release that adds eight `GraphLeg`
+  fields, so that future field additions are never breaking again. The Python
+  wheel's dict surface gains **optional keys only** (`max_nodes`, `max_cost`,
+  `weight_col`, `graph`, `seed_from_legs`, `gate_relation`, `gate_cols`,
+  `admit`; `graph_legs` entries no longer hard-require
+  `edge_relation`/`seeds`/`max_hops` — the builder's validation owns the
+  invariants) — existing dicts parse unchanged.
+
+### Fixed — a bare `minimal` build did not compile (ungated `rayon`)
+
+`query/eval.rs` imported `rayon` gated only on `not(wasm32)`, while `rayon`
+is an optional dependency that `minimal` does not enable — so
+`--no-default-features --features minimal` had been **uncompilable**, with
+nobody noticing because CI never built that combination and every known
+consumer enables `rayon`. Parallel stratum evaluation now degrades to
+sequential without the feature, and CI gained a `minimal` job so the
+combination (and the budgeted-leg feature-seam error) stays covered.
+
+### Fixed — the named `*rel{col}` fixed-rule input form always panicked
+
+The `fixed_named_relation_rel` parse arm stripped `':'` from an identifier
+the grammar defines as `*`-prefixed, so the `unwrap` panicked on every use —
+the named binding form for fixed-rule stored inputs was unusable (inherited
+upstream bug, present at fork-base). It now parses and binds **by name** in
+schema order, which is what makes the budgeted gate's order-independent
+`gate_cols` form possible.
+
 ### Added — datetime function library (`dt_*`)
 
 We market a bitemporal database; its datetime standard library was three

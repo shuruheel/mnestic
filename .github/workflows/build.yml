@@ -64,6 +64,24 @@ jobs:
       - name: Test (graph-projection interleaving)
         run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --verbose
 
+  # The `minimal` combination (no `graph-algo`, no `rayon`) is what a
+  # `--no-default-features --features minimal` consumer gets — and until this
+  # job existed it was never compiled anywhere: an ungated `rayon` import in
+  # eval.rs had made a bare minimal build UNCOMPILABLE with nobody noticing.
+  # It also runs the ungated hybrid suites, whose
+  # `budgeted_leg_errors_loudly_without_graph_algo` test only exists (and can
+  # only run) without `graph-algo` — the sole guard on the feature-seam loud
+  # error (design §a0, 0.14.0).
+  minimal:
+    name: test (minimal features, no graph-algo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test (hybrid suites under minimal)
+        run: cargo test -p mnestic --no-default-features --features minimal --test hybrid_graph_leg --test hybrid_helper --verbose
+
   clippy:
     name: clippy (blocking, -D warnings)
     runs-on: ubuntu-latest
