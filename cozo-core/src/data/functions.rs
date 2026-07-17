@@ -15,7 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::format::StrftimeItems;
+use chrono::{
+    DateTime, Datelike, Duration, LocalResult, Months, NaiveDate, NaiveDateTime, TimeZone,
+    Timelike, Utc,
+};
 use itertools::Itertools;
 #[cfg(target_arch = "wasm32")]
 use js_sys::Date;
@@ -2593,9 +2597,28 @@ pub(crate) fn op_parse_timestamp(args: &[DataValue]) -> Result<DataValue> {
     let s = args[0]
         .get_str()
         .ok_or_else(|| miette!("'parse_timestamp' expects a string"))?;
-    let dt = DateTime::parse_from_rfc3339(s).map_err(|_| miette!("bad datetime: {}", s))?;
-    let st: SystemTime = dt.into();
-    Ok(DataValue::from(system_time_to_secs_f64(st)))
+    // mnestic fork (0.14.0): exactly three accepted forms, enumerated — RFC3339;
+    // a naive datetime (read as UTC); a bare date (midnight UTC). Nothing else.
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        let st: SystemTime = dt.into();
+        return Ok(DataValue::from(system_time_to_secs_f64(st)));
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Ok(DataValue::from(
+            ndt.and_utc().timestamp_micros() as f64 / 1_000_000.,
+        ));
+    }
+    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let ndt = nd.and_hms_opt(0, 0, 0).unwrap();
+        return Ok(DataValue::from(
+            ndt.and_utc().timestamp_micros() as f64 / 1_000_000.,
+        ));
+    }
+    bail!(
+        "bad datetime: {} (accepted forms: RFC3339, \"YYYY-MM-DD hh:mm:ss[.fff]\" read as UTC, \
+         \"YYYY-MM-DD\" read as midnight UTC)",
+        s
+    )
 }
 
 pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
@@ -2611,6 +2634,301 @@ pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
         }
     };
     Ok(ValidityTs(Reverse(system_time_to_micros(st)?)))
+}
+
+// ---- mnestic fork (0.14.0): datetime function library ----
+//
+// Convention: timestamps are float Unix SECONDS (the `now()`/`parse_timestamp`
+// installed base); every `dt_*` function consumes and produces that. A float
+// second-count is NOT a validity — validities count integer MICROSECONDS (or an
+// abstract logical tick). The one bridge is `dt_to_validity`. Timezone-sensitive
+// functions take an optional trailing IANA-name string, default UTC — the same
+// convention as `format_timestamp`.
+
+/// Convert a float-seconds timestamp argument to a UTC instant.
+fn dt_instant(v: &DataValue, fn_name: &str) -> Result<DateTime<Utc>> {
+    let f = v.get_float().ok_or_else(|| {
+        miette!("'{fn_name}' expects a numeric timestamp (float seconds since the Unix epoch)")
+    })?;
+    let micros_f = (f * 1_000_000.).round();
+    // A non-finite or out-of-range float must not reach the `as i64` cast: the
+    // saturating cast would silently map NaN to 1970 and ±inf to the ends of time.
+    if !micros_f.is_finite() || micros_f < i64::MIN as f64 || micros_f > i64::MAX as f64 {
+        bail!("timestamp out of range for '{fn_name}': {f}");
+    }
+    Utc.timestamp_micros(micros_f as i64)
+        .single()
+        .ok_or_else(|| miette!("timestamp out of range for '{fn_name}': {f}"))
+}
+
+/// Read the optional trailing timezone argument at `tz_pos`, defaulting to UTC.
+fn dt_tz(args: &[DataValue], tz_pos: usize, fn_name: &str) -> Result<chrono_tz::Tz> {
+    match args.get(tz_pos) {
+        None => Ok(chrono_tz::Tz::UTC),
+        Some(v) => {
+            let s = v
+                .get_str()
+                .ok_or_else(|| miette!("'{fn_name}' timezone specification requires a string"))?;
+            chrono_tz::Tz::from_str(s).map_err(|_| miette!("bad timezone specification: {}", s))
+        }
+    }
+}
+
+/// Timestamp arg + optional tz arg → zone-aware datetime.
+fn dt_zoned(
+    args: &[DataValue],
+    tz_pos: usize,
+    fn_name: &str,
+) -> Result<DateTime<chrono_tz::Tz>> {
+    let dt = dt_instant(&args[0], fn_name)?;
+    let tz = dt_tz(args, tz_pos, fn_name)?;
+    Ok(dt.with_timezone(&tz))
+}
+
+/// Map a naive local wall-clock time back to an instant. DST rule (documented
+/// in the crate docs): an ambiguous local time resolves to its EARLIEST
+/// occurrence; a nonexistent local time (a DST gap) resolves to the first
+/// representable local time after the gap, probed in 15-minute steps
+/// (real-world gaps are 30–120 minutes).
+fn dt_resolve_local(
+    tz: chrono_tz::Tz,
+    naive: NaiveDateTime,
+    fn_name: &str,
+) -> Result<DateTime<chrono_tz::Tz>> {
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Ok(dt),
+        LocalResult::Ambiguous(earliest, _) => Ok(earliest),
+        LocalResult::None => {
+            for step in 1..=16i64 {
+                match tz.from_local_datetime(&(naive + Duration::minutes(15 * step))) {
+                    LocalResult::Single(dt) => return Ok(dt),
+                    LocalResult::Ambiguous(earliest, _) => return Ok(earliest),
+                    LocalResult::None => continue,
+                }
+            }
+            bail!("'{fn_name}': cannot resolve local time {naive} in timezone {tz}")
+        }
+    }
+}
+
+fn dt_instant_to_secs(dt: DateTime<chrono_tz::Tz>) -> DataValue {
+    DataValue::from(dt.timestamp_micros() as f64 / 1_000_000.)
+}
+
+macro_rules! define_dt_component {
+    ($const_name:ident, $fn_name:ident, $script_name:literal, $extract:expr) => {
+        define_op!($const_name, 1, true);
+        pub(crate) fn $fn_name(args: &[DataValue]) -> Result<DataValue> {
+            let dt = dt_zoned(args, 1, $script_name)?;
+            let extract: fn(&DateTime<chrono_tz::Tz>) -> i64 = $extract;
+            Ok(DataValue::from(extract(&dt)))
+        }
+    };
+}
+
+define_dt_component!(OP_DT_YEAR, op_dt_year, "dt_year", |dt| dt.year() as i64);
+define_dt_component!(OP_DT_MONTH, op_dt_month, "dt_month", |dt| dt.month() as i64);
+define_dt_component!(OP_DT_DAY, op_dt_day, "dt_day", |dt| dt.day() as i64);
+define_dt_component!(OP_DT_HOUR, op_dt_hour, "dt_hour", |dt| dt.hour() as i64);
+define_dt_component!(OP_DT_MINUTE, op_dt_minute, "dt_minute", |dt| {
+    dt.minute() as i64
+});
+define_dt_component!(OP_DT_SECOND, op_dt_second, "dt_second", |dt| {
+    dt.second() as i64
+});
+// ISO: Monday = 1 … Sunday = 7.
+define_dt_component!(OP_DT_DOW, op_dt_dow, "dt_dow", |dt| {
+    dt.weekday().number_from_monday() as i64
+});
+define_dt_component!(OP_DT_DOY, op_dt_doy, "dt_doy", |dt| dt.ordinal() as i64);
+
+define_op!(OP_DT_TRUNC, 2, true);
+pub(crate) fn op_dt_trunc(args: &[DataValue]) -> Result<DataValue> {
+    let unit = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_trunc' expects a unit string as second argument"))?;
+    let tz = dt_tz(args, 2, "dt_trunc")?;
+    let dt = dt_instant(&args[0], "dt_trunc")?.with_timezone(&tz);
+    let date = dt.date_naive();
+    let naive = match unit {
+        "year" => NaiveDate::from_ymd_opt(date.year(), 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        "quarter" => {
+            let quarter_month = (date.month() - 1) / 3 * 3 + 1;
+            NaiveDate::from_ymd_opt(date.year(), quarter_month, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        }
+        "month" => NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        // ISO week: truncate to Monday.
+        "week" => (date - Duration::days(dt.weekday().num_days_from_monday() as i64))
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        "day" => date.and_hms_opt(0, 0, 0).unwrap(),
+        "hour" => date.and_hms_opt(dt.hour(), 0, 0).unwrap(),
+        "minute" => date.and_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
+        "second" => date.and_hms_opt(dt.hour(), dt.minute(), dt.second()).unwrap(),
+        _ => bail!(
+            "bad unit for 'dt_trunc': {} (expected one of 'year', 'quarter', 'month', 'week', \
+             'day', 'hour', 'minute', 'second')",
+            unit
+        ),
+    };
+    Ok(dt_instant_to_secs(dt_resolve_local(tz, naive, "dt_trunc")?))
+}
+
+define_op!(OP_DT_ADD, 3, false);
+pub(crate) fn op_dt_add(args: &[DataValue]) -> Result<DataValue> {
+    let dt = dt_instant(&args[0], "dt_add")?;
+    let n = args[1]
+        .get_int()
+        .ok_or_else(|| miette!("'dt_add' expects an integer count as second argument"))?;
+    let unit = args[2]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_add' expects a unit string as third argument"))?;
+    let out_of_range = || miette!("'dt_add' result out of range");
+    // Calendar-aware month/quarter/year arithmetic clamps to month end
+    // (Jan-31 + 1 month = Feb-28/29) — chrono's `Months` semantics.
+    let add_months = |dt: DateTime<Utc>, months: i64| -> Result<DateTime<Utc>> {
+        let magnitude =
+            u32::try_from(months.unsigned_abs()).map_err(|_| miette!("'dt_add' count too large"))?;
+        if months >= 0 {
+            dt.checked_add_months(Months::new(magnitude))
+                .ok_or_else(out_of_range)
+        } else {
+            dt.checked_sub_months(Months::new(magnitude))
+                .ok_or_else(out_of_range)
+        }
+    };
+    let result = match unit {
+        "year" => add_months(dt, n.checked_mul(12).ok_or_else(out_of_range)?)?,
+        "quarter" => add_months(dt, n.checked_mul(3).ok_or_else(out_of_range)?)?,
+        "month" => add_months(dt, n)?,
+        // `Duration::weeks` and friends PANIC on overflow; `n` is user input,
+        // so only the `try_` constructors are safe here.
+        "week" => dt
+            .checked_add_signed(Duration::try_weeks(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "day" => dt
+            .checked_add_signed(Duration::try_days(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "hour" => dt
+            .checked_add_signed(Duration::try_hours(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "minute" => dt
+            .checked_add_signed(Duration::try_minutes(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "second" => dt
+            .checked_add_signed(Duration::try_seconds(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        _ => bail!(
+            "bad unit for 'dt_add': {} (expected one of 'year', 'quarter', 'month', 'week', \
+             'day', 'hour', 'minute', 'second')",
+            unit
+        ),
+    };
+    Ok(DataValue::from(
+        result.timestamp_micros() as f64 / 1_000_000.,
+    ))
+}
+
+/// Whole calendar months from `earlier` to `later` (`later >= earlier`),
+/// consistent with `dt_add`'s clamping: the count is the largest `n` with
+/// `earlier + n months <= later`.
+fn dt_whole_months(later: DateTime<Utc>, earlier: DateTime<Utc>) -> i64 {
+    let mut months = (later.year() as i64 - earlier.year() as i64) * 12
+        + (later.month() as i64 - earlier.month() as i64);
+    let added = |n: i64| {
+        earlier
+            .checked_add_months(Months::new(n.max(0) as u32))
+            // Unreachable in practice: `months` is bounded by real year spans.
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    };
+    while months > 0 && added(months) > later {
+        months -= 1;
+    }
+    while added(months + 1) <= later {
+        months += 1;
+    }
+    months
+}
+
+define_op!(OP_DT_DIFF, 3, false);
+pub(crate) fn op_dt_diff(args: &[DataValue]) -> Result<DataValue> {
+    let a = dt_instant(&args[0], "dt_diff")?;
+    let b = dt_instant(&args[1], "dt_diff")?;
+    let unit = args[2]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_diff' expects a unit string as third argument"))?;
+    // Signed `a - b`, truncated toward zero. month/quarter/year are
+    // calendar-aware and consistent with `dt_add`'s month-end clamping.
+    let n = match unit {
+        "year" | "quarter" | "month" => {
+            let (later, earlier, sign) = if a >= b { (a, b, 1) } else { (b, a, -1) };
+            let months = sign * dt_whole_months(later, earlier);
+            match unit {
+                "year" => months / 12,
+                "quarter" => months / 3,
+                _ => months,
+            }
+        }
+        "week" => (a - b).num_weeks(),
+        "day" => (a - b).num_days(),
+        "hour" => (a - b).num_hours(),
+        "minute" => (a - b).num_minutes(),
+        "second" => (a - b).num_seconds(),
+        _ => bail!(
+            "bad unit for 'dt_diff': {} (expected one of 'year', 'quarter', 'month', 'week', \
+             'day', 'hour', 'minute', 'second')",
+            unit
+        ),
+    };
+    Ok(DataValue::from(n))
+}
+
+define_op!(OP_DT_FORMAT, 2, true);
+pub(crate) fn op_dt_format(args: &[DataValue]) -> Result<DataValue> {
+    let fmt = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_format' expects a format string as second argument"))?;
+    // chrono's `format()` PANICS on an invalid strftime specifier when the
+    // `DelayedFormat` is rendered; the format string here is often LLM-authored
+    // query text, so pre-validate and fail loudly instead.
+    let items = StrftimeItems::new(fmt)
+        .parse()
+        .map_err(|_| miette!("bad strftime format string for 'dt_format': {}", fmt))?;
+    let dt = dt_zoned(args, 2, "dt_format")?;
+    Ok(DataValue::Str(SmartString::from(
+        dt.format_with_items(items.iter()).to_string(),
+    )))
+}
+
+define_op!(OP_DT_TO_VALIDITY, 1, true);
+pub(crate) fn op_dt_to_validity(args: &[DataValue]) -> Result<DataValue> {
+    let f = args[0].get_float().ok_or_else(|| {
+        miette!("'dt_to_validity' expects a numeric timestamp (float seconds since the Unix epoch)")
+    })?;
+    let micros_f = (f * 1_000_000.).round();
+    if !micros_f.is_finite() || micros_f < i64::MIN as f64 || micros_f > i64::MAX as f64 {
+        bail!("timestamp out of range for 'dt_to_validity': {f}");
+    }
+    let is_assert = if args.len() == 1 {
+        true
+    } else {
+        args[1]
+            .get_bool()
+            .ok_or_else(|| miette!("'dt_to_validity' expects a boolean as second argument"))?
+    };
+    Ok(DataValue::Validity(Validity {
+        timestamp: ValidityTs(Reverse(micros_f as i64)),
+        is_assert: Reverse(is_assert),
+    }))
 }
 
 define_op!(OP_RAND_UUID_V1, 0, false);
