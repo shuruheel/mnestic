@@ -145,6 +145,66 @@ Inherited from upstream Cozo; present since the options-file path was introduced
   skip their local lock when the program already owns it, avoiding an unlocked
   mutation on some backends and a recursive-lock deadlock on others.
 
+### Added — datetime function library (`dt_*`)
+
+We market a bitemporal database; its datetime standard library was three
+functions with inconsistent units. This adds the missing surface, on one loudly
+stated convention: **timestamps are float Unix seconds** (what `now()` and
+`parse_timestamp` already return); **a float second-count is NOT a validity**
+(validities count integer microseconds, or an abstract logical tick), and the
+one bridge between the two worlds is `dt_to_validity`. Timezone-sensitive
+functions take an optional trailing IANA-name string, default UTC — the same
+convention `format_timestamp` already used.
+
+- **Component extractors** `dt_year`, `dt_month`, `dt_day`, `dt_hour`,
+  `dt_minute`, `dt_second`, `dt_dow` (ISO: Monday = 1), `dt_doy` — all
+  `(ts, tz?) -> Int`.
+- **`dt_trunc(ts, unit, tz?) -> Float`** — unit ∈ `year | quarter | month |
+  week | day | hour | minute | second`; weeks are ISO (Monday). DST rule,
+  documented: an ambiguous local time resolves to its earliest occurrence; a
+  local time in a DST gap resolves to the first valid local time after the gap.
+- **`dt_add(ts, n, unit) -> Float`** — calendar-aware for
+  `month`/`quarter`/`year`, clamping to month end (Jan-31 + 1 month =
+  Feb-28/29); fixed-duration for `week`/`day`/`hour`/`minute`/`second`.
+  Overflow errors, it never panics.
+- **`dt_diff(a, b, unit) -> Int`** — signed `a - b`, truncating toward zero;
+  calendar-aware for `month`/`quarter`/`year`, consistent with `dt_add`'s
+  clamping (the count is the largest `n` with `b + n unit <= a`).
+- **`dt_format(ts, fmt, tz?) -> Str`** — strftime. The format string is
+  pre-validated: an invalid specifier is a loud error, where calling chrono
+  directly would panic (`dt_format` is expected to receive LLM-authored text).
+  `format_timestamp` stays, for RFC3339.
+- **`dt_to_validity(ts_seconds, is_assert?) -> Validity`** — the typed bridge:
+  seconds → microseconds *inside* the function, where the unit is known. With
+  it, `@` and `:as_of` now accept a `Validity`-typed expression
+  (`@ dt_to_validity(parse_timestamp('2024-01-01'))` reads as-of that instant);
+  previously `DataValue::Validity` in a temporal spec was an error. Together
+  with 0.12.2's float rejection this closes the seconds-vs-microseconds trap:
+  the raw-float misread errors loudly, and the typed path is the idiomatic
+  spelling. The seconds-as-`Int` form (`@ 1704067200`) remains inherently
+  ambiguous — valid time is an abstract clock, so no magnitude gate can reject
+  it — which is exactly why the typed bridge exists.
+- **`parse_timestamp` widened** (error → success, additive): accepts exactly
+  three enumerated forms — RFC3339; `"YYYY-MM-DD hh:mm:ss[.fff]"` read as UTC;
+  `"YYYY-MM-DD"` read as midnight UTC. Nothing else; the error message
+  enumerates the accepted forms.
+- Note: the new `dt_*` names are now **reserved against user registration** —
+  a downstream `register_custom_aggr` under one of these names will fail at
+  registration after the upgrade.
+
+### Added — parse errors name the expected tokens
+
+A failed parse now points its caret at the **deepest position the parser
+reached** (previously `err.location`, which for `?[a] a = 1` sat inside the
+rule head while the defect — the missing `:=` — was later), and carries a
+`help:` line naming the literal tokens that would have been accepted there,
+e.g. `expected one of: \`:=\`, \`<-\`, \`<~\``. Whitespace/comment noise is
+filtered; the hint is suppressed entirely when the surviving candidate set is
+empty or too large to identify a defect — an unactionable hint being the
+failure mode this exists to kill. Built on pest's parse-attempts tracking; no
+grammar change, and `ParseError` stays crate-private (the improved text flows
+to every surface — Rust, Python wheel, REPL — for free).
+
 ### Verification and release gates
 
 - **Continuous FTS/HNSW maintenance is now a release regression.** A persistent
