@@ -849,6 +849,21 @@ fn j1b_named_gate_binding_parses_and_binds_by_name() {
          ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], *g{nosuch}, max_nodes: 5)",
     );
     assert!(m.contains("nosuch"), "{m}");
+
+    // A repeated column KEY with distinct binding names used to silently
+    // overwrite the first pair (`uid: a` vanished; an admit referencing `a`
+    // then failed with a baffling 'Cannot find binding'). It is now a loud
+    // duplicate error at parse time, like the same-name forms always were.
+    let m = err(
+        &db,
+        "e[f, t, w] <- [['a','t',1.0]]\ns[n] <- [['a']]\n\
+         ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], *g{uid: a, uid: b}, \
+         max_nodes: 5, admit: a == 1)",
+    );
+    assert!(
+        m.contains("duplicate") || m.contains("Duplicate"),
+        "expected a loud duplicate-key error, got: {m}"
+    );
 }
 
 #[test]

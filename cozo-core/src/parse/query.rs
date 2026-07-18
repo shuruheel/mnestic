@@ -1097,6 +1097,7 @@ fn parse_fixed_rule(
                                 Rule::fixed_named_relation_arg_pair => {
                                     let mut vs = p.into_inner();
                                     let kp = vs.next().unwrap();
+                                    let key_span = kp.extract_span();
                                     let k = SmartString::from(kp.as_str());
                                     let v = match vs.next() {
                                         Some(vp) => {
@@ -1112,7 +1113,13 @@ fn parse_fixed_rule(
                                             Symbol::new(k.clone(), kp.extract_span())
                                         }
                                     };
-                                    bindings.insert(k, v);
+                                    // A repeated column KEY with distinct
+                                    // binding names (`{uid: a, uid: b}`) would
+                                    // silently overwrite the earlier pair —
+                                    // the name guard above cannot see it.
+                                    if bindings.insert(k, v).is_some() {
+                                        bail!(DuplicateBindingError(key_span))
+                                    }
                                 }
                                 Rule::validity_clause => {
                                     let (vt, tt) = parse_temporal_clause(p, param_pool, cur_vld)?;
