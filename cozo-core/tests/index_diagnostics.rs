@@ -7,7 +7,7 @@
  */
 
 //! Index-search diagnostics carry the code of the index kind that actually
-//! failed (upstream #231/#257; 0.14.0 item (e)). Before this suite, an FTS
+//! failed (upstream #231/#257; 0.13.0 item (e)). Before this suite, an FTS
 //! search with a missing `query:` said "required for HNSW search" with an
 //! `hnsw_query_required` code, the LSH normalizer reused two HNSW codes, and
 //! the generic index-not-found fall-through — which fires when *no* index of

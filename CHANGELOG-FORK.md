@@ -5,9 +5,11 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.12.2 work not yet cut to a release. Keep this section current as
+Post-0.13.0 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
+
+## 0.13.0 — 2026-07-18
 
 ### Fixed — RocksDB table options were silently discarded on every open (`mnestic-rocks`)
 
@@ -170,9 +172,9 @@ only by hand-writing Datalog around a FixedRule.
   and only those are generated and fused. A payload without its leg
   (`query_vector` with no `vector_index`, and vice versa) is a loud error,
   never a silently dropped signal.
-- **`GraphLeg` in recursive mode is unchanged** — the generated script is
-  byte-identical to 0.13 (snapshot-guarded), and it remains the only graph
-  leg in a `minimal` build (`BudgetedTraversal` registers under `graph-algo`);
+- **`GraphLeg` in recursive mode is unchanged** — adding the budgeted mode
+  leaves its generated script byte-identical (snapshot-guarded), and it
+  remains the only graph leg in a `minimal` build (`BudgetedTraversal` registers under `graph-algo`);
   a budgeted leg configured without the feature errors loudly at build time.
 - **Source-breaking (the honest minor):** `HybridSearch` and `GraphLeg` are
   now `#[non_exhaustive]` — construct with `Default` + field mutation. This
@@ -214,7 +216,7 @@ bypass — the mixed-type suite miscounts 4-for-3 without it).
   `List`/`Tuple` element types**: `JsonData`'s structural `Eq` and its
   `to_string()`-based `Ord` diverge in the current build (`json(-0.0)` vs
   `json(0.0)` are op_neq-equal but join-distinct — the fired rewrite
-  overcounted 2-for-0 before the exclusion; found and fixed in the 0.14.0
+  overcounted 2-for-0 before the exclusion; found and fixed in the 0.13.0
   review).
 - **Default stays OFF** (`Db::set_query_factorization`); the default-on flip
   waits for a nightly soak on the restored path, per the 0.10.5→0.10.7

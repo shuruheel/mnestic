@@ -227,7 +227,7 @@ fn script_builder_is_inspectable() {
     assert!(!script.contains("MaximalMarginalRelevance"));
 }
 
-// Optional legs (0.14.0): single-leg configurations run and fuse end-to-end.
+// Optional legs (0.13.0): single-leg configurations run and fuse end-to-end.
 #[test]
 fn helper_vector_only_runs() {
     let (db, _dir) = make_db();

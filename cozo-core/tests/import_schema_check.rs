@@ -6,7 +6,7 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
-//! `import_from_backup` must refuse a schema-mismatched restore (0.14.0
+//! `import_from_backup` must refuse a schema-mismatched restore (0.13.0
 //! Part III §0 — the prerequisite that makes the `!=` type gate sound).
 //!
 //! The path raw-puts the source's KV rows into the destination after a key

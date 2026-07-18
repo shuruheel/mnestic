@@ -340,7 +340,7 @@ impl Analysis {
         })
     }
 
-    /// The `!=` type gate (0.14.0; soundness write-up:
+    /// The `!=` type gate (0.13.0; soundness write-up:
     /// `cardinality-algebra.md` §3.3a — read it before touching this). The
     /// inclusion–exclusion correction term JOINS the two operands (the
     /// engine's total order), while the `!=` predicate compares them with
@@ -366,7 +366,7 @@ impl Analysis {
     /// With that, both operands are variant-identical **at rest** — query-path
     /// writes coerce to the declared variant, and `import_from_backup`, the
     /// one raw-put that bypassed coercion, now refuses mismatched schemas
-    /// (0.14.0 §0) — and every admissible type's equality agrees with its
+    /// (0.13.0 §0) — and every admissible type's equality agrees with its
     /// order, so inclusion–exclusion is exact. Anything unverifiable declines,
     /// in keeping with the pass's bias.
     fn neq_types_admissible(&self, tx: &SessionTx<'_>) -> bool {

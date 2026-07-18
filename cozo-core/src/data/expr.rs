@@ -931,7 +931,7 @@ pub(crate) fn get_op(name: &str) -> Option<&'static Op> {
         "now" => &OP_NOW,
         "format_timestamp" => &OP_FORMAT_TIMESTAMP,
         "parse_timestamp" => &OP_PARSE_TIMESTAMP,
-        // mnestic fork (0.14.0): datetime function library
+        // mnestic fork (0.13.0): datetime function library
         "dt_year" => &OP_DT_YEAR,
         "dt_month" => &OP_DT_MONTH,
         "dt_day" => &OP_DT_DAY,

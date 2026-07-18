@@ -36,6 +36,12 @@ capabilities on top of it:
   clock, `:as_of` reads, the two-level `(valid time, transaction time)`
   resolution, and `::history` / `::history_gc` / `::evict`.
   ([spec](docs/specs/bitemporality.md))
+- **Calendar-aware datetime library** — component extractors (`dt_year` …
+  `dt_dow`), `dt_trunc`, calendar-aware `dt_add` / `dt_diff`, timezone-aware
+  `dt_format`, and `dt_to_validity` — the typed bridge from float Unix *seconds*
+  to a `Validity`'s integer microseconds, so a timestamp reaches the valid-time
+  axis *as* a validity rather than a bare number whose unit the engine must
+  guess.
 - **Provenance semirings** — user-defined absorptive combines inside recursion
   (`Db::register_custom_aggr`), the `min_cost_k` bounded-meet aggregate returning
   the *k* best derivations with their evidence chains, and `:reconcile`
@@ -50,6 +56,9 @@ capabilities on top of it:
   ([spec](docs/specs/antichain-bounded-meet.md))
 - **In-engine hybrid retrieval** — reciprocal-rank fusion over vector, full-text
   and graph legs as one Datalog-composable fixed rule, with MMR diversification.
+  Each leg is optional, and a graph leg can run as budgeted cheapest-first
+  expansion — seeded from the vector/FTS hits — to fill a fixed context budget
+  with the cheapest graph neighborhood around what recall found.
 - **Read-only Cypher** — an openCypher subset translated to CozoScript (alpha;
   feature `cypher`, off by default).
   ([spec](docs/specs/cypher-read.md))
@@ -72,74 +81,74 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.12.2
+## New in 0.13.0
 
-**A float in a validity position was silently read — and written — one million
-times too small, landing in 1970.**
+A combined correctness-and-capability release: a nine-bug correctness union
+(FTS scoring, HNSW/FTS index maintenance, corrupt-blob handling, restore/open
+relation-id reconciliation) alongside a feature tranche — a datetime standard
+library, a budgeted-expansion mode for `HybridSearch`, and the restored `!=`
+factorized-count rewrite. It is a minor, not a patch: several fixes change
+results (BM25 scores, hybrid-leg rankings) and the RocksDB table-options fix
+changes the on-disk block format on *future* writes, but the public Rust API
+stays source-compatible except where flagged below.
 
-Validity and transaction-time stamps are integer *microseconds* since the epoch.
-`now()` and `parse_timestamp()` return float *seconds*. The engine coerced one
-into the other without a word, so:
+**RocksDB table options are now honoured (ships with `mnestic-rocks` 0.1.10).**
+Every `BlockBasedTableOptions` you configured — block cache, block size,
+index/filter caching — was silently discarded on every open, so the engine ran
+with an 8 MB default cache and 4 KB blocks no matter what your options file
+asked for. **Any read-path benchmark taken against a RocksDB store before this
+release measured a slower engine than mnestic actually is.** Fixed; newly
+written SSTs pick up the configured `block_size`, existing SSTs stay readable,
+no migration.
 
-- **A `:put` of `[parse_timestamp(…), true]` into a `Validity` column succeeded**
-  and stamped the row at 1970. The row reads back correctly on an ordinary query;
-  the damage is visible *only under time travel* — precisely where a bitemporal
-  database is supposed to be trustworthy. That is permanent, at-rest corruption,
-  written by a query the engine accepted, and it is why this is a correctness
-  release rather than an ergonomics one.
-- **`@ parse_timestamp('2024-06-01T00:00:00Z')` returned zero rows and no error.**
-  The misread lands *before* any row was asserted, which is indistinguishable from
-  "no data yet". (`@ 1e300` was accepted too, saturating to `i64::MAX` — silently
-  querying the end of time.)
+**Datetime standard library (`dt_*`).** Component extractors (`dt_year` …
+`dt_dow`), `dt_trunc`, calendar-aware `dt_add` / `dt_diff`, strftime
+`dt_format`, and — the piece a bitemporal database needed — `dt_to_validity`,
+the typed bridge from float Unix *seconds* to a `Validity`'s integer
+microseconds. `@` and `:as_of` now accept a `Validity`-typed expression
+(`@ dt_to_validity(parse_timestamp('2024-01-01'))`), which together with
+0.12.2's float rejection closes the seconds-vs-microseconds trap. The new
+`dt_*` names are reserved against custom-function registration.
 
-One bug, four reachable sites — the `@` valid-time selector, the `@ (tt: …)` /
-`:as_of` transaction-time selector, the `validity(...)` constructor, and the write
-path. All four now reject a float and name the unit, the factor, and the fix.
+**`HybridSearch`: budgeted graph expansion and optional legs.** Setting
+`GraphLeg::max_nodes` switches a graph leg to cheapest-first weighted expansion
+under a distinct-node budget — 0.12.0's `BudgetedTraversal`, now reachable from
+the one-call `hybrid_search` surface — and `vector_index` / `fts_index` are now
+`Option`, so you can fuse any non-empty subset of {vector, FTS, graph} legs.
+**BREAKING (API):** `HybridSearch` and `GraphLeg` are now `#[non_exhaustive]` —
+construct with `Default` and set fields — paid once, in the same release that
+adds eight `GraphLeg` fields, so future field additions never break again.
+Recursive-mode graph legs are unaffected; the Python dict surface gains optional
+keys only.
 
-**The bug is inherited, and it is as old as Cozo's time travel.** Three of the
-four sites are verbatim upstream code at the fork point (`481af05`, 2024-12-04):
-the `@` selector (`expr2vld_spec`), the `validity(...)` constructor (`op_validity`),
-and — worst — the write path itself, whose `DataValue::List` arm of
-`ColType::Validity` is byte-identical to upstream's. So is the accessor all three
-funnel through: `Num::get_int`, which coerces any whole-numbered float to an
-`i64`. Only the transaction-time
-selector is ours, and it inherited the coercion rather than introducing it — 0.10.0
-extended the same accessor onto a new axis. `Validity` columns and `@` time travel
-predate the fork by years; this is not something bitemporality broke. Every CozoDB
-database with a `Validity` column has it.
+**The `!=` factorized-count rewrite is restored, behind a type gate, default
+OFF.** Its inclusion–exclusion extension (cut in 0.10.5 for an Int/Float
+miscount) is sound this time: the rewrite fires only when both operands of
+every inequality are declared, non-nullable, variant-stable stored columns.
+Measured on LSQB q6 (sf0.1, SQLite): **41.7 s → 0.30 s (~140×)**, count
+identical to the published oracle either way. Enable with
+`Db::set_query_factorization(true)`; the default-on flip waits for a nightly
+soak.
 
-**Upgrade action — and note carefully *where* it bites.** The schema still compiles; it is
-the next **write** that now fails. The idiom `Validity default [floor(now()), true]` — and any
-spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`, or
-`parse_timestamp(...)` on a whole second — has been silently writing 1970 into your valid-time
-axis. It now errors on write. (Bare `[now(), true]` already errored before this release, but
-only by luck: `now()` returns a *fractional* float, and the coercion only ever accepted
-whole-numbered ones.) Write instead:
-```
-last_seen: Validity default [to_int(now() * 1000000), true]
-```
+**Better errors for query authors.** A failed parse points its caret at the
+deepest position the parser reached and adds a `help:` line naming the literal
+tokens that would have been accepted (e.g. `expected one of: :=, <-, <~`);
+index-search diagnostics now carry the code of the index kind that actually
+failed (`fts_query_required` rather than `hnsw_query_required`, and the like).
 
-We found exactly one caller of the broken idiom anywhere, and it was **upstream's
-own HNSW test** ([`cozo-core/src/runtime/tests.rs`](cozo-core/src/runtime/tests.rs)),
-which we inherited unchanged and which upstream still ships. It had been writing 1970
-into upstream's own valid-time axis for as long as the test existed. It never asserted
-on the value, so nothing ever went red. If it was in the test suite we inherited, it is
-in someone's schema.
+**Correctness union — you may need one `::reindex`.** BM25's document count `N`
+is now read free from the FTS index instead of by re-scanning the whole base
+relation on every query (previously a 30× score error and O(corpus) latency at
+scale, both deleted); no-op re-puts no longer inflate the FTS doc count; corrupt
+value blobs and corrupt HNSW/FTS index rows are ordinary query errors instead of
+process panics; and restore/open reconciles the relation-id counter instead of
+silently reusing a live id. HNSW indexes built by any release through 0.12.2 can
+carry stale nodes or edges from null-vector and pre-existing-row bugs — rebuild
+once per affected relation with `::reindex <relation>` (your rows are untouched;
+it rebuilds index relations only).
 
-**What this deliberately does *not* fix.** An integer in *seconds* (`@ 1704067200`)
-is still accepted and still silently returns nothing. Valid time is an abstract,
-user-settable logical clock — the tutorial itself queries `@ 2019` — so no magnitude
-check can distinguish a wrong-unit timestamp from a legitimate small one, and any
-such check would be wrong. The real answer is a typed path (`dt_to_validity` +
-`@ <Validity>`), which lands with the datetime library in 0.13.0. Until then:
-integer microseconds is the low-level form, and the string forms (`@ '2024-06-01'`,
-`@ '2024-06-01T12:00:00Z'`) are the safe ones.
-
-Public Rust API is byte-identical to 0.12.1. Guard:
-[`cozo-core/tests/validity_units.rs`](cozo-core/tests/validity_units.rs) — 14 tests,
-one per site that goes red when that site alone is reverted.
-
-Full detail is in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
+Full detail, including the complete HNSW / corrupt-blob / restore upgrade steps,
+is in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
 
 ## Introduction

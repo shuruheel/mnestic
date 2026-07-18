@@ -286,7 +286,7 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
             if let Some(x) = gd.get_item("undirected")? {
                 leg.undirected = x.extract()?;
             }
-            // Budgeted-expansion mode (0.14.0): presence of max_nodes
+            // Budgeted-expansion mode (0.13.0): presence of max_nodes
             // switches the leg; the rest configure it.
             if let Some(x) = gd.get_item("max_nodes")? {
                 leg.max_nodes = x.extract()?;

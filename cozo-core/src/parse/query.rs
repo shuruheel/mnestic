@@ -1268,7 +1268,7 @@ fn expr2tt_spec(expr: Expr) -> Result<ValidityTs> {
             "NOW" | "END" => Ok(MAX_VALIDITY_TS),
             s => Ok(str2vld(s).map_err(|_| BadValiditySpecification(vld_span))?),
         },
-        // mnestic fork (0.14.0): the typed bridge — `:as_of dt_to_validity(...)`
+        // mnestic fork (0.13.0): the typed bridge — `:as_of dt_to_validity(...)`
         // or any other expression producing a Validity carries its own unit.
         DataValue::Validity(vld) => Ok(vld.timestamp),
         _ => {
@@ -1338,7 +1338,7 @@ fn expr2vld_spec(expr: Expr, cur_vld: ValidityTs) -> Result<ValidityTs> {
             "END" => Ok(MAX_VALIDITY_TS),
             s => Ok(str2vld(s).map_err(|_| BadValiditySpecification(vld_span))?),
         },
-        // mnestic fork (0.14.0): the typed bridge — `@ dt_to_validity(...)` or
+        // mnestic fork (0.13.0): the typed bridge — `@ dt_to_validity(...)` or
         // any other expression producing a Validity carries its own unit.
         DataValue::Validity(vld) => Ok(vld.timestamp),
         _ => {

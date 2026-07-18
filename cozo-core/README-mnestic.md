@@ -38,6 +38,12 @@ capabilities on top of it:
   clock, `:as_of` reads, the two-level `(valid time, transaction time)`
   resolution, and `::history` / `::history_gc` / `::evict`.
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/bitemporality.md))
+- **Calendar-aware datetime library** — component extractors (`dt_year` …
+  `dt_dow`), `dt_trunc`, calendar-aware `dt_add` / `dt_diff`, timezone-aware
+  `dt_format`, and `dt_to_validity` — the typed bridge from float Unix *seconds*
+  to a `Validity`'s integer microseconds, so a timestamp reaches the valid-time
+  axis *as* a validity rather than a bare number whose unit the engine must
+  guess.
 - **Provenance semirings** — user-defined absorptive combines inside recursion
   (`Db::register_custom_aggr`), the `min_cost_k` bounded-meet aggregate returning
   the *k* best derivations with their evidence chains, and `:reconcile`
@@ -52,12 +58,16 @@ capabilities on top of it:
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/antichain-bounded-meet.md))
 - **In-engine hybrid retrieval** — reciprocal-rank fusion over vector, full-text
   and graph legs as one Datalog-composable fixed rule, with MMR diversification.
+  Each leg is optional, and a graph leg can run as budgeted cheapest-first
+  expansion — seeded from the vector/FTS hits — to fill a fixed context budget
+  with the cheapest graph neighborhood around what recall found.
 - **Read-only Cypher** — an openCypher subset translated to CozoScript (alpha;
   feature `cypher`, off by default).
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cypher-read.md))
 - **Faster lookups and plans** — equality pushdown turns post-filter point
   lookups into keyed seeks (~28× at 5k rows), plus a deterministic greedy join
-  reorder and an opt-in factorized `count()` rewrite.
+  reorder and an opt-in factorized `count()` rewrite (now covering inequalities,
+  behind a type gate).
 - **Non-blocking vector index builds** — HNSW builds in RAM in parallel and no
   longer blocks reads for minutes; search-path neighbour vectors batch-fetch
   through RocksDB `MultiGet`.
@@ -74,142 +84,75 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.12.2
+## New in 0.13.0
 
-**A float in a validity position was silently read — and written — one million
-times too small, landing in 1970.**
+A combined correctness-and-capability release: a nine-bug correctness union
+(FTS scoring, HNSW/FTS index maintenance, corrupt-blob handling, restore/open
+relation-id reconciliation) alongside a feature tranche — a datetime standard
+library, a budgeted-expansion mode for `HybridSearch`, and the restored `!=`
+factorized-count rewrite. It is a minor, not a patch: several fixes change
+results (BM25 scores, hybrid-leg rankings) and the RocksDB table-options fix
+changes the on-disk block format on *future* writes, but the public Rust API
+stays source-compatible except where flagged below.
 
-Validity and transaction-time stamps are integer *microseconds* since the epoch.
-`now()` and `parse_timestamp()` return float *seconds*. The engine coerced one
-into the other without a word, so:
+**RocksDB table options are now honoured (ships with `mnestic-rocks` 0.1.10).**
+Every `BlockBasedTableOptions` you configured — block cache, block size,
+index/filter caching — was silently discarded on every open, so the engine ran
+with an 8 MB default cache and 4 KB blocks no matter what your options file
+asked for. **Any read-path benchmark taken against a RocksDB store before this
+release measured a slower engine than mnestic actually is.** Fixed; newly
+written SSTs pick up the configured `block_size`, existing SSTs stay readable,
+no migration.
 
-- `@ parse_timestamp('2024-06-01T00:00:00Z')` returned **zero rows and no error**
-  — the misread lands *before* any row was asserted, which is indistinguishable
-  from "no data yet".
-- A `:put` of `[parse_timestamp(…), true]` into a `Validity` column **succeeded**
-  and stamped the row at 1970. The row reads back correctly on an ordinary query;
-  the damage is visible only under time travel — precisely where a bitemporal
-  database is meant to be trustworthy.
+**Datetime standard library (`dt_*`).** Component extractors (`dt_year` …
+`dt_dow`), `dt_trunc`, calendar-aware `dt_add` / `dt_diff`, strftime
+`dt_format`, and — the piece a bitemporal database needed — `dt_to_validity`,
+the typed bridge from float Unix *seconds* to a `Validity`'s integer
+microseconds. `@` and `:as_of` now accept a `Validity`-typed expression
+(`@ dt_to_validity(parse_timestamp('2024-01-01'))`), which together with
+0.12.2's float rejection closes the seconds-vs-microseconds trap. The new
+`dt_*` names are reserved against custom-function registration.
 
-All four affected paths — the `@` selector, `@ (tt: …)` / `:as_of`, the
-`validity(...)` constructor, and the write path — now reject a float and say what
-to write instead.
+**`HybridSearch`: budgeted graph expansion and optional legs.** Setting
+`GraphLeg::max_nodes` switches a graph leg to cheapest-first weighted expansion
+under a distinct-node budget — 0.12.0's `BudgetedTraversal`, now reachable from
+the one-call `hybrid_search` surface — and `vector_index` / `fts_index` are now
+`Option`, so you can fuse any non-empty subset of {vector, FTS, graph} legs.
+**BREAKING (API):** `HybridSearch` and `GraphLeg` are now `#[non_exhaustive]` —
+construct with `Default` and set fields — paid once, in the same release that
+adds eight `GraphLeg` fields, so future field additions never break again.
+Recursive-mode graph legs are unaffected; the Python dict surface gains optional
+keys only.
 
-**Upgrade action — and note carefully *where* it bites.** The schema still compiles; it is
-the next **write** that now fails. The idiom `Validity default [floor(now()), true]` — and any
-spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`, or
-`parse_timestamp(...)` on a whole second — has been silently writing 1970 into your valid-time
-axis. It now errors on write. (Bare `[now(), true]` already errored before this release, but
-only by luck: `now()` returns a *fractional* float, and the coercion only ever accepted
-whole-numbered ones.) Write instead:
-```
-last_seen: Validity default [to_int(now() * 1000000), true]
-```
+**The `!=` factorized-count rewrite is restored, behind a type gate, default
+OFF.** Its inclusion–exclusion extension (cut in 0.10.5 for an Int/Float
+miscount) is sound this time: the rewrite fires only when both operands of
+every inequality are declared, non-nullable, variant-stable stored columns.
+Measured on LSQB q6 (sf0.1, SQLite): **41.7 s → 0.30 s (~140×)**, count
+identical to the published oracle either way. Enable with
+`Db::set_query_factorization(true)`; the default-on flip waits for a nightly
+soak.
 
-We found exactly one caller of the broken idiom anywhere, and it was **our own
-HNSW test**, inherited from upstream, which had been stamping every row it wrote
-at 1970 for as long as the test existed. It never asserted on the value, so it
-never noticed. If it was in our test suite, it is in someone's schema.
+**Better errors for query authors.** A failed parse points its caret at the
+deepest position the parser reached and adds a `help:` line naming the literal
+tokens that would have been accepted (e.g. `expected one of: :=, <-, <~`);
+index-search diagnostics now carry the code of the index kind that actually
+failed (`fts_query_required` rather than `hnsw_query_required`, and the like).
 
-**What this deliberately does *not* fix.** An integer in *seconds* (`@ 1704067200`)
-is still accepted and still silently returns nothing. Valid time is an abstract,
-user-settable logical clock — the tutorial itself queries `@ 2019` — so no
-magnitude check can distinguish a wrong-unit timestamp from a legitimate small
-one, and any such check would be wrong. The real answer is a typed conversion,
-which lands with the datetime library. Until then: integer microseconds is the
-low-level form, and the string forms (`@ '2024-06-01'`,
-`@ '2024-06-01T12:00:00Z'`) are the safe ones.
+**Correctness union — you may need one `::reindex`.** BM25's document count `N`
+is now read free from the FTS index instead of by re-scanning the whole base
+relation on every query (previously a 30× score error and O(corpus) latency at
+scale, both deleted); no-op re-puts no longer inflate the FTS doc count; corrupt
+value blobs and corrupt HNSW/FTS index rows are ordinary query errors instead of
+process panics; and restore/open reconciles the relation-id counter instead of
+silently reusing a live id. HNSW indexes built by any release through 0.12.2 can
+carry stale nodes or edges from null-vector and pre-existing-row bugs — rebuild
+once per affected relation with `::reindex <relation>` (your rows are untouched;
+it rebuilds index relations only).
 
-Public Rust API is byte-identical to 0.12.1.
-
-Full detail is in
+Full detail, including the complete HNSW / corrupt-blob / restore upgrade steps,
+is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
-
-### Upgrading to 0.13.0
-
-**Pre-1970 timestamps.** mnestic now accepts a date before the Unix epoch
-wherever it accepts a timestamp string. It used to panic — and on the `mem` and
-`sqlite` backends the panic happened while the store's write guard was held,
-poisoning the lock and killing the database. Pre-epoch writes that previously
-panicked were never committed, so **no stored data is affected; simply re-run
-them.** No action is required on upgrade.
-
-**HNSW indexes may need one rebuild.** Three separate bugs left stale data in
-HNSW indexes built by any release through 0.12.2:
-
-- A `:put` or `update` that set a row's vector column to `null` (or shortened a
-  list-of-vectors column) left the row's old graph nodes behind. This is not a
-  stale-result bug — the search reads a node's vector back from the base row, so
-  a single stranded node makes **every** vector query on that relation fail with
-  `Cannot interpret null as vector`, or panic.
-- `::hnsw create` over a relation that **already had rows** wrote one-directional
-  edges. A later `:rm` — or a re-`:put` that changes a vector, i.e. re-embedding —
-  can then strand an orphan edge, and a search may fail with `Cannot find
-  compound key for HNSW`.
-- An all-zero vector (what a failed or absent embedding produces) made cosine
-  distance `NaN`, which wedged the search heap and silently degraded results.
-
-Upgrading alone restores **correct query results** for the zero-vector case. For
-the other two, the stale rows are on disk. Rebuild once, per affected relation:
-
-```text
-::reindex <relation>
-```
-
-Your rows are untouched and nothing is deleted; `::reindex` rebuilds index
-relations only. It is safe to run on an index that is already failing. An index
-created on an **empty** relation and populated only with non-null vectors by
-`:put`, without later nulling or shortening a vector field, is unaffected by the
-two on-disk bugs.
-
-**`::repair_corrupt` does not fix any of the above** and will report `removed: 0`.
-
-**Corrupt value blobs are now an error, not a panic.** A corrupt value in a
-stored relation used to panic the process — through the Python wheel that was a
-`PanicException`, a `BaseException` subclass that `except Exception:` does not
-catch. It is now an ordinary query error (`eval::corrupt_value_blob`, naming the
-key). If you hit it, run `::repair_corrupt <relation>` to drop the unreadable
-rows, **then** `::reindex <relation>` if that relation carries an HNSW/FTS/LSH
-index — repair cannot evict the dead row's index postings, because it cannot
-decode the row to know what they were.
-
-**`restore_backup` could mint colliding relation ids.** In any release through
-0.12.2, a relation created **after** a `restore_backup` into a fresh store could
-be given an id a restored relation already owned — silently sharing one
-keyspace, so reads of either returned both. **On upgrade, opening the store stops
-any further collisions with no action on your part**, and logs an error naming
-any relations that are already entangled.
-
-**If that error fires, the entangled rows cannot be separated.** The store never
-recorded which relation wrote which row. **Do not run `::repair_corrupt` on them
-— it deletes the narrower relation's rows.** Recover by restoring the
-**original** backup into a **fresh** store with this build. (If your only backup
-was taken *from* the already-damaged store, it carries the entanglement.) Stores
-where `restore_backup` was never called, or where no relation was created
-afterwards, are unaffected.
-
-**`hybrid_search`: every fusion leg now needs a distinct label.** Two graph legs
-sharing a label were never fused as two lists — reciprocal-rank fusion groups by
-the label, so the second was silently merged into the first.
-**`GraphLeg::default()` labels every leg `"graph"`, so two defaulted legs collided
-by construction**; in Python, `label` is optional and defaults to `"graph"`, so
-the same applies. This now **errors at build time** instead of returning a wrong
-ranking. Give each leg its own label (`"semantic"` and `"text"` are reserved). A
-single graph leg is unaffected.
-
-**`GraphLeg` no longer re-scores its own seeds.** A seed reachable from itself —
-guaranteed at hop 2 whenever `undirected: true`, and possible at hop 1 via a
-self-loop or an edge from a second seed — was re-entering its own ranked list.
-Seeds that legitimately match the vector or keyword query are still returned
-and still rank where those legs put them; only the spurious graph-leg
-contribution is gone. Rankings will shift. No migration.
-
-**One query that used to return zero rows now raises.** A query reading a stored
-relation by a **fully-bound key**, with a filter that errors at evaluation time,
-silently returned `Ok([])`; it now raises that error. (The same query with an
-unbound key already raised — the engine was giving two different answers to the
-same logical query depending on the plan it chose.)
-
 
 ## Importable name
 
@@ -218,7 +161,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.12.2"
+mnestic = "0.13.0"
 ```
 
 ```rust

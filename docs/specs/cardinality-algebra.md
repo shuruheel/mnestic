@@ -192,7 +192,7 @@ Two inequalities need four terms (include–exclude–exclude–include); beyond
 the term count doubles per inequality and the bookkeeping risk usually
 outweighs the win.
 
-#### 3.3a Soundness: the `!=` type gate (0.14.0 — read before touching this again)
+#### 3.3a Soundness: the `!=` type gate (0.13.0 — read before touching this again)
 
 The identity above has ONE hazard in this engine, it was shipped once, cut once
 (`a60a8013`), and restored behind a gate — state the argument here so the next
@@ -218,7 +218,7 @@ operands — declare the **same** type. Then:
    (`NullableColType::coerce` — the Int/Float arms *convert*, not merely
    check), so a declared-`Int` column holds only `Int` at rest.
 2. `import_from_backup` was the one user-reachable raw-put that bypassed
-   coercion; since 0.14.0 it refuses mismatched schemas
+   coercion; since 0.13.0 it refuses mismatched schemas
    (`tx::import_schema_mismatch`), so it cannot smuggle a `Float` into a
    declared-`Int` column.
 3. ⇒ both operands are variant-identical at rest, the divergent `(Int, Float)`

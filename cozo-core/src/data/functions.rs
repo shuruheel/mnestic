@@ -2593,7 +2593,7 @@ fn system_time_to_secs_f64(st: SystemTime) -> f64 {
     }
 }
 
-/// The ONE accepted datetime string grammar (mnestic fork, 0.14.0), shared by
+/// The ONE accepted datetime string grammar (mnestic fork, 0.13.0), shared by
 /// `parse_timestamp` (→ float seconds) and the validity string literals —
 /// `@ '...'` / `:as_of '...'` via [`str2vld`] (→ microseconds) — so a string
 /// one entry point accepts is never rejected by the other. Exactly three
@@ -2629,13 +2629,13 @@ pub(crate) fn op_parse_timestamp(args: &[DataValue]) -> Result<DataValue> {
 pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
     // mnestic fork: the same grammar as `parse_timestamp` — see
     // `parse_datetime_utc`. (Historically this accepted RFC3339 + bare dates
-    // only; 0.14.0 unified the two so a literal proven parseable by one entry
+    // only; 0.13.0 unified the two so a literal proven parseable by one entry
     // point cannot be rejected by the other.)
     let st = parse_datetime_utc(s).ok_or_else(|| miette!("bad datetime: {}", s))?;
     Ok(ValidityTs(Reverse(system_time_to_micros(st)?)))
 }
 
-// ---- mnestic fork (0.14.0): datetime function library ----
+// ---- mnestic fork (0.13.0): datetime function library ----
 //
 // Convention: timestamps are float Unix SECONDS (the `now()`/`parse_timestamp`
 // installed base); every `dt_*` function consumes and produces that. A float

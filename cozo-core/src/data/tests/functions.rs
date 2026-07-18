@@ -1488,7 +1488,7 @@ fn test_range() {
     assert_eq!(res["rows"][0][0], json!([15, 13, 11, 9, 7, 5]));
 }
 
-// ---- mnestic fork (0.14.0): datetime function library ----
+// ---- mnestic fork (0.13.0): datetime function library ----
 
 fn dt_secs(y: i32, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> DataValue {
     use chrono::TimeZone;
@@ -1995,7 +1995,7 @@ fn test_dt_validity_bridge_on_tt_axis() {
     assert_eq!(res["rows"], serde_json::json!([]));
 }
 
-// ---- 0.14.0 review fixes: regression tests ----
+// ---- 0.13.0 review fixes: regression tests ----
 
 /// Sub-day truncation inside a DST fall-back fold must stay in the fold arm
 /// the instant belongs to (the input's own offset disambiguates); it must be

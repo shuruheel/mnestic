@@ -52,120 +52,66 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-**New in 0.12.2: a float in a validity position was silently read — and written —
-one million times too small, landing in 1970.**
+## New in 0.13.0
 
-Validity timestamps are integer *microseconds* since the epoch. `now()` and
-`parse_timestamp()` return float *seconds*. The engine coerced one into the other
-without a word, so a `:put` of `[parse_timestamp(…), true]` into a `Validity`
-column **succeeded** and stamped the row at 1970 — a row that reads back correctly
-on an ordinary query, with the damage visible only under time travel. On the read
-side, `@ parse_timestamp(…)` returned **zero rows and no error**.
+0.13.0 is a combined correctness-and-capability release. The Python-facing
+highlights:
 
-This is especially easy to hit from Python, because a Python `float` reaches the
-engine as a float: passing `time.time() * 1_000_000` as a bound parameter worked
-only by luck (whenever the product happened to land on a whole number) and is now
-a clear error. Pass an `int`.
+- **The published wheel now honours RocksDB table options.** A block cache,
+  block size, and index/filter caching configured through an `options` file
+  were silently discarded on every open, so `CozoDbPy("rocksdb", ...)` ran with
+  an 8 MB default cache and 4 KB blocks no matter what the file asked for. Any
+  read-path benchmark taken against a RocksDB store before this release measured
+  a slower engine than mnestic actually is. Fixed in the bundled `mnestic-rocks`
+  0.1.10; the SQLite-only source distribution was never affected.
 
-**Upgrade action — and note carefully *where* it bites.** The schema still compiles; it is
-the next **write** that now fails. The idiom `Validity default [floor(now()), true]` — and any
-spelling that yields a *whole-numbered* float, so `floor(now())`, `round(now())`, or
-`parse_timestamp(...)` on a whole second — has been silently writing 1970 into your valid-time
-axis. It now errors on write. (Bare `[now(), true]` already errored before this release, but
-only by luck: `now()` returns a *fractional* float, and the coercion only ever accepted
-whole-numbered ones.) Write instead:
-```
-last_seen: Validity default [to_int(now() * 1000000), true]
-```
+- **Datetime standard library (`dt_*`), reachable from `run_script`.** Component
+  extractors (`dt_year` … `dt_dow`), `dt_trunc`, calendar-aware `dt_add` /
+  `dt_diff`, strftime `dt_format`, and `dt_to_validity` — the typed bridge from
+  float Unix *seconds* to a `Validity`'s integer microseconds. `@` and `:as_of`
+  now accept a `Validity`-typed expression
+  (`@ dt_to_validity(parse_timestamp('2024-01-01'))`), which together with
+  0.12.2's float rejection closes the seconds-vs-microseconds trap that is
+  especially easy to hit from Python. The new `dt_*` names are reserved against
+  `register_custom_aggr`.
 
-An integer in *seconds* (`@ 1704067200`) is still accepted and still silently
-returns nothing — valid time is an abstract logical clock (the tutorial queries
-`@ 2019`), so no magnitude check can tell a wrong unit from a legitimate small
-value. Use integer microseconds, or the string forms (`@ '2024-06-01'`).
+- **Better parse errors.** A failed `run_script` now points its caret at the
+  deepest position the parser reached and adds a `help:` line naming the literal
+  tokens that would have been accepted (`expected one of: :=, <-, <~`) — the
+  improved text flows straight through the wheel. Index-search diagnostics now
+  name the index kind that actually failed (`fts_query_required`, not the old
+  `hnsw_query_required`).
 
-### Upgrading to 0.13.0
+- **`hybrid_search`: budgeted graph expansion and optional legs.** A `graph_legs`
+  entry gains optional keys (`max_nodes`, `max_cost`, `weight_col`, `graph`,
+  `seed_from_legs`, `gate_relation` / `gate_cols` / `admit`); setting `max_nodes`
+  runs the leg as cheapest-first weighted expansion under a distinct-node budget.
+  `vector_index` and `fts_index` are now optional, so you can fuse any non-empty
+  subset of {vector, FTS, graph} legs. Existing dicts parse unchanged, but an
+  unknown key in a `graph_legs` entry is now rejected loudly, so a typo like
+  `max_hop` can no longer silently run the leg with defaults.
 
-**Pre-1970 timestamps.** mnestic now accepts a date before the Unix epoch
-wherever it accepts a timestamp string. It used to panic — and on the `mem` and
-`sqlite` backends the panic happened while the store's write guard was held,
-poisoning the lock and killing the database. Pre-epoch writes that previously
-panicked were never committed, so **no stored data is affected; simply re-run
-them.** No action is required on upgrade.
+- **The `!=` factorized-count rewrite is restored, default OFF.** Enable the
+  Db-wide switch with `db.set_query_factorization(True)` (read it back with
+  `db.query_factorization()`); it rewrites an eligible `count()`-over-join
+  carrying an inequality via inclusion–exclusion, sound behind a stored-column
+  type gate. Measured ~140× on LSQB q6. It stays off by default until a nightly
+  soak clears the default-on flip.
 
-**HNSW indexes may need one rebuild.** Three separate bugs left stale data in
-HNSW indexes built by any release through 0.12.2:
+- **Corrupt data raises instead of crashing the interpreter.** A corrupt value
+  blob in a stored relation used to raise `PanicException` — a `BaseException`
+  subclass that `except Exception:` does **not** catch. It is now an ordinary
+  `eval::corrupt_value_blob` query error naming the key: run `::repair_corrupt
+  <relation>` to drop the unreadable rows, then `::reindex <relation>` if that
+  relation carries an HNSW/FTS/LSH index. HNSW indexes built by any release
+  through 0.12.2 can also carry stale nodes/edges from null-vector and
+  pre-existing-row bugs — rebuild once per affected relation with `::reindex
+  <relation>`. Your rows are untouched; `::reindex` rebuilds index relations only.
 
-- A `:put` or `update` that set a row's vector column to `null` (or shortened a
-  list-of-vectors column) left the row's old graph nodes behind. This is not a
-  stale-result bug — the search reads a node's vector back from the base row, so
-  a single stranded node makes **every** vector query on that relation fail with
-  `Cannot interpret null as vector`, or panic.
-- `::hnsw create` over a relation that **already had rows** wrote one-directional
-  edges. A later `:rm` — or a re-`:put` that changes a vector, i.e. re-embedding —
-  can then strand an orphan edge, and a search may fail with `Cannot find
-  compound key for HNSW`.
-- An all-zero vector (what a failed or absent embedding produces) made cosine
-  distance `NaN`, which wedged the search heap and silently degraded results.
-
-Upgrading alone restores **correct query results** for the zero-vector case. For
-the other two, the stale rows are on disk. Rebuild once, per affected relation:
-
-```text
-::reindex <relation>
-```
-
-Your rows are untouched and nothing is deleted; `::reindex` rebuilds index
-relations only. It is safe to run on an index that is already failing. An index
-created on an **empty** relation and populated only with non-null vectors by
-`:put`, without later nulling or shortening a vector field, is unaffected by the
-two on-disk bugs.
-
-**`::repair_corrupt` does not fix any of the above** and will report `removed: 0`.
-
-**Corrupt value blobs are now an error, not a panic.** A corrupt value in a
-stored relation used to panic the process — through the Python wheel that was a
-`PanicException`, a `BaseException` subclass that `except Exception:` does not
-catch. It is now an ordinary query error (`eval::corrupt_value_blob`, naming the
-key). If you hit it, run `::repair_corrupt <relation>` to drop the unreadable
-rows, **then** `::reindex <relation>` if that relation carries an HNSW/FTS/LSH
-index — repair cannot evict the dead row's index postings, because it cannot
-decode the row to know what they were.
-
-**`restore_backup` could mint colliding relation ids.** In any release through
-0.12.2, a relation created **after** a `restore_backup` into a fresh store could
-be given an id a restored relation already owned — silently sharing one
-keyspace, so reads of either returned both. **On upgrade, opening the store stops
-any further collisions with no action on your part**, and logs an error naming
-any relations that are already entangled.
-
-**If that error fires, the entangled rows cannot be separated.** The store never
-recorded which relation wrote which row. **Do not run `::repair_corrupt` on them
-— it deletes the narrower relation's rows.** Recover by restoring the
-**original** backup into a **fresh** store with this build. (If your only backup
-was taken *from* the already-damaged store, it carries the entanglement.) Stores
-where `restore_backup` was never called, or where no relation was created
-afterwards, are unaffected.
-
-**`hybrid_search`: every fusion leg now needs a distinct label.** Two graph legs
-sharing a label were never fused as two lists — reciprocal-rank fusion groups by
-the label, so the second was silently merged into the first. In Python, `label`
-is optional and defaults to `"graph"`, so two defaulted graph legs collided by
-construction. This now **errors at build time** instead of returning a wrong
-ranking. Give each leg its own label (`"semantic"` and `"text"` are reserved). A
-single graph leg is unaffected.
-
-**Graph legs no longer re-score their own seeds.** A seed reachable from itself
-— guaranteed at hop 2 whenever `undirected: true`, and possible at hop 1 via a
-self-loop or an edge from a second seed — was re-entering its own ranked list.
-Seeds that legitimately match the vector or keyword query are still returned
-and still rank where those legs put them; only the spurious graph-leg
-contribution is gone. Rankings will shift. No migration.
-
-**One query that used to return zero rows now raises.** A query reading a stored
-relation by a **fully-bound key**, with a filter that errors at evaluation time,
-silently returned `Ok([])`; it now raises that error. (The same query with an
-unbound key already raised — the engine was giving two different answers to the
-same logical query depending on the plan it chose.)
+See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
+for the full per-case upgrade guidance — pre-1970 timestamps, `restore_backup`
+relation-id reconciliation, and the hybrid-leg ranking changes (fusion legs now
+require distinct labels, and a graph leg no longer re-scores its own seeds).
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

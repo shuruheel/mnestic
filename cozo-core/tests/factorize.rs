@@ -662,7 +662,7 @@ fn differential_naive_equals_factorized() {
 }
 
 // ------------------------------------------------------------------------
-// The `!=` type gate (0.14.0). The inclusion–exclusion correction term JOINS
+// The `!=` type gate (0.13.0). The inclusion–exclusion correction term JOINS
 // the operands while `!=` compares them with `op_neq`, and the two disagree on
 // numerically-equal cross-variant pairs (`Int(1)` vs `Float(1.0)`: distinct
 // under the engine total order, equal under `op_neq`). The gate admits the
@@ -772,7 +772,7 @@ fn ie_neq_disagreeing_occurrences_decline() {
 /// (serde_json equality — IEEE `==`, so json(-0.0) == json(0.0)) while its Ord
 /// (what the correction join uses) compares to_string() output — op_neq-equal
 /// but join-distinct pairs exist TODAY, and the fired rewrite overcounts
-/// 2-for-0 on this exact fixture (reproduced during the 0.14.0 review).
+/// 2-for-0 on this exact fixture (reproduced during the 0.13.0 review).
 #[test]
 fn ie_neq_json_typed_operand_declines() {
     let dir = tempfile::tempdir().unwrap();

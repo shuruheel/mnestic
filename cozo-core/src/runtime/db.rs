@@ -1093,7 +1093,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let src_handle = src_tx.get_relation(relation, false)?;
                 let dst_handle = dst_tx.get_relation(relation, false)?;
 
-                // mnestic fork (0.14.0, Part III §0): this path raw-puts the
+                // mnestic fork (0.13.0, Part III §0): this path raw-puts the
                 // source's KV rows after a key rewrite — no `coerce`, no
                 // per-value type check — so it was the ONE user-reachable way
                 // to put a value at rest that violates its column's declared

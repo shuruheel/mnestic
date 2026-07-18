@@ -1,6 +1,6 @@
 [package]
 name = "mnestic"
-version = "0.12.2"
+version = "0.13.0"
 edition = "2021"
 description = "A transactional relational-graph-vector database using Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory"
 authors = ["Shan Rizvi", "Ziyang Hu (original CozoDB author)"]
@@ -142,7 +142,7 @@ document-features = "0.2.8"
 rayon = { version = ">=1.10.0, <1.11", optional = true }
 minreq = { version = "2.11.2", features = ["https-rustls"], optional = true }
 tikv-jemallocator-global = { version = "0.5.0", optional = true }
-cozorocks = { package = "mnestic-rocks", path = "../cozorocks", version = "0.1.9", optional = true }
+cozorocks = { package = "mnestic-rocks", path = "../cozorocks", version = "0.1.10", optional = true }
 rocksdb = { version = "0.22.0", optional = true }
 sled = { version = "0.34.7", optional = true }
 tikv-client = { version = "0.3.0", optional = true }

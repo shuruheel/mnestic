@@ -267,7 +267,7 @@ fn lsqb_counts_match_the_published_oracle() {
         );
     }
 
-    // mnestic fork (0.14.0): q6 again with the factorized-count rewrite forced
+    // mnestic fork (0.13.0): q6 again with the factorized-count rewrite forced
     // ON. Without this arm the whole tier exercises only the default-OFF path,
     // and a broken `!=` inclusion–exclusion would ship behind a green gate (the
     // toggle is not reachable from CI config — only from test code). The oracle
