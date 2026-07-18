@@ -182,7 +182,18 @@ only by hand-writing Datalog around a FixedRule.
   `weight_col`, `graph`, `seed_from_legs`, `gate_relation`, `gate_cols`,
   `admit`; `graph_legs` entries no longer hard-require
   `edge_relation`/`seeds`/`max_hops` — the builder's validation owns the
-  invariants) — existing dicts parse unchanged.
+  invariants) — existing dicts parse unchanged. Because every leg key is now
+  optional, **unknown keys in a `graph_legs` entry are rejected loudly**: a
+  typo (`max_hop`, `seed_from_leg`) would otherwise silently run the leg with
+  defaults.
+- **Validation symmetry and no silently-ignored config**: a configured FTS
+  leg requires a non-empty `query_text` (mirroring the vector leg — an empty
+  query previously surfaced as a cryptic parse error mid-execution), and a
+  budgeted `graph:` leg rejects non-default `from_col`/`to_col` exactly as it
+  already rejected a stray `edge_relation`/`weight_col` (the projection
+  carries its own edges; ignored config is never accepted silently). The
+  newly-usable named fixed-rule input form rejects a **repeated column key**
+  (`*g{uid: a, uid: b}` used to silently drop the first pair).
 
 ### Added — the `!=` inclusion–exclusion count rewrite is restored, behind a type gate (default OFF)
 
@@ -193,22 +204,30 @@ this time. The miscount class: the correction term implements "equals" as a
 evaluated by `op_neq` (under which they are numerically equal), so a
 cross-variant pair escaped both terms. The restore adds a **type gate**: the
 rewrite fires only when every binding occurrence of both operands of every
-inequality is a declared non-nullable, non-`Any` stored column and all
-occurrences agree on one type — then both operands are variant-identical at
-rest and the divergent arm is unreachable (soundness argument written down in
+inequality is a declared non-nullable, **variant-stable** stored column and
+all occurrences agree on one type — then join equality and `op_neq` agree on
+every value the operands can hold (soundness argument written down in
 `docs/specs/cardinality-algebra.md` §3.3a; gate discrimination proven by
 bypass — the mixed-type suite miscounts 4-for-3 without it).
 
+- **Variant-stable excludes `Any` AND `Json`, recursively through
+  `List`/`Tuple` element types**: `JsonData`'s structural `Eq` and its
+  `to_string()`-based `Ord` diverge in the current build (`json(-0.0)` vs
+  `json(0.0)` are op_neq-equal but join-distinct — the fired rewrite
+  overcounted 2-for-0 before the exclusion; found and fixed in the 0.14.0
+  review).
 - **Default stays OFF** (`Db::set_query_factorization`); the default-on flip
   waits for a nightly soak on the restored path, per the 0.10.5→0.10.7
   planner lesson.
 - **Measured** (2026-07-17, LSQB sf0.1, sqlite, M-series, release): q6
   41.7 s → **0.30 s (~140×)** with the rewrite on, count exactly LSQB's
   published oracle either way. The nightly LSQB tier now runs q6 with the
-  toggle forced on, so the rewrite can never again ship behind a green gate
-  that only exercised the default-off path.
-- The pass now takes catalog access (`&SessionTx`) for the gate; with no
-  inequality present it stays purely syntactic.
+  toggle forced on **and asserts the rewrite actually fired** (the `*fac`
+  plan signature), so neither a miscount nor a silently-declining gate can
+  ship behind a green arm again.
+- The pass now takes catalog access (`&SessionTx`) for the gate — each
+  distinct relation's metadata is fetched once per query; with no inequality
+  present it stays purely syntactic.
 
 ### Changed — `import_from_backup` refuses mismatched schemas
 
@@ -256,16 +275,26 @@ convention `format_timestamp` already used.
   `dt_minute`, `dt_second`, `dt_dow` (ISO: Monday = 1), `dt_doy` — all
   `(ts, tz?) -> Int`.
 - **`dt_trunc(ts, unit, tz?) -> Float`** — unit ∈ `year | quarter | month |
-  week | day | hour | minute | second`; weeks are ISO (Monday). DST rule,
-  documented: an ambiguous local time resolves to its earliest occurrence; a
-  local time in a DST gap resolves to the first valid local time after the gap.
+  week | day | hour | minute | second`; weeks are ISO (Monday). DST rules,
+  documented: for sub-day units an ambiguous local time resolves to the fold
+  arm **the input instant itself belongs to** (its own offset disambiguates —
+  truncation stays containing and idempotent inside a fall-back fold); for
+  `day` and coarser, to the earliest occurrence. A local time in a gap
+  resolves to the first valid local time after it — probed in 15-minute steps
+  for 4 hours, then hourly to 26 hours, so historic deep transitions (the
+  6–10 h Antarctic station foundings, full-day Pacific date skips) resolve
+  instead of erroring. Range edges error loudly, never panic.
 - **`dt_add(ts, n, unit) -> Float`** — calendar-aware for
   `month`/`quarter`/`year`, clamping to month end (Jan-31 + 1 month =
   Feb-28/29); fixed-duration for `week`/`day`/`hour`/`minute`/`second`.
   Overflow errors, it never panics.
-- **`dt_diff(a, b, unit) -> Int`** — signed `a - b`, truncating toward zero;
-  calendar-aware for `month`/`quarter`/`year`, consistent with `dt_add`'s
-  clamping (the count is the largest `n` with `b + n unit <= a`).
+- **`dt_diff(a, b, unit) -> Int`** — signed `a - b`, truncating toward zero,
+  antisymmetric (`dt_diff(a,b,u) == -dt_diff(b,a,u)`); `month`/`quarter`/
+  `year` compute the calendar magnitude on the (later, earlier) pair — the
+  largest `n` with `earlier + n unit <= later`, consistent with `dt_add`'s
+  clamping in the forward direction — and apply the sign afterward. Because
+  clamping is asymmetric, a negative result is deliberately NOT the floor
+  form: `dt_diff(Jan-30, Mar-31, 'month')` is `-2`, not `-3`.
 - **`dt_format(ts, fmt, tz?) -> Str`** — strftime. The format string is
   pre-validated: an invalid specifier is a loud error, where calling chrono
   directly would panic (`dt_format` is expected to receive LLM-authored text).
@@ -279,11 +308,17 @@ convention `format_timestamp` already used.
   the raw-float misread errors loudly, and the typed path is the idiomatic
   spelling. The seconds-as-`Int` form (`@ 1704067200`) remains inherently
   ambiguous — valid time is an abstract clock, so no magnitude gate can reject
-  it — which is exactly why the typed bridge exists.
+  it — which is exactly why the typed bridge exists. Both `dt_to_validity`
+  and `validity()` now **reject the reserved i64 extremes** (`MAX_VALIDITY_TS`
+  = 'NOW'/'END', and the terminal retract sentinel) that every other write
+  path already fences.
 - **`parse_timestamp` widened** (error → success, additive): accepts exactly
   three enumerated forms — RFC3339; `"YYYY-MM-DD hh:mm:ss[.fff]"` read as UTC;
   `"YYYY-MM-DD"` read as midnight UTC. Nothing else; the error message
-  enumerates the accepted forms.
+  enumerates the accepted forms. **Validity string literals (`@ '...'`,
+  `:as_of '...'`) share the same grammar** — one parser
+  (`parse_datetime_utc`), so a literal one entry point accepts is never
+  rejected by the other (the naive-datetime form is new for `@` literals too).
 - Note: the new `dt_*` names are now **reserved against user registration** —
   a downstream `register_custom_aggr` under one of these names will fail at
   registration after the upgrade.
@@ -323,7 +358,10 @@ no consumer in the ecosystem asserts on the old ones (verified).
   `cargo clippy -p mnestic --all-targets -- -D warnings`, so integration tests
   and registered benchmarks cannot silently rot outside the release gate. The
   stale `read_path` benchmark call to `parse_script` was repaired, and
-  `cargo check -p mnestic --benches --release` is green.
+  `cargo check -p mnestic --benches --release` is green. Same rot class, same
+  fix: the `cozo-core-examples` `run_parse_ast` binary — uncompilable since
+  `parse_script` gained the custom-aggregate registries parameter — was
+  repaired (it is outside the clippy gate, which is how it rotted silently).
 
 ### Changed
 
