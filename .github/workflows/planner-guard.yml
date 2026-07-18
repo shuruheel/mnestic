@@ -65,4 +65,7 @@ jobs:
       - name: LSQB execution tier
         run: cargo test --release -p mnestic --test lsqb -- --ignored --nocapture --test-threads=1
         env:
-          LSQB_SF01_DIR: .lsqb/social-network-sf0.1-projected-fk
+          # Must be absolute: cargo runs test binaries with cwd = the PACKAGE
+          # dir (cozo-core/), not the workspace root, so a root-relative path
+          # never resolves. This kept the tier red from its first run.
+          LSQB_SF01_DIR: ${{ github.workspace }}/.lsqb/social-network-sf0.1-projected-fk

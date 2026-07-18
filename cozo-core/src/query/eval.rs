@@ -13,7 +13,10 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use itertools::Itertools;
 use log::{debug, trace};
 use miette::{bail, Result};
-#[cfg(not(target_arch = "wasm32"))]
+// `rayon` is an optional dependency (implied by `graph-algo`, absent in a
+// bare `minimal` build): parallel stratum evaluation degrades to sequential
+// without it. The wasm arm below is already sequential.
+#[cfg(all(not(target_arch = "wasm32"), feature = "rayon"))]
 use rayon::prelude::*;
 
 use crate::data::aggr::Aggregation;
@@ -242,8 +245,14 @@ impl<'a> SessionTx<'a> {
                         }
                     }
 
+                    #[cfg(feature = "rayon")]
                     let execs = prog
                         .par_iter()
+                        .filter(|(symb, _)| !(limiter_enabled && symb.is_prog_entry()))
+                        .map(execution);
+                    #[cfg(not(feature = "rayon"))]
+                    let execs = prog
+                        .iter()
                         .filter(|(symb, _)| !(limiter_enabled && symb.is_prog_entry()))
                         .map(execution);
 
@@ -323,8 +332,14 @@ impl<'a> SessionTx<'a> {
                         }
                     }
 
+                    #[cfg(feature = "rayon")]
                     let execs = prog
                         .par_iter()
+                        .filter(|(symb, _)| !(limiter_enabled && symb.is_prog_entry()))
+                        .map(execution);
+                    #[cfg(not(feature = "rayon"))]
+                    let execs = prog
+                        .iter()
                         .filter(|(symb, _)| !(limiter_enabled && symb.is_prog_entry()))
                         .map(execution);
                     for res in execs.collect::<Vec<_>>() {

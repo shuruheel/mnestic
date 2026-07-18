@@ -1092,6 +1092,35 @@ impl<'s, S: Storage<'s>> Db<S> {
                 }
                 let src_handle = src_tx.get_relation(relation, false)?;
                 let dst_handle = dst_tx.get_relation(relation, false)?;
+
+                // mnestic fork (0.14.0, Part III §0): this path raw-puts the
+                // source's KV rows after a key rewrite — no `coerce`, no
+                // per-value type check — so it was the ONE user-reachable way
+                // to put a value at rest that violates its column's declared
+                // type (a backed-up Float restored into a declared-Int column).
+                // Every query-path write coerces; this restore must not be the
+                // hole. Full-metadata equality is deliberately stricter than
+                // the type argument needs (names and defaults too): a restore
+                // across renamed columns is ambiguous about intent, and
+                // refusing loudly beats guessing.
+                #[derive(Debug, Error, Diagnostic)]
+                #[error(
+                    "cannot import relation '{0}' from backup: the source and destination \
+                     schemas differ"
+                )]
+                #[diagnostic(code(tx::import_schema_mismatch))]
+                #[diagnostic(help(
+                    "the backup path copies raw rows without type coercion, so the schemas \
+                     must match exactly (column names, types and defaults); re-create the \
+                     destination relation with the source schema, or re-ingest through a query"
+                ))]
+                struct ImportSchemaMismatch(String);
+
+                ensure!(
+                    src_handle.metadata == dst_handle.metadata,
+                    ImportSchemaMismatch(relation.to_string())
+                );
+
                 // Graph-projection dirty-set hook (spec §3.4 row 8): the rows
                 // below go straight to `store_tx.put`, bypassing the mutation
                 // paths that would otherwise mark this relation.
@@ -2053,6 +2082,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let (normalized_program, advisory) =
                     crate::query::factorize::maybe_rewrite_and_advise(
                         normalized_program,
+                        &*tx,
                         self.enable_factorize.load(Ordering::Relaxed),
                     );
                 let (stratified_program, _) = normalized_program.into_stratified_program()?;
@@ -2917,6 +2947,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         // the original program), so the rewrite never changes the result schema.
         let (normalized_program, _advisory) = crate::query::factorize::maybe_rewrite_and_advise(
             normalized_program,
+            &*tx,
             self.enable_factorize.load(Ordering::Relaxed),
         );
         let (stratified_program, store_lifetimes) = normalized_program.into_stratified_program()?;

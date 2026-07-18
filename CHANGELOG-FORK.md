@@ -145,6 +145,208 @@ Inherited from upstream Cozo; present since the options-file path was introduced
   skip their local lock when the program already owns it, avoiding an unlocked
   mutation on some backends and a recursive-lock deadlock on others.
 
+### Added — `HybridSearch` budgeted-expansion mode and optional legs
+
+The 0.12.0 headline (`BudgetedTraversal`) is now reachable from the one-call
+`hybrid_search` surface — the dict the PyPI wheel already exposes — instead of
+only by hand-writing Datalog around a FixedRule.
+
+- **Budgeted graph legs** (spec §9, resolved): setting `GraphLeg::max_nodes`
+  switches the leg from the recursive min-hop rule to a generated
+  `BudgetedTraversal` call — cheapest-first weighted expansion under a global
+  distinct-node budget, with optional `max_cost`, an exact layered-label depth
+  bound (`max_hops` → `max_depth`), optional `weight_col`, an optional
+  liveness gate (`gate_relation`/`gate_cols`/`admit` — emitted in the named,
+  order-independent binding form), and `graph:` naming a pre-created cached
+  projection (**the production path**: the positional edge input pays a full
+  scan + CSR build before any budget applies). Seeds default to the union of
+  the configured vector/FTS legs' own top-k (`seed_from_legs`), plus explicit
+  `seeds`; seed roots are excluded from the fusion contribution. With
+  `detailed: true`, the output head gains the cheapest-path witness
+  (`parent`, `depth`) — opt-in: without a budgeted leg every existing shape
+  is byte-identical (snapshot-guarded).
+- **Optional legs**: `vector_index`/`fts_index` are now `Option<String>` —
+  configure any non-empty subset of {vector, FTS, graph legs, extra lists}
+  and only those are generated and fused. A payload without its leg
+  (`query_vector` with no `vector_index`, and vice versa) is a loud error,
+  never a silently dropped signal.
+- **`GraphLeg` in recursive mode is unchanged** — the generated script is
+  byte-identical to 0.13 (snapshot-guarded), and it remains the only graph
+  leg in a `minimal` build (`BudgetedTraversal` registers under `graph-algo`);
+  a budgeted leg configured without the feature errors loudly at build time.
+- **Source-breaking (the honest minor):** `HybridSearch` and `GraphLeg` are
+  now `#[non_exhaustive]` — construct with `Default` + field mutation. This
+  is deliberately paid once, in the same release that adds eight `GraphLeg`
+  fields, so that future field additions are never breaking again. The Python
+  wheel's dict surface gains **optional keys only** (`max_nodes`, `max_cost`,
+  `weight_col`, `graph`, `seed_from_legs`, `gate_relation`, `gate_cols`,
+  `admit`; `graph_legs` entries no longer hard-require
+  `edge_relation`/`seeds`/`max_hops` — the builder's validation owns the
+  invariants) — existing dicts parse unchanged. Because every leg key is now
+  optional, **unknown keys in a `graph_legs` entry are rejected loudly**: a
+  typo (`max_hop`, `seed_from_leg`) would otherwise silently run the leg with
+  defaults.
+- **Validation symmetry and no silently-ignored config**: a configured FTS
+  leg requires a non-empty `query_text` (mirroring the vector leg — an empty
+  query previously surfaced as a cryptic parse error mid-execution), and a
+  budgeted `graph:` leg rejects non-default `from_col`/`to_col` exactly as it
+  already rejected a stray `edge_relation`/`weight_col` (the projection
+  carries its own edges; ignored config is never accepted silently). The
+  newly-usable named fixed-rule input form rejects a **repeated column key**
+  (`*g{uid: a, uid: b}` used to silently drop the first pair).
+
+### Added — the `!=` inclusion–exclusion count rewrite is restored, behind a type gate (default OFF)
+
+The factorized-count pass's `!=` extension — built in 0.10.5 and cut 34
+minutes later (`a60a8013`) for a silent Int/Float miscount — is back, sound
+this time. The miscount class: the correction term implements "equals" as a
+**join** (under which `Int(1)` and `Float(1.0)` are distinct) while `!=` is
+evaluated by `op_neq` (under which they are numerically equal), so a
+cross-variant pair escaped both terms. The restore adds a **type gate**: the
+rewrite fires only when every binding occurrence of both operands of every
+inequality is a declared non-nullable, **variant-stable** stored column and
+all occurrences agree on one type — then join equality and `op_neq` agree on
+every value the operands can hold (soundness argument written down in
+`docs/specs/cardinality-algebra.md` §3.3a; gate discrimination proven by
+bypass — the mixed-type suite miscounts 4-for-3 without it).
+
+- **Variant-stable excludes `Any` AND `Json`, recursively through
+  `List`/`Tuple` element types**: `JsonData`'s structural `Eq` and its
+  `to_string()`-based `Ord` diverge in the current build (`json(-0.0)` vs
+  `json(0.0)` are op_neq-equal but join-distinct — the fired rewrite
+  overcounted 2-for-0 before the exclusion; found and fixed in the 0.14.0
+  review).
+- **Default stays OFF** (`Db::set_query_factorization`); the default-on flip
+  waits for a nightly soak on the restored path, per the 0.10.5→0.10.7
+  planner lesson.
+- **Measured** (2026-07-17, LSQB sf0.1, sqlite, M-series, release): q6
+  41.7 s → **0.30 s (~140×)** with the rewrite on, count exactly LSQB's
+  published oracle either way. The nightly LSQB tier now runs q6 with the
+  toggle forced on **and asserts the rewrite actually fired** (the `*fac`
+  plan signature), so neither a miscount nor a silently-declining gate can
+  ship behind a green arm again.
+- The pass now takes catalog access (`&SessionTx`) for the gate — each
+  distinct relation's metadata is fetched once per query; with no inequality
+  present it stays purely syntactic.
+
+### Changed — `import_from_backup` refuses mismatched schemas
+
+The backup-import path raw-puts the source's rows after a key rewrite — no
+type coercion — so it was the one user-reachable way to put a value at rest
+that violates its column's declared type (a backed-up `Float` restored into a
+declared-`Int` column), which is exactly the invariant the `!=` type gate
+rests on. It now requires the source and destination schemas to match
+(column names, types and defaults — deliberately stricter than the type
+argument needs: a restore across renamed columns is ambiguous about intent,
+and refusing loudly beats guessing). Error → error for the corrupting case;
+a same-schema restore is unchanged. Code: `tx::import_schema_mismatch`.
+
+### Fixed — a bare `minimal` build did not compile (ungated `rayon`)
+
+`query/eval.rs` imported `rayon` gated only on `not(wasm32)`, while `rayon`
+is an optional dependency that `minimal` does not enable — so
+`--no-default-features --features minimal` had been **uncompilable**, with
+nobody noticing because CI never built that combination and every known
+consumer enables `rayon`. Parallel stratum evaluation now degrades to
+sequential without the feature, and CI gained a `minimal` job so the
+combination (and the budgeted-leg feature-seam error) stays covered.
+
+### Fixed — the named `*rel{col}` fixed-rule input form always panicked
+
+The `fixed_named_relation_rel` parse arm stripped `':'` from an identifier
+the grammar defines as `*`-prefixed, so the `unwrap` panicked on every use —
+the named binding form for fixed-rule stored inputs was unusable (inherited
+upstream bug, present at fork-base). It now parses and binds **by name** in
+schema order, which is what makes the budgeted gate's order-independent
+`gate_cols` form possible.
+
+### Added — datetime function library (`dt_*`)
+
+We market a bitemporal database; its datetime standard library was three
+functions with inconsistent units. This adds the missing surface, on one loudly
+stated convention: **timestamps are float Unix seconds** (what `now()` and
+`parse_timestamp` already return); **a float second-count is NOT a validity**
+(validities count integer microseconds, or an abstract logical tick), and the
+one bridge between the two worlds is `dt_to_validity`. Timezone-sensitive
+functions take an optional trailing IANA-name string, default UTC — the same
+convention `format_timestamp` already used.
+
+- **Component extractors** `dt_year`, `dt_month`, `dt_day`, `dt_hour`,
+  `dt_minute`, `dt_second`, `dt_dow` (ISO: Monday = 1), `dt_doy` — all
+  `(ts, tz?) -> Int`.
+- **`dt_trunc(ts, unit, tz?) -> Float`** — unit ∈ `year | quarter | month |
+  week | day | hour | minute | second`; weeks are ISO (Monday). DST rules,
+  documented: for sub-day units an ambiguous local time resolves to the fold
+  arm **the input instant itself belongs to** (its own offset disambiguates —
+  truncation stays containing and idempotent inside a fall-back fold); for
+  `day` and coarser, to the earliest occurrence. A local time in a gap
+  resolves to the first valid local time after it — probed in 15-minute steps
+  for 4 hours, then hourly to 26 hours, so historic deep transitions (the
+  6–10 h Antarctic station foundings, full-day Pacific date skips) resolve
+  instead of erroring. Range edges error loudly, never panic.
+- **`dt_add(ts, n, unit) -> Float`** — calendar-aware for
+  `month`/`quarter`/`year`, clamping to month end (Jan-31 + 1 month =
+  Feb-28/29); fixed-duration for `week`/`day`/`hour`/`minute`/`second`.
+  Overflow errors, it never panics.
+- **`dt_diff(a, b, unit) -> Int`** — signed `a - b`, truncating toward zero,
+  antisymmetric (`dt_diff(a,b,u) == -dt_diff(b,a,u)`); `month`/`quarter`/
+  `year` compute the calendar magnitude on the (later, earlier) pair — the
+  largest `n` with `earlier + n unit <= later`, consistent with `dt_add`'s
+  clamping in the forward direction — and apply the sign afterward. Because
+  clamping is asymmetric, a negative result is deliberately NOT the floor
+  form: `dt_diff(Jan-30, Mar-31, 'month')` is `-2`, not `-3`.
+- **`dt_format(ts, fmt, tz?) -> Str`** — strftime. The format string is
+  pre-validated: an invalid specifier is a loud error, where calling chrono
+  directly would panic (`dt_format` is expected to receive LLM-authored text).
+  `format_timestamp` stays, for RFC3339.
+- **`dt_to_validity(ts_seconds, is_assert?) -> Validity`** — the typed bridge:
+  seconds → microseconds *inside* the function, where the unit is known. With
+  it, `@` and `:as_of` now accept a `Validity`-typed expression
+  (`@ dt_to_validity(parse_timestamp('2024-01-01'))` reads as-of that instant);
+  previously `DataValue::Validity` in a temporal spec was an error. Together
+  with 0.12.2's float rejection this closes the seconds-vs-microseconds trap:
+  the raw-float misread errors loudly, and the typed path is the idiomatic
+  spelling. The seconds-as-`Int` form (`@ 1704067200`) remains inherently
+  ambiguous — valid time is an abstract clock, so no magnitude gate can reject
+  it — which is exactly why the typed bridge exists. Both `dt_to_validity`
+  and `validity()` now **reject the reserved i64 extremes** (`MAX_VALIDITY_TS`
+  = 'NOW'/'END', and the terminal retract sentinel) that every other write
+  path already fences.
+- **`parse_timestamp` widened** (error → success, additive): accepts exactly
+  three enumerated forms — RFC3339; `"YYYY-MM-DD hh:mm:ss[.fff]"` read as UTC;
+  `"YYYY-MM-DD"` read as midnight UTC. Nothing else; the error message
+  enumerates the accepted forms. **Validity string literals (`@ '...'`,
+  `:as_of '...'`) share the same grammar** — one parser
+  (`parse_datetime_utc`), so a literal one entry point accepts is never
+  rejected by the other (the naive-datetime form is new for `@` literals too).
+- Note: the new `dt_*` names are now **reserved against user registration** —
+  a downstream `register_custom_aggr` under one of these names will fail at
+  registration after the upgrade.
+
+### Added — parse errors name the expected tokens
+
+A failed parse now points its caret at the **deepest position the parser
+reached** (previously `err.location`, which for `?[a] a = 1` sat inside the
+rule head while the defect — the missing `:=` — was later), and carries a
+`help:` line naming the literal tokens that would have been accepted there,
+e.g. `expected one of: \`:=\`, \`<-\`, \`<~\``. Whitespace/comment noise is
+filtered; the hint is suppressed entirely when the surviving candidate set is
+empty or too large to identify a defect — an unactionable hint being the
+failure mode this exists to kill. Built on pest's parse-attempts tracking; no
+grammar change, and `ParseError` stays crate-private (the improved text flows
+to every surface — Rust, Python wheel, REPL — for free).
+
+In the same agent-actionable-errors spirit, **index-search diagnostics now
+carry the code of the index kind that actually failed** (upstream #231/#257):
+an FTS search with a missing `query:` no longer says "required for HNSW
+search" under an `hnsw_query_required` code (now `fts_query_required`, and
+the same for a missing `k`); the LSH normalizer's two reused HNSW codes are
+now `lsh_query_required`/`expected_int_for_lsh_k`; FTS `k` gets
+`expected_int_for_fts_k`; and the generic index-not-found fall-through —
+which fires when *no* index of any kind matched — is `eval::index_not_found`
+instead of `eval::hnsw_index_not_found`. User-visible error **codes** change;
+no consumer in the ecosystem asserts on the old ones (verified).
+
 ### Verification and release gates
 
 - **Continuous FTS/HNSW maintenance is now a release regression.** A persistent
@@ -156,7 +358,10 @@ Inherited from upstream Cozo; present since the options-file path was introduced
   `cargo clippy -p mnestic --all-targets -- -D warnings`, so integration tests
   and registered benchmarks cannot silently rot outside the release gate. The
   stale `read_path` benchmark call to `parse_script` was repaired, and
-  `cargo check -p mnestic --benches --release` is green.
+  `cargo check -p mnestic --benches --release` is green. Same rot class, same
+  fix: the `cozo-core-examples` `run_parse_ast` binary — uncompilable since
+  `parse_script` gained the custom-aggregate registries parameter — was
+  repaired (it is outside the clippy gate, which is how it rotted silently).
 
 ### Changed
 

@@ -15,7 +15,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;
-use chrono::{DateTime, TimeZone, Utc};
+use chrono::format::StrftimeItems;
+use chrono::{
+    DateTime, Datelike, Days, Duration, LocalResult, Months, NaiveDate, NaiveDateTime, Offset,
+    TimeZone, Timelike, Utc,
+};
 use itertools::Itertools;
 #[cfg(target_arch = "wasm32")]
 use js_sys::Date;
@@ -2589,28 +2593,400 @@ fn system_time_to_secs_f64(st: SystemTime) -> f64 {
     }
 }
 
+/// The ONE accepted datetime string grammar (mnestic fork, 0.14.0), shared by
+/// `parse_timestamp` (→ float seconds) and the validity string literals —
+/// `@ '...'` / `:as_of '...'` via [`str2vld`] (→ microseconds) — so a string
+/// one entry point accepts is never rejected by the other. Exactly three
+/// enumerated forms: RFC3339; `"YYYY-MM-DD hh:mm:ss[.fff]"` read as UTC;
+/// `"YYYY-MM-DD"` read as midnight UTC. Extend it here or nowhere.
+fn parse_datetime_utc(s: &str) -> Option<SystemTime> {
+    if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
+        return Some(dt.into());
+    }
+    if let Ok(ndt) = NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
+        return Some(ndt.and_utc().into());
+    }
+    if let Ok(nd) = NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        return Some(nd.and_hms_opt(0, 0, 0).unwrap().and_utc().into());
+    }
+    None
+}
+
 pub(crate) fn op_parse_timestamp(args: &[DataValue]) -> Result<DataValue> {
     let s = args[0]
         .get_str()
         .ok_or_else(|| miette!("'parse_timestamp' expects a string"))?;
-    let dt = DateTime::parse_from_rfc3339(s).map_err(|_| miette!("bad datetime: {}", s))?;
-    let st: SystemTime = dt.into();
+    let st = parse_datetime_utc(s).ok_or_else(|| {
+        miette!(
+            "bad datetime: {} (accepted forms: RFC3339, \"YYYY-MM-DD hh:mm:ss[.fff]\" read as \
+             UTC, \"YYYY-MM-DD\" read as midnight UTC)",
+            s
+        )
+    })?;
     Ok(DataValue::from(system_time_to_secs_f64(st)))
 }
 
 pub(crate) fn str2vld(s: &str) -> Result<ValidityTs> {
-    // mnestic fork: also accept a bare date (midnight UTC) — the docs' own
-    // examples use `@ "2026-01-01"`, which strict RFC3339 rejects.
-    let st: SystemTime = match DateTime::parse_from_rfc3339(s) {
-        Ok(dt) => dt.into(),
-        Err(_) => {
-            let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                .map_err(|_| miette!("bad datetime: {}", s))?;
-            let dt = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
-            dt.into()
+    // mnestic fork: the same grammar as `parse_timestamp` — see
+    // `parse_datetime_utc`. (Historically this accepted RFC3339 + bare dates
+    // only; 0.14.0 unified the two so a literal proven parseable by one entry
+    // point cannot be rejected by the other.)
+    let st = parse_datetime_utc(s).ok_or_else(|| miette!("bad datetime: {}", s))?;
+    Ok(ValidityTs(Reverse(system_time_to_micros(st)?)))
+}
+
+// ---- mnestic fork (0.14.0): datetime function library ----
+//
+// Convention: timestamps are float Unix SECONDS (the `now()`/`parse_timestamp`
+// installed base); every `dt_*` function consumes and produces that. A float
+// second-count is NOT a validity — validities count integer MICROSECONDS (or an
+// abstract logical tick). The one bridge is `dt_to_validity`. Timezone-sensitive
+// functions take an optional trailing IANA-name string, default UTC — the same
+// convention as `format_timestamp`.
+
+/// Convert a float-seconds timestamp argument to a UTC instant.
+fn dt_instant(v: &DataValue, fn_name: &str) -> Result<DateTime<Utc>> {
+    let f = v.get_float().ok_or_else(|| {
+        miette!("'{fn_name}' expects a numeric timestamp (float seconds since the Unix epoch)")
+    })?;
+    let micros_f = (f * 1_000_000.).round();
+    // A non-finite or out-of-range float must not reach the `as i64` cast: the
+    // saturating cast would silently map NaN to 1970 and ±inf to the ends of time.
+    if !micros_f.is_finite() || micros_f < i64::MIN as f64 || micros_f > i64::MAX as f64 {
+        bail!("timestamp out of range for '{fn_name}': {f}");
+    }
+    Utc.timestamp_micros(micros_f as i64)
+        .single()
+        .ok_or_else(|| miette!("timestamp out of range for '{fn_name}': {f}"))
+}
+
+/// Read the optional trailing timezone argument at `tz_pos`, defaulting to UTC.
+fn dt_tz(args: &[DataValue], tz_pos: usize, fn_name: &str) -> Result<chrono_tz::Tz> {
+    match args.get(tz_pos) {
+        None => Ok(chrono_tz::Tz::UTC),
+        Some(v) => {
+            let s = v
+                .get_str()
+                .ok_or_else(|| miette!("'{fn_name}' timezone specification requires a string"))?;
+            chrono_tz::Tz::from_str(s).map_err(|_| miette!("bad timezone specification: {}", s))
+        }
+    }
+}
+
+/// Timestamp arg + optional tz arg → zone-aware datetime.
+fn dt_zoned(args: &[DataValue], tz_pos: usize, fn_name: &str) -> Result<DateTime<chrono_tz::Tz>> {
+    let dt = dt_instant(&args[0], fn_name)?;
+    let tz = dt_tz(args, tz_pos, fn_name)?;
+    Ok(dt.with_timezone(&tz))
+}
+
+/// Map a naive local wall-clock time back to an instant. DST rules (documented
+/// in the crate docs):
+///
+/// * An ambiguous local time (a fall-back fold) resolves to the occurrence
+///   whose offset matches `prefer_offset` when one is supplied — sub-day
+///   truncation passes the input instant's OWN offset, so truncating inside a
+///   fold stays in the fold arm the instant belongs to instead of jumping a
+///   full hour early. Without a preference (or when neither arm matches, as in
+///   exotic sub-hour transitions) it resolves to the EARLIEST occurrence.
+/// * A nonexistent local time (a gap) resolves to the first representable
+///   local time after it, probed in 15-minute steps for the first 4 hours
+///   (covering every DST-style gap — the largest on record is 180 minutes)
+///   and then hourly up to 26 hours (covering historic full-day skips and the
+///   6–10 h station-founding jumps in the Antarctic zones, whose offsets are
+///   whole hours — the hourly phase therefore still lands exactly on the gap
+///   end).
+fn dt_resolve_local(
+    tz: chrono_tz::Tz,
+    naive: NaiveDateTime,
+    prefer_offset: Option<chrono::FixedOffset>,
+    fn_name: &str,
+) -> Result<DateTime<chrono_tz::Tz>> {
+    let pick =
+        |earliest: DateTime<chrono_tz::Tz>, latest: DateTime<chrono_tz::Tz>| match prefer_offset {
+            Some(off) if latest.offset().fix() == off => latest,
+            _ => earliest,
+        };
+    match tz.from_local_datetime(&naive) {
+        LocalResult::Single(dt) => Ok(dt),
+        LocalResult::Ambiguous(earliest, latest) => Ok(pick(earliest, latest)),
+        LocalResult::None => {
+            let quarter_hours = (1..=16i64).map(|s| 15 * s);
+            let hours = (5..=26i64).map(|h| 60 * h);
+            for minutes in quarter_hours.chain(hours) {
+                match tz.from_local_datetime(&(naive + Duration::minutes(minutes))) {
+                    LocalResult::Single(dt) => return Ok(dt),
+                    // A gap exit is unambiguous about which instant is "first";
+                    // the preference never applies here.
+                    LocalResult::Ambiguous(earliest, _) => return Ok(earliest),
+                    LocalResult::None => continue,
+                }
+            }
+            bail!("'{fn_name}': cannot resolve local time {naive} in timezone {tz}")
+        }
+    }
+}
+
+fn dt_instant_to_secs(dt: DateTime<chrono_tz::Tz>) -> DataValue {
+    DataValue::from(dt.timestamp_micros() as f64 / 1_000_000.)
+}
+
+macro_rules! define_dt_component {
+    ($const_name:ident, $fn_name:ident, $script_name:literal, $extract:expr) => {
+        define_op!($const_name, 1, true);
+        pub(crate) fn $fn_name(args: &[DataValue]) -> Result<DataValue> {
+            let dt = dt_zoned(args, 1, $script_name)?;
+            let extract: fn(&DateTime<chrono_tz::Tz>) -> i64 = $extract;
+            Ok(DataValue::from(extract(&dt)))
         }
     };
-    Ok(ValidityTs(Reverse(system_time_to_micros(st)?)))
+}
+
+define_dt_component!(OP_DT_YEAR, op_dt_year, "dt_year", |dt| dt.year() as i64);
+define_dt_component!(OP_DT_MONTH, op_dt_month, "dt_month", |dt| dt.month() as i64);
+define_dt_component!(OP_DT_DAY, op_dt_day, "dt_day", |dt| dt.day() as i64);
+define_dt_component!(OP_DT_HOUR, op_dt_hour, "dt_hour", |dt| dt.hour() as i64);
+define_dt_component!(OP_DT_MINUTE, op_dt_minute, "dt_minute", |dt| {
+    dt.minute() as i64
+});
+define_dt_component!(OP_DT_SECOND, op_dt_second, "dt_second", |dt| {
+    dt.second() as i64
+});
+// ISO: Monday = 1 … Sunday = 7.
+define_dt_component!(OP_DT_DOW, op_dt_dow, "dt_dow", |dt| {
+    dt.weekday().number_from_monday() as i64
+});
+define_dt_component!(OP_DT_DOY, op_dt_doy, "dt_doy", |dt| dt.ordinal() as i64);
+
+define_op!(OP_DT_TRUNC, 2, true);
+pub(crate) fn op_dt_trunc(args: &[DataValue]) -> Result<DataValue> {
+    let unit = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_trunc' expects a unit string as second argument"))?;
+    let tz = dt_tz(args, 2, "dt_trunc")?;
+    let dt = dt_instant(&args[0], "dt_trunc")?.with_timezone(&tz);
+    // NOT `dt.date_naive()`: that path is `checked_add_offset(...).expect(...)`
+    // and PANICS when instant+offset exits NaiveDateTime's range (reachable at
+    // both ends of the admitted range with any offset zone). The Datelike
+    // getters go through chrono's overflow-safe buffer-space path, and
+    // `from_ymd_opt` turns an out-of-range local date into a loud error.
+    let date = NaiveDate::from_ymd_opt(dt.year(), dt.month(), dt.day())
+        .ok_or_else(|| miette!("timestamp out of range for 'dt_trunc'"))?;
+    let naive = match unit {
+        "year" => NaiveDate::from_ymd_opt(date.year(), 1, 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        "quarter" => {
+            let quarter_month = (date.month() - 1) / 3 * 3 + 1;
+            NaiveDate::from_ymd_opt(date.year(), quarter_month, 1)
+                .unwrap()
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+        }
+        "month" => NaiveDate::from_ymd_opt(date.year(), date.month(), 1)
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        // ISO week: truncate to Monday. `NaiveDate - Duration` PANICS on
+        // underflow below NaiveDate::MIN (which is a Thursday, so the first
+        // four admitted days reach below it) — only the checked form is safe.
+        "week" => date
+            .checked_sub_days(Days::new(u64::from(dt.weekday().num_days_from_monday())))
+            .ok_or_else(|| miette!("timestamp out of range for 'dt_trunc'"))?
+            .and_hms_opt(0, 0, 0)
+            .unwrap(),
+        "day" => date.and_hms_opt(0, 0, 0).unwrap(),
+        "hour" => date.and_hms_opt(dt.hour(), 0, 0).unwrap(),
+        "minute" => date.and_hms_opt(dt.hour(), dt.minute(), 0).unwrap(),
+        "second" => date
+            .and_hms_opt(dt.hour(), dt.minute(), dt.second())
+            .unwrap(),
+        _ => bail!(
+            "bad unit for 'dt_trunc': {} (expected one of 'year', 'quarter', 'month', 'week', \
+             'day', 'hour', 'minute', 'second')",
+            unit
+        ),
+    };
+    // Sub-day truncation moves the instant by less than one DST shift, so
+    // inside a fall-back fold the truncated time must stay in the SAME fold
+    // arm as the input — pass the input's own offset as the disambiguator.
+    // Coarser units keep the documented earliest-occurrence policy (their
+    // target local midnight legitimately predates the transition).
+    let prefer_offset = matches!(unit, "hour" | "minute" | "second").then(|| dt.offset().fix());
+    Ok(dt_instant_to_secs(dt_resolve_local(
+        tz,
+        naive,
+        prefer_offset,
+        "dt_trunc",
+    )?))
+}
+
+define_op!(OP_DT_ADD, 3, false);
+pub(crate) fn op_dt_add(args: &[DataValue]) -> Result<DataValue> {
+    let dt = dt_instant(&args[0], "dt_add")?;
+    let n = args[1]
+        .get_int()
+        .ok_or_else(|| miette!("'dt_add' expects an integer count as second argument"))?;
+    let unit = args[2]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_add' expects a unit string as third argument"))?;
+    let out_of_range = || miette!("'dt_add' result out of range");
+    // Calendar-aware month/quarter/year arithmetic clamps to month end
+    // (Jan-31 + 1 month = Feb-28/29) — chrono's `Months` semantics.
+    let add_months = |dt: DateTime<Utc>, months: i64| -> Result<DateTime<Utc>> {
+        let magnitude = u32::try_from(months.unsigned_abs())
+            .map_err(|_| miette!("'dt_add' count too large"))?;
+        if months >= 0 {
+            dt.checked_add_months(Months::new(magnitude))
+                .ok_or_else(out_of_range)
+        } else {
+            dt.checked_sub_months(Months::new(magnitude))
+                .ok_or_else(out_of_range)
+        }
+    };
+    let result = match unit {
+        "year" => add_months(dt, n.checked_mul(12).ok_or_else(out_of_range)?)?,
+        "quarter" => add_months(dt, n.checked_mul(3).ok_or_else(out_of_range)?)?,
+        "month" => add_months(dt, n)?,
+        // `Duration::weeks` and friends PANIC on overflow; `n` is user input,
+        // so only the `try_` constructors are safe here.
+        "week" => dt
+            .checked_add_signed(Duration::try_weeks(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "day" => dt
+            .checked_add_signed(Duration::try_days(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "hour" => dt
+            .checked_add_signed(Duration::try_hours(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "minute" => dt
+            .checked_add_signed(Duration::try_minutes(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        "second" => dt
+            .checked_add_signed(Duration::try_seconds(n).ok_or_else(out_of_range)?)
+            .ok_or_else(out_of_range)?,
+        _ => bail!(
+            "bad unit for 'dt_add': {} (expected one of 'year', 'quarter', 'month', 'week', \
+             'day', 'hour', 'minute', 'second')",
+            unit
+        ),
+    };
+    Ok(DataValue::from(
+        result.timestamp_micros() as f64 / 1_000_000.,
+    ))
+}
+
+/// Whole calendar months from `earlier` to `later` (`later >= earlier`),
+/// consistent with `dt_add`'s clamping: the count is the largest `n` with
+/// `earlier + n months <= later`.
+fn dt_whole_months(later: DateTime<Utc>, earlier: DateTime<Utc>) -> i64 {
+    let mut months = (later.year() as i64 - earlier.year() as i64) * 12
+        + (later.month() as i64 - earlier.month() as i64);
+    let added = |n: i64| {
+        earlier
+            .checked_add_months(Months::new(n.max(0) as u32))
+            // Unreachable in practice: `months` is bounded by real year spans.
+            .unwrap_or(DateTime::<Utc>::MAX_UTC)
+    };
+    while months > 0 && added(months) > later {
+        months -= 1;
+    }
+    while added(months + 1) <= later {
+        months += 1;
+    }
+    months
+}
+
+define_op!(OP_DT_DIFF, 3, false);
+pub(crate) fn op_dt_diff(args: &[DataValue]) -> Result<DataValue> {
+    let a = dt_instant(&args[0], "dt_diff")?;
+    let b = dt_instant(&args[1], "dt_diff")?;
+    let unit = args[2]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_diff' expects a unit string as third argument"))?;
+    // Signed `a - b`, truncated toward zero, ANTISYMMETRIC by construction:
+    // dt_diff(a, b, u) == -dt_diff(b, a, u). month/quarter/year compute the
+    // calendar magnitude on the (later, earlier) pair — the largest n with
+    // earlier + n months <= later, consistent with `dt_add`'s clamping in the
+    // forward direction — and apply the sign afterward. Because month-end
+    // clamping is asymmetric, the NEGATIVE result deliberately does NOT
+    // satisfy the floor form "largest n with b + n unit <= a": e.g.
+    // dt_diff(Jan-30, Mar-31, 'month') is -2 (two whole months lie between
+    // them), not the floor form's -3. Documented, pinned by test.
+    let n = match unit {
+        "year" | "quarter" | "month" => {
+            let (later, earlier, sign) = if a >= b { (a, b, 1) } else { (b, a, -1) };
+            let months = sign * dt_whole_months(later, earlier);
+            match unit {
+                "year" => months / 12,
+                "quarter" => months / 3,
+                _ => months,
+            }
+        }
+        "week" => (a - b).num_weeks(),
+        "day" => (a - b).num_days(),
+        "hour" => (a - b).num_hours(),
+        "minute" => (a - b).num_minutes(),
+        "second" => (a - b).num_seconds(),
+        _ => bail!(
+            "bad unit for 'dt_diff': {} (expected one of 'year', 'quarter', 'month', 'week', \
+             'day', 'hour', 'minute', 'second')",
+            unit
+        ),
+    };
+    Ok(DataValue::from(n))
+}
+
+define_op!(OP_DT_FORMAT, 2, true);
+pub(crate) fn op_dt_format(args: &[DataValue]) -> Result<DataValue> {
+    let fmt = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'dt_format' expects a format string as second argument"))?;
+    // chrono's `format()` PANICS on an invalid strftime specifier when the
+    // `DelayedFormat` is rendered; the format string here is often LLM-authored
+    // query text, so pre-validate and fail loudly instead.
+    let items = StrftimeItems::new(fmt)
+        .parse()
+        .map_err(|_| miette!("bad strftime format string for 'dt_format': {}", fmt))?;
+    let dt = dt_zoned(args, 2, "dt_format")?;
+    Ok(DataValue::Str(SmartString::from(
+        dt.format_with_items(items.iter()).to_string(),
+    )))
+}
+
+define_op!(OP_DT_TO_VALIDITY, 1, true);
+pub(crate) fn op_dt_to_validity(args: &[DataValue]) -> Result<DataValue> {
+    let f = args[0].get_float().ok_or_else(|| {
+        miette!("'dt_to_validity' expects a numeric timestamp (float seconds since the Unix epoch)")
+    })?;
+    let micros_f = (f * 1_000_000.).round();
+    if !micros_f.is_finite() || micros_f < i64::MIN as f64 || micros_f > i64::MAX as f64 {
+        bail!("timestamp out of range for 'dt_to_validity': {f}");
+    }
+    let micros = micros_f as i64;
+    // `i64::MAX as f64` rounds UP to 2^63, so `micros_f == 2^63` passes the
+    // `>` guard above and the cast SATURATES to i64::MAX — which is exactly
+    // MAX_VALIDITY_TS, the reserved 'NOW'/'END' end-of-time bound; the
+    // negative twin casts exactly to i64::MIN = TERMINAL_VALIDITY's timestamp,
+    // whose key makes a temporal scan seek itself forever. Every other user
+    // write path fences these sentinels out (data/relation.rs); the typed
+    // bridge must not be the way to mint them.
+    ensure!(
+        micros != i64::MAX && micros != i64::MIN,
+        "timestamp out of range for 'dt_to_validity': {f}"
+    );
+    let is_assert = if args.len() == 1 {
+        true
+    } else {
+        args[1]
+            .get_bool()
+            .ok_or_else(|| miette!("'dt_to_validity' expects a boolean as second argument"))?
+    };
+    Ok(DataValue::Validity(Validity {
+        timestamp: ValidityTs(Reverse(micros)),
+        is_assert: Reverse(is_assert),
+    }))
 }
 
 define_op!(OP_RAND_UUID_V1, 0, false);
@@ -2757,6 +3133,14 @@ pub(crate) fn op_validity(args: &[DataValue]) -> Result<DataValue> {
         ),
         _ => miette!("'validity' expects an integer"),
     })?;
+    // The i64 extremes are reserved engine sentinels (MAX_VALIDITY_TS =
+    // 'NOW'/'END'; i64::MIN = TERMINAL_VALIDITY, whose key livelocks a
+    // temporal scan). The string/list write paths already reject them
+    // (data/relation.rs); the constructor must too.
+    ensure!(
+        ts != i64::MAX && ts != i64::MIN,
+        "'validity' timestamp {ts} is a reserved engine sentinel (end-of-time / terminal)"
+    );
     let is_assert = if args.len() == 1 {
         true
     } else {

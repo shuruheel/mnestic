@@ -266,6 +266,55 @@ fn lsqb_counts_match_the_published_oracle() {
             got.count
         );
     }
+
+    // mnestic fork (0.14.0): q6 again with the factorized-count rewrite forced
+    // ON. Without this arm the whole tier exercises only the default-OFF path,
+    // and a broken `!=` inclusion–exclusion would ship behind a green gate (the
+    // toggle is not reachable from CI config — only from test code). The oracle
+    // is toggle-agnostic: 55,607,896 is correct whether or not the rewrite
+    // fires. Measured 2026-07-17 (sqlite, M-series, release): OFF ~41.7 s,
+    // ON ~0.30 s — ~140×.
+    db.set_query_factorization(true);
+    // The count alone cannot distinguish "rewrite fired and is exact" from
+    // "rewrite silently declined and this is a second naive run" — assert the
+    // plan actually contains the synthesized `fac*` rules, so a gate/extract
+    // regression that declines q6 goes RED here instead of hiding behind a
+    // green (but 140× slower) arm.
+    let plan = db
+        .run_script(
+            &format!("::explain {{ {Q6} }}"),
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
+        .expect("::explain failed");
+    let rule_idx = plan
+        .headers
+        .iter()
+        .position(|h| h == "rule")
+        .expect("::explain output has a 'rule' column");
+    // The synthesized helper rules are `*fac…`-named (the same signal
+    // tests/factorize.rs's `fired()` pins).
+    let fired = plan
+        .rows
+        .iter()
+        .any(|r| r[rule_idx].get_str().is_some_and(|s| s.starts_with("*fac")));
+    assert!(
+        fired,
+        "the factorized-count rewrite did not fire on q6 with the toggle ON — \
+         the type gate or extractor declined a shape it must accept"
+    );
+    let on = timed_count(&db, Q6, cap_for("lsqb_q6"));
+    db.set_query_factorization(false);
+    println!(
+        "  q6(on)  {:>9.1} ms  count={}",
+        on.elapsed.as_secs_f64() * 1000.0,
+        on.count
+    );
+    assert_eq!(
+        on.count, oracle["lsqb_q6"],
+        "q6 with the factorized-count rewrite forced ON miscounts — the `!=` \
+         inclusion–exclusion is wrong (this is the a60a8013 class of failure)"
+    );
 }
 
 /// The reorder must still be worth having on q3 — the shape it was written for.

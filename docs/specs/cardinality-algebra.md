@@ -192,6 +192,71 @@ Two inequalities need four terms (include–exclude–exclude–include); beyond
 the term count doubles per inequality and the bookkeeping risk usually
 outweighs the win.
 
+#### 3.3a Soundness: the `!=` type gate (0.14.0 — read before touching this again)
+
+The identity above has ONE hazard in this engine, it was shipped once, cut once
+(`a60a8013`), and restored behind a gate — state the argument here so the next
+reviewer does not re-derive the miscount and revert a second time.
+
+**The hazard.** The subtrahend `count(body[A := B])` implements "A equals B" as
+a **join** — and joins use the engine's total order, under which `Int(1)` and
+`Float(1.0)` are **distinct** (`Num::cmp` maps numerically-equal cross-variant
+pairs to `Less`; the memcmp key encoding agrees). The predicate `A != B`,
+however, is evaluated by `op_neq`, which special-cases exactly the
+`(Int, Float)` pair and compares **numerically** (`1 != 1.0` is `false`). A
+numerically-equal cross-variant pair therefore escapes both terms: the naive
+form excludes it (op_neq says equal) while the factorized form counts it (the
+diagonal join never matches it). Silent miscount.
+
+**Why the automatic pass is sound anyway (the gate, `factorize.rs`
+`neq_types_admissible`).** The rewrite fires only when every binding occurrence
+of both operands of every inequality is a declared **non-nullable**,
+**non-`Any`** column of a stored relation, and all occurrences — across both
+operands — declare the **same** type. Then:
+
+1. Query-path writes coerce to the declared variant
+   (`NullableColType::coerce` — the Int/Float arms *convert*, not merely
+   check), so a declared-`Int` column holds only `Int` at rest.
+2. `import_from_backup` was the one user-reachable raw-put that bypassed
+   coercion; since 0.14.0 it refuses mismatched schemas
+   (`tx::import_schema_mismatch`), so it cannot smuggle a `Float` into a
+   declared-`Int` column.
+3. ⇒ both operands are variant-identical at rest, the divergent `(Int, Float)`
+   `op_neq` arm is unreachable, and the two "equality" notions coincide.
+
+**⚠️ Amended 2026-07-17 (review): the divergent class is NOT only cross-variant
+numerics.** `Json` columns diverge too, in the current build: `JsonData`'s `Eq`
+is **structural** (serde_json equality — IEEE `==`, so `json(-0.0)` equals
+`json(0.0)`; key-order-insensitive if any downstream crate unifies
+`serde_json/preserve_order`) while its `Ord` — what storage keys and the
+correction join use — compares `to_string()` output. Reproduced:
+`json(-0.0)` vs `json(0.0)` are op_neq-equal but join-distinct, and the fired
+rewrite overcounts 2-for-0 on a two-row self-join. The gate therefore requires
+**variant-stable** types (`factorize.rs::coltype_variant_stable`): `Any` and
+`Json` are excluded **recursively through `List`/`Tuple` element types** (the
+derived container impls inherit the element divergence). `Vec` is
+`OrderedFloat` on both sides and `Num`'s `PartialEq` is defined as
+`cmp == Equal` — consistent, admissible.
+
+Load-bearing details, each with a test in `tests/factorize.rs`:
+
+- **All occurrences, not the first** — an operand bound by two atoms must agree
+  at every occurrence; first-occurrence-wins is unsound
+  (`ie_neq_disagreeing_occurrences_decline`).
+- **`Any` is excluded by name** — an `Any` column is not variant-stable; it
+  holds `Int(1)` and `Float(1.0)` simultaneously
+  (`ie_neq_any_typed_operand_declines`).
+- **Same non-numeric types are admissible** — the divergent `op_neq` arm exists
+  only for `(Int, Float)` (`ie_neq_same_string_type_fires`).
+- The non-null requirement is sufficient but is NOT justified by `op_neq`
+  (`Null` hits the generic fallthrough, not the numeric arm); it is kept
+  because inclusion–exclusion has no independent story for `Null` operands and
+  the pass's bias is to decline.
+- **For hand-written factorizations** (the subject of this document) the gate
+  does not protect you: apply §3.3 only when both operand columns declare the
+  same non-`Any` type, or accept that a cross-variant numerically-equal pair
+  diverges from `!=` semantics.
+
 ### 3.4 P4 — Anti-join (negation) inclusion-exclusion
 
 A cross-component `not *rel[...]` atom is the same move with the negation

@@ -184,9 +184,51 @@ When `max_depth` is unset: plain single-label Dijkstra, zero overhead. When the 
 
 **Decision: exact layered semantics when `max_depth` is set on a weighted graph; the unweighted collapse as an optimization; depth-pruned single-label on weighted graphs is forbidden, including as a fallback.** _Rejected:_ documented-approximate depth pruning (procedural semantics; schedule-dependent output values; the antichain doctrine has no "documented" exemption for silent-wrong); deferring `max_depth` entirely (the flagship's traversal has carried a hop bound since inception — defaults 10 library / 5 HTTP — and `GraphLeg` is hop-bounded; shipping without it strands both consumers).
 
-## 9. The HybridSearch expansion seam (stated, not solved — its own build item in 0.12)
+## 9. The HybridSearch expansion seam (RESOLVED — built in 0.14.0; amendment 2026-07-17)
 
 The roadmap scopes 0.12 as the FixedRule **plus** its retrieval integration; this section pins the seam so the two halves stay separable. `HybridSearch` is a script *builder* (`runtime/hybrid.rs` module doc): its legs are generated Datalog rules fused by `ReciprocalRankFusion`. Today's `GraphLeg` (`hybrid.rs:109-140`) generates a recursive bounded min-hop rule from **explicit, caller-supplied seeds** — unweighted, hop-ranked, no budget. The integration replaces that generated recursion with one generated `BudgetedTraversal` call whose **seeds input is the vector/FTS legs' own top-k rule** (a tiny inline relation — the O(k) case where inline-input materialization is free), ranked into the fusion by ascending cost; `detailed: true` rows carry cost as the leg score, and parent pointers become recoverable per-leg detail. Two design questions deliberately left to that item, with the FixedRule's answer already compatible either way: whether seed `initial_cost` is derived from leg ranks (the seeds input's optional second column exists for exactly this) or left at 0; and whether `GraphLeg` is deprecated or kept as the no-budget fast path. What this spec guarantees the seam: FixedRules run in read-only scripts (mindgraph-rs already runs `ReciprocalRankFusion` under `ScriptMutability::Immutable` in production), and the seeds-from-a-rule shape needs no engine change — rule inputs are already first-class FixedRule inputs.
+
+> **Amendment (2026-07-17, ratified with the 0.14.0 build; design record
+> `docs/plans/mnestic-0121-0130/design-0140.md` Parts I–II).** The two open
+> questions are resolved, and one seam fact the original section did not
+> record turned out to force the first answer:
+>
+> - **(a0) The feature graph decides "deprecate or keep `GraphLeg`" by force.**
+>   `BudgetedTraversal` registers only under `graph-algo`
+>   (`fixed_rule/mod.rs:1024`), while `runtime/hybrid.rs` is ungated and
+>   `minimal` does not include `graph-algo` — so a `minimal` build has
+>   `HybridSearch` and the recursive `GraphLeg` but no `BudgetedTraversal`.
+>   **The recursion is load-bearing and stays; `GraphLeg` is extended, not
+>   deprecated.** `max_nodes: Option<usize>` switches the mode (`None` ⇒ the
+>   generated script is byte-identical to the pre-0.14 recursion,
+>   snapshot-guarded). The budgeted fields are **not** `cfg`-gated — a public
+>   struct whose fields appear and disappear by feature is a footgun — and
+>   `build_hybrid_query` errors loudly when a budgeted leg is configured in a
+>   build without the rule (guarded by the only-in-`minimal` test
+>   `budgeted_leg_errors_loudly_without_graph_algo` + CI's `minimal` job).
+>   Independently: `max_nodes` is *required* by the rule, so an unbounded
+>   hop-ball is not expressible in budgeted mode at all — the budgeted mode is
+>   not a superset and could never have replaced the recursion.
+> - **Seed `initial_cost` stays 0 in v1.** Leg scores live on incomparable
+>   scales (negated HNSW distance vs BM25) — folding them into path cost would
+>   poison `max_cost` semantics; within-list *rank* is not expressible in the
+>   generated Datalog without a sort stage; RRF already weights relevance at
+>   fusion. Hand-written callers keep the seeds input's second column.
+> - **Depth-0 rows are excluded from the fusion contribution** (`__d > 0` in
+>   the generated combine rule): the seeds are the other legs' own candidates —
+>   re-emitting them through the graph leg would double-count identity rather
+>   than measure proximity (the recursion's `not hg{i}_seed[id]`, on depth).
+> - **The gate is emitted in the *named* form** (`*gate{col, …}` from
+>   `GraphLeg::gate_cols`) — order-independent, schema-validated by
+>   `magic.rs`'s NamedStored rebuild. This became possible only after 0.14.0
+>   fixed the inherited parser bug that made the named fixed-rule input form
+>   panic unconditionally (`parse/query.rs`, `strip_prefix(':')` on a
+>   `*`-prefixed `relation_ident`).
+> - **`graph:` (a pre-created cached projection) is the production path**, not
+>   an option among equals: the positional edge input pays a full scan + CSR
+>   build before any budget applies. Documented on `GraphLeg` with the
+>   projection caveats (process-local registry; per-source write
+>   invalidation).
 
 ## 10. Delivery, and the validation gate
 

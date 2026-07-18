@@ -226,47 +226,93 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
         let mut legs = Vec::with_capacity(items.len());
         for it in items {
             let gd = it.downcast::<PyDict>()?;
-            let edge_relation = gd
-                .get_item("edge_relation")?
-                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'edge_relation'"))?
-                .extract()?;
-            let seeds_list = gd
-                .get_item("seeds")?
-                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'seeds'"))?
-                .downcast::<PyList>()?;
-            let mut seeds = Vec::with_capacity(seeds_list.len());
-            for s in seeds_list {
-                seeds.push(py_to_value(s)?);
+            // Every KNOWN key is optional and defaults like the Rust struct;
+            // the builder's validation owns the invariants (which fields each
+            // mode requires) so the rules live in exactly one place. Unknown
+            // keys are REJECTED: with all keys optional, a typo ('max_hop',
+            // 'seed_from_leg', a trailing space) would otherwise silently run
+            // the leg with defaults — plausible results, wrong depth/mode, no
+            // signal anywhere.
+            const KNOWN_LEG_KEYS: [&str; 15] = [
+                "label",
+                "edge_relation",
+                "from_col",
+                "to_col",
+                "seeds",
+                "max_hops",
+                "undirected",
+                "max_nodes",
+                "max_cost",
+                "weight_col",
+                "graph",
+                "seed_from_legs",
+                "gate_relation",
+                "gate_cols",
+                "admit",
+            ];
+            for key in gd.keys() {
+                let key: String = key.extract()?;
+                if !KNOWN_LEG_KEYS.contains(&key.as_str()) {
+                    return Err(PyException::new_err(format!(
+                        "graph_legs entry has unknown key {key:?}; known keys: {}",
+                        KNOWN_LEG_KEYS.join(", ")
+                    )));
+                }
             }
-            let max_hops = gd
-                .get_item("max_hops")?
-                .ok_or_else(|| PyException::new_err("graph_legs entry needs 'max_hops'"))?
-                .extract()?;
-            let label = match gd.get_item("label")? {
-                Some(x) => x.extract()?,
-                None => "graph".to_string(),
-            };
-            let from_col = match gd.get_item("from_col")? {
-                Some(x) => x.extract()?,
-                None => "from".to_string(),
-            };
-            let to_col = match gd.get_item("to_col")? {
-                Some(x) => x.extract()?,
-                None => "to".to_string(),
-            };
-            let undirected = match gd.get_item("undirected")? {
-                Some(x) => x.extract()?,
-                None => false,
-            };
-            legs.push(GraphLeg {
-                label,
-                edge_relation,
-                from_col,
-                to_col,
-                seeds,
-                max_hops,
-                undirected,
-            });
+            let mut leg = GraphLeg::default();
+            if let Some(x) = gd.get_item("label")? {
+                leg.label = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("edge_relation")? {
+                leg.edge_relation = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("from_col")? {
+                leg.from_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("to_col")? {
+                leg.to_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("seeds")? {
+                let seeds_list = x.downcast::<PyList>()?;
+                let mut seeds = Vec::with_capacity(seeds_list.len());
+                for s in seeds_list {
+                    seeds.push(py_to_value(s)?);
+                }
+                leg.seeds = seeds;
+            }
+            if let Some(x) = gd.get_item("max_hops")? {
+                leg.max_hops = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("undirected")? {
+                leg.undirected = x.extract()?;
+            }
+            // Budgeted-expansion mode (0.14.0): presence of max_nodes
+            // switches the leg; the rest configure it.
+            if let Some(x) = gd.get_item("max_nodes")? {
+                leg.max_nodes = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("max_cost")? {
+                leg.max_cost = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("weight_col")? {
+                leg.weight_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("graph")? {
+                leg.graph = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("seed_from_legs")? {
+                leg.seed_from_legs = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("gate_relation")? {
+                leg.gate_relation = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("gate_cols")? {
+                leg.gate_cols = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("admit")? {
+                leg.admit = x.extract()?;
+            }
+            legs.push(leg);
         }
         q.graph_legs = legs;
     }
@@ -522,13 +568,16 @@ impl CozoDbPy {
         Ok(db.query_factorization())
     }
     /// One-call hybrid retrieval (mnestic fork): HNSW + FTS (+ optional extra
-    /// ranked lists) fused with RRF and optionally diversified with MMR. Takes a
-    /// dict mirroring the Rust `HybridSearch` fields; returns the same shape as
-    /// `run_script` (`{rows, headers, next}`) with headers `["id","score"]`
-    /// (or `["id","rank"]` when MMR is set). With `detailed: True` the output
-    /// is long-format per-leg contributions: headers
-    /// `["id","score","list_id","leg_rank","leg_score"]` (no MMR) or
-    /// `["id","rank","score","list_id","leg_rank","leg_score"]` (MMR).
+    /// ranked lists and graph legs) fused with RRF and optionally diversified
+    /// with MMR. Takes a dict mirroring the Rust `HybridSearch` fields;
+    /// returns the same shape as `run_script` (`{rows, headers, next}`) with
+    /// headers `["id","score"]` (or `["id","rank"]` when MMR is set). With
+    /// `detailed: True` the output is long-format per-leg contributions:
+    /// headers `["id","score","list_id","leg_rank","leg_score"]` (no MMR) or
+    /// `["id","rank","score","list_id","leg_rank","leg_score"]` (MMR) — and
+    /// when any graph leg sets `max_nodes` (budgeted mode), TWO further
+    /// trailing columns `parent`, `depth` carry the cheapest-path witness
+    /// (null on non-graph rows): 7 columns without MMR, 8 with it.
     pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
         let db = self.db_ref()?;
         let q = py_to_hybrid_search(query)?;

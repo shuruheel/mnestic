@@ -1256,7 +1256,7 @@ impl SearchInput {
 
         #[derive(Debug, Error, Diagnostic)]
         #[error("Field `{0}` is required for LSH search")]
-        #[diagnostic(code(parser::hnsw_query_required))]
+        #[diagnostic(code(parser::lsh_query_required))]
         struct LshRequiredMissing(String, #[label] SourceSpan);
 
         #[derive(Debug, Error, Diagnostic)]
@@ -1293,14 +1293,14 @@ impl SearchInput {
             None => None,
             Some(k_expr) => {
                 let k = k_expr.eval_to_const()?;
-                let k = k.get_int().ok_or(ExpectedPosIntForFtsK(self.span))?;
+                let k = k.get_int().ok_or(ExpectedPosIntForLshK(self.span))?;
 
                 #[derive(Debug, Error, Diagnostic)]
                 #[error("Expected positive integer for `k`")]
-                #[diagnostic(code(parser::expected_int_for_hnsw_k))]
-                struct ExpectedPosIntForFtsK(#[label] SourceSpan);
+                #[diagnostic(code(parser::expected_int_for_lsh_k))]
+                struct ExpectedPosIntForLshK(#[label] SourceSpan);
 
-                ensure!(k > 0, ExpectedPosIntForFtsK(self.span));
+                ensure!(k > 0, ExpectedPosIntForLshK(self.span));
                 Some(k as usize)
             }
         };
@@ -1399,14 +1399,14 @@ impl SearchInput {
         }
 
         #[derive(Debug, Error, Diagnostic)]
-        #[error("Field `{0}` is required for HNSW search")]
-        #[diagnostic(code(parser::hnsw_query_required))]
-        struct HnswRequiredMissing(String, #[label] SourceSpan);
+        #[error("Field `{0}` is required for FTS search")]
+        #[diagnostic(code(parser::fts_query_required))]
+        struct FtsRequiredMissing(String, #[label] SourceSpan);
 
         let query = match self
             .parameters
             .remove("query")
-            .ok_or_else(|| miette!(HnswRequiredMissing("query".to_string(), self.span)))?
+            .ok_or_else(|| miette!(FtsRequiredMissing("query".to_string(), self.span)))?
         {
             Expr::Binding { var, .. } => var,
             expr => {
@@ -1426,13 +1426,13 @@ impl SearchInput {
         let k_expr = self
             .parameters
             .remove("k")
-            .ok_or_else(|| miette!(HnswRequiredMissing("k".to_string(), self.span)))?;
+            .ok_or_else(|| miette!(FtsRequiredMissing("k".to_string(), self.span)))?;
         let k = k_expr.eval_to_const()?;
         let k = k.get_int().ok_or(ExpectedPosIntForFtsK(self.span))?;
 
         #[derive(Debug, Error, Diagnostic)]
         #[error("Expected positive integer for `k`")]
-        #[diagnostic(code(parser::expected_int_for_hnsw_k))]
+        #[diagnostic(code(parser::expected_int_for_fts_k))]
         struct ExpectedPosIntForFtsK(#[label] SourceSpan);
 
         ensure!(k > 0, ExpectedPosIntForFtsK(self.span));
@@ -1777,7 +1777,7 @@ impl SearchInput {
         }
         #[derive(Debug, Error, Diagnostic)]
         #[error("Index {name} not found on relation {relation}")]
-        #[diagnostic(code(eval::hnsw_index_not_found))]
+        #[diagnostic(code(eval::index_not_found))]
         struct IndexNotFound {
             relation: String,
             name: String,

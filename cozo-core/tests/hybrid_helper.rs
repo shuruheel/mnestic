@@ -9,6 +9,11 @@
 //! Tests for the one-call `hybrid_search` helper (mnestic fork addition). Uses
 //! the sqlite backend (real stored-relation / index path) per the fork's
 //! testing convention.
+//!
+//! `HybridSearch` is `#[non_exhaustive]`, so struct literals are not
+//! constructible outside the defining crate — these tests build queries the
+//! way downstream users do: `Default` + field mutation.
+#![allow(clippy::field_reassign_with_default)]
 
 use cozo::{
     build_hybrid_query, DbInstance, HybridList, HybridSearch, MmrParams, NamedRows,
@@ -55,6 +60,17 @@ fn make_db() -> (DbInstance, tempfile::TempDir) {
     (db, dir)
 }
 
+/// The canonical both-legs query against `make_db`'s corpus.
+fn base_query() -> HybridSearch {
+    let mut q = HybridSearch::default();
+    q.relation = "docs".into();
+    q.vector_index = Some("vec".into());
+    q.query_vector = vec![1.0, 0.0];
+    q.fts_index = Some("fts".into());
+    q.query_text = "cat".into();
+    q
+}
+
 fn ids(res: &NamedRows) -> Vec<String> {
     res.rows
         .iter()
@@ -65,16 +81,9 @@ fn ids(res: &NamedRows) -> Vec<String> {
 #[test]
 fn helper_fuses_hnsw_and_fts() {
     let (db, _dir) = make_db();
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 3,
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        fts_k: 3,
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.vector_k = 3;
+    q.fts_k = 3;
     let res = db
         .hybrid_search(&q)
         .unwrap_or_else(|e| panic!("hybrid_search failed: {e:?}"));
@@ -99,16 +108,9 @@ fn helper_fuses_hnsw_and_fts() {
 #[test]
 fn helper_matches_handwritten_pattern() {
     let (db, _dir) = make_db();
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 3,
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        fts_k: 3,
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.vector_k = 3;
+    q.fts_k = 3;
     let helper = ids(&db.hybrid_search(&q).unwrap());
 
     // The same pattern, written by hand (mirrors tests/hybrid_retrieval_e2e.rs).
@@ -134,21 +136,14 @@ fn helper_matches_handwritten_pattern() {
 #[test]
 fn helper_with_mmr_rerank() {
     let (db, _dir) = make_db();
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 4,
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        fts_k: 4,
-        mmr: Some(MmrParams {
-            lambda: 0.7,
-            k: 3,
-            embedding_col: "emb".into(),
-        }),
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.vector_k = 4;
+    q.fts_k = 4;
+    q.mmr = Some(MmrParams {
+        lambda: 0.7,
+        k: 3,
+        embedding_col: "emb".into(),
+    });
     let res = db.hybrid_search(&q).unwrap();
     assert_eq!(res.rows.len(), 3, "MMR k=3 should yield three results");
     assert_eq!(
@@ -163,17 +158,10 @@ fn helper_extra_traversal_list_is_fused() {
     let (db, _dir) = make_db();
     // An extra "related" signal that strongly ranks d4 (which neither the
     // semantic nor keyword leg favors). Folding it in should surface d4.
-    let base = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 2,
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        fts_k: 2,
-        limit: 10,
-        ..HybridSearch::default()
-    };
+    let mut base = base_query();
+    base.vector_k = 2;
+    base.fts_k = 2;
+    base.limit = 10;
     let without = ids(&db.hybrid_search(&base).unwrap());
     assert!(
         !without.contains(&"d4".to_string()),
@@ -196,16 +184,10 @@ fn helper_extra_traversal_list_is_fused() {
 fn helper_handles_empty_fts_leg() {
     let (db, _dir) = make_db();
     // A keyword with no matches — the FTS leg is empty, the semantic leg carries.
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 2,
-        fts_index: "fts".into(),
-        query_text: "zzzznotaword".into(),
-        fts_k: 2,
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.vector_k = 2;
+    q.query_text = "zzzznotaword".into();
+    q.fts_k = 2;
     let res = db.hybrid_search(&q).unwrap();
     assert!(!res.rows.is_empty(), "semantic leg should still return rows");
     assert_eq!(ids(&res)[0], "d1", "closest embedding still ranks first");
@@ -213,31 +195,18 @@ fn helper_handles_empty_fts_leg() {
 
 #[test]
 fn rejects_identifier_injection() {
-    let bad = HybridSearch {
-        relation: "docs { } ?[x] <- [[1]] :rm docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        ..HybridSearch::default()
-    };
+    let mut bad = base_query();
+    bad.relation = "docs { } ?[x] <- [[1]] :rm docs".into();
     assert!(
         build_hybrid_query(&bad).is_err(),
         "an injection-y relation name must be rejected"
     );
 
-    let bad_label = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        extra_lists: vec![HybridList {
-            label: "x'; drop".into(),
-            rule_body: "id = 'd1', score = 1.0".into(),
-        }],
-        ..HybridSearch::default()
-    };
+    let mut bad_label = base_query();
+    bad_label.extra_lists = vec![HybridList {
+        label: "x'; drop".into(),
+        rule_body: "id = 'd1', score = 1.0".into(),
+    }];
     assert!(
         build_hybrid_query(&bad_label).is_err(),
         "an injection-y list label must be rejected"
@@ -246,14 +215,7 @@ fn rejects_identifier_injection() {
 
 #[test]
 fn script_builder_is_inspectable() {
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        ..HybridSearch::default()
-    };
+    let q = base_query();
     let (script, params) = build_hybrid_query(&q).unwrap();
     // Values are params, not interpolated.
     assert!(params.contains_key("qv"));
@@ -265,20 +227,51 @@ fn script_builder_is_inspectable() {
     assert!(!script.contains("MaximalMarginalRelevance"));
 }
 
+// Optional legs (0.14.0): single-leg configurations run and fuse end-to-end.
+#[test]
+fn helper_vector_only_runs() {
+    let (db, _dir) = make_db();
+    let mut q = HybridSearch::default();
+    q.relation = "docs".into();
+    q.vector_index = Some("vec".into());
+    q.query_vector = vec![1.0, 0.0];
+    q.vector_k = 3;
+    let res = db.hybrid_search(&q).unwrap();
+    assert_eq!(ids(&res)[0], "d1", "closest embedding ranks first");
+}
+
+#[test]
+fn helper_fts_only_runs() {
+    let (db, _dir) = make_db();
+    let mut q = HybridSearch::default();
+    q.relation = "docs".into();
+    q.fts_index = Some("fts".into());
+    q.query_text = "cat".into();
+    q.fts_k = 3;
+    let res = db.hybrid_search(&q).unwrap();
+    let order = ids(&res);
+    assert!(!order.is_empty(), "FTS-only fusion produced no rows");
+    assert!(
+        order.iter().all(|id| id == "d1" || id == "d3"),
+        "only the 'cat' matches belong here; got {order:?}"
+    );
+}
+
+#[test]
+fn helper_zero_legs_is_a_loud_error() {
+    let mut q = HybridSearch::default();
+    q.relation = "docs".into();
+    let e = format!("{:?}", build_hybrid_query(&q).unwrap_err());
+    assert!(e.contains("at least one leg"), "{e}");
+}
+
 #[test]
 fn helper_detailed_returns_per_leg_contributions() {
     let (db, _dir) = make_db();
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 3,
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        fts_k: 3,
-        detailed: true,
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.vector_k = 3;
+    q.fts_k = 3;
+    q.detailed = true;
     let res = db
         .hybrid_search(&q)
         .unwrap_or_else(|e| panic!("hybrid_search failed: {e:?}"));
@@ -324,22 +317,15 @@ fn helper_detailed_returns_per_leg_contributions() {
 #[test]
 fn helper_detailed_with_mmr_joins_detail_onto_selection() {
     let (db, _dir) = make_db();
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        vector_k: 4,
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        fts_k: 4,
-        detailed: true,
-        mmr: Some(MmrParams {
-            lambda: 0.5,
-            k: 2,
-            embedding_col: "emb".into(),
-        }),
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.vector_k = 4;
+    q.fts_k = 4;
+    q.detailed = true;
+    q.mmr = Some(MmrParams {
+        lambda: 0.5,
+        k: 2,
+        embedding_col: "emb".into(),
+    });
     let res = db
         .hybrid_search(&q)
         .unwrap_or_else(|e| panic!("hybrid_search failed: {e:?}"));
@@ -358,16 +344,9 @@ fn helper_detailed_with_mmr_joins_detail_onto_selection() {
 
 #[test]
 fn detailed_script_widens_limit_by_leg_count() {
-    let q = HybridSearch {
-        relation: "docs".into(),
-        vector_index: "vec".into(),
-        query_vector: vec![1.0, 0.0],
-        fts_index: "fts".into(),
-        query_text: "cat".into(),
-        detailed: true,
-        limit: 10,
-        ..HybridSearch::default()
-    };
+    let mut q = base_query();
+    q.detailed = true;
+    q.limit = 10;
     let (script, _params) = build_hybrid_query(&q).unwrap();
     assert!(script.contains("detailed: true"), "script: {script}");
     assert!(
