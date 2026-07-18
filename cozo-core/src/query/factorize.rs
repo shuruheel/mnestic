@@ -233,10 +233,8 @@ impl Analysis {
                     }
                     rel_atoms.push(r.clone());
                 }
-                NormalFormAtom::Predicate(expr) => match as_var_neq(expr) {
-                    Some(pair) => neqs.push(pair),
-                    None => return None, // any non-`!=` predicate — decline
-                },
+                // any non-`!=` predicate — decline
+                NormalFormAtom::Predicate(expr) => neqs.push(as_var_neq(expr)?),
                 NormalFormAtom::Unification(u) => unifs.push(u),
                 // Negation, rule applications, and search atoms all break the
                 // exactness conditions; decline.
