@@ -352,7 +352,16 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         ),
     }
     match &q.fts_index {
-        Some(fidx) => validate_ident(fidx, "fts_index")?,
+        Some(fidx) => {
+            validate_ident(fidx, "fts_index")?;
+            // Mirror of the vector arm: an empty FTS query would otherwise
+            // surface as a cryptic pest parse error deep inside execution
+            // (the FTS grammar cannot match empty input).
+            ensure!(
+                !q.query_text.is_empty(),
+                "hybrid_search: query_text is empty but fts_index is configured"
+            );
+        }
         None => ensure!(
             q.query_text.is_empty(),
             "hybrid_search: query_text is set but fts_index is None — \
@@ -439,7 +448,9 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
             Some(gname) => {
                 validate_ident(gname, "graph_legs.graph")?;
                 // The projection carries its own edges and weights; a stray
-                // edge config would be silently ignored — reject it.
+                // edge config would be silently ignored — reject it. That
+                // includes non-default column names: the defaults make a
+                // configured value detectable.
                 ensure!(
                     g.edge_relation.is_empty(),
                     "hybrid_search: graph_legs.graph supersedes edge_relation; set only one"
@@ -447,6 +458,10 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
                 ensure!(
                     g.weight_col.is_none(),
                     "hybrid_search: graph_legs.graph carries its own weights; drop weight_col"
+                );
+                ensure!(
+                    g.from_col == "from" && g.to_col == "to",
+                    "hybrid_search: graph_legs.graph supersedes from_col/to_col; drop them"
                 );
             }
             None => {
@@ -1062,6 +1077,14 @@ mod tests {
             ..Default::default()
         };
         assert!(err(&q).contains("query_vector is empty"));
+        // FTS leg without its payload — the mirror check (pre-fix this passed
+        // the builder and died as a pest parse error inside execution)
+        let q = HybridSearch {
+            relation: "docs".into(),
+            fts_index: Some("fts".into()),
+            ..Default::default()
+        };
+        assert!(err(&q).contains("query_text is empty"));
 
         let leg = |g: GraphLeg| HybridSearch {
             graph_legs: vec![g],
@@ -1114,6 +1137,15 @@ mod tests {
                 ..Default::default()
             }))
             .contains("drop weight_col"));
+            // non-default from/to columns are just as silently ignored by the
+            // projection — reject them too
+            assert!(err(&leg(GraphLeg {
+                graph: Some("g1".into()),
+                from_col: "src".into(),
+                max_nodes: Some(4),
+                ..Default::default()
+            }))
+            .contains("from_col"));
             // admit needs gate_cols; gate fields need a gate_relation
             assert!(err(&leg(GraphLeg {
                 edge_relation: "edges".into(),
