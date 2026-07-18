@@ -226,9 +226,39 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
         let mut legs = Vec::with_capacity(items.len());
         for it in items {
             let gd = it.downcast::<PyDict>()?;
-            // Every key is optional and defaults like the Rust struct; the
-            // builder's validation owns the invariants (which fields each
-            // mode requires) so the rules live in exactly one place.
+            // Every KNOWN key is optional and defaults like the Rust struct;
+            // the builder's validation owns the invariants (which fields each
+            // mode requires) so the rules live in exactly one place. Unknown
+            // keys are REJECTED: with all keys optional, a typo ('max_hop',
+            // 'seed_from_leg', a trailing space) would otherwise silently run
+            // the leg with defaults — plausible results, wrong depth/mode, no
+            // signal anywhere.
+            const KNOWN_LEG_KEYS: [&str; 15] = [
+                "label",
+                "edge_relation",
+                "from_col",
+                "to_col",
+                "seeds",
+                "max_hops",
+                "undirected",
+                "max_nodes",
+                "max_cost",
+                "weight_col",
+                "graph",
+                "seed_from_legs",
+                "gate_relation",
+                "gate_cols",
+                "admit",
+            ];
+            for key in gd.keys() {
+                let key: String = key.extract()?;
+                if !KNOWN_LEG_KEYS.contains(&key.as_str()) {
+                    return Err(PyException::new_err(format!(
+                        "graph_legs entry has unknown key {key:?}; known keys: {}",
+                        KNOWN_LEG_KEYS.join(", ")
+                    )));
+                }
+            }
             let mut leg = GraphLeg::default();
             if let Some(x) = gd.get_item("label")? {
                 leg.label = x.extract()?;
@@ -538,13 +568,16 @@ impl CozoDbPy {
         Ok(db.query_factorization())
     }
     /// One-call hybrid retrieval (mnestic fork): HNSW + FTS (+ optional extra
-    /// ranked lists) fused with RRF and optionally diversified with MMR. Takes a
-    /// dict mirroring the Rust `HybridSearch` fields; returns the same shape as
-    /// `run_script` (`{rows, headers, next}`) with headers `["id","score"]`
-    /// (or `["id","rank"]` when MMR is set). With `detailed: True` the output
-    /// is long-format per-leg contributions: headers
-    /// `["id","score","list_id","leg_rank","leg_score"]` (no MMR) or
-    /// `["id","rank","score","list_id","leg_rank","leg_score"]` (MMR).
+    /// ranked lists and graph legs) fused with RRF and optionally diversified
+    /// with MMR. Takes a dict mirroring the Rust `HybridSearch` fields;
+    /// returns the same shape as `run_script` (`{rows, headers, next}`) with
+    /// headers `["id","score"]` (or `["id","rank"]` when MMR is set). With
+    /// `detailed: True` the output is long-format per-leg contributions:
+    /// headers `["id","score","list_id","leg_rank","leg_score"]` (no MMR) or
+    /// `["id","rank","score","list_id","leg_rank","leg_score"]` (MMR) — and
+    /// when any graph leg sets `max_nodes` (budgeted mode), TWO further
+    /// trailing columns `parent`, `depth` carry the cheapest-path witness
+    /// (null on non-graph rows): 7 columns without MMR, 8 with it.
     pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
         let db = self.db_ref()?;
         let q = py_to_hybrid_search(query)?;
