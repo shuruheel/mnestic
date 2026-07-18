@@ -7,7 +7,7 @@ Vendored per integration package so each is standalone-installable.
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
 class MnesticStore:
@@ -110,7 +110,16 @@ class MnesticStore:
         *,
         rrf_k: float = 60.0,
         mmr: Optional[Dict[str, Any]] = None,
+        **extra: Any,
     ) -> List[Dict[str, Any]]:
+        """Hybrid (HNSW + FTS -> RRF) search.
+
+        Any extra keyword argument is passed straight through to the engine's
+        ``hybrid_search`` query dict (e.g. ``graph_legs``, ``extra_lists``,
+        ``vector_k``, ``fts_k``), so new engine keys need no adapter change.
+        ``detailed`` is rejected: its long format emits one row per
+        (result, leg) and would surface duplicate ids here.
+        """
         hq: Dict[str, Any] = {
             "relation": self.relation,
             "id_col": self.id_col,
@@ -129,8 +138,60 @@ class MnesticStore:
             mmr = dict(mmr)
             mmr.setdefault("embedding_col", self.emb_col)
             hq["mmr"] = mmr
+        if extra.pop("detailed", None):
+            raise ValueError(
+                "detailed is not supported through the adapter: the long format "
+                "emits one row per (result, leg) and would surface duplicate ids"
+            )
+        hq.update(extra)
         res = self.db.hybrid_search(hq)
         ranked = [(row[0], float(row[1])) for row in res["rows"]][:k]
+        return self._hydrate(ranked)
+
+    def search_by_vector(
+        self,
+        query_vector: Sequence[float],
+        k: int,
+        *,
+        ef: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Vector-only recall (no FTS leg, no fusion).
+
+        ``score`` is the negated engine distance, so higher = more similar —
+        the same orientation as the hybrid semantic leg. Works on every engine
+        version the adapters support (plain HNSW index search).
+        """
+        vec_call = "vec($qv, 'F64')" if self.dtype == "F64" else "vec($qv)"
+        script = (
+            f"?[id, score] := ~{self.relation}:{self.vector_index}{{ "
+            f"{self.id_col}: id | query: {vec_call}, k: {int(k)}, "
+            f"ef: {int(ef) if ef is not None else max(self.ef_search, k)}, "
+            f"bind_distance: __dist }}, score = -__dist\n"
+            f":order -score\n"
+            f":limit {int(k)}"
+        )
+        res = self.db.run_script(script, {"qv": [float(x) for x in query_vector]}, True)
+        ranked = [(row[0], float(row[1])) for row in res["rows"]]
+        return self._hydrate(ranked)
+
+    def get(self, ids: Sequence[str]) -> List[Dict[str, Any]]:
+        """Keyed lookup by id, preserving input order; missing ids are skipped."""
+        by_id = self._fetch(list(ids))
+        out: List[Dict[str, Any]] = []
+        for rid in ids:
+            row = by_id.get(rid)
+            if row is None:
+                continue
+            out.append(
+                {
+                    "id": rid,
+                    "text": row[1],
+                    "metadata": (row[2] if row[2] is not None else {}),
+                }
+            )
+        return out
+
+    def _hydrate(self, ranked: List[Tuple[str, float]]) -> List[Dict[str, Any]]:
         if not ranked:
             return []
         by_id = self._fetch([rid for rid, _ in ranked])

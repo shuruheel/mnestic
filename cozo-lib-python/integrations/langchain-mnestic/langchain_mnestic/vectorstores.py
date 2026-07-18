@@ -9,7 +9,7 @@ creating the HNSW + FTS indices on first use.
 from __future__ import annotations
 
 import uuid
-from typing import Any, Iterable, List, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
 
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
@@ -63,6 +63,28 @@ class MnesticVectorStore(VectorStore):
         embeddings = self._embedding.embed_documents(texts)
         return self._store.add(ids, texts, embeddings, metadatas)
 
+    def add_embeddings(
+        self,
+        embeddings: List[List[float]],
+        metadatas: Optional[List[dict]] = None,
+        *,
+        ids: Optional[List[str]] = None,
+        texts: Optional[Sequence[str]] = None,
+        **kwargs: Any,
+    ) -> List[str]:
+        """Insert precomputed embeddings (no embedding call).
+
+        The indexed text comes from `texts` when given, else from each
+        metadata's `"data"` key (the Mem0 payload convention), else `""`.
+        """
+        if not embeddings:
+            return []
+        metas = list(metadatas) if metadatas is not None else [{} for _ in embeddings]
+        ids = ids or [uuid.uuid4().hex for _ in embeddings]
+        if texts is None:
+            texts = [str((m or {}).get("data", "")) for m in metas]
+        return self._store.add(ids, list(texts), embeddings, metas)
+
     @classmethod
     def from_texts(
         cls,
@@ -89,13 +111,57 @@ class MnesticVectorStore(VectorStore):
     ) -> List[Tuple[Document, float]]:
         query_vector = self._embedding.embed_query(query)
         hits = self._store.search(query_vector, query, k, **kwargs)
-        return [
-            (
-                Document(id=h["id"], page_content=h["text"], metadata={**h["metadata"], "id": h["id"]}),
-                h["score"],
-            )
-            for h in hits
-        ]
+        return [(self._to_document(h), h["score"]) for h in hits]
 
     def similarity_search(self, query: str, k: int = 4, **kwargs: Any) -> List[Document]:
         return [doc for doc, _ in self.similarity_search_with_score(query, k, **kwargs)]
+
+    def similarity_search_with_score_by_vector(
+        self, embedding: List[float], k: int = 4, **kwargs: Any
+    ) -> List[Tuple[Document, float]]:
+        """Vector-only search from a precomputed embedding.
+
+        `score` is the negated engine distance (higher = more similar), unlike
+        the hybrid methods whose score is the RRF fused score. An optional
+        `filter` dict (scalar metadata equality, e.g. `{"user_id": "u1"}` —
+        the shape Mem0 passes) is applied post-search over an over-fetched
+        candidate set; operator filters raise rather than silently match
+        nothing.
+        """
+        metadata_filter = kwargs.pop("filter", None)
+        if metadata_filter:
+            for key, val in metadata_filter.items():
+                if isinstance(val, (dict, list)):
+                    raise ValueError(
+                        f"unsupported filter for {key!r}: only scalar equality "
+                        "filters are supported (got an operator/list form)"
+                    )
+            hits = self._store.search_by_vector(embedding, max(k * 4, 20), **kwargs)
+            hits = [
+                h
+                for h in hits
+                if all(h["metadata"].get(key) == val for key, val in metadata_filter.items())
+            ][:k]
+        else:
+            hits = self._store.search_by_vector(embedding, k, **kwargs)
+        return [(self._to_document(h), h["score"]) for h in hits]
+
+    def similarity_search_by_vector(
+        self, embedding: List[float], k: int = 4, **kwargs: Any
+    ) -> List[Document]:
+        return [
+            doc
+            for doc, _ in self.similarity_search_with_score_by_vector(embedding, k, **kwargs)
+        ]
+
+    def get_by_ids(self, ids: Sequence[str], /) -> List[Document]:
+        """Fetch documents by id, preserving input order; missing ids are skipped."""
+        return [self._to_document(r) for r in self._store.get(list(ids))]
+
+    @staticmethod
+    def _to_document(hit: dict) -> Document:
+        return Document(
+            id=hit["id"],
+            page_content=hit["text"],
+            metadata={**hit["metadata"], "id": hit["id"]},
+        )

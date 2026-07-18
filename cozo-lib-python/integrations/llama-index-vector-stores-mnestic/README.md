@@ -28,6 +28,26 @@ nodes = index.as_retriever(similarity_top_k=4).retrieve("feline")
 `dim` must match your embedding model's dimension. `query` runs hybrid search when
 the query carries text (the usual index path), otherwise vector-only.
 
+## Engine pass-through: graph legs and more
+
+Extra keyword arguments flow from the retriever to the engine's hybrid query via
+`vector_store_kwargs`. That includes **`graph_legs`** — fuse graph proximity into
+the ranking alongside the dense and keyword legs, in the same single call:
+
+```python
+retriever = index.as_retriever(
+    similarity_top_k=4,
+    vector_store_kwargs={"graph_legs": [{
+        "edge_relation": "links", "from_col": "src", "to_col": "dst",
+        "seeds": ["doc-1"], "max_hops": 2, "label": "graph",
+    }]},
+)
+```
+
+`MnesticRetriever(..., search_kwargs={...})` forwards the same way, and so do
+`extra_lists`, `vector_k`, `fts_k`, `rrf_k`, and future engine keys — no adapter
+release needed when the engine grows new knobs.
+
 ## License
 
 Mozilla Public License 2.0.

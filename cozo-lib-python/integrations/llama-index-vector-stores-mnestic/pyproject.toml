@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "llama-index-vector-stores-mnestic"
-version = "0.1.0"
+version = "0.2.0"
 description = "LlamaIndex vector store for mnestic — embedded graph + vector + full-text store with one-call hybrid retrieval."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,7 @@ license = { text = "MPL-2.0" }
 authors = [{ name = "Shan Rizvi" }]
 keywords = ["llamaindex", "llama-index", "mnestic", "vector-store", "hybrid-search", "rag", "cozodb"]
 dependencies = [
-    "mnestic>=0.8.2",
+    "mnestic>=0.8.3",
     "llama-index-core>=0.12,<0.15",
 ]
 

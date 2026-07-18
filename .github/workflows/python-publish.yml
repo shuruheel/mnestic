@@ -142,6 +142,34 @@ jobs:
           name: dist-${{ matrix.pkg }}
           path: cozo-lib-python/integrations/${{ matrix.pkg }}/dist
 
+  # --- adapter test suites (against the latest published mnestic wheel) ---
+  # Runs each integration package's pytest suite with mnestic installed from
+  # PyPI — the adapters ship independently of the engine wheel, so this is the
+  # environment users actually get. Also guards the vendored-copy invariant.
+  test-integrations:
+    name: test ${{ matrix.pkg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - pkg: langchain-mnestic
+            deps: langchain-core mem0ai langchain-community
+          - pkg: llama-index-vector-stores-mnestic
+            deps: llama-index-core
+    steps:
+      - uses: actions/checkout@v4
+      - name: vendored _core.py copies must stay byte-identical
+        run: >
+          diff
+          cozo-lib-python/integrations/langchain-mnestic/langchain_mnestic/_core.py
+          cozo-lib-python/integrations/llama-index-vector-stores-mnestic/llama_index/vector_stores/mnestic/_core.py
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: python -m pip install mnestic pytest ${{ matrix.deps }}
+      - run: python -m pip install -e cozo-lib-python/integrations/${{ matrix.pkg }}
+      - run: python -m pytest cozo-lib-python/integrations/${{ matrix.pkg }}/tests -q
+
   # --- wheel smoke test: a wheel whose rocksdb engine doesn't open must not ship ---
   # One natively runnable runner per built wheel. The mac x86_64 cross wheel has
   # no native runner (Intel-mac runners are retired); it was validated locally
@@ -235,7 +263,7 @@ jobs:
 
   publish-langchain-mnestic:
     # The adapters wrap the mnestic wheel — don't ship them off a broken wheel set.
-    needs: [build-adapters, test-wheels]
+    needs: [build-adapters, test-wheels, test-integrations]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
@@ -250,7 +278,7 @@ jobs:
           skip-existing: true
 
   publish-llama-index-vector-stores-mnestic:
-    needs: [build-adapters, test-wheels]
+    needs: [build-adapters, test-wheels, test-integrations]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi
