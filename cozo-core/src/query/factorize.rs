@@ -72,6 +72,35 @@ use crate::data::value::DataValue;
 use crate::parse::SourceSpan;
 use crate::runtime::transact::SessionTx;
 
+/// A column type is VARIANT-STABLE when the engine's join equality
+/// (`DataValue`'s `Ord`, which storage keys and the inclusion–exclusion
+/// correction term use) and `op_neq`'s equality (`DataValue`'s `PartialEq`)
+/// agree on every value pair the column can hold. Two classes fail
+/// (`cardinality-algebra.md` §3.3a):
+///
+/// * `Any` — not a single variant at all: it holds `Int(1)` and `Float(1.0)`
+///   simultaneously, the one pair `op_neq` equates numerically while the
+///   total order separates them.
+/// * `Json` — `JsonData`'s `Eq` is STRUCTURAL (serde_json equality: IEEE
+///   `==`, so `json(-0.0) == json(0.0)`; key-order-insensitive under a
+///   downstream `preserve_order`) while its `Ord` compares `to_string()`
+///   output — op_neq-equal yet join-distinct pairs exist in the current
+///   build (reproduced 2026-07-17).
+///
+/// The check recurses through `List`/`Tuple` element types: the derived
+/// container impls inherit the element divergence element-wise. (`Vec` is
+/// `OrderedFloat` on both sides — consistent; `Num`'s `PartialEq` is defined
+/// as `cmp == Equal` — consistent; everything else derives both from the
+/// same data.)
+fn coltype_variant_stable(t: &ColType) -> bool {
+    match t {
+        ColType::Any | ColType::Json => false,
+        ColType::List { eltype, .. } => coltype_variant_stable(&eltype.coltype),
+        ColType::Tuple(elts) => elts.iter().all(|e| coltype_variant_stable(&e.coltype)),
+        _ => true,
+    }
+}
+
 /// Cap on synthesized-rule generation. The recursion depth is bounded by the
 /// number of body atoms (each level removes the central atom), so this only ever
 /// trips on a pathological program; it exists purely as a safety valve.
@@ -153,9 +182,9 @@ impl Analysis {
             return None;
         }
         let rules = rules_or_fixed.rules()?; // `None` for a fixed/algo rule.
-        // Single clause only: a multi-clause aggregate rule streams every clause
-        // into ONE accumulator, so a union-duplicated tuple is bag-counted twice
-        // — a single-clause factorization cannot reproduce that.
+                                             // Single clause only: a multi-clause aggregate rule streams every clause
+                                             // into ONE accumulator, so a union-duplicated tuple is bag-counted twice
+                                             // — a single-clause factorization cannot reproduce that.
         if rules.len() != 1 {
             return None;
         }
@@ -299,7 +328,11 @@ impl Analysis {
 
         let group_keys: Vec<Symbol> = group_key_set.iter().cloned().collect();
         Some(Analysis {
-            span: rule.head.first().map(|s| s.span).unwrap_or(SourceSpan(0, 0)),
+            span: rule
+                .head
+                .first()
+                .map(|s| s.span)
+                .unwrap_or(SourceSpan(0, 0)),
             orig_head: rule.head.clone(),
             count_pos,
             group_keys,
@@ -309,20 +342,25 @@ impl Analysis {
         })
     }
 
-    /// The `!=` type gate (0.14.0; `cardinality-algebra.md` §3.4). The
-    /// inclusion–exclusion correction term JOINS the two operands, while the
-    /// `!=` predicate compares them with `op_neq` — and the two disagree on
-    /// exactly one class of pair: numerically-equal cross-variant numbers
-    /// (`Int(1)` vs `Float(1.0)` never join under the engine's total order,
-    /// but `op_neq` says they are equal). The rewrite is exact iff that class
-    /// is unreachable, which the gate guarantees by requiring, for **every**
-    /// binding occurrence of **both** operands of every inequality:
+    /// The `!=` type gate (0.14.0; soundness write-up:
+    /// `cardinality-algebra.md` §3.3a — read it before touching this). The
+    /// inclusion–exclusion correction term JOINS the two operands (the
+    /// engine's total order), while the `!=` predicate compares them with
+    /// `op_neq` (`DataValue` `PartialEq`) — the rewrite is exact iff no value
+    /// pair the operands can hold makes the two disagree. The gate requires,
+    /// for **every** binding occurrence of **both** operands of every
+    /// inequality:
     ///
     /// * the occurrence is a declared column of a stored relation
     ///   (`extract` already confines `!=` operands to relation-atom bindings —
     ///   no expression-, literal- or rule-head-bound operands reach here);
-    /// * the column is **non-nullable** and not **`Any`** (an `Any` column is
-    ///   not variant-stable: it holds `Int(1)` and `Float(1.0)` at once);
+    /// * the column is **non-nullable** and **variant-stable**
+    ///   ([`coltype_variant_stable`]): `Any` is out (it holds `Int(1)` and
+    ///   `Float(1.0)` at once — the pair `op_neq` equates numerically while
+    ///   the join separates them), and `Json` is out (`JsonData`'s `Eq` is
+    ///   structural while its `Ord` is `to_string()`-based — `json(-0.0)` vs
+    ///   `json(0.0)` are op_neq-equal but join-distinct), recursively through
+    ///   `List`/`Tuple` element types;
     /// * every occurrence — across BOTH operands — declares the **same** type
     ///   (first-occurrence-wins would be unsound: an operand bound by two
     ///   atoms must agree at *every* occurrence).
@@ -330,24 +368,37 @@ impl Analysis {
     /// With that, both operands are variant-identical **at rest** — query-path
     /// writes coerce to the declared variant, and `import_from_backup`, the
     /// one raw-put that bypassed coercion, now refuses mismatched schemas
-    /// (0.14.0 §0) — so the divergent `(Int, Float)` `op_neq` arm is
-    /// unreachable and inclusion–exclusion is exact. Same non-numeric declared
-    /// types (`String`, …) are admissible for the same reason. Anything
-    /// unverifiable declines, in keeping with the pass's bias.
+    /// (0.14.0 §0) — and every admissible type's equality agrees with its
+    /// order, so inclusion–exclusion is exact. Anything unverifiable declines,
+    /// in keeping with the pass's bias.
     fn neq_types_admissible(&self, tx: &SessionTx<'_>) -> bool {
         if self.neqs.is_empty() {
             return true;
         }
+        // Fetch each distinct relation's metadata ONCE — `get_relation` is a
+        // real storage get + msgpack decode per call, and the operands share
+        // the same atoms.
+        let mut handles = BTreeMap::new();
+        for atom in &self.rel_atoms {
+            if !handles.contains_key(&atom.name) {
+                match tx.get_relation(&atom.name, false) {
+                    Ok(h) => {
+                        handles.insert(atom.name.clone(), h);
+                    }
+                    Err(_) => return false,
+                }
+            }
+        }
         // Declared type of every binding occurrence of `sym`, or None when any
-        // occurrence is unverifiable (missing relation, arity drift, nullable,
-        // `Any`) or the occurrences disagree.
+        // occurrence is unverifiable (arity drift, nullable, variant-unstable)
+        // or the occurrences disagree.
         let occurrence_type = |sym: &Symbol| -> Option<ColType> {
             let mut found: Option<ColType> = None;
             for atom in &self.rel_atoms {
-                let handle = match tx.get_relation(&atom.name, false) {
-                    Ok(h) => h,
-                    Err(_) => return None,
-                };
+                if !atom.args.iter().any(|arg| arg == sym) {
+                    continue;
+                }
+                let handle = &handles[&atom.name];
                 let cols: Vec<_> = handle
                     .metadata
                     .keys
@@ -361,7 +412,7 @@ impl Analysis {
                     if arg != sym {
                         continue;
                     }
-                    if col.typing.nullable || col.typing.coltype == ColType::Any {
+                    if col.typing.nullable || !coltype_variant_stable(&col.typing.coltype) {
                         return None;
                     }
                     match &found {
@@ -519,7 +570,12 @@ struct NamedRule {
 
 fn insert_rules(prog: &mut BTreeMap<Symbol, NormalFormRulesOrFixed>, rules: Vec<NamedRule>) {
     for nr in rules {
-        prog.insert(nr.name, NormalFormRulesOrFixed::Rules { rules: vec![nr.rule] });
+        prog.insert(
+            nr.name,
+            NormalFormRulesOrFixed::Rules {
+                rules: vec![nr.rule],
+            },
+        );
     }
 }
 

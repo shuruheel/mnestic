@@ -224,6 +224,20 @@ operands — declare the **same** type. Then:
 3. ⇒ both operands are variant-identical at rest, the divergent `(Int, Float)`
    `op_neq` arm is unreachable, and the two "equality" notions coincide.
 
+**⚠️ Amended 2026-07-17 (review): the divergent class is NOT only cross-variant
+numerics.** `Json` columns diverge too, in the current build: `JsonData`'s `Eq`
+is **structural** (serde_json equality — IEEE `==`, so `json(-0.0)` equals
+`json(0.0)`; key-order-insensitive if any downstream crate unifies
+`serde_json/preserve_order`) while its `Ord` — what storage keys and the
+correction join use — compares `to_string()` output. Reproduced:
+`json(-0.0)` vs `json(0.0)` are op_neq-equal but join-distinct, and the fired
+rewrite overcounts 2-for-0 on a two-row self-join. The gate therefore requires
+**variant-stable** types (`factorize.rs::coltype_variant_stable`): `Any` and
+`Json` are excluded **recursively through `List`/`Tuple` element types** (the
+derived container impls inherit the element divergence). `Vec` is
+`OrderedFloat` on both sides and `Num`'s `PartialEq` is defined as
+`cmp == Equal` — consistent, admissible.
+
 Load-bearing details, each with a test in `tests/factorize.rs`:
 
 - **All occurrences, not the first** — an operand bound by two atoms must agree

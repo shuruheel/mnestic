@@ -177,13 +177,23 @@ fn populate_toy(db: &DbInstance) {
         db,
         "group_tag",
         2,
-        &[vec![100, 200], vec![100, 201], vec![101, 201], vec![102, 202]],
+        &[
+            vec![100, 200],
+            vec![100, 201],
+            vec![101, 201],
+            vec![102, 202],
+        ],
     );
     put_rows(
         db,
         "tag_class",
         2,
-        &[vec![200, 300], vec![201, 300], vec![201, 301], vec![202, 302]],
+        &[
+            vec![200, 300],
+            vec![201, 300],
+            vec![201, 301],
+            vec![202, 302],
+        ],
     );
     put_rows(
         db,
@@ -361,7 +371,11 @@ fn toggle_off_is_dormant_but_correct() {
         !fired(&db, STAR),
         "with the toggle off the rewrite must be dormant"
     );
-    assert_eq!(scalar(&db, STAR), 15, "dormant path returns the naive count");
+    assert_eq!(
+        scalar(&db, STAR),
+        15,
+        "dormant path returns the naive count"
+    );
 }
 
 // ------------------------------------------------------------------------
@@ -404,9 +418,11 @@ fn detector_advisory_independent_of_toggle() {
     );
 
     // A non-factorizing query (single atom) emits no advisory.
-    assert!(!explain_ops(&db, "?[count(city)] := *lives_in[person, city]")
-        .iter()
-        .any(|o| o == "factorize_advisory"));
+    assert!(
+        !explain_ops(&db, "?[count(city)] := *lives_in[person, city]")
+            .iter()
+            .any(|o| o == "factorize_advisory")
+    );
 }
 
 // ------------------------------------------------------------------------
@@ -615,10 +631,12 @@ fn differential_naive_equals_factorized() {
                 ie_fired += 1;
             }
         }
-        if naive_mem
-            .iter()
-            .any(|r| r.last().and_then(|v| v.get_int()).map(|c| c > 1).unwrap_or(false))
-        {
+        if naive_mem.iter().any(|r| {
+            r.last()
+                .and_then(|v| v.get_int())
+                .map(|c| c > 1)
+                .unwrap_or(false)
+        }) {
             nonzero_count += 1;
         }
     }
@@ -660,7 +678,10 @@ fn populate_mixed(db: &DbInstance) {
     // knows_i: Int endpoints; knows_f: Float endpoints. The values coincide
     // numerically (1 vs 1.0) so op_neq and the join disagree about them.
     run_mut(db, ":create knows_i { c0: Int, c1: Int }");
-    run_mut(db, "?[c0, c1] <- [[1, 100], [2, 100]] :put knows_i {c0, c1}");
+    run_mut(
+        db,
+        "?[c0, c1] <- [[1, 100], [2, 100]] :put knows_i {c0, c1}",
+    );
     run_mut(db, ":create knows_f { c0: Float, c1: Int }");
     run_mut(
         db,
@@ -745,4 +766,58 @@ fn ie_neq_disagreeing_occurrences_decline() {
         &db,
         "?[count(x)] := *oa[a, x], *ob[a, x], *oc[b, x], a != b",
     );
+}
+
+/// A `Json`-typed operand column must decline: JsonData's Eq is STRUCTURAL
+/// (serde_json equality — IEEE `==`, so json(-0.0) == json(0.0)) while its Ord
+/// (what the correction join uses) compares to_string() output — op_neq-equal
+/// but join-distinct pairs exist TODAY, and the fired rewrite overcounts
+/// 2-for-0 on this exact fixture (reproduced during the 0.14.0 review).
+#[test]
+fn ie_neq_json_typed_operand_declines() {
+    let dir = tempfile::tempdir().unwrap();
+    for db in [mem_db(), sqlite_db(&dir, "json_gate.db")] {
+        run_mut(&db, ":create jr { k: Int => v: Json }");
+        run_mut(
+            &db,
+            "?[k, v] <- [[1, parse_json('-0.0')], [2, parse_json('0.0')]] :put jr {k, v}",
+        );
+        let q = "?[count(a)] := *jr{k: a, v: x}, *jr{k: b, v: y}, x != y";
+        db.set_query_factorization(false);
+        assert_eq!(scalar(&db, q), 0, "naive: -0.0 and 0.0 are op_neq-equal");
+        assert_declines(&db, q);
+    }
+}
+
+/// The variant-stability check recurses: a List embedding Json inherits the
+/// Eq/Ord divergence element-wise and must decline...
+#[test]
+fn ie_neq_list_of_json_declines() {
+    let db = mem_db();
+    run_mut(&db, ":create lj { k: Int => v: [Json] }");
+    run_mut(
+        &db,
+        "?[k, v] := k = 1, v = [parse_json('-0.0')] :put lj {k, v}",
+    );
+    run_mut(
+        &db,
+        "?[k, v] := k = 2, v = [parse_json('0.0')] :put lj {k, v}",
+    );
+    assert_declines(
+        &db,
+        "?[count(a)] := *lj{k: a, v: x}, *lj{k: b, v: y}, x != y",
+    );
+}
+
+/// ...while a List of a stable element type (Int) still FIRES — the recursion
+/// must not over-decline.
+#[test]
+fn ie_neq_list_of_int_fires() {
+    let db = mem_db();
+    run_mut(&db, ":create li { k: Int => v: [Int] }");
+    run_mut(&db, "?[k, v] <- [[1, [1]], [2, [2]]] :put li {k, v}");
+    let q = "?[count(a)] := *li{k: a, v: x}, *li{k: b, v: y}, x != y";
+    db.set_query_factorization(false);
+    assert_eq!(scalar(&db, q), 2, "naive baseline");
+    assert_fires_and_matches(&db, q);
 }
