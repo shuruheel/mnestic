@@ -67,9 +67,18 @@ class MnesticVectorStore(BasePydanticVectorStore):
         self._store.delete([ref_doc_id])
 
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        """Hybrid search; vector-only when the query carries no `query_str`.
+
+        Extra keyword arguments (e.g. from the retriever's
+        `vector_store_kwargs`) are forwarded to the engine's hybrid query —
+        `graph_legs`, `extra_lists`, `vector_k`, `fts_k`, ...
+        """
         k = query.similarity_top_k or 4
         query_str = query.query_str or ""
-        hits = self._store.search(query.query_embedding, query_str, k)
+        if not query_str and not kwargs:
+            hits = self._store.search_by_vector(query.query_embedding, k)
+        else:
+            hits = self._store.search(query.query_embedding, query_str, k, **kwargs)
         nodes: List[TextNode] = []
         similarities: List[float] = []
         ids: List[str] = []
@@ -81,7 +90,12 @@ class MnesticVectorStore(BasePydanticVectorStore):
 
 
 class MnesticRetriever(BaseRetriever):
-    """Direct hybrid retriever over a `MnesticVectorStore` + an embed model."""
+    """Direct hybrid retriever over a `MnesticVectorStore` + an embed model.
+
+    `search_kwargs` are forwarded to every query — e.g.
+    `search_kwargs={"graph_legs": [...]}` adds a graph-proximity leg to the
+    hybrid fusion.
+    """
 
     def __init__(
         self,
@@ -89,10 +103,12 @@ class MnesticRetriever(BaseRetriever):
         embed_model: Any,
         similarity_top_k: int = 4,
         callback_manager: Optional[Any] = None,
+        search_kwargs: Optional[dict] = None,
     ) -> None:
         self._vector_store = vector_store
         self._embed_model = embed_model
         self._similarity_top_k = similarity_top_k
+        self._search_kwargs = dict(search_kwargs or {})
         super().__init__(callback_manager=callback_manager)
 
     def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
@@ -104,7 +120,8 @@ class MnesticRetriever(BaseRetriever):
                 query_embedding=embedding,
                 query_str=query_bundle.query_str,
                 similarity_top_k=self._similarity_top_k,
-            )
+            ),
+            **self._search_kwargs,
         )
         nodes: List[NodeWithScore] = []
         for i, node in enumerate(result.nodes or []):
