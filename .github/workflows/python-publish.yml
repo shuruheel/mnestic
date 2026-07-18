@@ -130,7 +130,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        pkg: [langchain-mnestic, llama-index-vector-stores-mnestic, langgraph-store-mnestic]
+        pkg: [langchain-mnestic, llama-index-vector-stores-mnestic, langgraph-store-mnestic, mnestic-mcp]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -159,6 +159,8 @@ jobs:
             deps: llama-index-core
           - pkg: langgraph-store-mnestic
             deps: '"langgraph-checkpoint>=4.1,<5" "langgraph>=1.0"'
+          - pkg: mnestic-mcp
+            deps: '"mcp>=1.27,<2" "fastembed>=0.8"'
     steps:
       - uses: actions/checkout@v4
       - name: vendored _core.py copies must stay byte-identical
@@ -304,6 +306,21 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with: { name: dist-langgraph-store-mnestic, path: dist }
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist
+          skip-existing: true
+
+  publish-mnestic-mcp:
+    needs: [build-adapters, test-wheels, test-integrations]
+    if: github.event_name == 'push' || inputs.publish
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { name: dist-mnestic-mcp, path: dist }
       - uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist
