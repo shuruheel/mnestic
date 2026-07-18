@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "mnestic-mcp"
+version = "0.1.0"
+description = "Local memory MCP server backed by mnestic — hybrid BM25+vector+graph recall with per-leg attribution and time travel, all on your machine."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MPL-2.0" }
+authors = [{ name = "Shan Rizvi" }]
+keywords = ["mcp", "model-context-protocol", "memory", "agent-memory", "mnestic", "hybrid-search", "cozodb"]
+dependencies = [
+    "mnestic>=0.12.2",
+    "mcp>=1.27,<2",
+    "fastembed>=0.8",
+]
+
+[project.scripts]
+mnestic-mcp = "mnestic_mcp.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/shuruheel/mnestic"
+Repository = "https://github.com/shuruheel/mnestic"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mnestic_mcp"]
