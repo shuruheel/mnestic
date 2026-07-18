@@ -1594,7 +1594,10 @@ fn test_dt_trunc_dst_trichotomy() {
         .and_hms_opt(0, 0, 0)
         .unwrap();
     assert!(
-        matches!(havana.from_local_datetime(&spring_midnight), LocalResult::None),
+        matches!(
+            havana.from_local_datetime(&spring_midnight),
+            LocalResult::None
+        ),
         "tzdb changed: Havana 2025-03-09 00:00 is no longer a DST gap; pick a new fixture"
     );
     // Nonexistent local midnight resolves forward to the first valid local
@@ -1639,7 +1642,10 @@ fn test_dt_trunc_dst_trichotomy() {
         .and_hms_opt(0, 0, 0)
         .unwrap();
     assert!(
-        matches!(santiago.from_local_datetime(&scl_midnight), LocalResult::None),
+        matches!(
+            santiago.from_local_datetime(&scl_midnight),
+            LocalResult::None
+        ),
         "tzdb changed: Santiago 2025-09-07 00:00 is no longer a DST gap; pick a new fixture"
     );
     assert_eq!(
@@ -1865,7 +1871,12 @@ fn test_parse_timestamp_widened() {
         dt_secs(1969, 7, 20, 0, 0, 0)
     );
     // nothing else parses, and the error enumerates the accepted forms
-    for bad in ["01/01/2024", "2024-1-1T00:00", "yesterday", "2024-01-01T25:00:00Z"] {
+    for bad in [
+        "01/01/2024",
+        "2024-1-1T00:00",
+        "yesterday",
+        "2024-01-01T25:00:00Z",
+    ] {
         let err = op_parse_timestamp(&[DataValue::from(bad)]).unwrap_err();
         assert!(err.to_string().contains("accepted forms"), "{bad}: {err}");
     }
@@ -1913,9 +1924,7 @@ fn test_dt_to_validity() {
     // errors, not silent misreads
     assert!(op_dt_to_validity(&[DataValue::from(f64::NAN)]).is_err());
     assert!(op_dt_to_validity(&[DataValue::from("2024-01-01")]).is_err());
-    assert!(
-        op_dt_to_validity(&[dt_secs(2024, 1, 1, 0, 0, 0), DataValue::from(1)]).is_err()
-    );
+    assert!(op_dt_to_validity(&[dt_secs(2024, 1, 1, 0, 0, 0), DataValue::from(1)]).is_err());
 }
 
 #[test]
@@ -1984,4 +1993,195 @@ fn test_dt_validity_bridge_on_tt_axis() {
         .unwrap()
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([]));
+}
+
+// ---- 0.14.0 review fixes: regression tests ----
+
+/// Sub-day truncation inside a DST fall-back fold must stay in the fold arm
+/// the instant belongs to (the input's own offset disambiguates); it must be
+/// idempotent and containing. Pre-fix, the earliest-occurrence policy returned
+/// results a full hour early for second-pass instants.
+#[test]
+fn test_dt_trunc_dst_fold_prefers_input_offset() {
+    use std::str::FromStr;
+
+    use chrono::offset::LocalResult;
+    use chrono::TimeZone;
+
+    let ny = chrono_tz::Tz::from_str("America/New_York").unwrap();
+    let fold = chrono::NaiveDate::from_ymd_opt(2025, 11, 2)
+        .unwrap()
+        .and_hms_opt(1, 0, 0)
+        .unwrap();
+    assert!(
+        matches!(ny.from_local_datetime(&fold), LocalResult::Ambiguous(..)),
+        "tzdb changed: NY 2025-11-02 01:00 is no longer ambiguous; pick a new fixture"
+    );
+    let tr = |ts: DataValue, unit: &str| {
+        op_dt_trunc(&[ts, DataValue::from(unit), DataValue::from("America/New_York")]).unwrap()
+    };
+    // 06:30Z = 01:30 EST — the SECOND pass of the fold.
+    assert_eq!(
+        tr(dt_secs(2025, 11, 2, 6, 30, 0), "hour"),
+        dt_secs(2025, 11, 2, 6, 0, 0),
+        "hour start must be in the same (EST) arm, not an hour early in EDT"
+    );
+    assert_eq!(
+        tr(dt_secs(2025, 11, 2, 6, 30, 0), "minute"),
+        dt_secs(2025, 11, 2, 6, 30, 0)
+    );
+    // truncation to the second of an on-boundary instant is the identity
+    assert_eq!(
+        tr(dt_secs(2025, 11, 2, 6, 30, 0), "second"),
+        dt_secs(2025, 11, 2, 6, 30, 0)
+    );
+    // 05:30Z = 01:30 EDT — the FIRST pass stays in EDT.
+    assert_eq!(
+        tr(dt_secs(2025, 11, 2, 5, 30, 0), "hour"),
+        dt_secs(2025, 11, 2, 5, 0, 0)
+    );
+}
+
+/// The admitted timestamp range's edges must produce loud errors, not chrono
+/// panics (pre-fix: `NaiveDate - TimeDelta` overflow in the 'week' arm, and
+/// `date_naive()`'s offset-overflow expect with non-UTC zones).
+#[test]
+fn test_dt_trunc_range_edges_error_not_panic() {
+    // first partial week above NaiveDate::MIN (a Thursday): Monday underflows
+    assert!(op_dt_trunc(&[
+        DataValue::from(-8334601227800.001),
+        DataValue::from("week")
+    ])
+    .is_err());
+    // MIN end + negative-offset zone: local date below NaiveDate::MIN
+    assert!(op_dt_trunc(&[
+        DataValue::from(-8334601228799.0),
+        DataValue::from("day"),
+        DataValue::from("Etc/GMT+12")
+    ])
+    .is_err());
+    // MAX end + positive-offset zone: local date above NaiveDate::MAX
+    assert!(op_dt_trunc(&[
+        DataValue::from(8210298412799.0),
+        DataValue::from("day"),
+        DataValue::from("Pacific/Kiritimati")
+    ])
+    .is_err());
+}
+
+/// Historic transitions deeper than 4 h (the Antarctic station foundings jump
+/// 6–10 h at exactly local midnight) must resolve, not hard-error: the probe
+/// ladder now extends hourly to 26 h. Guarded on the LocalResult so a tzdb
+/// bump that moves the transition fails loudly here.
+#[test]
+fn test_dt_trunc_resolves_deep_historic_gaps() {
+    use std::str::FromStr;
+
+    use chrono::offset::LocalResult;
+    use chrono::{Datelike, TimeZone, Timelike};
+
+    let casey = chrono_tz::Tz::from_str("Antarctica/Casey").unwrap();
+    let midnight = chrono::NaiveDate::from_ymd_opt(1969, 1, 1)
+        .unwrap()
+        .and_hms_opt(0, 0, 0)
+        .unwrap();
+    assert!(
+        matches!(casey.from_local_datetime(&midnight), LocalResult::None),
+        "tzdb changed: Casey 1969-01-01 00:00 is no longer a gap; pick a new fixture"
+    );
+    // ...and the gap is deeper than the old 4 h ladder (the discriminating
+    // premise: pre-fix this test errored).
+    let four_h = midnight + chrono::Duration::hours(4);
+    assert!(
+        matches!(casey.from_local_datetime(&four_h), LocalResult::None),
+        "tzdb changed: the Casey founding gap is no longer > 4 h"
+    );
+    let out = op_dt_trunc(&[
+        dt_secs(1969, 6, 1, 0, 0, 0),
+        DataValue::from("year"),
+        DataValue::from("Antarctica/Casey"),
+    ])
+    .unwrap();
+    // The resolved instant is the first valid local time after the gap.
+    let secs = out.get_float().unwrap();
+    let local = chrono::Utc
+        .timestamp_micros((secs * 1_000_000.).round() as i64)
+        .unwrap()
+        .with_timezone(&casey);
+    assert_eq!(
+        (local.year(), local.month(), local.day(), local.minute()),
+        (1969, 1, 1, 0),
+        "resolved instant must be the gap end on the founding day: {local:?}"
+    );
+    assert!(
+        matches!(
+            casey.from_local_datetime(&local.naive_local()),
+            LocalResult::Single(_)
+        ),
+        "resolved local time must actually exist: {local:?}"
+    );
+}
+
+/// The i64 extremes are reserved engine sentinels: dt_to_validity's one-ulp
+/// guard gap must not mint MAX_VALIDITY_TS ('NOW'/'END') or TERMINAL_VALIDITY
+/// (whose key livelocks temporal scans), and validity() must reject them too.
+// The over-precise float literals are the point: they pin the exact f64 whose
+// `(f * 1e6).round()` lands on ±2^63 — truncating them would test a
+// different value.
+#[allow(clippy::excessive_precision)]
+#[test]
+fn test_validity_constructors_reject_sentinels() {
+    // (f * 1e6).round() == 2^63 exactly for this literal — pre-fix it passed
+    // the `> i64::MAX as f64` guard and saturated to MAX_VALIDITY_TS.
+    assert!(op_dt_to_validity(&[DataValue::from(9223372036854.7754)]).is_err());
+    assert!(op_dt_to_validity(&[
+        DataValue::from(-9223372036854.775808),
+        DataValue::from(false)
+    ])
+    .is_err());
+    assert!(op_validity(&[DataValue::from(i64::MAX)]).is_err());
+    assert!(op_validity(&[DataValue::from(i64::MIN), DataValue::from(false)]).is_err());
+    // near-but-legal values still construct
+    assert!(op_dt_to_validity(&[DataValue::from(9223372036000.0)]).is_ok());
+    assert!(op_validity(&[DataValue::from(i64::MAX - 1)]).is_ok());
+    assert!(op_validity(&[DataValue::from(i64::MIN + 1), DataValue::from(false)]).is_ok());
+}
+
+/// One datetime string grammar for both entry points: a literal parse_timestamp
+/// accepts must be accepted by validity string literals (`@ '...'`) too.
+#[test]
+fn test_validity_literals_share_parse_timestamp_grammar() {
+    assert_eq!(
+        str2vld("2024-06-01 12:00:00").unwrap(),
+        str2vld("2024-06-01T12:00:00Z").unwrap()
+    );
+    let db = DbInstance::default();
+    db.run_default(":create gf {k: Int, at: Validity => x: Int}")
+        .unwrap();
+    db.run_default("?[k, at, x] <- [[1, [1717243200000000, true], 5]] :put gf {k, at => x}")
+        .unwrap();
+    let res = db
+        .run_default("?[x] := *gf[1, at, x @ '2024-06-01 12:00:00']")
+        .unwrap()
+        .into_json();
+    assert_eq!(res["rows"], serde_json::json!([[5]]));
+}
+
+/// Negative-span dt_diff semantics, pinned: antisymmetric truncation toward
+/// zero — deliberately NOT the floor form (month-end clamping is asymmetric;
+/// see the op_dt_diff comment).
+#[test]
+fn test_dt_diff_negative_span_is_antisymmetric() {
+    let diff = |a: DataValue, b: DataValue| {
+        op_dt_diff(&[a, b, DataValue::from("month")]).unwrap()
+    };
+    assert_eq!(
+        diff(dt_secs(2023, 1, 30, 0, 0, 0), dt_secs(2023, 3, 31, 0, 0, 0)),
+        DataValue::from(-2),
+        "two whole months lie between them; the floor form's -3 is rejected by design"
+    );
+    assert_eq!(
+        diff(dt_secs(2023, 3, 31, 0, 0, 0), dt_secs(2023, 1, 30, 0, 0, 0)),
+        DataValue::from(2)
+    );
 }
