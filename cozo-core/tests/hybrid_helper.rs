@@ -96,7 +96,12 @@ fn helper_fuses_hnsw_and_fts() {
     let fused: std::collections::HashMap<String, f64> = res
         .rows
         .iter()
-        .map(|r| (r[0].get_str().unwrap().to_string(), r[1].get_float().unwrap()))
+        .map(|r| {
+            (
+                r[0].get_str().unwrap().to_string(),
+                r[1].get_float().unwrap(),
+            )
+        })
         .collect();
     for (id, score) in &fused {
         if id != "d1" {
@@ -189,7 +194,10 @@ fn helper_handles_empty_fts_leg() {
     q.query_text = "zzzznotaword".into();
     q.fts_k = 2;
     let res = db.hybrid_search(&q).unwrap();
-    assert!(!res.rows.is_empty(), "semantic leg should still return rows");
+    assert!(
+        !res.rows.is_empty(),
+        "semantic leg should still return rows"
+    );
     assert_eq!(ids(&res)[0], "d1", "closest embedding still ranks first");
 }
 
@@ -289,9 +297,17 @@ fn helper_detailed_returns_per_leg_contributions() {
         .iter()
         .filter(|r| r[0].get_str() == Some("d1"))
         .collect();
-    assert_eq!(d1_rows.len(), 2, "d1 contributes from both legs: {:?}", res.rows);
+    assert_eq!(
+        d1_rows.len(),
+        2,
+        "d1 contributes from both legs: {:?}",
+        res.rows
+    );
     let lists: Vec<&str> = d1_rows.iter().map(|r| r[2].get_str().unwrap()).collect();
-    assert!(lists.contains(&"semantic") && lists.contains(&"text"), "lists = {lists:?}");
+    assert!(
+        lists.contains(&"semantic") && lists.contains(&"text"),
+        "lists = {lists:?}"
+    );
     assert_eq!(
         d1_rows[0][1], d1_rows[1][1],
         "fused score repeats across an item's rows"
@@ -339,7 +355,12 @@ fn helper_detailed_with_mmr_joins_detail_onto_selection() {
     let mut ids: Vec<&str> = res.rows.iter().map(|r| r[0].get_str().unwrap()).collect();
     ids.sort();
     ids.dedup();
-    assert_eq!(ids.len(), 2, "MMR k=2 bounds the items; rows = {:?}", res.rows);
+    assert_eq!(
+        ids.len(),
+        2,
+        "MMR k=2 bounds the items; rows = {:?}",
+        res.rows
+    );
 }
 
 #[test]

@@ -28,7 +28,10 @@ fn put_line_points(db: &DbInstance, n: i64) {
     let rows: Vec<String> = (0..n).map(|i| format!("[{i},[{}.0,0.0]]", i)).collect();
     run(
         db,
-        &format!("?[id, emb] <- [{}] :put pts {{ id => emb }}", rows.join(",")),
+        &format!(
+            "?[id, emb] <- [{}] :put pts {{ id => emb }}",
+            rows.join(",")
+        ),
     );
 }
 
@@ -88,7 +91,10 @@ fn sst_built_index_survives_reopen() {
     let db = DbInstance::new("rocksdb", path_str, "").unwrap();
     let ids = nearest_ids(&db, 50.0, 5);
     assert_eq!(ids.len(), 5, "index lost across reopen; got {ids:?}");
-    assert_eq!(ids[0], 50, "nearest to x=50 must be id 50 after reopen; got {ids:?}");
+    assert_eq!(
+        ids[0], 50,
+        "nearest to x=50 must be id 50 after reopen; got {ids:?}"
+    );
     for id in &ids {
         assert!(
             (*id - 50).abs() <= 4,
@@ -223,7 +229,10 @@ fn drop_and_recreate_index() {
 #[test]
 #[ignore]
 fn measure_reader_unblock() {
-    let n: i64 = std::env::var("MEASURE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(40000);
+    let n: i64 = std::env::var("MEASURE_N")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(40000);
     let dir = tempfile::tempdir().unwrap();
     let db = DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "").unwrap();
     run(&db, ":create pts { id: Int => emb: <F32; 2> }");

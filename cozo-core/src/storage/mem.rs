@@ -205,24 +205,20 @@ impl<'s> StoreTx<'s> for MemTx<'s> {
         valid_at: ValidityTs,
     ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
         match self {
-            MemTx::Reader(stored) => Box::new(
-                SkipIterator {
-                    inner: stored,
-                    upper: upper.to_vec(),
-                    valid_at,
-                    next_bound: lower.to_vec(),
-                    size_hint: None,
-                },
-            ),
-            MemTx::Writer(stored, delta) => Box::new(
-                SkipDualIterator {
-                    stored,
-                    delta,
-                    upper: upper.to_vec(),
-                    valid_at,
-                    next_bound: lower.to_vec(),
-                },
-            ),
+            MemTx::Reader(stored) => Box::new(SkipIterator {
+                inner: stored,
+                upper: upper.to_vec(),
+                valid_at,
+                next_bound: lower.to_vec(),
+                size_hint: None,
+            }),
+            MemTx::Writer(stored, delta) => Box::new(SkipDualIterator {
+                stored,
+                delta,
+                upper: upper.to_vec(),
+                valid_at,
+                next_bound: lower.to_vec(),
+            }),
         }
     }
 

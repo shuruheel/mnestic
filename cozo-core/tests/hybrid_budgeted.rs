@@ -80,7 +80,10 @@ fn make_db_with_edges(edges: &[(&str, &str, f64)]) -> (DbInstance, tempfile::Tem
             extractor: text, tokenizer: Simple, filters: [Lowercase]
         }"#,
     );
-    run(&db, ":create edges { from: String, to: String => w: Float }");
+    run(
+        &db,
+        ":create edges { from: String, to: String => w: Float }",
+    );
     let rows: Vec<String> = edges
         .iter()
         .map(|(f, t, w)| format!("['{f}', '{t}', {w:?}]"))
@@ -283,7 +286,13 @@ fn detailed_head_carries_the_path_witness() {
     assert_eq!(
         res.headers,
         vec![
-            "id", "score", "list_id", "leg_rank", "leg_score", "parent", "depth"
+            "id",
+            "score",
+            "list_id",
+            "leg_rank",
+            "leg_score",
+            "parent",
+            "depth"
         ],
         "witness head"
     );
@@ -316,11 +325,7 @@ fn detailed_head_carries_the_path_witness() {
 /// the 1-hop d2 (cost 5) within the graph leg.
 #[test]
 fn weight_col_ranks_by_path_cost() {
-    let (db, _dir) = make_db_with_edges(&[
-        ("d1", "d2", 5.0),
-        ("d1", "d3", 1.0),
-        ("d3", "d4", 1.0),
-    ]);
+    let (db, _dir) = make_db_with_edges(&[("d1", "d2", 5.0), ("d1", "d3", 1.0), ("d3", "d4", 1.0)]);
     let mut q = budgeted_query(|g| g.weight_col = Some("w".into()));
     q.detailed = true;
     let res = db.hybrid_search(&q).unwrap();

@@ -697,12 +697,11 @@ impl InputProgram {
         // yield a different (still-valid) row subset, so we keep the authored
         // order there. `key_arity_cache` memoizes primary-key arities across all
         // rules in this program (SessionTx has no relation-handle cache).
-        let reorder_mode =
-            if self.out_opts.limit.is_some() && self.out_opts.sorters.is_empty() {
-                ReorderMode::Written
-            } else {
-                self.out_opts.reorder
-            };
+        let reorder_mode = if self.out_opts.limit.is_some() && self.out_opts.sorters.is_empty() {
+            ReorderMode::Written
+        } else {
+            self.out_opts.reorder
+        };
         let mut key_arity_cache: BTreeMap<Symbol, Option<usize>> = BTreeMap::new();
 
         let mut prog: BTreeMap<Symbol, _> = Default::default();

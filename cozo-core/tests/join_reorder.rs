@@ -25,7 +25,8 @@ fn run_mut(db: &DbInstance, s: &str) {
 }
 
 fn run_p(db: &DbInstance, s: &str, params: BTreeMap<String, DataValue>) -> NamedRows {
-    db.run_script(s, params, ScriptMutability::Immutable).unwrap()
+    db.run_script(s, params, ScriptMutability::Immutable)
+        .unwrap()
 }
 
 fn run_mut_p(db: &DbInstance, s: &str, params: BTreeMap<String, DataValue>) {
@@ -129,7 +130,11 @@ fn assert_repro_win(db: &DbInstance, assert_plan: bool) {
 
     // Greedy (default) runs the query fast and returns the correct count.
     let greedy = run(db, NAIVE);
-    assert_eq!(greedy.rows.len(), 1320, "greedy default must return 1320 rows");
+    assert_eq!(
+        greedy.rows.len(),
+        1320,
+        "greedy default must return 1320 rows"
+    );
 
     // Same count under the escape hatch (correctness parity). At N=120 the
     // written order is quadratic-per-group but still finite; the small-N parity
@@ -184,7 +189,10 @@ fn escape_hatch_keeps_written_order() {
 
     let default_sig = plan_sig(&explain(&db, NAIVE));
     let written_sig = plan_sig(&explain(&db, &format!("{NAIVE} :reorder written")));
-    assert_ne!(default_sig, written_sig, "default should reorder the naive body");
+    assert_ne!(
+        default_sig, written_sig,
+        "default should reorder the naive body"
+    );
 
     // `:reorder greedy` is the explicit default and matches the plain default.
     let greedy_sig = plan_sig(&explain(&db, &format!("{NAIVE} :reorder greedy")));
@@ -287,7 +295,10 @@ fn pending_leading_unif_is_actually_reordered() {
     let db = sqlite_db(&dir);
     setup_pending(&db);
     let default_loads = load_refs(&explain(&db, PENDING_UNIF_QUERY));
-    let written_loads = load_refs(&explain(&db, &format!("{PENDING_UNIF_QUERY} :reorder written")));
+    let written_loads = load_refs(&explain(
+        &db,
+        &format!("{PENDING_UNIF_QUERY} :reorder written"),
+    ));
     assert_eq!(written_loads, vec![":r0", ":r1", ":r2", ":r3"]);
     assert_eq!(
         default_loads,
@@ -430,15 +441,17 @@ fn assert_multi_in_aggregation_parity(db: &DbInstance) {
     // it to a filter (count = 1) — the reorder must decline (ineligible).
     let q = "?[count(y)] := *r0[a], y in [5, 5], *rbig[a, b, c], *ry[a, y]";
     let default = run(db, q).rows[0][0].get_int().unwrap();
-    let written = run(db, &format!("{q} :reorder written"))
-        .rows[0][0]
+    let written = run(db, &format!("{q} :reorder written")).rows[0][0]
         .get_int()
         .unwrap();
     assert_eq!(
         default, written,
         "multi-`in` + aggregation was reordered: default={default} written={written}"
     );
-    assert_eq!(default, 2, "written-order semantics: `y in [5,5]` generates two rows");
+    assert_eq!(
+        default, 2,
+        "written-order semantics: `y in [5,5]` generates two rows"
+    );
 }
 
 #[test]
@@ -477,13 +490,19 @@ fn assert_partial_key_not_pulled_forward(db: &DbInstance, assert_plan: bool) {
     run_mut(db, ":create tb { z: Int, y: Int }");
     run_mut(db, ":create tc { y: Int, z: Int }");
     run_mut(db, "?[x, y] <- [[0, 0], [0, 1]] :put ta { x, y }");
-    run_mut(db, "?[z, y] <- [[0, 0], [1, 0], [2, 0], [0, 1]] :put tb { z, y }");
+    run_mut(
+        db,
+        "?[z, y] <- [[0, 0], [1, 0], [2, 0], [0, 1]] :put tb { z, y }",
+    );
     // `tc` is high fan-out on its leading key `y` (8 `z` per `y`) — the shape a
     // partial-key expansion on `y` alone blows up on.
     let mut tc = vec![];
     for y in 0..2i64 {
         for z in 0..8i64 {
-            tc.push(DataValue::List(vec![DataValue::from(y), DataValue::from(z)]));
+            tc.push(DataValue::List(vec![
+                DataValue::from(y),
+                DataValue::from(z),
+            ]));
         }
     }
     let mut p = BTreeMap::new();

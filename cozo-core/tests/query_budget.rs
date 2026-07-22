@@ -129,8 +129,12 @@ fn assert_timeout(label: &str, is_err: bool, code: &str, elapsed: Duration) {
 fn assert_in_script_timeout(engine: &str, path: &str) {
     let db = setup_spin_db(engine, path);
     let script = format!("{SPIN_QUERY} :timeout 1");
-    let (is_err, code, elapsed) =
-        run_and_code(&db, &script, ScriptMutability::Immutable, ScriptRunOptions::default());
+    let (is_err, code, elapsed) = run_and_code(
+        &db,
+        &script,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::default(),
+    );
     assert_timeout(&format!("{engine}/:timeout"), is_err, &code, elapsed);
 }
 
@@ -156,8 +160,7 @@ fn assert_per_call_timeout(engine: &str, path: &str) {
     let db = setup_spin_db(engine, path);
     // No `:timeout` in the query text — the budget comes purely from the call.
     let opts = ScriptRunOptions::new().with_timeout(1.0);
-    let (is_err, code, elapsed) =
-        run_and_code(&db, SPIN_QUERY, ScriptMutability::Immutable, opts);
+    let (is_err, code, elapsed) = run_and_code(&db, SPIN_QUERY, ScriptMutability::Immutable, opts);
     assert_timeout(&format!("{engine}/per-call"), is_err, &code, elapsed);
 }
 
@@ -184,8 +187,12 @@ fn db_default_aborts_bare_query() {
     db.set_default_query_timeout(Some(1.0));
     assert_eq!(db.default_query_timeout(), Some(1.0));
 
-    let (is_err, code, elapsed) =
-        run_and_code(&db, SPIN_QUERY, ScriptMutability::Immutable, ScriptRunOptions::default());
+    let (is_err, code, elapsed) = run_and_code(
+        &db,
+        SPIN_QUERY,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::default(),
+    );
     assert_timeout("db-default/bare", is_err, &code, elapsed);
 }
 
@@ -198,8 +205,12 @@ fn block_timeout_cannot_exceed_db_default() {
     // min() makes the default a guard. If precedence were wrong this would run
     // for ~999s (i.e. far past ABORT_BOUND) and the test would hang/fail.
     let script = format!("{SPIN_QUERY} :timeout 999");
-    let (is_err, code, elapsed) =
-        run_and_code(&db, &script, ScriptMutability::Immutable, ScriptRunOptions::default());
+    let (is_err, code, elapsed) = run_and_code(
+        &db,
+        &script,
+        ScriptMutability::Immutable,
+        ScriptRunOptions::default(),
+    );
     assert_timeout("db-default/min", is_err, &code, elapsed);
 }
 
@@ -210,8 +221,7 @@ fn per_call_cannot_exceed_db_default() {
 
     // A large per-call timeout is likewise bounded by the small default.
     let opts = ScriptRunOptions::new().with_timeout(999.0);
-    let (is_err, code, elapsed) =
-        run_and_code(&db, SPIN_QUERY, ScriptMutability::Immutable, opts);
+    let (is_err, code, elapsed) = run_and_code(&db, SPIN_QUERY, ScriptMutability::Immutable, opts);
     assert_timeout("db-default/per-call-min", is_err, &code, elapsed);
 }
 
@@ -231,7 +241,10 @@ fn fast_query_completes_under_budget() {
         ScriptMutability::Immutable,
         opts,
     );
-    assert!(res.is_ok(), "fast query tripped a generous per-call budget: {res:?}");
+    assert!(
+        res.is_ok(),
+        "fast query tripped a generous per-call budget: {res:?}"
+    );
     assert_eq!(res.unwrap().rows.len(), 3);
 
     // Generous Db default, plus a generous in-script `:timeout`.
@@ -241,7 +254,10 @@ fn fast_query_completes_under_budget() {
         BTreeMap::new(),
         ScriptMutability::Immutable,
     );
-    assert!(res.is_ok(), "fast query tripped a generous default budget: {res:?}");
+    assert!(
+        res.is_ok(),
+        "fast query tripped a generous default budget: {res:?}"
+    );
     assert_eq!(res.unwrap().rows.len(), 2);
 
     // Clearing the default restores unbounded behavior.
@@ -262,17 +278,18 @@ fn assert_imperative_rollback(engine: &str, path: &str) {
     // Imperative program: statement 1 writes a row into `target`; statement 2
     // spins. The whole program shares one transaction and one per-call
     // deadline, so timing out in statement 2 must roll back statement 1's write.
-    let script = format!(
-        "{{ ?[x] <- [[1]] :put target {{x}} }}\n{{ {SPIN_QUERY} }}"
-    );
+    let script = format!("{{ ?[x] <- [[1]] :put target {{x}} }}\n{{ {SPIN_QUERY} }}");
     let opts = ScriptRunOptions::new().with_timeout(1.0);
-    let (is_err, code, elapsed) =
-        run_and_code(&db, &script, ScriptMutability::Mutable, opts);
+    let (is_err, code, elapsed) = run_and_code(&db, &script, ScriptMutability::Mutable, opts);
     assert_timeout(&format!("{engine}/imperative"), is_err, &code, elapsed);
 
     // The write from statement 1 must have been rolled back.
     let after = db
-        .run_script("?[x] := *target[x]", BTreeMap::new(), ScriptMutability::Immutable)
+        .run_script(
+            "?[x] := *target[x]",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
         .expect("post-abort read of `target` failed");
     assert!(
         after.rows.is_empty(),
@@ -284,7 +301,11 @@ fn assert_imperative_rollback(engine: &str, path: &str) {
     // The db is still usable after the abort.
     mutable(&db, "?[x] <- [[7]] :put target {x}");
     let after = db
-        .run_script("?[x] := *target[x]", BTreeMap::new(), ScriptMutability::Immutable)
+        .run_script(
+            "?[x] := *target[x]",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
         .unwrap();
     assert_eq!(after.rows.len(), 1);
 }
@@ -314,9 +335,16 @@ fn huge_and_infinite_budgets_do_not_panic() {
 
     // In-script `:timeout` with an absurd value: parses to a finite-but-huge or
     // infinite f64; must not panic, and a trivial query still completes.
-    for script in ["?[x] <- [[1]] :timeout 1e300", "?[x] <- [[1]] :timeout 1e309"] {
-        let (is_err, code, _) =
-            run_and_code(&db, script, ScriptMutability::Immutable, ScriptRunOptions::default());
+    for script in [
+        "?[x] <- [[1]] :timeout 1e300",
+        "?[x] <- [[1]] :timeout 1e309",
+    ] {
+        let (is_err, code, _) = run_and_code(
+            &db,
+            script,
+            ScriptMutability::Immutable,
+            ScriptRunOptions::default(),
+        );
         assert!(!is_err, "{script} should complete, got error {code:?}");
     }
 
@@ -328,7 +356,10 @@ fn huge_and_infinite_budgets_do_not_panic() {
             ScriptMutability::Immutable,
             ScriptRunOptions::new().with_timeout(secs),
         );
-        assert!(!is_err, "per-call timeout {secs} should complete, got {code:?}");
+        assert!(
+            !is_err,
+            "per-call timeout {secs} should complete, got {code:?}"
+        );
     }
 
     // Db-wide default of f64::MAX: saturates, must not panic; query completes.

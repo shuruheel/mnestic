@@ -36,8 +36,11 @@ fn snapshot_reads_are_isolated_from_open_writers() {
 
     // Open a write transaction and mutate without committing.
     let tx = db.multi_transaction(true);
-    tx.run_script("?[k, v] <- [[1, 20], [2, 200]] :put kv { k => v }", BTreeMap::new())
-        .unwrap();
+    tx.run_script(
+        "?[k, v] <- [[1, 20], [2, 200]] :put kv { k => v }",
+        BTreeMap::new(),
+    )
+    .unwrap();
 
     // A read-only script (snapshot path) must see the pre-write state and
     // must not block on the writer's open locks.
@@ -48,7 +51,11 @@ fn snapshot_reads_are_isolated_from_open_writers() {
             ScriptMutability::Immutable,
         )
         .unwrap();
-    assert_eq!(res.rows.len(), 1, "uncommitted write leaked into snapshot read");
+    assert_eq!(
+        res.rows.len(),
+        1,
+        "uncommitted write leaked into snapshot read"
+    );
     assert_eq!(res.rows[0][1].get_int().unwrap(), 10);
 
     tx.commit().unwrap();

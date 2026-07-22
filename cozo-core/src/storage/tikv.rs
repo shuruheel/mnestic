@@ -311,13 +311,9 @@ impl Iterator for BatchScanner {
     type Item = Result<Tuple>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        swap_option_result(
-            self.raw
-                .next_inner()
-                .and_then(|mkv| {
-                    mkv.map(|(k, v)| try_decode_tuple_from_kv(k, v, None))
-                        .transpose()
-                }),
-        )
+        swap_option_result(self.raw.next_inner().and_then(|mkv| {
+            mkv.map(|(k, v)| try_decode_tuple_from_kv(k, v, None))
+                .transpose()
+        }))
     }
 }

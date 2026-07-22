@@ -110,10 +110,7 @@ impl<'s> Storage<'s> for NewRocksDbStorage {
         let mut opts = OptimisticTransactionOptions::default();
         opts.set_snapshot(write);
         Ok(NewRocksDbTx {
-            db_tx: Some(
-                self.db
-                    .transaction_opt(&WriteOptions::default(), &opts),
-            ),
+            db_tx: Some(self.db.transaction_opt(&WriteOptions::default(), &opts)),
         })
     }
 

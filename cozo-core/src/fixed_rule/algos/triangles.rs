@@ -33,7 +33,8 @@ impl FixedRule for ClusteringCoefficients {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let (source, _input_base) = payload.graph_input(0, VariantSpec::unweighted(true), &poison)?;
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::unweighted(true), &poison)?;
         let indices = source.indices();
         if indices.is_empty() {
             return Ok(());

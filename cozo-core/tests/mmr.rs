@@ -46,7 +46,10 @@ fn mmr_prefers_diversity_over_near_duplicate() {
     // First pick is the most relevant: A.
     assert_eq!(m["A"], 1, "A (highest relevance) selected first");
     // Diversity makes C beat the near-duplicate B despite B's higher relevance.
-    assert!(m["C"] < m["B"], "C (diverse) ranked before B (near-dup): {m:?}");
+    assert!(
+        m["C"] < m["B"],
+        "C (diverse) ranked before B (near-dup): {m:?}"
+    );
     assert_eq!(m["C"], 2);
     assert_eq!(m["B"], 3);
 }
@@ -90,7 +93,10 @@ fn mmr_mismatched_dimensions_error_not_panic() {
         BTreeMap::new(),
         ScriptMutability::Mutable,
     );
-    assert!(res.is_err(), "mismatched vector dimensions must error, not panic");
+    assert!(
+        res.is_err(),
+        "mismatched vector dimensions must error, not panic"
+    );
 }
 
 #[test]

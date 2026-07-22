@@ -490,7 +490,8 @@ impl<'a> SessionTx<'a> {
                         delta_key, rule_symb, rule_n
                     );
                     for item_res in
-                        rule.relation.iter(self, Some(delta_key), stores, poison.clone())?
+                        rule.relation
+                            .iter(self, Some(delta_key), stores, poison.clone())?
                     {
                         out_store.bounded_meet_put(item_res?)?;
                     }
@@ -738,7 +739,8 @@ impl<'a> SessionTx<'a> {
                         delta_key, rule_symb, rule_n
                     );
                     for item_res in
-                        rule.relation.iter(self, Some(delta_key), stores, poison.clone())?
+                        rule.relation
+                            .iter(self, Some(delta_key), stores, poison.clone())?
                     {
                         let item = item_res?;
                         // improvement: the clauses can actually be evaluated in parallel
@@ -822,7 +824,8 @@ impl<'a> SessionTx<'a> {
                         delta_key, rule_symb, rule_n
                     );
                     for item_res in
-                        rule.relation.iter(self, Some(delta_key), stores, poison.clone())?
+                        rule.relation
+                            .iter(self, Some(delta_key), stores, poison.clone())?
                     {
                         out_store.meet_put(item_res?)?;
                     }

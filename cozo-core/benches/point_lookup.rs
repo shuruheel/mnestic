@@ -43,9 +43,7 @@ fn make_db() -> (tempfile::TempDir, DbInstance) {
     let mut i = 0;
     while i < N {
         let end = (i + 500).min(N);
-        let rows: Vec<String> = (i..end)
-            .map(|k| format!(r#"["k{k}","v{k}"]"#))
-            .collect();
+        let rows: Vec<String> = (i..end).map(|k| format!(r#"["k{k}","v{k}"]"#)).collect();
         let script = format!(
             "?[uid, val] <- [{}] :put pk_test {{ uid => val }}",
             rows.join(",")
@@ -61,7 +59,10 @@ fn bench_point_lookup(c: &mut Criterion) {
     let (_dir, db) = make_db();
     // Look up a key in the middle of the keyspace.
     let mut params = BTreeMap::new();
-    params.insert("u".to_string(), DataValue::Str(format!("k{}", N / 2).into()));
+    params.insert(
+        "u".to_string(),
+        DataValue::Str(format!("k{}", N / 2).into()),
+    );
 
     let mut group = c.benchmark_group("point_lookup");
     for (name, query) in [
@@ -73,7 +74,10 @@ fn bench_point_lookup(c: &mut Criterion) {
             "eq_postfilter_brace",
             "?[uid, val] := *pk_test{uid, val}, uid == $u",
         ),
-        ("binding_first", "?[uid, val] := uid = $u, *pk_test{uid, val}"),
+        (
+            "binding_first",
+            "?[uid, val] := uid = $u, *pk_test{uid, val}",
+        ),
     ] {
         group.bench_with_input(BenchmarkId::from_parameter(name), &query, |b, q| {
             b.iter(|| {

@@ -977,9 +977,9 @@ impl NormalAggrObj for AggrIntSumProd {
             let n = it
                 .get_int()
                 .ok_or_else(|| miette!("'int_sum_prod' factor is not an integer: {:?}", it))?;
-            product = product
-                .checked_mul(n)
-                .ok_or_else(|| miette!("'int_sum_prod' overflowed i64 while multiplying factors"))?;
+            product = product.checked_mul(n).ok_or_else(|| {
+                miette!("'int_sum_prod' overflowed i64 while multiplying factors")
+            })?;
         }
         self.sum = self
             .sum
@@ -1811,7 +1811,9 @@ mod tests {
     #[test]
     fn int_sum_prod_rejects_non_integer_factor() {
         let mut a = AggrIntSumProd::default();
-        assert!(a.set(&DataValue::List(vec![int(3), DataValue::Null])).is_err());
+        assert!(a
+            .set(&DataValue::List(vec![int(3), DataValue::Null]))
+            .is_err());
         assert!(a.set(&int(5)).is_err()); // not a list
     }
 }

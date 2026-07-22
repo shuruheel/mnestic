@@ -85,11 +85,11 @@ pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 #[cfg(feature = "graph-algo")]
 pub use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, DirectedNeighborsWithValues, Graph};
 pub use runtime::db::Db;
+pub use runtime::db::NamedRows;
 #[cfg(feature = "graph-algo")]
 pub use runtime::graph_projection::{
     GraphSource, GraphVariant, ProjectionVariant, VariantKey, VariantSpec,
 };
-pub use runtime::db::NamedRows;
 pub use runtime::hybrid::{build_hybrid_query, GraphLeg, HybridList, HybridSearch, MmrParams};
 pub use runtime::relation::{decode_tuple_from_kv, try_decode_tuple_from_kv};
 pub use runtime::temp_store::RegularTempStore;

@@ -72,5 +72,8 @@ fn binding_first_nonpk_indexed_lookup_returns_rows() {
     let mut b_sorted = b.rows.clone();
     a_sorted.sort();
     b_sorted.sort();
-    assert_eq!(a_sorted, b_sorted, "both query forms must return the same rows");
+    assert_eq!(
+        a_sorted, b_sorted,
+        "both query forms must return the same rows"
+    );
 }

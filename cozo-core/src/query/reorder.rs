@@ -226,9 +226,7 @@ fn well_order_body(body: Vec<NormalFormAtom>) -> Result<Vec<NormalFormAtom>> {
                 round_1_collected.push(NormalFormAtom::Relation(v))
             }
             NormalFormAtom::NegatedRule(r) => pending.push(NormalFormAtom::NegatedRule(r)),
-            NormalFormAtom::NegatedRelation(v) => {
-                pending.push(NormalFormAtom::NegatedRelation(v))
-            }
+            NormalFormAtom::NegatedRelation(v) => pending.push(NormalFormAtom::NegatedRelation(v)),
             NormalFormAtom::Predicate(p) => {
                 pending.push(NormalFormAtom::Predicate(p));
             }
@@ -724,8 +722,7 @@ mod tests {
             rel("part", &["k1", "w"]),
             rel("full", &["k1", "k2", "v"]),
         ];
-        let schema =
-            SchemaView::from([(sym("base"), 2), (sym("part"), 2), (sym("full"), 2)]);
+        let schema = SchemaView::from([(sym("base"), 2), (sym("part"), 2), (sym("full"), 2)]);
         let got = greedy_reorder_conjunction(&body, &schema, "test").expect("should reorder");
         assert_eq!(relation_order(&got), ["base", "full", "part"]);
     }

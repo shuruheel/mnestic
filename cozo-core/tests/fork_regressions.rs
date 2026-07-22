@@ -44,7 +44,11 @@ fn top_level_create_underscore_relation_is_a_silent_noop() {
     let rels = db
         .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)
         .unwrap();
-    assert_eq!(rels.rows.len(), 0, "the `_foo` temp silently did not persist");
+    assert_eq!(
+        rels.rows.len(),
+        0,
+        "the `_foo` temp silently did not persist"
+    );
 }
 
 /// Fork #1 (FIXED): `*rel[col, ...], col == <ground>` and `*rel{col, ...},
@@ -118,8 +122,7 @@ fn keyword_prefixed_identifiers_parse() {
     let q = |s: &str| db.run_script(s, BTreeMap::new(), ScriptMutability::Mutable);
 
     q(":create rel { id: Int => nullable_column: Int? }").unwrap();
-    q(r#"?[id, nullable_column] <- [[1, 10],[2, 20]] :put rel { id => nullable_column }"#)
-        .unwrap();
+    q(r#"?[id, nullable_column] <- [[1, 10],[2, 20]] :put rel { id => nullable_column }"#).unwrap();
 
     // The #281 case: `field: binding` where the binding name starts with `null`.
     let r = q("?[id, nullable_column] := *rel{id, nullable_column: nullable_column}")
@@ -147,7 +150,13 @@ fn keyword_prefixed_identifiers_parse() {
     assert_eq!(lit("?[x] := x = true")[0][0], DataValue::Bool(true));
     assert_eq!(lit("?[x] := x = false")[0][0], DataValue::Bool(false));
     assert_eq!(lit("?[x] := x = null")[0][0], DataValue::Null);
-    assert_eq!(lit("?[x] := x = [null, true, false]")[0][0].get_slice().unwrap().len(), 3);
+    assert_eq!(
+        lit("?[x] := x = [null, true, false]")[0][0]
+            .get_slice()
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 /// Fork #1 boundary (review fix): numeric equality post-filters must NOT be pushed
@@ -262,23 +271,39 @@ fn repair_corrupt_basics() {
     assert_eq!(imperative.rows[0][0].get_int(), Some(0));
 
     let res = db
-        .run_script("::repair_corrupt t", BTreeMap::new(), ScriptMutability::Mutable)
+        .run_script(
+            "::repair_corrupt t",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
         .unwrap();
     assert_eq!(res.headers, vec!["removed".to_string()]);
     assert_eq!(res.rows[0][0].get_int(), Some(0));
 
     // healthy rows untouched
     let rows = db
-        .run_script("?[k] := *t[k, _, _]", BTreeMap::new(), ScriptMutability::Immutable)
+        .run_script(
+            "?[k] := *t[k, _, _]",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
         .unwrap();
     assert_eq!(rows.rows.len(), 2);
 
     let err = db
-        .run_script("::repair_corrupt t", BTreeMap::new(), ScriptMutability::Immutable)
+        .run_script(
+            "::repair_corrupt t",
+            BTreeMap::new(),
+            ScriptMutability::Immutable,
+        )
         .unwrap_err();
     assert!(err.to_string().to_lowercase().contains("read-only"));
 
     assert!(db
-        .run_script("::repair_corrupt missing_rel", BTreeMap::new(), ScriptMutability::Mutable)
+        .run_script(
+            "::repair_corrupt missing_rel",
+            BTreeMap::new(),
+            ScriptMutability::Mutable
+        )
         .is_err());
 }

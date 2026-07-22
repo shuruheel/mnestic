@@ -38,20 +38,29 @@ fn ulid_timestamp_decodes_known_vectors() {
     let db = DbInstance::default();
     // A '1' in the 32^16 place encodes the value 2^80, whose high-48-bit
     // timestamp is exactly 1. (10-char timestamp section + 16-char randomness.)
-    let ts1 = scalar(&db, "?[t] := t = ulid_timestamp('00000000010000000000000000')");
+    let ts1 = scalar(
+        &db,
+        "?[t] := t = ulid_timestamp('00000000010000000000000000')",
+    );
     assert_eq!(ts1, DataValue::from(1i64));
 
     // A real ULID: its first 10 chars '01ARZ3NDEK' decode (Crockford base32) to
     // 1469922850259 — verifiable by hand: ((((((((1*32+10)*32+24)*32+31)*32+3)
     // *32+21)*32+13)*32+14)*32+19) over digits [0,1,10,24,31,3,21,13,14,19].
-    let ts2 = scalar(&db, "?[t] := t = ulid_timestamp('01ARZ3NDEKTSV4RRFFQ69G5FAV')");
+    let ts2 = scalar(
+        &db,
+        "?[t] := t = ulid_timestamp('01ARZ3NDEKTSV4RRFFQ69G5FAV')",
+    );
     assert_eq!(ts2, DataValue::from(1469922850259i64));
 }
 
 #[test]
 fn ulid_timestamp_zero() {
     let db = DbInstance::default();
-    let ts = scalar(&db, "?[t] := t = ulid_timestamp('00000000000000000000000000')");
+    let ts = scalar(
+        &db,
+        "?[t] := t = ulid_timestamp('00000000000000000000000000')",
+    );
     assert_eq!(ts, DataValue::from(0i64));
 }
 
@@ -77,7 +86,11 @@ fn rand_ulid_is_sortable_and_distinct() {
         &db,
         "?[b] := u = rand_ulid(), b = ('00000000000000000000000000' < u)",
     );
-    assert_eq!(cmp, DataValue::Bool(true), "now-ULID must sort after epoch-ULID");
+    assert_eq!(
+        cmp,
+        DataValue::Bool(true),
+        "now-ULID must sort after epoch-ULID"
+    );
 
     // Two ULIDs are distinct (randomness half differs even within a ms).
     let distinct = scalar(
@@ -95,7 +108,10 @@ fn ulid_timestamp_rejects_malformed() {
             .is_err()
     };
     // Wrong length.
-    assert!(err("?[t] := t = ulid_timestamp('TOOSHORT')"), "short string");
+    assert!(
+        err("?[t] := t = ulid_timestamp('TOOSHORT')"),
+        "short string"
+    );
     // Invalid Crockford char ('U' is excluded).
     assert!(
         err("?[t] := t = ulid_timestamp('U0000000000000000000000000')"),

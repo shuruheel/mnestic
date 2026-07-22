@@ -65,8 +65,7 @@ impl FixedRule for KShortestPathYen {
         if starting_nodes.len() <= 1 && termination_nodes.len() <= 1 {
             for start in starting_nodes {
                 for goal in &termination_nodes {
-                    for (cost, path) in
-                        k_shortest_path_yen(k, graph, start, *goal, poison.clone())?
+                    for (cost, path) in k_shortest_path_yen(k, graph, start, *goal, poison.clone())?
                     {
                         let t = vec![
                             indices[start as usize].clone(),

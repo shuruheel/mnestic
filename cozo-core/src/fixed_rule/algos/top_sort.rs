@@ -30,7 +30,8 @@ impl FixedRule for TopSort {
         out: &mut RegularTempStore,
         poison: Poison,
     ) -> Result<()> {
-        let (source, _input_base) = payload.graph_input(0, VariantSpec::unweighted(false), &poison)?;
+        let (source, _input_base) =
+            payload.graph_input(0, VariantSpec::unweighted(false), &poison)?;
         let indices = source.indices();
         if indices.is_empty() {
             return Ok(());

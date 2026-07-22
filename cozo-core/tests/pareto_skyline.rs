@@ -96,11 +96,19 @@ fn one_dimensional_reduces_to_min_and_max() {
     let res = run(&format!(
         "cand[g, p] <- {data}\nsurv[g, pareto_min(p)] := cand[g, p]\n?[g, p] := surv[g, p]"
     ));
-    assert_eq!(packs_of(&res.rows), vec![pack(&[1])], "1-D min = the minimum, dedup'd");
+    assert_eq!(
+        packs_of(&res.rows),
+        vec![pack(&[1])],
+        "1-D min = the minimum, dedup'd"
+    );
     let res = run(&format!(
         "cand[g, p] <- {data}\nsurv[g, pareto_max(p)] := cand[g, p]\n?[g, p] := surv[g, p]"
     ));
-    assert_eq!(packs_of(&res.rows), vec![pack(&[3])], "1-D max = the maximum");
+    assert_eq!(
+        packs_of(&res.rows),
+        vec![pack(&[3])],
+        "1-D max = the maximum"
+    );
 }
 
 #[test]
@@ -202,20 +210,16 @@ fn recursive_multi_objective_reachability() {
             .unwrap_or_else(|e| panic!("script failed: {s}\n{e:?}"))
     };
     run(":create edge2 {src: String, dst: String => dx: Int, dy: Int}");
-    run(
-        r#"?[src, dst, dx, dy] <- [
+    run(r#"?[src, dst, dx, dy] <- [
             ["start", "a", 1, 3], ["start", "b", 3, 1], ["a", "end", 1, 3],
             ["b", "end", 3, 1], ["start", "end", 3, 3], ["end", "a", 1, 1]
-        ] :put edge2 {src, dst => dx, dy}"#,
-    );
-    let res = run(
-        r#"
+        ] :put edge2 {src, dst => dx, dy}"#);
+    let res = run(r#"
         reach[t, pareto_min(p)] := *edge2{src: "start", dst: t, dx, dy}, p = [dx, dy]
         reach[t, pareto_min(p)] := reach[m, q], *edge2{src: m, dst: t, dx, dy},
                                    p = [get(q, 0) + dx, get(q, 1) + dy]
         ?[t, p] := reach[t, p], t = "end"
-        "#,
-    );
+        "#);
     assert_eq!(
         packs_of(&res.rows),
         vec![pack(&[2, 6]), pack(&[3, 3]), pack(&[6, 2])],
@@ -229,8 +233,10 @@ fn operand_contract_is_enforced_loudly() {
     let run = |s: &str| db.run_script(s, BTreeMap::new(), ScriptMutability::Mutable);
 
     // Non-list operand.
-    let err = run("cand[g, x] <- [[\"g\", 3]]\nsurv[g, pareto_min(x)] := cand[g, x]\n?[g, p] := surv[g, p]")
-        .unwrap_err();
+    let err = run(
+        "cand[g, x] <- [[\"g\", 3]]\nsurv[g, pareto_min(x)] := cand[g, x]\n?[g, p] := surv[g, p]",
+    )
+    .unwrap_err();
     assert!(
         errstr(&err).contains("list of numbers"),
         "non-list rejected: {err:?}"
@@ -245,8 +251,10 @@ fn operand_contract_is_enforced_loudly() {
     );
 
     // Empty vector.
-    let err = run("cand[g, p] <- [[\"g\", []]]\nsurv[g, pareto_min(p)] := cand[g, p]\n?[g, q] := surv[g, q]")
-        .unwrap_err();
+    let err = run(
+        "cand[g, p] <- [[\"g\", []]]\nsurv[g, pareto_min(p)] := cand[g, p]\n?[g, q] := surv[g, q]",
+    )
+    .unwrap_err();
     assert!(
         errstr(&err).contains("non-empty"),
         "empty vector rejected: {err:?}"

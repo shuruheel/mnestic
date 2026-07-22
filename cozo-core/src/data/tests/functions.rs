@@ -2018,7 +2018,12 @@ fn test_dt_trunc_dst_fold_prefers_input_offset() {
         "tzdb changed: NY 2025-11-02 01:00 is no longer ambiguous; pick a new fixture"
     );
     let tr = |ts: DataValue, unit: &str| {
-        op_dt_trunc(&[ts, DataValue::from(unit), DataValue::from("America/New_York")]).unwrap()
+        op_dt_trunc(&[
+            ts,
+            DataValue::from(unit),
+            DataValue::from("America/New_York"),
+        ])
+        .unwrap()
     };
     // 06:30Z = 01:30 EST — the SECOND pass of the fold.
     assert_eq!(
@@ -2048,11 +2053,7 @@ fn test_dt_trunc_dst_fold_prefers_input_offset() {
 #[test]
 fn test_dt_trunc_range_edges_error_not_panic() {
     // first partial week above NaiveDate::MIN (a Thursday): Monday underflows
-    assert!(op_dt_trunc(&[
-        DataValue::from(-8334601227800.001),
-        DataValue::from("week")
-    ])
-    .is_err());
+    assert!(op_dt_trunc(&[DataValue::from(-8334601227800.001), DataValue::from("week")]).is_err());
     // MIN end + negative-offset zone: local date below NaiveDate::MIN
     assert!(op_dt_trunc(&[
         DataValue::from(-8334601228799.0),
@@ -2172,9 +2173,7 @@ fn test_validity_literals_share_parse_timestamp_grammar() {
 /// see the op_dt_diff comment).
 #[test]
 fn test_dt_diff_negative_span_is_antisymmetric() {
-    let diff = |a: DataValue, b: DataValue| {
-        op_dt_diff(&[a, b, DataValue::from("month")]).unwrap()
-    };
+    let diff = |a: DataValue, b: DataValue| op_dt_diff(&[a, b, DataValue::from("month")]).unwrap();
     assert_eq!(
         diff(dt_secs(2023, 1, 30, 0, 0, 0), dt_secs(2023, 3, 31, 0, 0, 0)),
         DataValue::from(-2),

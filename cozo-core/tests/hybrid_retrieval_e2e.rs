@@ -76,7 +76,12 @@ fn hnsw_plus_fts_fused_with_rrf() {
     let fused: HashMap<String, f64> = res
         .rows
         .iter()
-        .map(|r| (r[0].get_str().unwrap().to_string(), r[1].get_float().unwrap()))
+        .map(|r| {
+            (
+                r[0].get_str().unwrap().to_string(),
+                r[1].get_float().unwrap(),
+            )
+        })
         .collect();
 
     // d1 is rank-1 in BOTH lists (closest embedding to [1,0] AND best "cat"

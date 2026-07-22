@@ -41,7 +41,10 @@ fn setup(db: &DbInstance, rows: &str) {
         db,
         r"::fts create doc:fts { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
     );
-    run(db, &format!(r"?[k, body] <- [{rows}] :put doc {{k => body}}"));
+    run(
+        db,
+        &format!(r"?[k, body] <- [{rows}] :put doc {{k => body}}"),
+    );
 }
 
 /// query -> {doc_key: score}, using the given fts param tail (after `|`).
@@ -52,7 +55,12 @@ fn scores(db: &DbInstance, params: &str) -> HashMap<String, f64> {
     );
     res.rows
         .iter()
-        .map(|r| (r[0].get_str().unwrap().to_string(), r[1].get_float().unwrap()))
+        .map(|r| {
+            (
+                r[0].get_str().unwrap().to_string(),
+                r[1].get_float().unwrap(),
+            )
+        })
         .collect()
 }
 

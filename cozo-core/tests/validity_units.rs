@@ -42,7 +42,9 @@ fn seeded() -> DbInstance {
     run(&db, ":create ev {k: String, at: Validity => v: String}").unwrap();
     run(
         &db,
-        &format!("?[k, at, v] <- [['a', [{MICROS_2024_06_01}, true], 'JUN2024']] :put ev {{k, at => v}}"),
+        &format!(
+            "?[k, at, v] <- [['a', [{MICROS_2024_06_01}, true], 'JUN2024']] :put ev {{k, at => v}}"
+        ),
     )
     .unwrap();
     db
@@ -209,7 +211,11 @@ fn op_validity_rejects_float() {
 #[test]
 fn control_int_micros_still_works() {
     let db = seeded();
-    let rows = run(&db, &format!("?[k, v] := *ev{{k, v @ {MICROS_2024_06_01}}}")).unwrap();
+    let rows = run(
+        &db,
+        &format!("?[k, v] := *ev{{k, v @ {MICROS_2024_06_01}}}"),
+    )
+    .unwrap();
     assert_eq!(rows.as_array().unwrap().len(), 1, "int micros must work");
 }
 
@@ -217,8 +223,8 @@ fn control_int_micros_still_works() {
 fn control_string_forms_still_work() {
     let db = seeded();
     for sel in [
-        "'2024-06-01'",              // bare date (fork feature, 0.10.0)
-        "'2024-06-01T00:00:00Z'",    // RFC3339 (upstream)
+        "'2024-06-01'",           // bare date (fork feature, 0.10.0)
+        "'2024-06-01T00:00:00Z'", // RFC3339 (upstream)
         "'END'",
     ] {
         let rows = run(&db, &format!("?[k, v] := *ev{{k, v @ {sel}}}")).unwrap();

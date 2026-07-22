@@ -324,7 +324,10 @@ fn pest_error_to_parse_error(src: &str, err: pest::error::Error<Rule>) -> ParseE
         // start with the character sitting at the error position — narrow to
         // those whenever that subset is non-empty (`:limi` → the `:option`
         // keywords; `::index crate` → `create`).
-        if let Some(next_char) = src.get(attempts.max_position..).and_then(|r| r.chars().next()) {
+        if let Some(next_char) = src
+            .get(attempts.max_position..)
+            .and_then(|r| r.chars().next())
+        {
             let narrowed: Vec<String> = tokens
                 .iter()
                 .filter(|t| t.starts_with(next_char))

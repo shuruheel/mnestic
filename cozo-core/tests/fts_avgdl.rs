@@ -35,7 +35,10 @@ fn setup(db: &DbInstance) {
 }
 
 fn put(db: &DbInstance, rows: &str) {
-    run(db, &format!(r"?[k, body] <- [{rows}] :put doc {{k => body}}"));
+    run(
+        db,
+        &format!(r"?[k, body] <- [{rows}] :put doc {{k => body}}"),
+    );
 }
 
 fn rm(db: &DbInstance, keys: &str) {
@@ -50,7 +53,12 @@ fn scores(db: &DbInstance, query: &str) -> HashMap<String, f64> {
     );
     res.rows
         .iter()
-        .map(|r| (r[0].get_str().unwrap().to_string(), r[1].get_float().unwrap()))
+        .map(|r| {
+            (
+                r[0].get_str().unwrap().to_string(),
+                r[1].get_float().unwrap(),
+            )
+        })
         .collect()
 }
 
@@ -58,7 +66,8 @@ fn new_db(path: &std::path::Path) -> DbInstance {
     DbInstance::new("sqlite", path.to_str().unwrap(), Default::default()).unwrap()
 }
 
-const FILLER: &str = "pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad";
+const FILLER: &str =
+    "pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad pad";
 
 /// The counter must net correctly through deletes: a corpus reached by inserting
 /// extra long documents and then deleting them must score *identically* to the
@@ -188,7 +197,10 @@ fn bulk_build_doc_stats_match_incremental_on_multi_column_pk() {
     for q in ["gamma", "delta", "epsilon"] {
         let sa = scores(&bulk, q);
         let sb = scores(&incr, q);
-        assert!(!sa.is_empty(), "query '{q}' returned no hits on the bulk build");
+        assert!(
+            !sa.is_empty(),
+            "query '{q}' returned no hits on the bulk build"
+        );
         assert_eq!(
             sa.len(),
             sb.len(),
@@ -222,7 +234,10 @@ fn avgdl_value_feeds_bm25_denominator() {
     // Large avgdl: the other document is long (same N, same df for 'gamma').
     let large = new_db(&dir.path().join("large.db"));
     setup(&large);
-    put(&large, &format!(r"['target', 'gamma'], ['other', 'delta {FILLER}']"));
+    put(
+        &large,
+        &format!(r"['target', 'gamma'], ['other', 'delta {FILLER}']"),
+    );
     let s_large = scores(&large, "gamma")["target"];
 
     assert!(

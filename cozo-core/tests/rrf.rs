@@ -19,7 +19,12 @@ fn run(db: &DbInstance, s: &str) -> NamedRows {
 fn fused_map(res: &NamedRows) -> HashMap<String, f64> {
     res.rows
         .iter()
-        .map(|r| (r[0].get_str().unwrap().to_string(), r[1].get_float().unwrap()))
+        .map(|r| {
+            (
+                r[0].get_str().unwrap().to_string(),
+                r[1].get_float().unwrap(),
+            )
+        })
         .collect()
 }
 
@@ -83,7 +88,12 @@ fn rrf_ascending_direction() {
     );
     let m = fused_map(&res);
     // ascending: near(0.1) is rank1, far(0.9) is rank2.
-    assert!(m["near"] > m["far"], "near {} should beat far {}", m["near"], m["far"]);
+    assert!(
+        m["near"] > m["far"],
+        "near {} should beat far {}",
+        m["near"],
+        m["far"]
+    );
     assert!((m["near"] - 1.0 / 61.0).abs() < 1e-9);
 }
 
@@ -115,7 +125,11 @@ fn rrf_dedups_within_list_keeping_best() {
     );
     let m = fused_map(&res);
     // x's best (0.9) ranks above y (0.7), so x=rank1 => 1/61, y=rank2 => 1/62.
-    assert!((m["x"] - 1.0 / 61.0).abs() < 1e-9, "x deduped to best score (rank1): {}", m["x"]);
+    assert!(
+        (m["x"] - 1.0 / 61.0).abs() < 1e-9,
+        "x deduped to best score (rank1): {}",
+        m["x"]
+    );
     assert!((m["y"] - 1.0 / 62.0).abs() < 1e-9, "y = {}", m["y"]);
 }
 
@@ -197,7 +211,10 @@ fn rrf_detailed_long_format() {
     // x: only in a at rank1 => single row, fused = 1/61.
     let (f, r, s) = m[&("x".into(), "a".into())];
     assert!(approx(f, 1.0 / 61.0) && approx(r, 1.0) && approx(s, 0.9));
-    assert!(!m.contains_key(&("x".into(), "b".into())), "no row for a non-contributing list");
+    assert!(
+        !m.contains_key(&("x".into(), "b".into())),
+        "no row for a non-contributing list"
+    );
 }
 
 #[test]
@@ -220,7 +237,10 @@ fn rrf_detailed_dedups_and_reports_best_leg_score() {
         let leg_score = r[4].get_float().unwrap();
         if item == "x" {
             assert_eq!(leg_rank, 1.0);
-            assert!((leg_score - 0.9).abs() < 1e-9, "reports the kept best score");
+            assert!(
+                (leg_score - 0.9).abs() < 1e-9,
+                "reports the kept best score"
+            );
         } else {
             assert_eq!(leg_rank, 2.0);
         }

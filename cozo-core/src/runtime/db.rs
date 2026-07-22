@@ -2599,10 +2599,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(iter::once(&rel_name.name))
                 };
-                let _guards = locks
-                    .iter()
-                    .map(|lock| lock.write().unwrap())
-                    .collect_vec();
+                let _guards = locks.iter().map(|lock| lock.write().unwrap()).collect_vec();
 
                 let handle = tx.get_relation(rel_name, true)?;
                 // Graph-projection dirty-set hook: the index rows below are
@@ -2633,10 +2630,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(iter::once(&rel_name.name))
                 };
-                let _guards = locks
-                    .iter()
-                    .map(|lock| lock.write().unwrap())
-                    .collect_vec();
+                let _guards = locks.iter().map(|lock| lock.write().unwrap()).collect_vec();
                 let handle = tx.get_relation(rel_name, true)?;
                 // Graph-projection dirty-set hook (spec §3.4 row 10).
                 tx.mark_dirty(&handle);
@@ -2964,7 +2958,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         let effective_deadline = {
             let mut deadline = tx.script_deadline;
             if let Some(secs) = out_opts.timeout {
-                if let Some(block) = budget_now().and_then(|start| deadline_from_secs(start, secs)) {
+                if let Some(block) = budget_now().and_then(|start| deadline_from_secs(start, secs))
+                {
                     deadline = Some(deadline.map_or(block, |existing| existing.min(block)));
                 }
             }
