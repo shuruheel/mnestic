@@ -12,7 +12,7 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::sync::Arc;
+use std::sync::{Arc, Once};
 
 use either::{Either, Left};
 use miette::{bail, Diagnostic, IntoDiagnostic, Result};
@@ -288,6 +288,15 @@ pub(crate) struct ParseError {
 /// defect and becomes a grammar dump, which is worse than no hint at all.
 const MAX_EXPECTED_TOKENS_IN_HINT: usize = 24;
 
+/// Pest 2.8 made detailed parse-attempt tracking opt-in. Mnestic's parser
+/// diagnostics intentionally depend on those attempts to name useful literal
+/// repairs, so enable the process-wide parser setting once before converting
+/// pest errors into [`ParseError`].
+fn enable_detailed_parse_errors() {
+    static ENABLE: Once = Once::new();
+    ENABLE.call_once(|| pest::set_error_detail(true));
+}
+
 /// Convert a pest failure into our [`ParseError`], using pest's parse-attempts
 /// tracking (the literal tokens the grammar would have accepted at the deepest
 /// position reached) to point the span at the real defect and name the tokens
@@ -368,6 +377,7 @@ pub(crate) fn parse_expressions(
     src: &str,
     param_pool: &BTreeMap<String, DataValue>,
 ) -> Result<Expr> {
+    enable_detailed_parse_errors();
     let parsed = CozoScriptParser::parse(Rule::expression_script, src)
         .map_err(|err| pest_error_to_parse_error(src, err))?
         .next()
@@ -394,6 +404,7 @@ pub fn parse_script(
     custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<CozoScript> {
+    enable_detailed_parse_errors();
     let parsed = CozoScriptParser::parse(Rule::script, src)
         .map_err(|err| pest_error_to_parse_error(src, err))?
         .next()
@@ -443,6 +454,7 @@ mod tests {
     use super::*;
 
     fn parse_err(src: &str) -> ParseError {
+        enable_detailed_parse_errors();
         match CozoScriptParser::parse(Rule::script, src) {
             Ok(_) => panic!("script unexpectedly parsed: {src}"),
             Err(err) => pest_error_to_parse_error(src, err),
