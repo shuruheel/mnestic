@@ -2992,7 +2992,9 @@ pub(crate) fn op_dt_to_validity(args: &[DataValue]) -> Result<DataValue> {
 define_op!(OP_RAND_UUID_V1, 0, false);
 pub(crate) fn op_rand_uuid_v1(_args: &[DataValue]) -> Result<DataValue> {
     let mut rng = rand::thread_rng();
-    let uuid_ctx = uuid::ContextV1::new(rng.gen());
+    // Keep the version-neutral alias while the platform lockfile is on UUID 1.22.
+    #[allow(deprecated)]
+    let uuid_ctx = uuid::v1::Context::new(rng.gen());
     #[cfg(target_arch = "wasm32")]
     let ts = {
         let since_epoch: f64 = Date::now();
