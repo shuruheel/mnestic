@@ -10,7 +10,7 @@ use crate::data::expr::{eval_bytecode, eval_bytecode_pred, Bytecode};
 use crate::data::program::{FtsScoreKind, FtsSearch};
 use crate::data::tuple::{decode_tuple_from_key, Tuple};
 use crate::data::value::LARGEST_UTF_CHAR;
-use crate::fts::ast::{FtsExpr, FtsLiteral, FtsNear};
+use crate::fts::ast::{FtsExpr, FtsLiteral, FtsNear, FtsPhrase, FtsPhraseToken};
 use crate::fts::tokenizer::TextAnalyzer;
 use crate::parse::fts::parse_fts_query;
 use crate::runtime::relation::{try_decode_val_only, RelationHandle};
@@ -267,6 +267,81 @@ impl<'a> SessionTx<'a> {
                 }
                 res
             }
+            FtsExpr::Phrase(FtsPhrase { tokens, booster }) => {
+                // Exact phrase: the NEAR intersection below restricted to
+                // ordered, exact-offset adjacency. Anchors (candidate phrase
+                // start positions) seed from the first token's postings; each
+                // later token keeps only anchors whose document contains it at
+                // anchor + (its query position − the first token's). Deltas
+                // come from the query-side analyzer's own positions, so a
+                // removed stopword constrains nothing — a one-token wildcard
+                // slot, symmetric with the document side (spec §4.1).
+                let mut tok_it = tokens.iter();
+                let first_tok = tok_it.next().unwrap();
+                let q0 = first_tok.position;
+                let as_literal = |tok: &FtsPhraseToken| FtsLiteral {
+                    value: tok.value.clone(),
+                    is_prefix: false,
+                    booster: *booster,
+                    is_phrase: false,
+                };
+                let mut doc_lens: FxHashMap<Tuple, u32> = FxHashMap::default();
+                let mut coll: FxHashMap<Tuple, Vec<u32>> = FxHashMap::default();
+                for first_el in
+                    self.fts_search_literal(&as_literal(first_tok), &config.idx_handle)?
+                {
+                    doc_lens.insert(first_el.key.clone(), first_el.doc_len);
+                    coll.insert(
+                        first_el.key,
+                        first_el
+                            .position_info
+                            .into_iter()
+                            .map(|el| el.position)
+                            .collect_vec(),
+                    );
+                }
+                for tok in tok_it {
+                    if coll.is_empty() {
+                        break;
+                    }
+                    let delta = tok.position - q0;
+                    let el_res =
+                        self.fts_search_literal(&as_literal(tok), &config.idx_handle)?;
+                    let mut nxt_coll: FxHashMap<Tuple, Vec<u32>> = FxHashMap::default();
+                    for x in el_res {
+                        if let Some(anchors) = coll.remove(&x.key) {
+                            let at: FxHashSet<u32> =
+                                x.position_info.iter().map(|el| el.position).collect();
+                            let kept = anchors
+                                .into_iter()
+                                .filter(|p| at.contains(&(*p + delta)))
+                                .collect_vec();
+                            if !kept.is_empty() {
+                                nxt_coll.insert(x.key, kept);
+                            }
+                        }
+                    }
+                    coll = nxt_coll;
+                }
+                let coll_len = coll.len();
+                coll.into_iter()
+                    .map(|(k, anchors)| {
+                        let doc_len = doc_lens.get(&k).copied().unwrap_or(0);
+                        // tf = number of anchors = phrase occurrences; df = the
+                        // phrase's own matching-doc count (spec §5).
+                        let score = Self::fts_compute_score(
+                            anchors.len(),
+                            coll_len,
+                            n,
+                            doc_len,
+                            avgdl,
+                            booster.0,
+                            config,
+                        );
+                        (k, score)
+                    })
+                    .collect()
+            }
             FtsExpr::And(ls) => {
                 let mut l_iter = ls.iter();
                 let mut res = self.fts_search_impl(l_iter.next().unwrap(), config, n, avgdl)?;
@@ -317,7 +392,11 @@ impl<'a> SessionTx<'a> {
                             .collect_vec(),
                     );
                 }
-                for lit_nxt in literals {
+                // NB: iterate the REMAINDER (`l_it`), not `literals` from the
+                // top — the first literal seeded `coll` above, and re-scanning
+                // it here cost a redundant full posting fetch per NEAR query
+                // (results were unchanged: self-distance 0 always survived).
+                for lit_nxt in l_it {
                     let el_res = self.fts_search_literal(lit_nxt, &config.idx_handle)?;
                     coll = el_res
                         .into_iter()
@@ -418,9 +497,26 @@ impl<'a> SessionTx<'a> {
         stack: &mut Vec<DataValue>,
         cache: &mut FtsCache,
     ) -> Result<Vec<Tuple>> {
-        let ast = parse_fts_query(q)?.tokenize(tokenizer);
+        let ast = parse_fts_query(q)?.tokenize(tokenizer)?;
         if ast.is_empty() {
             return Ok(vec![]);
+        }
+        if ast.contains_phrase() && config.manifest.tokenizer.name == "NGram" {
+            #[derive(Debug, Diagnostic, Error)]
+            #[error("cannot run a phrase query against index '{0}': its NGram tokenizer stores no usable token positions")]
+            #[diagnostic(
+                code(eval::fts::phrase_without_positions),
+                help("NGram assigns every gram position 0, so adjacency cannot be \
+                      checked — a phrase would match every document containing the \
+                      grams. Term search on this index still works; for phrase \
+                      queries, index with a position-preserving tokenizer \
+                      (Simple, Whitespace).")
+            )]
+            struct FtsPhraseWithoutPositions(String);
+
+            bail!(FtsPhraseWithoutPositions(
+                config.manifest.index_name.to_string()
+            ))
         }
         // One cache read serves both IDF's `N` and BM25's `avgdl`; neither touches storage on a
         // warm index. `Tf` scoring uses neither, so it does not seed the cache at all.

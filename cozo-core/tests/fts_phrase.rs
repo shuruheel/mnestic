@@ -1,0 +1,274 @@
+/*
+ * Copyright 2026, Shan Rizvi (mnestic fork).
+ *
+ * This Source Code Form is subject to the terms of the Mozilla Public License, v. 2.0.
+ * If a copy of the MPL was not distributed with this file,
+ * You can obtain one at https://mozilla.org/MPL/2.0/.
+ */
+
+//! Exact-phrase FTS: contract fixtures per docs/specs/fts-phrase-and-snippets.md §9.
+//! sqlite backend per the repo test-backend rule. NB fixture vocabulary must
+//! avoid EN stopwords when Stopwords('en') is in play ("over" is one).
+
+use cozo::{DbInstance, ScriptMutability};
+use std::collections::BTreeMap;
+
+fn db() -> (tempfile::TempDir, DbInstance) {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fts_phrase.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), Default::default()).unwrap();
+    (dir, db)
+}
+
+fn run(db: &DbInstance, script: &str) -> cozo::NamedRows {
+    db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)
+        .unwrap_or_else(|e| panic!("script failed: {script}\n{e:?}"))
+}
+
+fn run_err(db: &DbInstance, script: &str) -> String {
+    match db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable) {
+        Ok(r) => panic!("expected error, got rows: {r:?}"),
+        Err(e) => format!("{e:?}"),
+    }
+}
+
+fn ids(rows: &cozo::NamedRows) -> Vec<i64> {
+    let mut v: Vec<i64> = rows.rows.iter().map(|r| r[0].get_int().unwrap()).collect();
+    v.sort();
+    v
+}
+
+fn setup(db: &DbInstance) {
+    run(db, ":create doc {id: Int => body: String}");
+    run(
+        db,
+        "::fts create doc:idx { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+    );
+    run(
+        db,
+        r#"?[id, body] <- [
+            [1, "hello world again"],
+            [2, "hello wide world"],
+            [3, "say hello world hello world bye"]
+        ] :put doc {id => body}"#,
+    );
+}
+
+// The headline: a quoted multi-word query requires adjacency in order.
+#[test]
+fn phrase_requires_adjacency() {
+    let (_d, db) = db();
+    setup(&db);
+    let res = run(&db, r#"?[id] := ~doc:idx{id | query: '"hello world"', k: 10}"#);
+    assert_eq!(ids(&res), vec![1, 3], "non-adjacent doc 2 must be excluded");
+}
+
+// Unquoted stays AND-of-terms — byte-identical to pre-0.13.2.
+#[test]
+fn unquoted_stays_and() {
+    let (_d, db) = db();
+    setup(&db);
+    let res = run(&db, r#"?[id] := ~doc:idx{id | query: 'hello world', k: 10}"#);
+    assert_eq!(ids(&res), vec![1, 2, 3]);
+}
+
+// Quoted single token ≡ unquoted single token.
+#[test]
+fn quoted_single_token_equivalent() {
+    let (_d, db) = db();
+    setup(&db);
+    let quoted = run(&db, r#"?[id] := ~doc:idx{id | query: '"world"', k: 10}"#);
+    let bare = run(&db, r#"?[id] := ~doc:idx{id | query: 'world', k: 10}"#);
+    assert_eq!(ids(&quoted), ids(&bare));
+}
+
+// Order matters. Note doc 3 ("say hello world hello world bye") genuinely
+// contains "world hello" as an overlapping occurrence (world@2, hello@3) —
+// docs 1 and 2, which contain both words but never in that order, are the
+// ones the ordering must exclude.
+#[test]
+fn phrase_is_ordered() {
+    let (_d, db) = db();
+    setup(&db);
+    let res = run(&db, r#"?[id] := ~doc:idx{id | query: '"world hello"', k: 10}"#);
+    assert_eq!(ids(&res), vec![3]);
+    let res = run(&db, r#"?[id] := ~doc:idx{id | query: '"again hello"', k: 10}"#);
+    assert_eq!(ids(&res), Vec::<i64>::new());
+}
+
+// tf = anchor count: doc 3 contains the phrase twice and must outrank doc 1
+// under Tf scoring.
+#[test]
+fn phrase_tf_is_anchor_count() {
+    let (_d, db) = db();
+    setup(&db);
+    let res = run(
+        &db,
+        r#"?[id, s] := ~doc:idx{id | query: '"hello world"', k: 10, score_kind: 'tf', bind_score: s}
+           :order -s"#,
+    );
+    assert_eq!(res.rows[0][0].get_int().unwrap(), 3);
+    assert!(res.rows[0][1].get_float().unwrap() > res.rows[1][1].get_float().unwrap());
+}
+
+// §4.1: a removed stopword leaves a hole that matches exactly one token —
+// any token — symmetrically on both sides.
+#[test]
+fn stopword_hole_is_one_token_wildcard() {
+    let (_d, db) = db();
+    run(&db, ":create sdoc {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create sdoc:idx { extractor: body, tokenizer: Simple, filters: [Lowercase, Stopwords('en')] }",
+    );
+    run(
+        &db,
+        r#"?[id, body] <- [
+            [1, "alpha the beta"],
+            [2, "alpha that beta"],
+            [3, "alpha beta"],
+            [4, "alpha gamma delta beta"]
+        ] :put sdoc {id => body}"#,
+    );
+    // Query "alpha the beta": alpha@0, hole@1, beta@2. Docs 1 and 2 have beta
+    // two slots after alpha (the middle token being a stopword or not is
+    // irrelevant — the hole constrains nothing). Doc 3 (adjacent) and doc 4
+    // (three slots) must NOT match.
+    let res = run(
+        &db,
+        r#"?[id] := ~sdoc:idx{id | query: '"alpha the beta"', k: 10}"#,
+    );
+    assert_eq!(ids(&res), vec![1, 2]);
+}
+
+// §3.2: a quoted phrase that is ALL stopwords tokenizes to nothing — empty
+// query, empty result, no error.
+#[test]
+fn all_stopword_phrase_is_empty() {
+    let (_d, db) = db();
+    run(&db, ":create s2 {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create s2:idx { extractor: body, tokenizer: Simple, filters: [Lowercase, Stopwords('en')] }",
+    );
+    run(&db, r#"?[id, body] <- [[1, "alpha beta"]] :put s2 {id => body}"#);
+    let res = run(&db, r#"?[id] := ~s2:idx{id | query: '"the of"', k: 10}"#);
+    assert_eq!(ids(&res), Vec::<i64>::new());
+}
+
+// §3.4: phrase-prefix is a named error (was: silently zero rows).
+#[test]
+fn phrase_prefix_is_named_error() {
+    let (_d, db) = db();
+    setup(&db);
+    let err = run_err(&db, r#"?[id] := ~doc:idx{id | query: '"hello wor"*', k: 10}"#);
+    assert!(
+        err.contains("phrase_prefix_unsupported"),
+        "wrong error: {err}"
+    );
+}
+
+// §3.4: a quoted multi-word phrase inside NEAR is a named error (was: bag).
+#[test]
+fn phrase_in_near_is_named_error() {
+    let (_d, db) = db();
+    setup(&db);
+    let err = run_err(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: 'NEAR/3("hello world" bye)', k: 10}"#,
+    );
+    assert!(
+        err.contains("phrase_in_near_unsupported"),
+        "wrong error: {err}"
+    );
+}
+
+// A quoted SINGLE token inside NEAR stays legal (pre-0.13.2 behavior).
+#[test]
+fn single_token_quoted_in_near_still_legal() {
+    let (_d, db) = db();
+    setup(&db);
+    let res = run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: 'NEAR/3("hello" bye)', k: 10}"#,
+    );
+    assert_eq!(ids(&res), vec![3]);
+}
+
+// §4.3: phrase against an NGram index is a named error, term search works.
+#[test]
+fn ngram_phrase_is_named_error_terms_still_work() {
+    let (_d, db) = db();
+    run(&db, ":create nd {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create nd:idx { extractor: body, tokenizer: NGram(2, 3) }",
+    );
+    run(&db, r#"?[id, body] <- [[1, "hello world"]] :put nd {id => body}"#);
+    let err = run_err(&db, r#"?[id] := ~nd:idx{id | query: '"hel wor"', k: 10}"#);
+    assert!(err.contains("phrase_without_positions"), "wrong error: {err}");
+    let ok = run(&db, r#"?[id] := ~nd:idx{id | query: 'hel', k: 10}"#);
+    assert_eq!(ids(&ok), vec![1]);
+}
+
+// §4.2: phrases match stems symmetrically — both sides run the index analyzer.
+#[test]
+fn stemmed_phrase_matches_stems() {
+    let (_d, db) = db();
+    run(&db, ":create st {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create st:idx { extractor: body, tokenizer: Simple, filters: [Lowercase, Stemmer('english')] }",
+    );
+    run(
+        &db,
+        r#"?[id, body] <- [
+            [1, "connections refusing"],
+            [2, "refusing connections"]
+        ] :put st {id => body}"#,
+    );
+    let res = run(
+        &db,
+        r#"?[id] := ~st:idx{id | query: '"connection refused"', k: 10}"#,
+    );
+    assert_eq!(ids(&res), vec![1], "stems match in order; reversed doc 2 must not");
+}
+
+// §9 subset oracle: on a generated corpus, phrase results ⊆ AND results.
+#[test]
+fn phrase_subset_of_and() {
+    let (_d, db) = db();
+    run(&db, ":create g {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create g:idx { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+    );
+    // Deterministic corpus cycling a tiny vocabulary.
+    let vocab = ["red", "blue", "green", "fish", "bird"];
+    let mut puts = String::from("?[id, body] <- [");
+    for i in 0..40i64 {
+        let w = |k: i64| vocab[((i * 7 + k * 3) % 5) as usize];
+        puts.push_str(&format!(
+            r#"[{i}, "{} {} {} {}"],"#,
+            w(0),
+            w(1),
+            w(2),
+            w(3)
+        ));
+    }
+    puts.push_str("] :put g {id => body}");
+    run(&db, &puts);
+    for pair in [("red", "blue"), ("blue", "fish"), ("green", "bird")] {
+        let phrase = ids(&run(
+            &db,
+            &format!(r#"?[id] := ~g:idx{{id | query: '"{} {}"', k: 100}}"#, pair.0, pair.1),
+        ));
+        let and = ids(&run(
+            &db,
+            &format!(r#"?[id] := ~g:idx{{id | query: '{} {}', k: 100}}"#, pair.0, pair.1),
+        ));
+        for id in &phrase {
+            assert!(and.contains(id), "phrase result {id} missing from AND set");
+        }
+    }
+}

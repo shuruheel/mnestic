@@ -86,16 +86,21 @@ fn build_term(pair: Pair<'_>) -> Result<FtsExpr> {
 fn build_phrase(pair: Pair<'_>) -> Result<FtsLiteral> {
     let mut inner = pair.into_inner();
     let kernel = inner.next().unwrap();
-    let core_text = match kernel.as_rule() {
-        Rule::fts_phrase_group => SmartString::from(kernel.as_str().trim()),
-        Rule::quoted_string | Rule::s_quoted_string | Rule::raw_string => parse_string(kernel)?,
+    // Whether the kernel was quoted decides phrase-vs-AND semantics at
+    // tokenize time (fts/ast.rs::do_tokenize) — a quoted multi-token literal
+    // is an exact phrase since 0.13.2; a bare word group stays AND-of-terms.
+    let (core_text, is_phrase) = match kernel.as_rule() {
+        Rule::fts_phrase_group => (SmartString::from(kernel.as_str().trim()), false),
+        Rule::quoted_string | Rule::s_quoted_string | Rule::raw_string => {
+            (parse_string(kernel)?, true)
+        }
         _ => unreachable!("unexpected rule: {:?}", kernel.as_rule()),
     };
-    let mut is_quoted = false;
+    let mut is_prefix = false;
     let mut booster = 1.0;
     for pair in inner {
         match pair.as_rule() {
-            Rule::fts_prefix_marker => is_quoted = true,
+            Rule::fts_prefix_marker => is_prefix = true,
             Rule::fts_booster => {
                 let boosted = pair.into_inner().next().unwrap();
                 match boosted.as_rule() {
@@ -123,8 +128,9 @@ fn build_phrase(pair: Pair<'_>) -> Result<FtsLiteral> {
     }
     Ok(FtsLiteral {
         value: core_text,
-        is_prefix: is_quoted,
+        is_prefix,
         booster: booster.into(),
+        is_phrase,
     })
 }
 
