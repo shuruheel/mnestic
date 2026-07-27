@@ -234,6 +234,68 @@ fn stemmed_phrase_matches_stems() {
     assert_eq!(ids(&res), vec![1], "stems match in order; reversed doc 2 must not");
 }
 
+fn spans_of(rows: &cozo::NamedRows, row: usize, col: usize) -> Vec<(i64, i64)> {
+    match &rows.rows[row][col] {
+        cozo::DataValue::List(l) => l
+            .iter()
+            .map(|s| match s {
+                cozo::DataValue::List(pair) => {
+                    (pair[0].get_int().unwrap(), pair[1].get_int().unwrap())
+                }
+                other => panic!("unexpected span: {other:?}"),
+            })
+            .collect(),
+        other => panic!("unexpected spans value: {other:?}"),
+    }
+}
+
+// §6.1: bind_spans returns byte offsets of the matched occurrences.
+// doc 1 = "hello world again": hello@0..5, world@6..11, again@12..17.
+#[test]
+fn bind_spans_term_and_phrase() {
+    let (_d, db) = db();
+    setup(&db);
+    // Term: each occurrence's own span.
+    let res = run(
+        &db,
+        r#"?[id, sp] := ~doc:idx{id | query: 'again', k: 10, bind_spans: sp}"#,
+    );
+    assert_eq!(ids(&res), vec![1]);
+    assert_eq!(spans_of(&res, 0, 1), vec![(12, 17)]);
+    // Phrase: first token's `from` to last matched token's `to`, per anchor.
+    let res = run(
+        &db,
+        r#"?[id, sp] := ~doc:idx{id | query: '"hello world"', k: 10, bind_spans: sp} :order id"#,
+    );
+    assert_eq!(ids(&res), vec![1, 3]);
+    assert_eq!(spans_of(&res, 0, 1), vec![(0, 11)]);
+    // doc 3 = "say hello world hello world bye": two anchors.
+    assert_eq!(spans_of(&res, 1, 1), vec![(4, 15), (16, 27)]);
+}
+
+// §9: offsets are BYTE offsets — multi-byte text must round-trip correctly.
+#[test]
+fn bind_spans_multibyte() {
+    let (_d, db) = db();
+    run(&db, ":create mb {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create mb:idx { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+    );
+    // "héllo wörld": héllo = 6 bytes (é is 2), space at 6, wörld = 7..13.
+    run(&db, r#"?[id, body] <- [[1, "héllo wörld"]] :put mb {id => body}"#);
+    let res = run(
+        &db,
+        r#"?[id, sp] := ~mb:idx{id | query: '"héllo wörld"', k: 10, bind_spans: sp}"#,
+    );
+    assert_eq!(ids(&res), vec![1]);
+    let spans = spans_of(&res, 0, 1);
+    assert_eq!(spans, vec![(0, 13)]);
+    // The span must slice the original text cleanly on char boundaries.
+    let body = "héllo wörld";
+    assert_eq!(&body[spans[0].0 as usize..spans[0].1 as usize], body);
+}
+
 // §9 subset oracle: on a generated corpus, phrase results ⊆ AND results.
 #[test]
 fn phrase_subset_of_and() {

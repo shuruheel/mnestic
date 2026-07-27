@@ -70,9 +70,21 @@ impl FtsCache {
 }
 
 struct PositionInfo {
-    // from: u32,
-    // to: u32,
+    /// Byte offsets of the occurrence in the original indexed text, recorded
+    /// by the index-side analyzer (so they point at the source word even when
+    /// the posting key is its stem). Written since the fork point; decoded
+    /// and discarded until 0.13.2's `bind_spans`.
+    from: u32,
+    to: u32,
     position: u32,
+}
+
+/// Per-document result of an FTS sub-expression: the score plus, when the
+/// query binds `bind_spans`, the byte spans of the occurrences that evidence
+/// the match (left empty otherwise — spans are collected only on demand).
+struct DocHit {
+    score: f64,
+    spans: Vec<(u32, u32)>,
 }
 
 struct LiteralStats {
@@ -223,10 +235,14 @@ impl<'a> SessionTx<'a> {
                 .iter()
                 .zip(tos.iter())
                 .zip(positions.iter())
-                .map(|(_, p)| {
+                .map(|((f, t), p)| {
                     Ok(PositionInfo {
-                        // from: f.get_int().unwrap() as u32,
-                        // to: t.get_int().unwrap() as u32,
+                        from: f.get_int().ok_or_else(|| {
+                            miette!("corrupt FTS posting value: start offset is not an integer")
+                        })? as u32,
+                        to: t.get_int().ok_or_else(|| {
+                            miette!("corrupt FTS posting value: end offset is not an integer")
+                        })? as u32,
                         position: p.get_int().ok_or_else(|| {
                             miette!("corrupt FTS posting value: position is not an integer")
                         })? as u32,
@@ -247,7 +263,10 @@ impl<'a> SessionTx<'a> {
         config: &FtsSearch,
         n: usize,
         avgdl: f64,
-    ) -> Result<FxHashMap<Tuple, f64>> {
+    ) -> Result<FxHashMap<Tuple, DocHit>> {
+        // Spans are collected only when the query binds them (`bind_spans`);
+        // otherwise every arm leaves them empty and pays nothing.
+        let want_spans = config.bind_spans.is_some();
         Ok(match ast {
             FtsExpr::Literal(l) => {
                 let mut res = FxHashMap::default();
@@ -263,7 +282,12 @@ impl<'a> SessionTx<'a> {
                         l.booster.0,
                         config,
                     );
-                    res.insert(el.key, score);
+                    let spans = if want_spans {
+                        el.position_info.iter().map(|p| (p.from, p.to)).collect()
+                    } else {
+                        vec![]
+                    };
+                    res.insert(el.key, DocHit { score, spans });
                 }
                 res
             }
@@ -286,7 +310,11 @@ impl<'a> SessionTx<'a> {
                     is_phrase: false,
                 };
                 let mut doc_lens: FxHashMap<Tuple, u32> = FxHashMap::default();
-                let mut coll: FxHashMap<Tuple, Vec<u32>> = FxHashMap::default();
+                // Anchors per doc as (position, span_from, span_to): the span
+                // starts at the first token's occurrence and its `to` advances
+                // to each later matched token's end, so a surviving anchor's
+                // span covers the whole phrase occurrence (spec §6.1).
+                let mut coll: FxHashMap<Tuple, Vec<(u32, u32, u32)>> = FxHashMap::default();
                 for first_el in
                     self.fts_search_literal(&as_literal(first_tok), &config.idx_handle)?
                 {
@@ -296,7 +324,7 @@ impl<'a> SessionTx<'a> {
                         first_el
                             .position_info
                             .into_iter()
-                            .map(|el| el.position)
+                            .map(|el| (el.position, el.from, el.to))
                             .collect_vec(),
                     );
                 }
@@ -307,14 +335,20 @@ impl<'a> SessionTx<'a> {
                     let delta = tok.position - q0;
                     let el_res =
                         self.fts_search_literal(&as_literal(tok), &config.idx_handle)?;
-                    let mut nxt_coll: FxHashMap<Tuple, Vec<u32>> = FxHashMap::default();
+                    let mut nxt_coll: FxHashMap<Tuple, Vec<(u32, u32, u32)>> =
+                        FxHashMap::default();
                     for x in el_res {
                         if let Some(anchors) = coll.remove(&x.key) {
-                            let at: FxHashSet<u32> =
-                                x.position_info.iter().map(|el| el.position).collect();
+                            let at: FxHashMap<u32, u32> = x
+                                .position_info
+                                .iter()
+                                .map(|el| (el.position, el.to))
+                                .collect();
                             let kept = anchors
                                 .into_iter()
-                                .filter(|p| at.contains(&(*p + delta)))
+                                .filter_map(|(p, from, _)| {
+                                    at.get(&(p + delta)).map(|to| (p, from, *to))
+                                })
                                 .collect_vec();
                             if !kept.is_empty() {
                                 nxt_coll.insert(x.key, kept);
@@ -338,7 +372,12 @@ impl<'a> SessionTx<'a> {
                             booster.0,
                             config,
                         );
-                        (k, score)
+                        let spans = if want_spans {
+                            anchors.into_iter().map(|(_, f, t)| (f, t)).collect()
+                        } else {
+                            vec![]
+                        };
+                        (k, DocHit { score, spans })
                     })
                     .collect()
             }
@@ -346,10 +385,16 @@ impl<'a> SessionTx<'a> {
                 let mut l_iter = ls.iter();
                 let mut res = self.fts_search_impl(l_iter.next().unwrap(), config, n, avgdl)?;
                 for nxt in l_iter {
-                    let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
+                    let mut nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     res = res
                         .into_iter()
-                        .filter_map(|(k, v)| nxt_res.get(&k).map(|nxt_v| (k, v + nxt_v)))
+                        .filter_map(|(k, mut v)| {
+                            nxt_res.remove(&k).map(|nxt_v| {
+                                v.score += nxt_v.score;
+                                v.spans.extend(nxt_v.spans);
+                                (k, v)
+                            })
+                        })
                         .collect();
                 }
                 res
@@ -358,16 +403,17 @@ impl<'a> SessionTx<'a> {
                 // BM25 sums each query term's contribution (a doc matching more terms
                 // ranks higher); tf/tf_idf keep upstream's max-combine for compatibility.
                 let sum_terms = config.score_kind == FtsScoreKind::Bm25;
-                let mut res: FxHashMap<Tuple, f64> = FxHashMap::default();
+                let mut res: FxHashMap<Tuple, DocHit> = FxHashMap::default();
                 for nxt in ls {
                     let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     for (k, v) in nxt_res {
                         if let Some(old_v) = res.get_mut(&k) {
-                            *old_v = if sum_terms {
-                                *old_v + v
+                            old_v.score = if sum_terms {
+                                old_v.score + v.score
                             } else {
-                                (*old_v).max(v)
+                                old_v.score.max(v.score)
                             };
+                            old_v.spans.extend(v.spans);
                         } else {
                             res.insert(k, v);
                         }
@@ -381,8 +427,22 @@ impl<'a> SessionTx<'a> {
                 // The document length is identical across a doc's postings, so capture
                 // it from the first literal's scan for BM25 length normalization.
                 let mut doc_lens: FxHashMap<Tuple, u32> = FxHashMap::default();
+                // `coll`'s surviving positions are mixed-origin (a kept
+                // position may belong to any literal), so spans are resolved
+                // at the end through a per-doc position → byte-span side map
+                // accumulated from every literal's scan.
+                let mut occ_spans: FxHashMap<Tuple, FxHashMap<u32, (u32, u32)>> =
+                    FxHashMap::default();
                 for first_el in self.fts_search_literal(l_it.next().unwrap(), &config.idx_handle)? {
                     doc_lens.insert(first_el.key.clone(), first_el.doc_len);
+                    if want_spans {
+                        occ_spans.entry(first_el.key.clone()).or_default().extend(
+                            first_el
+                                .position_info
+                                .iter()
+                                .map(|el| (el.position, (el.from, el.to))),
+                        );
+                    }
                     coll.insert(
                         first_el.key,
                         first_el
@@ -403,6 +463,13 @@ impl<'a> SessionTx<'a> {
                         .filter_map(|x| match coll.remove(&x.key) {
                             None => None,
                             Some(prev_pos) => {
+                                if want_spans {
+                                    occ_spans.entry(x.key.clone()).or_default().extend(
+                                        x.position_info
+                                            .iter()
+                                            .map(|el| (el.position, (el.from, el.to))),
+                                    );
+                                }
                                 let mut inner_coll = FxHashSet::default();
                                 for p in prev_pos {
                                     for pi in x.position_info.iter() {
@@ -442,7 +509,16 @@ impl<'a> SessionTx<'a> {
                             booster,
                             config,
                         );
-                        (k, score)
+                        let spans = if want_spans {
+                            let doc_occ = occ_spans.get(&k);
+                            cands
+                                .iter()
+                                .filter_map(|p| doc_occ.and_then(|m| m.get(p)).copied())
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                        (k, DocHit { score, spans })
                     })
                     .collect()
             }
@@ -541,20 +617,36 @@ impl<'a> SessionTx<'a> {
             .fts_search_impl(&ast, config, n, avgdl)?
             .into_iter()
             .collect();
-        result.sort_by_key(|(_, score)| Reverse(OrderedFloat(*score)));
+        result.sort_by_key(|(_, hit)| Reverse(OrderedFloat(hit.score)));
         if config.filter.is_none() {
             result.truncate(config.k);
         }
 
         let mut ret = Vec::with_capacity(config.k);
-        for (found_key, score) in result {
+        for (found_key, hit) in result {
             let mut cand_tuple = config
                 .base_handle
                 .get(self, &found_key)?
                 .ok_or_else(|| miette!("corrupted index"))?;
 
             if config.bind_score.is_some() {
-                cand_tuple.push(DataValue::from(score));
+                cand_tuple.push(DataValue::from(hit.score));
+            }
+            if config.bind_spans.is_some() {
+                let mut spans = hit.spans;
+                spans.sort_unstable();
+                spans.dedup();
+                cand_tuple.push(DataValue::List(
+                    spans
+                        .into_iter()
+                        .map(|(f, t)| {
+                            DataValue::List(vec![
+                                DataValue::from(f as i64),
+                                DataValue::from(t as i64),
+                            ])
+                        })
+                        .collect(),
+                ));
             }
 
             if let Some((code, span)) = filter_code {

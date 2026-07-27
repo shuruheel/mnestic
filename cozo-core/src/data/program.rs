@@ -1164,6 +1164,14 @@ pub(crate) struct FtsSearch {
     pub(crate) query: Symbol,
     pub(crate) score_kind: FtsScoreKind,
     pub(crate) bind_score: Option<Symbol>,
+    /// Binds, per returned document, the list of `[from, to]` byte offsets
+    /// (into the original indexed text) of the occurrences that evidence the
+    /// match — for a term, each occurrence's own span; for a phrase, first
+    /// token's `from` to last matched token's `to` at each anchor. The offsets
+    /// come straight off the postings (recorded by the analyzer that built the
+    /// index), so they are index-consistent under stemming with no
+    /// re-tokenization. Spec: docs/specs/fts-phrase-and-snippets.md §6.1.
+    pub(crate) bind_spans: Option<Symbol>,
     // pub(crate) lax_mode: bool,
     pub(crate) filter: Option<Expr>,
     pub(crate) span: SourceSpan,
@@ -1182,7 +1190,10 @@ impl HnswSearch {
 
 impl FtsSearch {
     pub(crate) fn all_bindings(&self) -> impl Iterator<Item = &Symbol> {
-        self.bindings.iter().chain(self.bind_score.iter())
+        self.bindings
+            .iter()
+            .chain(self.bind_score.iter())
+            .chain(self.bind_spans.iter())
     }
 }
 
@@ -1496,6 +1507,23 @@ impl SearchInput {
             }
         };
 
+        let bind_spans = match self.parameters.remove("bind_spans") {
+            None => None,
+            Some(Expr::Binding { var, .. }) => Some(var),
+            Some(expr) => {
+                let span = expr.span();
+                let kw = gen.next(span);
+                let unif = NormalFormAtom::Unification(Unification {
+                    binding: kw.clone(),
+                    expr,
+                    one_many_unif: false,
+                    span,
+                });
+                conj.push(unif);
+                Some(kw)
+            }
+        };
+
         if !self.parameters.is_empty() {
             bail!("Unknown parameters for FTS: {:?}", self.parameters.keys());
         }
@@ -1511,6 +1539,7 @@ impl SearchInput {
             query,
             score_kind,
             bind_score,
+            bind_spans,
             // lax_mode,
             filter,
             span: self.span,
