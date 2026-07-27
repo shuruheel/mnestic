@@ -353,6 +353,26 @@ fn snippet_pure_edges() {
     assert_eq!(res.rows[0][0].get_str().unwrap(), "hello world");
 }
 
+// §7 regression: NEAR must scan each literal ONCE. The pre-0.13.2 bug
+// (first literal seeded the intersection and was then re-scanned by the main
+// loop) was invisible in results — self-distance 0 always survived — so only
+// a scan count can pin the fix. The counter is thread-local and query eval
+// runs on this thread, so parallel tests cannot perturb the deltas.
+#[test]
+fn near_scans_each_literal_once() {
+    let (_d, db) = db();
+    setup(&db);
+    let count = || cozo::FTS_LITERAL_SCANS.with(|c| c.get());
+    let before = count();
+    run(&db, r#"?[id] := ~doc:idx{id | query: 'NEAR/3(hello world)', k: 10}"#);
+    let near_delta = count() - before;
+    let before = count();
+    run(&db, r#"?[id] := ~doc:idx{id | query: '"hello world"', k: 10}"#);
+    let phrase_delta = count() - before;
+    assert_eq!(near_delta, 2, "NEAR of 2 literals must scan exactly 2 (was 3 pre-fix)");
+    assert_eq!(phrase_delta, 2, "phrase of 2 tokens must scan exactly 2");
+}
+
 // §9 subset oracle: on a generated corpus, phrase results ⊆ AND results.
 #[test]
 fn phrase_subset_of_and() {

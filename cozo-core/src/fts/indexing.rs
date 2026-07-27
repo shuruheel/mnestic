@@ -194,6 +194,7 @@ impl<'a> SessionTx<'a> {
         literal: &FtsLiteral,
         idx_handle: &RelationHandle,
     ) -> Result<Vec<LiteralStats>> {
+        crate::fts::FTS_LITERAL_SCANS.with(|c| c.set(c.get() + 1));
         let start_key_str = &literal.value as &str;
         let start_key = vec![DataValue::Str(SmartString::from(start_key_str))];
         let mut end_key_str = literal.value.clone();

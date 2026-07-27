@@ -9,6 +9,97 @@ Post-0.13.1 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
 
+### Changed — a quoted full-text query is now an exact phrase
+
+**The migration note first, because the break is the fix working:** a quoted
+multi-word FTS query — `'"connection refused"'` — previously matched any
+document containing both words *anywhere*, in any order; the quotes were
+parsed and then silently discarded (`parse/fts.rs` collapsed every kernel to
+the same literal, and tokenization split it into an AND of independent terms).
+It now matches only documents containing the words **adjacent and in order** —
+strictly fewer, more relevant rows. If you relied on quoted-means-AND, drop
+the quotes: unquoted queries are byte-identical to before.
+
+Design, prior-art verification (Lucene/FTS5/Elasticsearch), and the empirical
+record are in `docs/specs/fts-phrase-and-snippets.md` — every §10 decision was
+verified against the shipped 0.13.1 engine before build.
+
+What "exact phrase" means, precisely:
+
+- Matching anchors on the **token positions the postings have stored since the
+  fork point**: document matches at anchor `p` iff every query token with
+  analyzer position `qᵢ` occurs at exactly `p + (qᵢ − q₀)`. Overlapping
+  occurrences are found; tf for scoring = anchor count; df = the phrase's own
+  matching-doc count. No storage-format change in either direction — a 0.13.2
+  index opens under 0.13.0 and vice versa.
+- **A removed stopword is a one-token wildcard slot, symmetrically.** The
+  tokenizer numbers tokens before filters run and `Stopwords` skips without
+  renumbering, so `"jumped over the lazy dog"` (EN stopwords) matches "jumped
+  over *that* lazy dog" — the position the stopword held constrains nothing.
+  This is Lucene's contract, and the alternative (dense renumbering) is the
+  `enablePositionIncrements=false` option Lucene *removed* in 4.4 for
+  producing broken token streams.
+- **Phrases match stems, symmetrically** — both sides run the index analyzer,
+  so with an English stemmer `"connection refused"` matches "connections
+  refusing" (in that order).
+- Quoted single tokens are unchanged: `'"fox"'` ≡ `fox`, including `'"fox"*'`
+  prefix search.
+
+Three silent failures became named errors instead of wrong answers:
+
+- **`parser::fts::phrase_prefix_unsupported`** — `'"connection refu"*'`
+  previously matched **nothing, silently**: the un-tokenized quoted string was
+  prefix-matched against single-token posting keys. The error names the
+  `"connection refused" OR refu*` workaround; the real phrase-prefix
+  (Elasticsearch `match_phrase_prefix`-style) can land later without breaking
+  anything.
+- **`parser::fts::phrase_in_near_unsupported`** — a quoted multi-word phrase
+  inside `NEAR(...)` previously degraded to its bag of tokens, dropping the
+  adjacency the quotes asked for. Quoted *single* tokens inside NEAR stay
+  legal.
+- **`eval::fts::phrase_without_positions`** — a phrase query against an
+  `NGram`-tokenized index: every gram is stored at position 0, so adjacency is
+  unfalsifiable and a phrase would match every document containing the grams.
+  Term search on such indexes still works. (Lucene answers this same case with
+  `IllegalStateException: field was indexed without position data`.)
+
+Also fixed while in that loop: **`NEAR` scanned its first literal twice** —
+seeded the intersection, then re-scanned it against itself. Results were
+unchanged (self-distance 0 always survived) but every `NEAR` query paid one
+redundant full posting fetch; a thread-local scan counter now pins the count
+in CI, since the bug class is invisible in results by construction.
+
+### Added — `bind_spans` and `snippet()`: return the part that matched
+
+For agentic memory, returning a 4k-token document when a 40-token window
+matched is the context-budget failure mode. Two pieces, split so neither
+tokenizes at read time:
+
+- **`bind_spans: sp`** on the FTS search atom (beside `bind_score`): per
+  returned document, the list of `[from, to]` **byte offsets into the original
+  text** of the occurrences that evidence the match — a term's own spans, a
+  phrase anchor's first-token-`from` to last-token-`to`, `NEAR`'s surviving
+  occurrences. The offsets were **already written per posting by every release
+  since the fork point** and discarded at decode (`PositionInfo.from/to` sat
+  commented out); this reads them, only when the binding is requested. Because
+  the index-side analyzer recorded them, they point at the source words even
+  when the posting key is a stem — Lucene's offsets-in-postings highlighting
+  mode, natively.
+- **`snippet(text, spans, window)`** (and `snippet(text, spans, window, open,
+  close)` for markup): a pure formatting scalar over those spans — coalesces
+  overlaps so markers never nest, picks the densest cluster fitting the
+  `window` char budget, cuts on char boundaries only (multi-byte text safe),
+  marks truncation with `…`. It never tokenizes, so it cannot disagree with
+  the index analyzer — the failure mode that ruled out a `highlight(text,
+  query)` shape re-analyzing text at read time.
+
+Guards: `cozo-core/tests/fts_phrase.rs` — 18 fixtures covering adjacency,
+ordering (incl. overlapping anchors), the stopword-hole contract from both
+sides, stemmed phrases, all-stopword degeneration, the three named errors,
+quoted-single-token equivalence, byte-exact spans on multi-byte text, snippet
+end-to-end and edge cases, the scan-count regression, and a subset oracle
+(phrase results ⊆ AND results on a generated corpus).
+
 ## 0.13.1 — 2026-07-27
 
 ### Changed — the factorized `count()` rewrite is ON by default

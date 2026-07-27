@@ -27,6 +27,17 @@ pub(crate) mod cangjie;
 pub(crate) mod indexing;
 pub(crate) mod tokenizer;
 
+thread_local! {
+    /// Per-thread count of FTS posting-range scans (`fts_search_literal`
+    /// calls). One cell bump per *literal*, not per posting — negligible
+    /// beside the scan itself. Exists so tests can pin scan counts: the NEAR
+    /// first-literal double-scan (fixed in 0.13.2) was invisible in results by
+    /// construction, and only a counter regression test can keep it fixed.
+    /// Thread-local (query eval runs on the calling thread) so parallel tests
+    /// cannot race each other's deltas.
+    pub static FTS_LITERAL_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Clone, PartialEq, serde_derive::Serialize, serde_derive::Deserialize)]
 pub(crate) struct FtsIndexManifest {
     pub(crate) base_relation: SmartString<LazyCompact>,

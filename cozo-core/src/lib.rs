@@ -126,6 +126,11 @@ pub mod cypher;
 pub mod data;
 pub(crate) mod fixed_rule;
 pub(crate) mod fts;
+/// Test-support metric, not a public API: process-wide FTS posting-scan
+/// counter, for scan-count regression tests (the NEAR double-scan class is
+/// invisible in results). Hidden from docs; no stability guarantee.
+#[doc(hidden)]
+pub use fts::FTS_LITERAL_SCANS;
 pub mod parse;
 pub(crate) mod query;
 pub(crate) mod runtime;
