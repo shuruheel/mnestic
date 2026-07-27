@@ -892,6 +892,7 @@ pub(crate) fn get_op(name: &str) -> Option<&'static Op> {
         "regex_matches" => &OP_REGEX_MATCHES,
         "regex_replace" => &OP_REGEX_REPLACE,
         "regex_replace_all" => &OP_REGEX_REPLACE_ALL,
+        "snippet" => &OP_SNIPPET,
         "regex_extract" => &OP_REGEX_EXTRACT,
         "regex_extract_first" => &OP_REGEX_EXTRACT_FIRST,
         "t2s" => &OP_T2S,

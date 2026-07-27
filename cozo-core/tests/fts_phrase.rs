@@ -296,6 +296,63 @@ fn bind_spans_multibyte() {
     assert_eq!(&body[spans[0].0 as usize..spans[0].1 as usize], body);
 }
 
+// §6.2: snippet(text, spans, window) — end-to-end with bind_spans.
+#[test]
+fn snippet_end_to_end() {
+    let (_d, db) = db();
+    run(&db, ":create sn {id: Int => body: String}");
+    run(
+        &db,
+        "::fts create sn:idx { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
+    );
+    let long = "prelude words that pad the head. the needle phrase sits here in the middle. \
+                and a long tail of trailing words follows to force truncation on both sides.";
+    run(
+        &db,
+        &format!(r#"?[id, body] <- [[1, "{long}"]] :put sn {{id => body}}"#),
+    );
+    let res = run(
+        &db,
+        r#"?[snip] := ~sn:idx{id, body | query: '"needle phrase"', k: 5, bind_spans: sp},
+                     snip = snippet(body, sp, 30)"#,
+    );
+    let snip = res.rows[0][0].get_str().unwrap();
+    assert!(snip.contains("needle phrase"), "window must cover the match: {snip}");
+    assert!(snip.starts_with('…') && snip.ends_with('…'), "both ends truncated: {snip}");
+    assert!(snip.chars().count() <= 32, "window + 2 ellipses at most: {snip}");
+
+    // Highlight form: markers wrap the matched span.
+    let res = run(
+        &db,
+        r#"?[snip] := ~sn:idx{id, body | query: '"needle phrase"', k: 5, bind_spans: sp},
+                     snip = snippet(body, sp, 30, '<b>', '</b>')"#,
+    );
+    let snip = res.rows[0][0].get_str().unwrap();
+    assert!(snip.contains("<b>needle phrase</b>"), "markers must wrap: {snip}");
+}
+
+// snippet is a pure function: no-span and multi-byte edges.
+#[test]
+fn snippet_pure_edges() {
+    let (_d, db) = db();
+    // No spans: head of the text, truncation marked.
+    let res = run(&db, r#"?[s] := s = snippet('abcdefghij', [], 4)"#);
+    assert_eq!(res.rows[0][0].get_str().unwrap(), "abcd…");
+    // Multi-byte: window counts CHARS and never splits a code point.
+    let res = run(
+        &db,
+        r#"?[s] := s = snippet('ααββγγδδεε', [[4, 8]], 4, '<', '>')"#,
+    );
+    let s = res.rows[0][0].get_str().unwrap();
+    assert!(s.contains("<ββ>"), "span [4,8) is the two-byte chars ββ: {s}");
+    // Malformed spans are dropped, not fatal.
+    let res = run(
+        &db,
+        r#"?[s] := s = snippet('hello world', [[6, 5], [-2, 3], [6, 11]], 20)"#,
+    );
+    assert_eq!(res.rows[0][0].get_str().unwrap(), "hello world");
+}
+
 // §9 subset oracle: on a generated corpus, phrase results ⊆ AND results.
 #[test]
 fn phrase_subset_of_and() {

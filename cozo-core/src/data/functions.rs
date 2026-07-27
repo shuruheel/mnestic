@@ -3155,3 +3155,171 @@ pub(crate) fn op_validity(args: &[DataValue]) -> Result<DataValue> {
         is_assert: Reverse(is_assert),
     }))
 }
+
+define_op!(OP_SNIPPET, 3, true);
+/// `snippet(text, spans, window)` / `snippet(text, spans, window, open, close)`
+///
+/// Pure formatting over `bind_spans` output (spec
+/// `docs/specs/fts-phrase-and-snippets.md` §6.2): extracts the window of at
+/// most `window` characters around the densest cluster of matched spans,
+/// cutting on char boundaries and marking truncation with `…`. With `open` /
+/// `close`, every matched span inside the window is wrapped (highlight form).
+/// It never tokenizes, so there is no analyzer-mismatch failure mode; spans
+/// are byte offsets into `text` exactly as `bind_spans` returns them.
+pub(crate) fn op_snippet(args: &[DataValue]) -> Result<DataValue> {
+    let text = args[0]
+        .get_str()
+        .ok_or_else(|| miette!("'snippet' expects a string as first argument"))?;
+    let spans_arg = args[1]
+        .get_slice()
+        .ok_or_else(|| miette!("'snippet' expects a list of [from, to] spans as second argument"))?;
+    let window = args[2]
+        .get_int()
+        .ok_or_else(|| miette!("'snippet' expects an integer window (chars) as third argument"))?;
+    ensure!(window > 0, "'snippet' window must be positive, got {window}");
+    let window = window as usize;
+    let (open, close) = match (args.get(3), args.get(4)) {
+        (None, None) => (None, None),
+        (Some(o), Some(c)) => (
+            Some(o.get_str().ok_or_else(|| {
+                miette!("'snippet' expects a string open-marker as fourth argument")
+            })?),
+            Some(c.get_str().ok_or_else(|| {
+                miette!("'snippet' expects a string close-marker as fifth argument")
+            })?),
+        ),
+        _ => bail!("'snippet' takes the open and close markers together (both or neither)"),
+    };
+
+    // Char-boundary machinery: all window math runs in char space and maps
+    // back through `char_starts`, so a cut can never split a code point.
+    let char_starts: Vec<usize> = text.char_indices().map(|(i, _)| i).collect();
+    let n_chars = char_starts.len();
+    let byte_len = text.len();
+    let char_rank = |byte: usize| -> usize {
+        // Rank of the char containing `byte` (== exact rank on a boundary).
+        match char_starts.binary_search(&byte) {
+            Ok(r) => r,
+            Err(ins) => ins.saturating_sub(1),
+        }
+    };
+
+    // Sanitize: clamp to the text, snap outward to char boundaries, drop
+    // empty/invalid, then coalesce overlaps (FTS5-style) so nested markers
+    // cannot arise.
+    let mut spans: Vec<(usize, usize)> = vec![];
+    for sp in spans_arg {
+        let pair = sp
+            .get_slice()
+            .ok_or_else(|| miette!("'snippet' spans must be [from, to] pairs, got {sp:?}"))?;
+        if pair.len() != 2 {
+            bail!("'snippet' spans must be [from, to] pairs, got {sp:?}");
+        }
+        let from = pair[0]
+            .get_int()
+            .ok_or_else(|| miette!("'snippet' span offsets must be integers"))?;
+        let to = pair[1]
+            .get_int()
+            .ok_or_else(|| miette!("'snippet' span offsets must be integers"))?;
+        if from < 0 || to <= from {
+            continue;
+        }
+        let mut from = (from as usize).min(byte_len);
+        let mut to = (to as usize).min(byte_len);
+        while from > 0 && !text.is_char_boundary(from) {
+            from -= 1;
+        }
+        while to < byte_len && !text.is_char_boundary(to) {
+            to += 1;
+        }
+        if from < to {
+            spans.push((from, to));
+        }
+    }
+    spans.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = vec![];
+    for (f, t) in spans {
+        match merged.last_mut() {
+            Some((_, lt)) if f <= *lt => *lt = (*lt).max(t),
+            _ => merged.push((f, t)),
+        }
+    }
+
+    // Window placement in char space.
+    let (start_char, end_char) = if merged.is_empty() {
+        // No spans: the head of the text (FTS5's convention for a column
+        // without a match).
+        (0, window.min(n_chars))
+    } else {
+        // Densest cluster: the run of merged spans covering the most spans
+        // while fitting the window; earliest wins ties.
+        let mut best = (0, 0); // (i, j) inclusive
+        let mut best_count = 0;
+        let mut i = 0;
+        for j in 0..merged.len() {
+            while char_rank(merged[j].1) + 1 - char_rank(merged[i].0) > window && i < j {
+                i += 1;
+            }
+            let count = j - i + 1;
+            if count > best_count {
+                best_count = count;
+                best = (i, j);
+            }
+        }
+        let c_from = char_rank(merged[best.0].0);
+        let c_to = (char_rank(merged[best.1].1.saturating_sub(1)) + 1).min(n_chars);
+        let cluster_len = c_to - c_from;
+        if cluster_len >= window {
+            // A single merged span (or tight cluster) larger than the budget:
+            // show its head.
+            (c_from, c_from + window)
+        } else {
+            let pad = window - cluster_len;
+            let left = (pad / 2).min(c_from);
+            let start = c_from - left;
+            let end = (start + window).min(n_chars);
+            // Give unused right-side budget back to the left.
+            let start = start.min(end.saturating_sub(window.min(end)));
+            (start, end)
+        }
+    };
+    let b_start = if start_char >= n_chars {
+        byte_len
+    } else {
+        char_starts[start_char]
+    };
+    let b_end = if end_char >= n_chars {
+        byte_len
+    } else {
+        char_starts[end_char]
+    };
+
+    // Assemble, wrapping every merged span that intersects the window
+    // (clipped to it) when markers were given.
+    let mut out = String::new();
+    if b_start > 0 {
+        out.push('…');
+    }
+    match (open, close) {
+        (Some(open), Some(close)) => {
+            let mut cursor = b_start;
+            for &(f, t) in &merged {
+                let (cf, ct) = (f.max(b_start), t.min(b_end));
+                if cf >= ct {
+                    continue;
+                }
+                out.push_str(&text[cursor..cf]);
+                out.push_str(open);
+                out.push_str(&text[cf..ct]);
+                out.push_str(close);
+                cursor = ct;
+            }
+            out.push_str(&text[cursor..b_end]);
+        }
+        _ => out.push_str(&text[b_start..b_end]),
+    }
+    if b_end < byte_len {
+        out.push('…');
+    }
+    Ok(DataValue::Str(SmartString::from(out)))
+}
