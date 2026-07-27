@@ -135,4 +135,4 @@ If you're considering a larger feature (for example extending the Cypher-read su
 
 ## Relationship to MindGraph
 
-mnestic is developed alongside, and consumed by, [MindGraph](https://crates.io/crates/mindgraph), a typed cognitive knowledge-graph library built on top of it. MindGraph is the engine's most demanding user and drives much of its hardening — but mnestic is a general-purpose database in its own right, and its roadmap is set to serve the broader community of developers building local-first and embedded AI memory.
+mnestic is developed alongside, and consumed by, MindGraph, a typed cognitive knowledge-graph library built on top of it. MindGraph is the engine's most demanding user and drives much of its hardening — but mnestic is a general-purpose database in its own right, and its roadmap is set to serve the broader community of developers building local-first and embedded AI memory.
