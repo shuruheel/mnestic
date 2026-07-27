@@ -170,7 +170,16 @@ def test_hybrid_explain_shows_graph_leg(mem):
     mem.store("omega distractor")
     mem.link(a, b)
 
-    out = mem.search("zebra", explain=True)
+    # The query MUST carry a GRADIENT token (here "alpha"), or the semantic leg
+    # is a coin flip and so is the ranking assertion at the bottom of this test.
+    # `gvec` falls back to [0.5, 0.5] for a text with no known token, and that
+    # point is exactly equidistant from [1, 0] (a) and [0, 1] (b and the
+    # distractor) — so all three tie in the vector leg, HNSW returns them in an
+    # order that depends on their random UUIDs, and whichever one wins semantic
+    # rank 1 collects 1/(60+1) instead of 1/(60+3). That RRF delta (~0.0005) is
+    # larger than the gap between a's and b's other contributions, so first
+    # place flipped run to run: bare "zebra" failed here ~7 times in 12.
+    out = mem.search("alpha zebra", explain=True)
     assert out["mode_used"] == "hybrid"
     assert "graph" in out["explain"]["legs"]
     by_id = {p["id"]: p for p in out["explain"]["per_result"]}
