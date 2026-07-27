@@ -66,6 +66,15 @@ fn cap_for(query_name: &str) -> Duration {
     }
 }
 
+/// The ported LSQB queries the factorized-count rewrite fires on. Both are
+/// acyclic counts; the rewrite declines q2/q3/q9 (a predicate, a negation, or a
+/// cyclic shape disqualifies them) and leaves their plans byte-identical.
+///
+/// Keep this list honest: a query that starts or stops firing changes which
+/// path the tier above measures, and T0 (`planner_shape.rs`) goes red when the
+/// firing set changes, which is the prompt to update this.
+const FACTORIZING_QUERIES: &[&str] = &["lsqb_q1", "lsqb_q6"];
+
 /// The reorder must buy at least this much on q3. Asserted as a *bounded*
 /// check — `written` is given `MIN_Q3_REORDER_RATIO ×` the greedy time and must
 /// fail to finish in it — rather than by running the pathological plan to
@@ -267,54 +276,79 @@ fn lsqb_counts_match_the_published_oracle() {
         );
     }
 
-    // mnestic fork (0.13.0): q6 again with the factorized-count rewrite forced
-    // ON. Without this arm the whole tier exercises only the default-OFF path,
-    // and a broken `!=` inclusion–exclusion would ship behind a green gate (the
-    // toggle is not reachable from CI config — only from test code). The oracle
-    // is toggle-agnostic: 55,607,896 is correct whether or not the rewrite
-    // fires. Measured 2026-07-17 (sqlite, M-series, release): OFF ~41.7 s,
-    // ON ~0.30 s — ~140×.
-    db.set_query_factorization(true);
-    // The count alone cannot distinguish "rewrite fired and is exact" from
-    // "rewrite silently declined and this is a second naive run" — assert the
-    // plan actually contains the synthesized `fac*` rules, so a gate/extract
-    // regression that declines q6 goes RED here instead of hiding behind a
-    // green (but 140× slower) arm.
-    let plan = db
-        .run_script(
-            &format!("::explain {{ {Q6} }}"),
-            BTreeMap::new(),
-            ScriptMutability::Immutable,
-        )
-        .expect("::explain failed");
-    let rule_idx = plan
-        .headers
-        .iter()
-        .position(|h| h == "rule")
-        .expect("::explain output has a 'rule' column");
-    // The synthesized helper rules are `*fac…`-named (the same signal
-    // tests/factorize.rs's `fired()` pins).
-    let fired = plan
-        .rows
-        .iter()
-        .any(|r| r[rule_idx].get_str().is_some_and(|s| s.starts_with("*fac")));
-    assert!(
-        fired,
-        "the factorized-count rewrite did not fire on q6 with the toggle ON — \
-         the type gate or extractor declined a shape it must accept"
-    );
-    let on = timed_count(&db, Q6, cap_for("lsqb_q6"));
-    db.set_query_factorization(false);
-    println!(
-        "  q6(on)  {:>9.1} ms  count={}",
-        on.elapsed.as_secs_f64() * 1000.0,
-        on.count
-    );
-    assert_eq!(
-        on.count, oracle["lsqb_q6"],
-        "q6 with the factorized-count rewrite forced ON miscounts — the `!=` \
-         inclusion–exclusion is wrong (this is the a60a8013 class of failure)"
-    );
+    // mnestic fork: every query the factorized-count rewrite FIRES on, run
+    // again with the toggle in the other position. Without this arm one path is
+    // untested, and a broken `!=` inclusion–exclusion would ship behind a green
+    // gate (the toggle is not reachable from CI config — only from test code).
+    // The oracle is toggle-agnostic: the published counts are correct whether or
+    // not the rewrite fires.
+    //
+    // **0.13.1 widened this from q6 to every firing query.** Through 0.13.0 the
+    // main loop above ran the default-OFF path and this arm covered q6 alone —
+    // so q1, which the rewrite also fires on, had never been executed with the
+    // rewrite ON in any tier. The 0.13.1 default flip made that the *default*
+    // path, i.e. the untested configuration became the shipped one. Any future
+    // default flip must widen this arm first, not after.
+    //
+    // Measured 2026-07-27 (sqlite, M-series, release), naive -> factorized:
+    // q1 72,360.7 ms -> 1,048.2 ms (~69×), q6 42,120.8 ms -> 314.0 ms (~134×).
+    // q1's factorized time also retires the open question about its 300 s cap:
+    // the shipped path leaves ~285× headroom.
+    // The loop above ran the DEFAULT path, which since 0.13.1 is rewrite-ON.
+    // So this arm carries the other half: that the rewrite really fired on the
+    // shipped path (a silent decline would hide behind a green-but-slow run),
+    // and that the naive enumeration it replaced still returns the same count.
+    for name in FACTORIZING_QUERIES {
+        let query = LSQB_QUERIES
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, q)| *q)
+            .unwrap_or_else(|| panic!("{name} is not in LSQB_QUERIES"));
+
+        // The count alone cannot distinguish "rewrite fired and is exact" from
+        // "rewrite silently declined and this was a naive run" — assert the plan
+        // actually contains the synthesized `fac*` rules, so a gate/extractor
+        // regression goes RED here instead of hiding behind a green arm.
+        let plan = db
+            .run_script(
+                &format!("::explain {{ {query} }}"),
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .expect("::explain failed");
+        let rule_idx = plan
+            .headers
+            .iter()
+            .position(|h| h == "rule")
+            .expect("::explain output has a 'rule' column");
+        // The synthesized helper rules are `*fac…`-named (the same signal
+        // tests/factorize.rs's `fired()` pins).
+        let fired = plan
+            .rows
+            .iter()
+            .any(|r| r[rule_idx].get_str().is_some_and(|s| s.starts_with("*fac")));
+        assert!(
+            fired,
+            "the factorized-count rewrite did not fire on {name} under the \
+             default toggle — the type gate or extractor declined a shape it \
+             must accept, and the tier above just measured the naive path while \
+             claiming to measure the shipped one"
+        );
+
+        db.set_query_factorization(false);
+        let off = timed_count(&db, query, cap_for(name));
+        db.set_query_factorization(true);
+        println!(
+            "  {name}(naive)  {:>9.1} ms  count={}",
+            off.elapsed.as_secs_f64() * 1000.0,
+            off.count
+        );
+        assert_eq!(
+            off.count, oracle[name],
+            "{name} disagrees between the factorized and naive paths — the \
+             decomposition is not exact (this is the a60a8013 class of failure)"
+        );
+    }
 }
 
 /// The reorder must still be worth having on q3 — the shape it was written for.

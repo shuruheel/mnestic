@@ -20,7 +20,7 @@
 //!   Never estimates cardinalities (the engine has no statistics).
 //!
 //! * **Item J — rewrite.** When the caller passes `enabled = true` (a Db-level
-//!   kill switch, default OFF for this release) AND the body factorizes with a
+//!   kill switch, default ON since 0.13.1) AND the body factorizes with a
 //!   *provably exact* decomposition, the entry rule is replaced by synthesized
 //!   sub-rules. When ANYTHING is unverifiable the pass declines and the program
 //!   passes through untouched — biasing hard toward NOT firing, because a

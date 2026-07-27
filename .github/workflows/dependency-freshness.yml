@@ -1,0 +1,42 @@
+# Weekly fresh-resolve lane — catches what a committed lockfile hides.
+#
+# Why this exists: mnestic commits its `Cargo.lock`, so every ordinary CI run
+# builds against the versions we pinned. That is correct for reproducibility and
+# it makes one whole class of regression invisible — a dependency whose newer,
+# semver-compatible release changes behaviour our code depends on. It shipped
+# once: pest 2.8.0 made parse-attempt tracking opt-in, and because our lockfile
+# pinned 2.7.x, CI stayed green while every consumer resolving fresh silently
+# lost 0.13.0's expected-token parse hints (fixed in 0.13.1).
+#
+# This lane resolves the newest semver-compatible versions of everything and
+# runs the test suite against them. A failure here is not necessarily a bug in
+# our code — it is a signal that what a *new consumer* gets differs from what we
+# test, which is exactly the gap the pest regression fell into. It is scheduled,
+# never a required PR check.
+
+name: dependency-freshness
+
+on:
+  schedule:
+    - cron: "23 6 * * 1"      # weekly, Monday 06:23 UTC
+  workflow_dispatch:
+
+jobs:
+  fresh-resolve:
+    name: cargo update + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Update to the newest semver-compatible dependencies
+        run: cargo update
+      - name: Show what moved
+        run: git diff --stat Cargo.lock
+      - name: Test against the fresh resolve
+        run: cargo test -p mnestic
+      - name: Upload the resolved lockfile
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fresh-Cargo.lock
+          path: Cargo.lock

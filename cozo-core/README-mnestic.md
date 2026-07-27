@@ -66,7 +66,7 @@ capabilities on top of it:
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cypher-read.md))
 - **Faster lookups and plans** — equality pushdown turns post-filter point
   lookups into keyed seeks (~28× at 5k rows), plus a deterministic greedy join
-  reorder and an opt-in factorized `count()` rewrite (now covering inequalities,
+  reorder and a default-on factorized `count()` rewrite (covering inequalities,
   behind a type gate).
 - **Non-blocking vector index builds** — HNSW builds in RAM in parallel and no
   longer blocks reads for minutes; search-path neighbour vectors batch-fetch
@@ -84,74 +84,36 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.13.0
+## New in 0.13.1
 
-A combined correctness-and-capability release: a nine-bug correctness union
-(FTS scoring, HNSW/FTS index maintenance, corrupt-blob handling, restore/open
-relation-id reconciliation) alongside a feature tranche — a datetime standard
-library, a budgeted-expansion mode for `HybridSearch`, and the restored `!=`
-factorized-count rewrite. It is a minor, not a patch: several fixes change
-results (BM25 scores, hybrid-leg rankings) and the RocksDB table-options fix
-changes the on-disk block format on *future* writes, but the public Rust API
-stays source-compatible except where flagged below.
+A patch release: one planner default flips, and one 0.13.0 feature that a
+dependency upgrade had silently switched off is restored.
 
-**RocksDB table options are now honoured (ships with `mnestic-rocks` 0.1.10).**
-Every `BlockBasedTableOptions` you configured — block cache, block size,
-index/filter caching — was silently discarded on every open, so the engine ran
-with an 8 MB default cache and 4 KB blocks no matter what your options file
-asked for. **Any read-path benchmark taken against a RocksDB store before this
-release measured a slower engine than mnestic actually is.** Fixed; newly
-written SSTs pick up the configured `block_size`, existing SSTs stay readable,
-no migration.
+**The factorized `count()` rewrite is now ON by default.** An eligible
+single-clause `count()`-over-a-positive-join is counted without materializing
+the join — including the `!=` inclusion–exclusion form restored in 0.13.0
+Measured on LSQB sf0.1 (SQLite, release), both paths returning LDBC's published
+count: **q1 72.4 s → 1.05 s (~69×)** and **q6 42.1 s → 0.31 s (~134×)**.
+**Answers do not change** — the pass fires only on a provably exact
+decomposition and declines on anything unverifiable, leaving declined queries
+byte-identical — but plans do. Restore the previous behaviour with
+`db.set_query_factorization(false)`.
 
-**Datetime standard library (`dt_*`).** Component extractors (`dt_year` …
-`dt_dow`), `dt_trunc`, calendar-aware `dt_add` / `dt_diff`, strftime
-`dt_format`, and — the piece a bitemporal database needed — `dt_to_validity`,
-the typed bridge from float Unix *seconds* to a `Validity`'s integer
-microseconds. `@` and `:as_of` now accept a `Validity`-typed expression
-(`@ dt_to_validity(parse_timestamp('2024-01-01'))`), which together with
-0.12.2's float rejection closes the seconds-vs-microseconds trap. The new
-`dt_*` names are reserved against custom-function registration.
+**0.13.0's expected-token parse hints work again on current dependencies.**
+pest 2.8.0 made parse-attempt tracking opt-in and off by default; because our
+requirement was a caret `2.7.9`, anyone resolving fresh built 0.13.0 against
+2.8.x, where the `help:` token list and the corrected caret position silently
+reverted to pre-0.13.0 behaviour. Our own CI never saw it — the committed
+lockfile pinned 2.7.x — so a scheduled fresh-resolve lane now runs. The floor is
+raised to `pest = "2.8"`, and mnestic enables pest's detail tracking **only
+around a re-parse of a script that already failed**, so successful parses pay
+nothing and the process-wide setting is not left on inside your application.
 
-**`HybridSearch`: budgeted graph expansion and optional legs.** Setting
-`GraphLeg::max_nodes` switches a graph leg to cheapest-first weighted expansion
-under a distinct-node budget — 0.12.0's `BudgetedTraversal`, now reachable from
-the one-call `hybrid_search` surface — and `vector_index` / `fts_index` are now
-`Option`, so you can fuse any non-empty subset of {vector, FTS, graph} legs.
-**BREAKING (API):** `HybridSearch` and `GraphLeg` are now `#[non_exhaustive]` —
-construct with `Default` and set fields — paid once, in the same release that
-adds eight `GraphLeg` fields, so future field additions never break again.
-Recursive-mode graph legs are unaffected; the Python dict surface gains optional
-keys only.
+Also: `op_rand_uuid_v1` builds through the version-neutral `uuid::v1::Context`
+alias, so the crate compiles against any uuid resolvable within its declared
+requirement.
 
-**The `!=` factorized-count rewrite is restored, behind a type gate, default
-OFF.** Its inclusion–exclusion extension (cut in 0.10.5 for an Int/Float
-miscount) is sound this time: the rewrite fires only when both operands of
-every inequality are declared, non-nullable, variant-stable stored columns.
-Measured on LSQB q6 (sf0.1, SQLite): **41.7 s → 0.30 s (~140×)**, count
-identical to the published oracle either way. Enable with
-`Db::set_query_factorization(true)`; the default-on flip waits for a nightly
-soak.
-
-**Better errors for query authors.** A failed parse points its caret at the
-deepest position the parser reached and adds a `help:` line naming the literal
-tokens that would have been accepted (e.g. `expected one of: :=, <-, <~`);
-index-search diagnostics now carry the code of the index kind that actually
-failed (`fts_query_required` rather than `hnsw_query_required`, and the like).
-
-**Correctness union — you may need one `::reindex`.** BM25's document count `N`
-is now read free from the FTS index instead of by re-scanning the whole base
-relation on every query (previously a 30× score error and O(corpus) latency at
-scale, both deleted); no-op re-puts no longer inflate the FTS doc count; corrupt
-value blobs and corrupt HNSW/FTS index rows are ordinary query errors instead of
-process panics; and restore/open reconciles the relation-id counter instead of
-silently reusing a live id. HNSW indexes built by any release through 0.12.2 can
-carry stale nodes or edges from null-vector and pre-existing-row bugs — rebuild
-once per affected relation with `::reindex <relation>` (your rows are untouched;
-it rebuilds index relations only).
-
-Full detail, including the complete HNSW / corrupt-blob / restore upgrade steps,
-is in
+Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
 ## Importable name
@@ -161,7 +123,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.13.0"
+mnestic = "0.13.1"
 ```
 
 ```rust

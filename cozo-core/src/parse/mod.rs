@@ -12,7 +12,8 @@
 use std::cmp::{max, min};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Display, Formatter};
-use std::sync::{Arc, Once};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use either::{Either, Left};
 use miette::{bail, Diagnostic, IntoDiagnostic, Result};
@@ -288,13 +289,53 @@ pub(crate) struct ParseError {
 /// defect and becomes a grammar dump, which is worse than no hint at all.
 const MAX_EXPECTED_TOKENS_IN_HINT: usize = 24;
 
-/// Pest 2.8 made detailed parse-attempt tracking opt-in. Mnestic's parser
-/// diagnostics intentionally depend on those attempts to name useful literal
-/// repairs, so enable the process-wide parser setting once before converting
-/// pest errors into [`ParseError`].
-fn enable_detailed_parse_errors() {
-    static ENABLE: Once = Once::new();
-    ENABLE.call_once(|| pest::set_error_detail(true));
+/// Pest 2.8 made detailed parse-attempt tracking opt-in, and pest's own docs
+/// note that it "has a higher performance cost (hence, it's off by default)".
+/// The switch is a **pest-wide global**, so an embedded engine that turns it on
+/// and leaves it on taxes every subsequent successful parse — parse is the
+/// dominant cost on cheap high-frequency point reads — and silently changes the
+/// behaviour of any other pest-based parser in the host process.
+///
+/// So mnestic enables it only around a **re-parse of a script that has already
+/// failed**: the success path pays nothing, and the global is on for the
+/// duration of a re-parse the caller is already paying for. The counter makes
+/// concurrent failing parses safe — the last one out restores the flag.
+struct DetailedParseErrors;
+
+static DETAIL_DEPTH: AtomicUsize = AtomicUsize::new(0);
+
+impl DetailedParseErrors {
+    fn enable() -> Self {
+        if DETAIL_DEPTH.fetch_add(1, Ordering::SeqCst) == 0 {
+            pest::set_error_detail(true);
+        }
+        DetailedParseErrors
+    }
+}
+
+impl Drop for DetailedParseErrors {
+    fn drop(&mut self) {
+        if DETAIL_DEPTH.fetch_sub(1, Ordering::SeqCst) == 1 {
+            pest::set_error_detail(false);
+        }
+    }
+}
+
+/// Convert a failed parse into a [`ParseError`] carrying the expected-token
+/// hint, by re-running the parse with attempt tracking enabled. The grammar is
+/// deterministic, so the retry fails at the same position — it just carries the
+/// detail the diagnostic needs. If the retry unexpectedly succeeds, fall back
+/// to converting the original error.
+fn parse_error_with_detail(
+    src: &str,
+    err: pest::error::Error<Rule>,
+    reparse: impl FnOnce() -> std::result::Result<(), pest::error::Error<Rule>>,
+) -> ParseError {
+    let _detail = DetailedParseErrors::enable();
+    match reparse() {
+        Err(detailed) => pest_error_to_parse_error(src, detailed),
+        Ok(()) => pest_error_to_parse_error(src, err),
+    }
 }
 
 /// Convert a pest failure into our [`ParseError`], using pest's parse-attempts
@@ -377,9 +418,12 @@ pub(crate) fn parse_expressions(
     src: &str,
     param_pool: &BTreeMap<String, DataValue>,
 ) -> Result<Expr> {
-    enable_detailed_parse_errors();
     let parsed = CozoScriptParser::parse(Rule::expression_script, src)
-        .map_err(|err| pest_error_to_parse_error(src, err))?
+        .map_err(|err| {
+            parse_error_with_detail(src, err, || {
+                CozoScriptParser::parse(Rule::expression_script, src).map(|_| ())
+            })
+        })?
         .next()
         .unwrap();
 
@@ -404,9 +448,12 @@ pub fn parse_script(
     custom_aggrs: crate::data::aggr::CustomAggrRegistries<'_>,
     cur_vld: ValidityTs,
 ) -> Result<CozoScript> {
-    enable_detailed_parse_errors();
     let parsed = CozoScriptParser::parse(Rule::script, src)
-        .map_err(|err| pest_error_to_parse_error(src, err))?
+        .map_err(|err| {
+            parse_error_with_detail(src, err, || {
+                CozoScriptParser::parse(Rule::script, src).map(|_| ())
+            })
+        })?
         .next()
         .unwrap();
     Ok(match parsed.as_rule() {
@@ -454,10 +501,13 @@ mod tests {
     use super::*;
 
     fn parse_err(src: &str) -> ParseError {
-        enable_detailed_parse_errors();
+        // Exercise the same retry path production callers take, so these tests
+        // pin the diagnostic a real failed `parse_script` produces.
         match CozoScriptParser::parse(Rule::script, src) {
             Ok(_) => panic!("script unexpectedly parsed: {src}"),
-            Err(err) => pest_error_to_parse_error(src, err),
+            Err(err) => parse_error_with_detail(src, err, || {
+                CozoScriptParser::parse(Rule::script, src).map(|_| ())
+            }),
         }
     }
 

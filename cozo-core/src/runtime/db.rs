@@ -390,9 +390,10 @@ impl<'s, S: Storage<'s>> Db<S> {
             index_builds_in_progress: Default::default(),
             fts_doc_stats_cache: Default::default(),
             default_query_timeout_ms: Default::default(),
-            // DEFAULT for the automatic factorized-count rewrite. Flip this one
-            // line to `AtomicBool::new(true)` to make the rewrite default-on.
-            enable_factorize: Arc::new(AtomicBool::new(false)),
+            // DEFAULT for the automatic factorized-count rewrite: ON as of
+            // 0.13.1, after the nightly planner-guard soak. Flip this one line
+            // to `AtomicBool::new(false)` to make the rewrite opt-in again.
+            enable_factorize: Arc::new(AtomicBool::new(true)),
             graph_projections: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_next_commit: Arc::new(AtomicBool::new(false)),
@@ -717,7 +718,7 @@ impl<'s, S: Storage<'s>> Db<S> {
 
     /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
     /// query factorization; `query/factorize.rs`). The kill switch is a Db-wide
-    /// toggle, default OFF for this release. When on, an eligible single-clause
+    /// toggle, **default ON since 0.13.1**. When on, an eligible single-clause
     /// `count()`-over-a-positive-join is rewritten to Yannakakis-style counting
     /// sub-rules whose answer is bit-identical to the naive enumeration; every
     /// query the conservative trigger declines is evaluated exactly as before.

@@ -5,9 +5,105 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.13.0 work not yet cut to a release. Keep this section current as
+Post-0.13.1 work not yet cut to a release. Keep this section current as
 divergences land (see `CLAUDE.md` release rules) so a release never has to
 reconstruct them.
+
+## 0.13.1 — 2026-07-27
+
+### Changed — the factorized `count()` rewrite is ON by default
+
+The rewrite shipped in 0.10.5 and has been opt-in ever since, most recently
+with its restored `!=` inclusion–exclusion extension (0.13.0, measured ~140× on
+LSQB q6). The stated gate was a nightly planner-guard soak on the restored
+rewrite, and the soak has now run **green every night since the workflow's
+first-ever green on the 0.13.0 PR** — including the tier that asserts the q6
+toggle-ON result. So the default flips.
+
+What this changes for you: an eligible single-clause `count()`-over-a-positive-
+join is now counted without materializing the join. **Answers are unchanged** —
+the pass fires only on a *provably exact* decomposition and declines on anything
+unverifiable, and the differential suite asserts naive-equals-factorized on
+every shape it covers. What changes is the plan, and therefore the time and
+memory a counting query spends.
+
+Measured on LSQB sf0.1 (SQLite, release, M-series, 2026-07-27); both paths
+return LDBC's published expected-output count:
+
+| query | naive | factorized | |
+|---|---|---|---|
+| q1 | 72,360.7 ms | **1,048.2 ms** | ~69× |
+| q6 | 42,120.8 ms | **314.0 ms** | ~134× |
+
+The rewrite declines q2, q3 and q9 — a predicate, a negation or a cyclic shape
+disqualifies them — and their plans are byte-identical to 0.13.0, which the
+plan-shape gate asserts rather than assumes.
+
+**The q1 number is also a correction to how this release was gated.** The
+nightly soak that cleared the flip ran the rewrite-ON path on **q6 only**: the
+tier's main loop ran the default, and the default was OFF. So q1 — which the
+rewrite also fires on — had never been executed in the configuration this
+release makes the default. We found it because the plan-shape gate went red on
+two queries when we expected one. The execution tier now covers every firing
+query, pins the firing set, and asserts that the default path really fired
+(a silent decline would otherwise hide behind a green-but-slow run); the rule
+going forward is that a default flip widens its coverage *first*.
+
+The kill switch is unchanged and still a `Db`-wide toggle:
+`db.set_query_factorization(false)` restores the previous behaviour;
+`db.query_factorization()` reports the current setting. The detector advisory
+(the `log::info!` line and the `::explain` row) is unaffected — it always ran
+independently of the toggle.
+
+### Fixed — the 0.13.0 expected-token parse hints were silently disabled by pest 2.8
+
+0.13.0 shipped "parse errors that name the expected tokens": a `help:` line
+listing the literal tokens the grammar would have accepted, and a span pointing
+at the real defect rather than at `err.location` (which, for `?[a] a = 1`,
+points inside the rule head while the missing `:=` is later). Both are built
+from pest's parse-attempt tracking.
+
+**pest 2.8.0 made that tracking opt-in and off by default.** Our dependency
+requirement is `pest = "2.7.9"`, which is a caret requirement, so any consumer
+resolving fresh after pest 2.8's release builds mnestic 0.13.0 against 2.8.x —
+where `err.parse_attempts()` returns `None`, the token list is dropped, and the
+span falls back to the location the feature exists to correct. The degradation
+is silent and total: the feature reverts to pre-0.13.0 behaviour with no error
+and no warning. Our own builds and CI never saw it, because the committed
+`Cargo.lock` pinned 2.7.x — a lockfile makes this whole class of regression
+invisible to CI, which is why a scheduled fresh-resolve lane now runs
+(`.github/workflows/dependency-freshness.yml`).
+
+Fixed by enabling the setting explicitly, and the dependency floor is raised to
+`pest = "2.8"` (`pest::set_error_detail` does not exist in 2.7.x, so the floor
+is now load-bearing in both directions).
+
+**Where it is enabled matters, and it is not enabled globally.** `set_error_detail`
+is a pest-*wide* global, and pest's own documentation notes it "has a higher
+performance cost (hence, it's off by default)". An embedded engine that switches
+it on at first parse and leaves it on would tax every subsequent *successful*
+parse — parse is the dominant cost on cheap high-frequency point reads — and
+would silently change the behaviour of any other pest-based parser in the host
+process, which now includes whatever process `mnestic-mcp` or
+`langgraph-store-mnestic` is running inside. So mnestic enables it only around a
+**re-parse of a script that has already failed**: the success path pays nothing,
+the flag is on only for the duration of a re-parse of an already-failing script,
+and a depth counter makes concurrent failing parses safe (the last one out
+restores it). `parse/mod.rs`.
+
+### Fixed
+
+- **Source compatibility across the uuid 1.x range.** `op_rand_uuid_v1` now
+  builds its context through the version-neutral `uuid::v1::Context` alias
+  (under `#[allow(deprecated)]`) instead of the `uuid::ContextV1` name
+  introduced later in the 1.x line, so the crate compiles against any uuid a
+  consumer's lockfile resolves within our declared `1.8.0` requirement. No
+  behavioural change; the generated UUIDs are identical.
+
+### Changed
+
+- **Dependency refresh** across the workspace (`Cargo.lock`), with the Rust
+  sources reformatted. No API or behavioural change beyond the two items above.
 
 ## 0.13.0 — 2026-07-18
 

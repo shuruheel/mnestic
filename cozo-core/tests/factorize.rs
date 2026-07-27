@@ -358,15 +358,32 @@ fn non_firing_guards_sqlite() {
 }
 
 // ------------------------------------------------------------------------
-// The toggle default (OFF) leaves an eligible query dormant but correct.
+// The toggle default (ON since 0.13.1) fires on an eligible query; flipping
+// it off leaves that same query dormant but correct.
 // ------------------------------------------------------------------------
+
+#[test]
+fn toggle_default_is_on_and_fires() {
+    let db = mem_db();
+    populate_toy(&db);
+    // Fresh DbInstance defaults to factorization ON (0.13.1 flip).
+    assert!(db.query_factorization(), "default must be ON since 0.13.1");
+    assert!(
+        fired(&db, STAR),
+        "with the default toggle the rewrite must fire on an eligible query"
+    );
+    assert_eq!(
+        scalar(&db, STAR),
+        15,
+        "the rewritten path returns the same count as naive enumeration"
+    );
+}
 
 #[test]
 fn toggle_off_is_dormant_but_correct() {
     let db = mem_db();
     populate_toy(&db);
-    // Fresh DbInstance defaults to factorization OFF.
-    assert!(!db.query_factorization(), "default must be OFF (opt-in)");
+    db.set_query_factorization(false);
     assert!(
         !fired(&db, STAR),
         "with the toggle off the rewrite must be dormant"

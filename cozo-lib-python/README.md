@@ -52,66 +52,32 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-## New in 0.13.0
+## New in 0.13.1
 
-0.13.0 is a combined correctness-and-capability release. The Python-facing
-highlights:
+A patch release. The Python-facing highlights:
 
-- **The published wheel now honours RocksDB table options.** A block cache,
-  block size, and index/filter caching configured through an `options` file
-  were silently discarded on every open, so `CozoDbPy("rocksdb", ...)` ran with
-  an 8 MB default cache and 4 KB blocks no matter what the file asked for. Any
-  read-path benchmark taken against a RocksDB store before this release measured
-  a slower engine than mnestic actually is. Fixed in the bundled `mnestic-rocks`
-  0.1.10; the SQLite-only source distribution was never affected.
+- **The factorized `count()` rewrite is ON by default.** Through 0.13.0 you had
+  to opt in with `db.set_query_factorization(True)`; the nightly soak that
+  gated the flip has run green, so an eligible `count()`-over-join — including
+  the inequality form handled by inclusion–exclusion — is now counted without
+  materializing the join (measured on LSQB sf0.1: q1 72.4 s → 1.05 s, q6
+  42.1 s → 0.31 s, both returning LDBC's published count). Answers are unchanged;
+  the rewrite fires only on a provably exact decomposition and leaves every
+  query it declines byte-identical. Opt back out with
+  `db.set_query_factorization(False)`, and read the setting with
+  `db.query_factorization()`.
 
-- **Datetime standard library (`dt_*`), reachable from `run_script`.** Component
-  extractors (`dt_year` … `dt_dow`), `dt_trunc`, calendar-aware `dt_add` /
-  `dt_diff`, strftime `dt_format`, and `dt_to_validity` — the typed bridge from
-  float Unix *seconds* to a `Validity`'s integer microseconds. `@` and `:as_of`
-  now accept a `Validity`-typed expression
-  (`@ dt_to_validity(parse_timestamp('2024-01-01'))`), which together with
-  0.12.2's float rejection closes the seconds-vs-microseconds trap that is
-  especially easy to hit from Python. The new `dt_*` names are reserved against
-  `register_custom_aggr`.
-
-- **Better parse errors.** A failed `run_script` now points its caret at the
-  deepest position the parser reached and adds a `help:` line naming the literal
-  tokens that would have been accepted (`expected one of: :=, <-, <~`) — the
-  improved text flows straight through the wheel. Index-search diagnostics now
-  name the index kind that actually failed (`fts_query_required`, not the old
-  `hnsw_query_required`).
-
-- **`hybrid_search`: budgeted graph expansion and optional legs.** A `graph_legs`
-  entry gains optional keys (`max_nodes`, `max_cost`, `weight_col`, `graph`,
-  `seed_from_legs`, `gate_relation` / `gate_cols` / `admit`); setting `max_nodes`
-  runs the leg as cheapest-first weighted expansion under a distinct-node budget.
-  `vector_index` and `fts_index` are now optional, so you can fuse any non-empty
-  subset of {vector, FTS, graph} legs. Existing dicts parse unchanged, but an
-  unknown key in a `graph_legs` entry is now rejected loudly, so a typo like
-  `max_hop` can no longer silently run the leg with defaults.
-
-- **The `!=` factorized-count rewrite is restored, default OFF.** Enable the
-  Db-wide switch with `db.set_query_factorization(True)` (read it back with
-  `db.query_factorization()`); it rewrites an eligible `count()`-over-join
-  carrying an inequality via inclusion–exclusion, sound behind a stored-column
-  type gate. Measured ~140× on LSQB q6. It stays off by default until a nightly
-  soak clears the default-on flip.
-
-- **Corrupt data raises instead of crashing the interpreter.** A corrupt value
-  blob in a stored relation used to raise `PanicException` — a `BaseException`
-  subclass that `except Exception:` does **not** catch. It is now an ordinary
-  `eval::corrupt_value_blob` query error naming the key: run `::repair_corrupt
-  <relation>` to drop the unreadable rows, then `::reindex <relation>` if that
-  relation carries an HNSW/FTS/LSH index. HNSW indexes built by any release
-  through 0.12.2 can also carry stale nodes/edges from null-vector and
-  pre-existing-row bugs — rebuild once per affected relation with `::reindex
-  <relation>`. Your rows are untouched; `::reindex` rebuilds index relations only.
+- **Parse errors name the expected tokens again.** 0.13.0 shipped the `help:`
+  line listing the literal tokens that would have been accepted, but pest 2.8
+  made the underlying tracking opt-in, so wheels built against it silently lost
+  both the token list and the corrected caret position. Restored, and the
+  tracking is now enabled only around a re-parse of a script that already
+  failed — successful parses pay nothing for it.
 
 See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
-for the full per-case upgrade guidance — pre-1970 timestamps, `restore_backup`
-relation-id reconciliation, and the hybrid-leg ranking changes (fusion legs now
-require distinct labels, and a graph leg no longer re-scores its own seeds).
+for the full accounting, and for 0.13.0's upgrade guidance if you are coming
+from an earlier release (`::reindex` for HNSW/FTS indexes, pre-1970 timestamps,
+and the hybrid-leg ranking changes).
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

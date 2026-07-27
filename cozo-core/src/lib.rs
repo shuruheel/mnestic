@@ -333,7 +333,7 @@ impl DbInstance {
         }
     }
     /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
-    /// query factorization). Db-wide kill switch, default OFF. See
+    /// query factorization). Db-wide kill switch, default ON since 0.13.1. See
     /// [`crate::Db::set_query_factorization`].
     pub fn set_query_factorization(&self, enabled: bool) {
         match self {
