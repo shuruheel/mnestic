@@ -17,13 +17,14 @@ EXPECTED_TOOLS = {
     "link",
     "recall_as_of",
     "stats",
+    "continue_result",
 }
 
 
-def test_server_registers_ten_tools(mem):
+def test_server_registers_eleven_tools(mem):
     mcp = build_server(mem)
     assert set(tool_names(mcp)) == EXPECTED_TOOLS
-    assert len(tool_names(mcp)) == 10
+    assert len(tool_names(mcp)) == 11
     assert "no session" in (mcp.instructions or "")
 
 

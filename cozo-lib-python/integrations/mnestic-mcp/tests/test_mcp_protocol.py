@@ -24,7 +24,7 @@ def test_initialize_list_tools_store_search(tmp_path):
             assert "no session" in (init.instructions or "")
 
             tools = await client.list_tools()
-            assert len(tools.tools) == 10
+            assert len(tools.tools) == 11
 
             stored = await client.call_tool(
                 "store_memory", {"text": "alpha protocol fact", "meta": {"k": 1}}

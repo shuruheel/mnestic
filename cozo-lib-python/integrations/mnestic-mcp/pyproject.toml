@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "mnestic-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local memory MCP server backed by mnestic — hybrid BM25+vector+graph recall with per-leg attribution and time travel, all on your machine."
 readme = "README.md"
 requires-python = ">=3.10"

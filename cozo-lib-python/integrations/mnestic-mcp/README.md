@@ -40,6 +40,15 @@ memory server has:
 typed, weighted memory graph that both `find_related` (budget-bounded
 traversal) and the hybrid graph leg exploit.
 
+**Byte-budgeted output** (0.2.0): every wide-result tool (`search`,
+`find_related`, `list_recent`, `recall_as_of`) takes `max_bytes` (default
+20 000). An over-budget result is cut **at item boundaries** — item content is
+never trimmed — and returns `truncated: true`, a `remaining` count, and a
+single-use `continuation` token; **`continue_result(token)`** serves the next
+slice under the same budget. A wide result can no longer blow your agent's
+context with no way back. (Tokens don't survive a server restart; the error
+says so and tells you to re-run the query.)
+
 ## Configuration
 
 | Flag / env | Default | Meaning |
