@@ -549,12 +549,12 @@ impl CozoDbPy {
         Ok(db.default_query_timeout())
     }
     /// Enable or disable the automatic factorized-`count()` rewrite (mnestic
-    /// fork, query factorization). This is a Db-wide kill switch, default OFF —
-    /// when on, a `count()` over an alpha-acyclic all-positive join is computed
-    /// per-separator instead of materializing the full join, without changing the
-    /// result. Forwards to [`DbInstance::set_query_factorization`]. Mirrors the
-    /// Rust-only switch so Python callers can toggle it (and produce soak
-    /// evidence) exactly like `set_default_query_timeout`.
+    /// fork, query factorization). This is a Db-wide kill switch, **default ON
+    /// since 0.13.1** — when on, a `count()` over an alpha-acyclic all-positive
+    /// join is computed per-separator instead of materializing the full join,
+    /// without changing the result. Forwards to
+    /// [`DbInstance::set_query_factorization`]. Mirrors the Rust switch so
+    /// Python callers can toggle it exactly like `set_default_query_timeout`.
     pub fn set_query_factorization(&self, enabled: bool) -> PyResult<()> {
         let db = self.db_ref()?;
         db.set_query_factorization(enabled);
@@ -566,6 +566,20 @@ impl CozoDbPy {
     pub fn query_factorization(&self) -> PyResult<bool> {
         let db = self.db_ref()?;
         Ok(db.query_factorization())
+    }
+    /// Request that write transactions **fsync on commit** (mnestic fork,
+    /// 0.13.2). Returns `True` iff the storage backend honors the knob —
+    /// `rocksdb` does (per-transaction `WriteOptions.sync`; note the bulk
+    /// import/restore channels are separate non-transactional paths outside
+    /// it); `sqlite` returns `False` because its writes are **already
+    /// durable** (`synchronous=FULL` default); `mem` has nothing to sync.
+    /// The contract this makes explicit: by default the RocksDB backend
+    /// writes its WAL without fsync, so an OS crash or power loss can lose
+    /// the most recent acknowledged commits (a mere process crash cannot).
+    /// Forwards to [`DbInstance::set_durable_writes`].
+    pub fn set_durable_writes(&self, durable: bool) -> PyResult<bool> {
+        let db = self.db_ref()?;
+        Ok(db.set_durable_writes(durable))
     }
     /// One-call hybrid retrieval (mnestic fork): HNSW + FTS (+ optional extra
     /// ranked lists and graph legs) fused with RRF and optionally diversified

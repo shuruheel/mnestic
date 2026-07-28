@@ -98,7 +98,8 @@ fn tokenize_with_positions(value: &str, tokenizer: &TextAnalyzer) -> Vec<FtsPhra
     code(parser::fts::phrase_prefix_unsupported),
     help("split it: `\"{0}\" OR {1}*` searches the exact phrase or the prefix term. \
           (Before 0.13.2 this query silently matched nothing: the whole quoted string \
-          was prefix-matched against single-token index entries.)")
+          was prefix-matched against single-token index entries. True phrase-prefix \
+          search is tracked at https://github.com/shuruheel/mnestic/issues/19.)")
 )]
 struct FtsPhrasePrefixUnsupported(String, String);
 
@@ -109,7 +110,8 @@ struct FtsPhrasePrefixUnsupported(String, String);
     help("NEAR treats every operand as an unordered bag of single terms, so quoting \
           \"{0}\" inside it would silently drop the adjacency requirement. Use the \
           phrase and the NEAR group as separate AND-ed query parts, or list the \
-          words unquoted to keep bag-of-terms proximity.")
+          words unquoted to keep bag-of-terms proximity. (Phrase-in-NEAR is tracked \
+          at https://github.com/shuruheel/mnestic/issues/20.)")
 )]
 struct FtsPhraseInNearUnsupported(String);
 
