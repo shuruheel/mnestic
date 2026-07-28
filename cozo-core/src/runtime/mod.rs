@@ -8,6 +8,7 @@
 
 pub(crate) mod callback;
 pub(crate) mod db;
+pub(crate) mod diagnostics;
 pub(crate) mod graph_projection;
 pub(crate) mod hnsw;
 pub(crate) mod hnsw_build;

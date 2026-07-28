@@ -59,10 +59,14 @@ impl FixedRule for PageRank {
         // means the `iterations` cap stopped it short of convergence. An `epsilon` of zero opts
         // out of the convergence test altogether — run exactly `iterations` and stay quiet.
         if epsilon > 0. && error >= epsilon as f64 {
-            log::warn!(
-                "PageRank stopped at its `iterations` cap ({n_run}) with a total error of \
-                 {error:.3e}, above the `epsilon` of {epsilon:.3e}: the ranks have not \
-                 converged. Raise `iterations` or `epsilon`."
+            crate::runtime::diagnostics::emit(
+                "fixed_rule.pagerank.unconverged",
+                format!(
+                    "PageRank stopped at its `iterations` cap ({n_run}) with a total error of \
+                     {error:.3e}, above the `epsilon` of {epsilon:.3e}: the ranks have not \
+                     converged. Raise `iterations` or `epsilon`."
+                ),
+                "raise `iterations` (or loosen `epsilon`) until the run converges",
             );
         }
 

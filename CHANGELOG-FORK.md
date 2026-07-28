@@ -69,6 +69,72 @@ unchanged (self-distance 0 always survived) but every `NEAR` query paid one
 redundant full posting fetch; a thread-local scan counter now pins the count
 in CI, since the bug class is invisible in results by construction.
 
+### Added — the recursive-workload planner pin (the suite's outstanding tier)
+
+The planner regression suite gated 0.13.1's factorization flip through its
+plan-shape gate and nightly LSQB execution tier — but the roadmap's stated
+position was that **no further planner pass ships default-on until the
+*recursive* workload is pinned**, fixpoint reachability being what this engine
+is fastest at and therefore what a regression would hurt most. It is now
+pinned (`cozo-core/tests/recursive_workload.rs`):
+
+- **Per-PR:** plan-shape baselines for the three canonical recursive shapes —
+  full transitive closure, seeded reachability (the magic-sets shape),
+  same-generation (the magic-sets stress shape) — over empty relations, plus
+  exact-count execution oracles: closed forms on constructed graphs (chains at
+  depth 64→1024, a cycle, a full binary tree) and a Rust-side BFS oracle on a
+  seeded pseudo-random digraph, sharing nothing with the engine but the edge
+  list.
+- **Nightly (`planner-guard.yml`):** a deep-fixpoint pathology cap — 10,000
+  semi-naive iterations down a chain, exact answer, generous wall-clock bound.
+  Self-contained: the graph is generated in-test.
+
+A finding the baseline records: today the two arms (greedy reorder on/off) are
+**identical** on every recursive shape — no shipped pass touches recursive
+rules at all (derived-rule atoms disqualify them, and the base cases sit below
+the reorder's 3-stored-atom horizon). The moment a future pass does touch
+them, the baseline fires. With this tier in place, the standing restriction is
+lifted: a future planner pass may go default-on by the same route
+factorization took — plan-shape gate, then nightly soak.
+
+### Added — an explicit durability knob: `set_durable_writes`
+
+The RocksDB backend commits **without syncing its WAL** — the log is written
+but not fsynced, so an OS crash or power loss can lose the most recent
+acknowledged commits (a mere process crash cannot). A defensible default for
+an embedded engine, and an indefensible *invisible* one for a database that
+offers audited eviction and a crash-safe commit clock. It is now explicit:
+`db.set_durable_writes(true)` makes every subsequent write transaction fsync
+on commit, and returns whether the backend honors the knob at all. Per-backend
+contract (documented on `Storage::set_durable_writes`): `rocksdb` honors it
+(note the bulk channels — `batch_put` / SST ingest, i.e. `import_relations`
+and restore — are separate non-transactional paths outside the knob);
+`sqlite` reports `false` because its writes are **already durable**
+(`synchronous=FULL` default); `mem` has nothing to sync. Third-party `Storage`
+impls keep compiling — the trait method has a default no-op.
+
+### Added — structured query diagnostics: `::warnings`
+
+The engine has long *known* things worth telling the query author and said
+them only through `log::warn!`, where nothing programmatic can see them — a
+downstream project shipped a full-scan traversal for months while the engine
+warned about it on every call. Warnings are now **typed** (`code`, `message`,
+actionable `hint`), buffered in a bounded per-`Db` ring (256, monotone `seq`
+so consumers can track what they've seen), and readable from **every** binding
+via plain CozoScript — `::warnings` lists, `::warnings clear` empties — plus
+`Db::recent_warnings` for embedded Rust. The log side is unchanged; four
+findings emit structured warnings today:
+
+| code | finding |
+|---|---|
+| `query.cartesian_step` | a rule still contains a disconnected conjunction after the greedy reorder — the exact finding that once rotted in the logs |
+| `import.stranded_indexes` | a bulk import / restore left FTS/HNSW/LSH indexes stale; the hint names the `::reindex` |
+| `fixed_rule.pagerank.unconverged` | PageRank stopped at its `iterations` cap above `epsilon` |
+| `graph_projection.over_capacity` | a projection exceeds the cache ceiling and is rebuilt per query |
+
+Codes are stable identifiers; new ones may appear in any release — match on
+the ones you know, ignore the rest. Guard: `cozo-core/tests/query_warnings.rs`.
+
 ### Added — `bind_spans` and `snippet()`: return the part that matched
 
 For agentic memory, returning a 4k-token document when a 40-token window

@@ -668,6 +668,15 @@ fn test_multi_tx() {
 }
 
 #[test]
+fn durable_writes_not_honored_off_rocksdb() {
+    // The knob's contract: backends that don't wire it up return false (the
+    // default trait impl). `mem` has nothing to sync; sqlite is already
+    // durable via SQLite's synchronous=FULL default and reports false too.
+    let db = DbInstance::new("mem", "", "").unwrap();
+    assert!(!db.set_durable_writes(true));
+}
+
+#[test]
 fn test_vec_types() {
     let db = DbInstance::new("mem", "", "").unwrap();
     db.run_default(":create a {k: String => v: <F32; 8>}")

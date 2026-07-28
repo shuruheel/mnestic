@@ -1161,12 +1161,16 @@ impl ProjectionCache {
                 // A zero ceiling means caching is off, which is a choice, not
                 // a problem to warn about on every query.
                 if reg.capacity > 0 {
-                    log::warn!(
-                        "graph projection '{name}' variant {} needs ~{est_bytes} bytes, over the \
-                         whole {} byte cache ceiling; building it fresh for every query. Raise \
-                         the ceiling with `Db::set_graph_projection_capacity`.",
-                        key.label(),
-                        reg.capacity
+                    crate::runtime::diagnostics::emit(
+                        "graph_projection.over_capacity",
+                        format!(
+                            "graph projection '{name}' variant {} needs ~{est_bytes} bytes, over the \
+                             whole {} byte cache ceiling; building it fresh for every query. Raise \
+                             the ceiling with `Db::set_graph_projection_capacity`.",
+                            key.label(),
+                            reg.capacity
+                        ),
+                        "raise the ceiling with `Db::set_graph_projection_capacity`",
                     );
                 }
                 break 'rules;

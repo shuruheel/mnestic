@@ -86,6 +86,7 @@ pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 pub use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, DirectedNeighborsWithValues, Graph};
 pub use runtime::db::Db;
 pub use runtime::db::NamedRows;
+pub use runtime::diagnostics::QueryWarning;
 #[cfg(feature = "graph-algo")]
 pub use runtime::graph_projection::{
     GraphSource, GraphVariant, ProjectionVariant, VariantKey, VariantSpec,
@@ -225,6 +226,23 @@ impl DbInstance {
         options: &str,
     ) -> std::result::Result<Self, String> {
         Self::new(engine, path, options).map_err(|err| err.to_string())
+    }
+
+    /// Dispatcher method.  See [crate::Db::set_durable_writes].
+    pub fn set_durable_writes(&self, durable: bool) -> bool {
+        match self {
+            DbInstance::Mem(db) => db.set_durable_writes(durable),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.set_durable_writes(durable),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.set_durable_writes(durable),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.set_durable_writes(durable),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.set_durable_writes(durable),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.set_durable_writes(durable),
+        }
     }
 
     /// Dispatcher method.  See [crate::Db::get_fixed_rules].

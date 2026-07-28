@@ -30,6 +30,7 @@ on:
       - "cozo-core/tests/common/**"
       - "cozo-core/tests/planner_shape.rs"
       - "cozo-core/tests/planner_baseline.json"
+      - "cozo-core/tests/recursive_workload.rs"
       - "scripts/fetch_lsqb.sh"
       - ".github/workflows/planner-guard.yml"
 
@@ -69,3 +70,9 @@ jobs:
           # dir (cozo-core/), not the workspace root, so a root-relative path
           # never resolves. This kept the tier red from its first run.
           LSQB_SF01_DIR: ${{ github.workspace }}/.lsqb/social-network-sf0.1-projected-fk
+
+      # The recursive-workload tier (mnestic fork): deep-fixpoint pathology cap.
+      # Self-contained — the graph is generated in-test, no dataset, no env.
+      # Shares the release build with the LSQB step above, so it adds seconds.
+      - name: Recursive-workload tier (deep fixpoint)
+        run: cargo test --release -p mnestic --test recursive_workload -- --ignored deep_chain --nocapture

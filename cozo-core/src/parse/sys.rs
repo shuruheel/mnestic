@@ -29,6 +29,10 @@ use crate::{Expr, FixedRule};
 #[derive(Debug)]
 pub enum SysOp {
     Compact,
+    /// mnestic fork, structured diagnostics (`runtime/diagnostics.rs`):
+    /// `::warnings` lists the Db's recent structured query warnings;
+    /// `::warnings clear` empties the ring. The bool is `clear`.
+    Warnings(bool),
     ListColumns(Symbol),
     ListIndices(Symbol),
     ListRelations,
@@ -178,6 +182,7 @@ pub(crate) fn parse_sys(
             SysOp::TtEvict(rel_symbol, keys, unredacted)
         }
         Rule::compact_op => SysOp::Compact,
+        Rule::warnings_op => SysOp::Warnings(inner.into_inner().next().is_some()),
         Rule::running_op => SysOp::ListRunning,
         Rule::kill_op => {
             let i_expr = inner.into_inner().next().unwrap();

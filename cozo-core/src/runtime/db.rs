@@ -7,7 +7,7 @@
  */
 
 use std::collections::btree_map::Entry;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::default::Default;
 use std::fmt::{Debug, Formatter};
 use std::iter;
@@ -53,6 +53,7 @@ use crate::runtime::callback::{
 };
 use crate::runtime::graph_projection;
 use crate::runtime::graph_projection::ProjectionCache;
+use crate::runtime::diagnostics::QueryWarning;
 use crate::runtime::relation::{
     try_extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
 };
@@ -190,6 +191,13 @@ pub struct Db<S> {
     /// `SessionTx`, which captures a watermark off it before its storage
     /// transaction pins and reports its dirty relations back at commit.
     pub(crate) graph_projections: Arc<ProjectionCache>,
+    /// Bounded ring of recent structured query warnings (mnestic fork,
+    /// `runtime/diagnostics.rs`): `(seq, warning)`, oldest dropped past
+    /// [`WARNING_RING_CAP`]. Filled by `flush_warnings`, read by `::warnings`
+    /// and [`Db::recent_warnings`].
+    pub(crate) warnings: Arc<Mutex<VecDeque<(u64, QueryWarning)>>>,
+    /// Monotone id for warnings, so consumers can track what they've seen.
+    pub(crate) warning_seq: Arc<AtomicU64>,
     /// Test-only: make the next multi-transaction commit fail without attempting
     /// it (mnestic fork, 0.12.1). Commit failures are real but rare in
     /// production — an I/O error, a backend conflict — and there is no portable
@@ -349,6 +357,9 @@ impl NamedRows {
 
 const STATUS_STR: &str = "status";
 const OK_STR: &str = "OK";
+/// Bound on the structured-warnings ring (mnestic fork, diagnostics); oldest
+/// entries drop first. `seq` stays monotone, so consumers can detect loss.
+const WARNING_RING_CAP: usize = 256;
 
 /// The query and parameters.
 pub type Payload = (String, BTreeMap<String, DataValue>);
@@ -395,6 +406,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             // to `AtomicBool::new(false)` to make the rewrite opt-in again.
             enable_factorize: Arc::new(AtomicBool::new(true)),
             graph_projections: Default::default(),
+            warnings: Default::default(),
+            warning_seq: Default::default(),
             #[cfg(any(test, feature = "test-hooks"))]
             fail_next_commit: Arc::new(AtomicBool::new(false)),
         };
@@ -647,13 +660,46 @@ impl<'s, S: Storage<'s>> Db<S> {
     ) -> Result<NamedRows> {
         let read_only = mutability == ScriptMutability::Immutable;
         let outer_deadline = self.effective_outer_deadline(call_timeout);
-        match payload {
+        let res = match payload {
             CozoScript::Single(p) => self.execute_single(cur_vld, p, read_only, outer_deadline),
             CozoScript::Imperative(ps) => {
                 self.execute_imperative(cur_vld, &ps, read_only, outer_deadline)
             }
             CozoScript::Sys(op) => self.run_sys_op(op, read_only),
+        };
+        // Structured diagnostics (mnestic fork): move whatever this script
+        // emitted into the Db ring, on success AND on error — a failed query's
+        // warnings are still evidence.
+        self.flush_warnings();
+        res
+    }
+
+    /// Drain the current thread's emitted [`QueryWarning`]s into the bounded
+    /// per-`Db` ring (mnestic fork, `runtime/diagnostics.rs`). Called at the
+    /// end of every script run and after the import paths' stranded-index
+    /// checks; anything left in the thread-local sink between those points is
+    /// simply carried to the next flush on that thread.
+    fn flush_warnings(&self) {
+        let drained = crate::runtime::diagnostics::drain();
+        if drained.is_empty() {
+            return;
         }
+        let mut ring = self.warnings.lock().unwrap();
+        for w in drained {
+            let seq = self.warning_seq.fetch_add(1, Ordering::Relaxed);
+            ring.push_back((seq, w));
+            while ring.len() > WARNING_RING_CAP {
+                ring.pop_front();
+            }
+        }
+    }
+
+    /// Snapshot of the recent structured warnings ring, oldest first, as
+    /// `(seq, warning)` — the Rust-side twin of the `::warnings` sysop
+    /// (mnestic fork). `seq` is monotone per `Db`, so callers can remember the
+    /// last seen id and act only on what's new.
+    pub fn recent_warnings(&self) -> Vec<(u64, QueryWarning)> {
+        self.warnings.lock().unwrap().iter().cloned().collect()
     }
 
     /// Compute the whole-script deadline from the per-call timeout and the Db
@@ -730,6 +776,18 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// (mnestic fork, query factorization).
     pub fn query_factorization(&self) -> bool {
         self.enable_factorize.load(Ordering::Relaxed)
+    }
+
+    /// Request that write transactions **fsync on commit** (mnestic fork).
+    /// Returns `true` iff the storage backend honors the knob — see
+    /// `Storage::set_durable_writes` for the full per-backend contract. The
+    /// short version: RocksDB commits without syncing its WAL by default, so
+    /// an OS crash or power loss can lose the most recent acknowledged
+    /// commits; with the knob on, it cannot, at a per-commit fsync cost.
+    /// SQLite is already durable (`synchronous=FULL`), `mem` has nothing to
+    /// sync — both return `false`.
+    pub fn set_durable_writes(&self, durable: bool) -> bool {
+        self.db.set_durable_writes(durable)
     }
 
     /// The current Db-wide default per-query budget in seconds, or `None` if
@@ -846,6 +904,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // loudly rather than corrupt-silently; a hard error would break
             // legitimate import-then-reindex callers. (mnestic fork, hardening)
             warn_if_indexes_stranded(&handle, relation, "bulk import into");
+            self.flush_warnings();
 
             if handle.access_level < AccessLevel::Protected {
                 bail!(InsufficientAccessLevel(
@@ -1157,6 +1216,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 // restore never did. Same warning, one shared helper, so they
                 // cannot drift apart again.
                 warn_if_indexes_stranded(&dst_handle, relation, "backup restore into");
+                self.flush_warnings();
 
                 if dst_handle.access_level < AccessLevel::Protected {
                     bail!(InsufficientAccessLevel(
@@ -2099,6 +2159,39 @@ impl<'s, S: Storage<'s>> Db<S> {
                 Ok(NamedRows::new(
                     vec![STATUS_STR.to_string()],
                     vec![vec![DataValue::from(OK_STR)]],
+                ))
+            }
+            SysOp::Warnings(clear) => {
+                // Structured diagnostics (mnestic fork): list — or with
+                // `clear`, empty — the Db's recent-warnings ring. Read-only
+                // safe in both forms: the ring is diagnostics state, not data.
+                if *clear {
+                    self.warnings.lock().unwrap().clear();
+                    return Ok(NamedRows::new(
+                        vec![STATUS_STR.to_string()],
+                        vec![vec![DataValue::from(OK_STR)]],
+                    ));
+                }
+                let rows = self
+                    .recent_warnings()
+                    .into_iter()
+                    .map(|(seq, w)| {
+                        vec![
+                            DataValue::from(seq as i64),
+                            DataValue::from(w.code),
+                            DataValue::from(w.message.as_str()),
+                            DataValue::from(w.hint.as_str()),
+                        ]
+                    })
+                    .collect_vec();
+                Ok(NamedRows::new(
+                    vec![
+                        "seq".to_string(),
+                        "code".to_string(),
+                        "message".to_string(),
+                        "hint".to_string(),
+                    ],
+                    rows,
                 ))
             }
             SysOp::ListRelations => self.list_relations(tx),
@@ -3429,13 +3522,17 @@ fn warn_if_indexes_stranded(handle: &RelationHandle, relation: &str, verb: &str)
     if kinds.is_empty() {
         return;
     }
-    log::warn!(
-        "{} relation '{}' does not maintain its {} index(es); the imported rows are \
-         invisible to those indices until you rebuild them — run `::reindex {}`",
-        verb,
-        relation,
-        kinds.join("/"),
-        relation
+    crate::runtime::diagnostics::emit(
+        "import.stranded_indexes",
+        format!(
+            "{} relation '{}' does not maintain its {} index(es); the imported rows are \
+             invisible to those indices until you rebuild them — run `::reindex {}`",
+            verb,
+            relation,
+            kinds.join("/"),
+            relation
+        ),
+        format!("run `::reindex {relation}`"),
     );
 }
 

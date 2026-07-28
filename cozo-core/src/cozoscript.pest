@@ -13,10 +13,10 @@ query_script_inner_no_bracket = { (option | rule | const_rule | fixed_rule)+ }
 imperative_script = {SOI ~ imperative_stmt+ ~ EOI}
 sys_script = {SOI ~ "::" ~ (history_op | history_gc_op | evict_op | list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | reindex_op | remove_relations_op | trigger_relation_op |
                     trigger_relation_show_op | rename_relations_op | running_op | kill_op | explain_op |
-                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules | graph_op) ~ EOI}
+                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | warnings_op | list_fixed_rules | graph_op) ~ EOI}
 sys_script_inner = {"{" ~ "::" ~ (history_op | history_gc_op | evict_op | list_relations_op | list_columns_op | list_indices_op | describe_relation_op | repair_corrupt_op | reindex_op | remove_relations_op | trigger_relation_op |
                     trigger_relation_show_op | rename_relations_op | running_op | kill_op | explain_op |
-                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | list_fixed_rules | graph_op) ~ "}"}
+                    access_level_op | index_op | vec_idx_op | fts_idx_op | lsh_idx_op | compact_op | warnings_op | list_fixed_rules | graph_op) ~ "}"}
 index_op = {"index" ~ (index_create | index_drop)}
 vec_idx_op = {"hnsw" ~ (index_create_adv | index_drop)}
 fts_idx_op = {"fts" ~ (index_create_adv | index_drop)}
@@ -29,6 +29,8 @@ index_create = {"create" ~ compound_ident ~ ":" ~ ident ~ "{" ~ (ident ~ ",")* ~
 index_create_adv = {"create" ~ compound_ident ~ ":" ~ ident ~ "{" ~ (index_opt_field ~ ",")* ~ index_opt_field? ~ "}"}
 index_drop = {"drop" ~ compound_ident ~ ":" ~ ident }
 compact_op = {"compact"}
+warnings_op = {"warnings" ~ warnings_clear?}
+warnings_clear = {"clear"}
 history_op = {"history" ~ compound_ident ~ expr ~ (pos_int ~ pos_int?)?}
 history_gc_op = {"history_gc" ~ compound_ident ~ expr}
 evict_op = {"evict" ~ compound_ident ~ expr ~ evict_unredacted?}

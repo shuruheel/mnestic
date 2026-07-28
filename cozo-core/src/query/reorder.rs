@@ -640,12 +640,18 @@ fn greedy_reorder_conjunction(
         remaining.retain(|&ci| ci != pick);
     }
 
-    // Diagnostic: even the greedy order still contains a Cartesian step. Warn so
-    // agent frameworks can surface it; `::explain` also annotates the op.
+    // Diagnostic: even the greedy order still contains a Cartesian step. Emit
+    // a structured warning (`::warnings`) so agent frameworks can act on it —
+    // this exact finding once reached only the log while a downstream project
+    // shipped a full-scan traversal for months. `::explain` also annotates the op.
     if has_cartesian_step {
-        log::warn!(
-            "join-reorder: rule `{rule_name}` still contains a Cartesian step \
-             (a disconnected conjunction); consider revising the query"
+        crate::runtime::diagnostics::emit(
+            "query.cartesian_step",
+            format!(
+                "join-reorder: rule `{rule_name}` still contains a Cartesian step \
+                 (a disconnected conjunction); consider revising the query"
+            ),
+            "add a shared variable or an explicit join between the disconnected atom groups",
         );
     }
 

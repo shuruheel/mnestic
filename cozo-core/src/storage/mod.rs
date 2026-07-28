@@ -56,6 +56,32 @@ pub trait Storage<'s>: Send + Sync + Clone {
         false
     }
 
+    /// Request that write transactions **fsync on commit** from now on (or stop
+    /// doing so, with `false`). Returns `true` iff this backend honors the
+    /// knob; the default implementation is a no-op returning `false`, so
+    /// third-party [`Storage`] impls keep compiling. (mnestic fork)
+    ///
+    /// The contract this makes explicit: the **RocksDB backend commits without
+    /// syncing its WAL by default** — the log is written but not fsynced, so an
+    /// OS crash or power loss can lose the most recent commits (a mere process
+    /// crash cannot; the OS still has the pages). With `set_durable_writes
+    /// (true)` every subsequent write transaction's commit fsyncs first —
+    /// slower, but a power cut loses nothing acknowledged.
+    ///
+    /// Per-backend behavior:
+    /// - `rocksdb` — honored (returns `true`); flips per-transaction
+    ///   `WriteOptions.sync`. NOTE: the bulk paths (`batch_put`,
+    ///   `ingest_sorted`, i.e. `import_relations`/restore) are separate
+    ///   non-transactional channels and are **not** covered by the knob.
+    /// - `sqlite` — not honored (returns `false`), but writes are already
+    ///   durable: it runs with SQLite's default `synchronous=FULL`.
+    /// - `mem` — nothing to sync; not persistent. Returns `false`.
+    /// - `newrocksdb`, `sled`, `tikv` — not wired up (returns `false`).
+    fn set_durable_writes(&self, durable: bool) -> bool {
+        let _ = durable;
+        false
+    }
+
     /// Bulk-publish strictly-ascending key-value `entries` into the *live*
     /// database by building an SST file and atomically ingesting it, bypassing
     /// the transaction write-batch overlay entirely. The engine manages the

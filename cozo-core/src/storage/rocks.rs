@@ -8,7 +8,8 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use log::info;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
@@ -115,11 +116,18 @@ pub fn new_cozo_rocksdb(path: impl AsRef<Path>) -> Result<Db<RocksDbStorage>> {
 #[derive(Clone)]
 pub struct RocksDbStorage {
     db: RocksDb,
+    /// When set, every write transaction's commit fsyncs the WAL first
+    /// (`WriteOptions.sync = true`). See `Storage::set_durable_writes` for the
+    /// contract; `Arc` because clones of the storage must share the knob.
+    sync_writes: Arc<AtomicBool>,
 }
 
 impl RocksDbStorage {
     pub(crate) fn new(db: RocksDb) -> Self {
-        Self { db }
+        Self {
+            db,
+            sync_writes: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
@@ -137,11 +145,21 @@ impl Storage<'_> for RocksDbStorage {
         // lock-manager bookkeeping and no write-batch overlay consulted on
         // every read. Writes keep the pessimistic transaction unchanged.
         let inner = if write {
-            RocksTxInner::Txn(self.db.transact().set_snapshot(true).start())
+            let mut builder = self.db.transact().set_snapshot(true);
+            if self.sync_writes.load(Ordering::Relaxed) {
+                // Durable-writes knob (mnestic fork): fsync the WAL on commit.
+                builder = builder.sync(true);
+            }
+            RocksTxInner::Txn(builder.start())
         } else {
             RocksTxInner::Snap(self.db.snapshot_read())
         };
         Ok(RocksDbTx { inner })
+    }
+
+    fn set_durable_writes(&self, durable: bool) -> bool {
+        self.sync_writes.store(durable, Ordering::Relaxed);
+        true
     }
 
     fn range_compact(&self, lower: &[u8], upper: &[u8]) -> Result<()> {
@@ -627,6 +645,34 @@ mod tests {
         )?;
 
         Ok((temp_dir, db))
+    }
+
+    #[test]
+    fn durable_writes_knob() -> Result<()> {
+        let (_temp_dir, db) = setup_test_db()?;
+        // RocksDB honors the knob; writes succeed in both modes and the data
+        // reads back. (The fsync itself is not observable from a test — this
+        // pins the plumbing: the flag reaches the write path without breaking
+        // commits, in both directions.)
+        assert!(db.set_durable_writes(true));
+        db.run_script(
+            "?[k, v] <- [[1, 1]] :put plain {k => v}",
+            Default::default(),
+            ScriptMutability::Mutable,
+        )?;
+        assert!(db.set_durable_writes(false));
+        db.run_script(
+            "?[k, v] <- [[2, 2]] :put plain {k => v}",
+            Default::default(),
+            ScriptMutability::Mutable,
+        )?;
+        let res = db.run_script(
+            "?[k] := *plain[k, _]",
+            Default::default(),
+            ScriptMutability::Immutable,
+        )?;
+        assert_eq!(res.rows.len(), 2);
+        Ok(())
     }
 
     #[test]
