@@ -292,10 +292,20 @@ struct StartTransactPayload {
     write: bool,
 }
 
+fn transaction_access_allowed(mutability: ScriptMutability) -> bool {
+    // MultiTransaction does not accept a ScriptMutability and therefore cannot
+    // enforce read-only bearer grants while running or committing scripts.
+    mutability == ScriptMutability::Mutable
+}
+
 async fn start_transact(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Query(payload): Query<StartTransactPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !transaction_access_allowed(mutability) {
+        return (StatusCode::FORBIDDEN, json!({"ok": false}).into());
+    }
     let tx = st.db.multi_transaction(payload.write);
     let id = st.tx_counter.fetch_add(1, Ordering::SeqCst);
     st.txs.lock().unwrap().insert(id, Arc::new(tx));
@@ -303,10 +313,14 @@ async fn start_transact(
 }
 
 async fn transact_query(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Path(id): Path<u32>,
     Json(payload): Json<QueryPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !transaction_access_allowed(mutability) {
+        return (StatusCode::FORBIDDEN, json!({"ok": false}).into());
+    }
     let tx = match st.txs.lock().unwrap().get(&id) {
         None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
         Some(tx) => tx.clone(),
@@ -338,10 +352,14 @@ struct FinishTransactPayload {
 }
 
 async fn finish_query(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Path(id): Path<u32>,
     Json(payload): Json<FinishTransactPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !transaction_access_allowed(mutability) {
+        return (StatusCode::FORBIDDEN, json!({"ok": false}).into());
+    }
     let tx = match st.txs.lock().unwrap().remove(&id) {
         None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
         Some(tx) => tx,
@@ -358,6 +376,12 @@ async fn finish_query(
             json!({"ok": false, "message": err.to_string()}).into(),
         ),
     }
+}
+
+#[test]
+fn multi_transactions_require_mutable_authorization() {
+    assert!(transaction_access_allowed(ScriptMutability::Mutable));
+    assert!(!transaction_access_allowed(ScriptMutability::Immutable));
 }
 
 #[derive(serde_derive::Deserialize)]
