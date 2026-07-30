@@ -815,11 +815,12 @@ impl<'s, S: Storage<'s>> Db<S> {
             let handle = tx.get_relation(rel.as_ref(), false)?;
             let size_hint = handle.metadata.keys.len() + handle.metadata.non_keys.len();
 
-            if handle.access_level < AccessLevel::ReadOnly {
+            let access_level = tx.effective_read_access_level(&handle)?;
+            if access_level < AccessLevel::ReadOnly {
                 bail!(InsufficientAccessLevel(
                     handle.name.to_string(),
                     "data export".to_string(),
-                    handle.access_level
+                    access_level
                 ));
             }
 

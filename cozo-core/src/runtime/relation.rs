@@ -121,6 +121,23 @@ impl RelationHandle {
     }
 }
 
+impl<'a> SessionTx<'a> {
+    /// Return the effective access level for a relation read. Ordinary
+    /// indexes are stored as independent `base:index` relations, but they
+    /// must never grant more access than their base relation.
+    pub(crate) fn effective_read_access_level(
+        &self,
+        handle: &RelationHandle,
+    ) -> Result<AccessLevel> {
+        if let Some((base_name, _)) = handle.name.split_once(':') {
+            let base = self.get_relation(base_name, false)?;
+            Ok(handle.access_level.min(base.access_level))
+        } else {
+            Ok(handle.access_level)
+        }
+    }
+}
+
 #[derive(
     Copy,
     Clone,
@@ -1824,6 +1841,13 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         // Get relation handle
         let mut rel_handle = self.get_relation(rel_name, true)?;
+        if rel_handle.access_level < AccessLevel::Normal {
+            bail!(InsufficientAccessLevel(
+                rel_handle.name.to_string(),
+                "creating index".to_string(),
+                rel_handle.access_level
+            ));
+        }
         Self::reject_txtime_relation(&rel_handle, "::index create")?;
 
         // Check if index already exists

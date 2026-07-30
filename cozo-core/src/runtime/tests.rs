@@ -515,6 +515,28 @@ fn test_index() {
 }
 
 #[test]
+fn index_respects_base_relation_access_level() {
+    let db = DbInstance::default();
+    db.run_default(":create secret {id: Int => value: String}")
+        .unwrap();
+    db.run_default("?[id, value] <- [[1, 'classified']] :put secret {id => value}")
+        .unwrap();
+    db.run_default("::index create secret:by_value {value}")
+        .unwrap();
+    db.run_default("::access_level hidden secret").unwrap();
+
+    assert!(db
+        .run_default("?[id, value] := *secret:by_value{value, id}")
+        .is_err());
+    assert!(db
+        .export_relations(["secret:by_value"].into_iter())
+        .is_err());
+    assert!(db
+        .run_default("::index create secret:another {value}")
+        .is_err());
+}
+
+#[test]
 fn test_json_objects() {
     let db = DbInstance::default();
     db.run_default("?[a] := a = {'a': 1}").unwrap();
