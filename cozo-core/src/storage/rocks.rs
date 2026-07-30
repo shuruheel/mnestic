@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use log::info;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
@@ -150,7 +150,7 @@ impl Storage<'_> for RocksDbStorage {
                 // Durable-writes knob (mnestic fork): fsync the WAL on commit.
                 builder = builder.sync(true);
             }
-            RocksTxInner::Txn(builder.start())
+            RocksTxInner::Txn(Mutex::new(builder.start()))
         } else {
             RocksTxInner::Snap(self.db.snapshot_read())
         };
@@ -237,12 +237,10 @@ pub struct RocksDbTx {
 
 enum RocksTxInner {
     /// Pessimistic transaction — all writing scripts.
-    Txn(Tx),
+    Txn(Mutex<Tx>),
     /// Plain snapshot reads — read-only scripts (mnestic fork).
     Snap(SnapReader),
 }
-
-unsafe impl Sync for RocksDbTx {}
 
 impl RocksDbTx {
     #[inline]
@@ -251,10 +249,13 @@ impl RocksDbTx {
     }
 
     #[inline]
-    fn iter_builder(&self) -> cozorocks::IterBuilder {
+    fn iter_builder(&self) -> (cozorocks::IterBuilder, Option<MutexGuard<'_, Tx>>) {
         match &self.inner {
-            RocksTxInner::Txn(tx) => tx.iterator(),
-            RocksTxInner::Snap(snap) => snap.iterator(),
+            RocksTxInner::Txn(tx) => {
+                let guard = tx.lock().expect("RocksDB transaction mutex poisoned");
+                (guard.iterator(), Some(guard))
+            }
+            RocksTxInner::Snap(snap) => (snap.iterator(), None),
         }
     }
 }
@@ -263,7 +264,11 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn get(&self, key: &[u8], for_update: bool) -> Result<Option<Vec<u8>>> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.get(key, for_update)?.map(|v| v.to_vec())),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .lock()
+                .expect("RocksDB transaction mutex poisoned")
+                .get(key, for_update)?
+                .map(|v| v.to_vec())),
             RocksTxInner::Snap(snap) => {
                 if for_update {
                     return Err(Self::read_only_write_err());
@@ -275,10 +280,12 @@ impl<'s> StoreTx<'s> for RocksDbTx {
 
     fn multi_get(&self, keys: &[Vec<u8>], for_update: bool) -> Result<Vec<Option<Vec<u8>>>> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => keys
-                .iter()
-                .map(|k| Ok(tx.get(k, for_update)?.map(|v| v.to_vec())))
-                .collect(),
+            RocksTxInner::Txn(tx) => {
+                let tx = tx.lock().expect("RocksDB transaction mutex poisoned");
+                keys.iter()
+                    .map(|k| Ok(tx.get(k, for_update)?.map(|v| v.to_vec())))
+                    .collect()
+            }
             RocksTxInner::Snap(snap) => {
                 if for_update {
                     return Err(Self::read_only_write_err());
@@ -292,7 +299,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.put(key, val)?),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .lock()
+                .expect("RocksDB transaction mutex poisoned")
+                .put(key, val)?),
             RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
         }
     }
@@ -306,6 +316,7 @@ impl<'s> StoreTx<'s> for RocksDbTx {
                 // the transaction's final write before commit, all user keys
                 // were locked (and validated) earlier, and the caller holds
                 // the process-wide serialization lock for this key.
+                let tx = tx.get_mut().expect("RocksDB transaction mutex poisoned");
                 tx.clear_snapshot();
                 Ok(tx.put(key, val)?)
             }
@@ -320,7 +331,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn par_put(&self, key: &[u8], val: &[u8]) -> Result<()> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.put(key, val)?),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .lock()
+                .expect("RocksDB transaction mutex poisoned")
+                .put(key, val)?),
             RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
         }
     }
@@ -328,7 +342,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn del(&mut self, key: &[u8]) -> Result<()> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.del(key)?),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .lock()
+                .expect("RocksDB transaction mutex poisoned")
+                .del(key)?),
             RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
         }
     }
@@ -336,7 +353,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn par_del(&self, key: &[u8]) -> Result<()> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.del(key)?),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .lock()
+                .expect("RocksDB transaction mutex poisoned")
+                .del(key)?),
             RocksTxInner::Snap(_) => Err(Self::read_only_write_err()),
         }
     }
@@ -345,6 +365,7 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         let RocksTxInner::Txn(tx) = &self.inner else {
             return Err(Self::read_only_write_err());
         };
+        let tx = tx.get_mut().expect("RocksDB transaction mutex poisoned");
         let mut inner = tx.iterator().upper_bound(upper).start();
         inner.seek(lower);
         while let Some(key) = inner.key()? {
@@ -360,7 +381,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     #[inline]
     fn exists(&self, key: &[u8], for_update: bool) -> Result<bool> {
         match &self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.exists(key, for_update)?),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .lock()
+                .expect("RocksDB transaction mutex poisoned")
+                .exists(key, for_update)?),
             RocksTxInner::Snap(snap) => {
                 if for_update {
                     return Err(Self::read_only_write_err());
@@ -372,7 +396,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
 
     fn commit(&mut self) -> Result<()> {
         match &mut self.inner {
-            RocksTxInner::Txn(tx) => Ok(tx.commit()?),
+            RocksTxInner::Txn(tx) => Ok(tx
+                .get_mut()
+                .expect("RocksDB transaction mutex poisoned")
+                .commit()?),
             // Nothing to commit: the snapshot read view simply ends.
             RocksTxInner::Snap(_) => Ok(()),
         }
@@ -386,9 +413,11 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     where
         's: 'a,
     {
-        let mut inner = self.iter_builder().upper_bound(upper).start();
+        let (builder, guard) = self.iter_builder();
+        let mut inner = builder.upper_bound(upper).start();
         inner.seek(lower);
         Box::new(RocksDbIterator {
+            _guard: guard,
             inner,
             started: false,
             upper_bound: upper.to_vec(),
@@ -401,8 +430,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         upper: &[u8],
         valid_at: ValidityTs,
     ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        let inner = self.iter_builder().upper_bound(upper).start();
+        let (builder, guard) = self.iter_builder();
+        let inner = builder.upper_bound(upper).start();
         Box::new(RocksDbSkipIterator {
+            _guard: guard,
             inner,
             upper_bound: upper.to_vec(),
             next_bound: lower.to_owned(),
@@ -420,8 +451,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         // Step-6 seek override: ONE pinned iterator for the whole walk
         // (`HybridProbe` turns most probes into sequential `next()`s); the
         // generic default constructs a fresh iterator per probe.
-        let inner = self.iter_builder().upper_bound(upper).start();
+        let (builder, guard) = self.iter_builder();
+        let inner = builder.upper_bound(upper).start();
         let mut probe = crate::data::bitemporal::HybridProbe::new(RocksSeekCursor {
+            _guard: guard,
             inner,
             upper_bound: upper.to_vec(),
         });
@@ -441,9 +474,11 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     where
         's: 'a,
     {
-        let mut inner = self.iter_builder().upper_bound(upper).start();
+        let (builder, guard) = self.iter_builder();
+        let mut inner = builder.upper_bound(upper).start();
         inner.seek(lower);
         Box::new(RocksDbIteratorRaw {
+            _guard: guard,
             inner,
             started: false,
             upper_bound: upper.to_vec(),
@@ -454,7 +489,8 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     where
         's: 'a,
     {
-        let mut inner = self.iter_builder().upper_bound(upper).start();
+        let (builder, _guard) = self.iter_builder();
+        let mut inner = builder.upper_bound(upper).start();
         inner.seek(lower);
         let mut count = 0;
         while let Some(k) = inner.key()? {
@@ -475,13 +511,15 @@ impl<'s> StoreTx<'s> for RocksDbTx {
     }
 }
 
-pub(crate) struct RocksDbIterator {
+pub(crate) struct RocksDbIterator<'a> {
     inner: DbIter,
+    // Declared after `inner` so the iterator is destroyed before the lock is released.
+    _guard: Option<MutexGuard<'a, Tx>>,
     started: bool,
     upper_bound: Vec<u8>,
 }
 
-impl RocksDbIterator {
+impl RocksDbIterator<'_> {
     #[inline]
     fn next_inner(&mut self) -> Result<Option<Tuple>> {
         if self.started {
@@ -503,7 +541,7 @@ impl RocksDbIterator {
     }
 }
 
-impl Iterator for RocksDbIterator {
+impl Iterator for RocksDbIterator<'_> {
     type Item = Result<Tuple>;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -512,12 +550,13 @@ impl Iterator for RocksDbIterator {
 }
 
 /// Pinned-iterator cursor for the bitemporal walk (bitemporality step 6).
-struct RocksSeekCursor {
+struct RocksSeekCursor<'a> {
     inner: DbIter,
+    _guard: Option<MutexGuard<'a, Tx>>,
     upper_bound: Vec<u8>,
 }
 
-impl RocksSeekCursor {
+impl RocksSeekCursor<'_> {
     fn current(&self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         Ok(match self.inner.pair()? {
             None => None,
@@ -532,7 +571,7 @@ impl RocksSeekCursor {
     }
 }
 
-impl crate::data::bitemporal::SeekCursor for RocksSeekCursor {
+impl crate::data::bitemporal::SeekCursor for RocksSeekCursor<'_> {
     fn seek(&mut self, bound: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         if bound >= self.upper_bound.as_slice() {
             return Ok(None);
@@ -547,14 +586,15 @@ impl crate::data::bitemporal::SeekCursor for RocksSeekCursor {
     }
 }
 
-pub(crate) struct RocksDbSkipIterator {
+pub(crate) struct RocksDbSkipIterator<'a> {
     inner: DbIter,
+    _guard: Option<MutexGuard<'a, Tx>>,
     upper_bound: Vec<u8>,
     next_bound: Vec<u8>,
     valid_at: ValidityTs,
 }
 
-impl RocksDbSkipIterator {
+impl RocksDbSkipIterator<'_> {
     #[inline]
     fn next_inner(&mut self) -> Result<Option<Tuple>> {
         loop {
@@ -578,7 +618,7 @@ impl RocksDbSkipIterator {
     }
 }
 
-impl Iterator for RocksDbSkipIterator {
+impl Iterator for RocksDbSkipIterator<'_> {
     type Item = Result<Tuple>;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
@@ -586,13 +626,14 @@ impl Iterator for RocksDbSkipIterator {
     }
 }
 
-pub(crate) struct RocksDbIteratorRaw {
+pub(crate) struct RocksDbIteratorRaw<'a> {
     inner: DbIter,
+    _guard: Option<MutexGuard<'a, Tx>>,
     started: bool,
     upper_bound: Vec<u8>,
 }
 
-impl RocksDbIteratorRaw {
+impl RocksDbIteratorRaw<'_> {
     #[inline]
     fn next_inner(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
         if self.started {
@@ -614,7 +655,7 @@ impl RocksDbIteratorRaw {
     }
 }
 
-impl Iterator for RocksDbIteratorRaw {
+impl Iterator for RocksDbIteratorRaw<'_> {
     type Item = Result<(Vec<u8>, Vec<u8>)>;
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
