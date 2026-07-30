@@ -280,7 +280,13 @@ impl<'de> Visitor<'de> for VectorVisitor {
             .ok_or_else(|| serde::de::Error::invalid_length(1, &self))?;
         match tag {
             0u8 => {
-                let len = bytes.len() / std::mem::size_of::<f32>();
+                let element_size = std::mem::size_of::<f32>();
+                if bytes.len() % element_size != 0 {
+                    return Err(serde::de::Error::custom(
+                        "f32 vector byte length must be a multiple of 4",
+                    ));
+                }
+                let len = bytes.len() / element_size;
                 let mut v = vec![];
                 v.reserve_exact(len);
                 let ptr = v.as_mut_ptr() as *mut u8;
@@ -291,7 +297,13 @@ impl<'de> Visitor<'de> for VectorVisitor {
                 Ok(Vector::F32(Array1::from(v)))
             }
             1u8 => {
-                let len = bytes.len() / std::mem::size_of::<f64>();
+                let element_size = std::mem::size_of::<f64>();
+                if bytes.len() % element_size != 0 {
+                    return Err(serde::de::Error::custom(
+                        "f64 vector byte length must be a multiple of 8",
+                    ));
+                }
+                let len = bytes.len() / element_size;
                 let mut v = vec![];
                 v.reserve_exact(len);
                 let ptr = v.as_mut_ptr() as *mut u8;
@@ -733,3 +745,18 @@ impl DataValue {
 }
 
 pub(crate) const LARGEST_UTF_CHAR: char = '\u{10ffff}';
+
+#[cfg(test)]
+mod tests {
+    use super::Vector;
+
+    #[test]
+    fn reject_misaligned_vector_bytes() {
+        // MessagePack tuples containing a vector tag followed by a one-byte payload.
+        let malformed_f32 = [0x92, 0x00, 0xc4, 0x01, 0x41];
+        let malformed_f64 = [0x92, 0x01, 0xc4, 0x01, 0x41];
+
+        assert!(rmp_serde::from_slice::<Vector>(&malformed_f32).is_err());
+        assert!(rmp_serde::from_slice::<Vector>(&malformed_f64).is_err());
+    }
+}
