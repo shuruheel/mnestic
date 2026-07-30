@@ -181,8 +181,30 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
     }
 }
 
-#[test]
-fn x() {}
+fn require_mutable(
+    mutability: ScriptMutability,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match mutability {
+        ScriptMutability::Mutable => Ok(()),
+        ScriptMutability::Immutable => Err((
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "message": "this operation requires a mutable token"}).into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutable_operations_require_mutable_authorization() {
+        assert!(require_mutable(ScriptMutability::Mutable).is_ok());
+
+        let (status, _) = require_mutable(ScriptMutability::Immutable).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+}
 
 pub(crate) async fn server_main(args: ServerArgs) {
     let db = DbInstance::new(&args.engine, &args.path, &args.config).unwrap();
@@ -437,9 +459,14 @@ async fn export_relations(
 }
 
 async fn import_relations(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_mutable(mutability) {
+        return response;
+    }
+
     let payload = match payload.as_object() {
         None => {
             return (
@@ -482,9 +509,14 @@ struct BackupPayload {
 }
 
 async fn backup(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Json(payload): Json<BackupPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_mutable(mutability) {
+        return response;
+    }
+
     let result = spawn_blocking(move || st.db.backup_db(payload.path)).await;
 
     match result {
@@ -507,9 +539,14 @@ struct BackupImportPayload {
 }
 
 async fn import_from_backup(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Json(payload): Json<BackupImportPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_mutable(mutability) {
+        return response;
+    }
+
     let result =
         spawn_blocking(move || st.db.import_from_backup(&payload.path, &payload.relations)).await;
 
