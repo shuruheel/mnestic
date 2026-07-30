@@ -254,11 +254,12 @@ impl<'a> SessionTx<'a> {
                 }
                 MagicAtom::Relation(rel_app) => {
                     let store = self.get_relation(&rel_app.name, false)?;
-                    if store.access_level < AccessLevel::ReadOnly {
+                    let access_level = self.effective_read_access_level(&store)?;
+                    if access_level < AccessLevel::ReadOnly {
                         bail!(InsufficientAccessLevel(
                             store.name.to_string(),
                             "reading rows".to_string(),
-                            store.access_level
+                            access_level
                         ));
                     }
                     ensure!(
