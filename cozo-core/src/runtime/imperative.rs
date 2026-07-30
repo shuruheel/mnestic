@@ -22,7 +22,7 @@ use crate::data::symb::Symbol;
 use crate::parse::{ImperativeCondition, ImperativeProgram, ImperativeStmt, SourceSpan};
 use crate::runtime::callback::CallbackCollector;
 use crate::runtime::db::{seconds_since_the_epoch, RunningQueryCleanup, RunningQueryHandle};
-use crate::runtime::relation::InputRelationHandle;
+use crate::runtime::relation::{AccessLevel, InputRelationHandle, InsufficientAccessLevel};
 use crate::runtime::transact::SessionTx;
 use crate::{DataValue, Db, NamedRows, Poison, Storage, ValidityTs};
 
@@ -102,6 +102,13 @@ impl<'s, S: Storage<'s>> Db<S> {
                             )?,
                             Right(rel) => {
                                 let relation = tx.get_relation(rel, false)?;
+                                if relation.access_level < AccessLevel::ReadOnly {
+                                    bail!(InsufficientAccessLevel(
+                                        relation.name.to_string(),
+                                        "reading rows".to_string(),
+                                        relation.access_level
+                                    ));
+                                }
                                 relation.as_named_rows(tx)?
                             }
                         };
