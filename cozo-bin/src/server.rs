@@ -83,7 +83,18 @@ struct DbState {
     rule_senders: Arc<Mutex<BTreeMap<u32, crossbeam::channel::Sender<miette::Result<NamedRows>>>>>,
     rule_counter: Arc<AtomicU32>,
     tx_counter: Arc<AtomicU32>,
-    txs: Arc<Mutex<BTreeMap<u32, Arc<MultiTransaction>>>>,
+    txs: Arc<Mutex<BTreeMap<u32, StoredTransaction>>>,
+}
+
+struct StoredTransaction {
+    tx: Arc<MultiTransaction>,
+    owner: String,
+}
+
+#[derive(Clone)]
+struct AuthContext {
+    mutability: ScriptMutability,
+    principal: String,
 }
 
 #[derive(Clone)]
@@ -105,6 +116,10 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
         Box::pin(async move {
             if skip_auth {
                 request.extensions_mut().insert(ScriptMutability::Mutable);
+                request.extensions_mut().insert(AuthContext {
+                    mutability: ScriptMutability::Mutable,
+                    principal: "local".to_string(),
+                });
                 return Ok(request);
             }
 
@@ -114,7 +129,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
             // that needs query params (e.g. `/transact?write=true`,
             // `/rules/name?arity=2`). Returns None when there's no token table or
             // no usable bearer header, so callers can fall through to deny.
-            let bearer_grant = || -> Option<ScriptMutability> {
+            let bearer_grant = || -> Option<AuthContext> {
                 let tt = token_table.as_ref()?;
                 let (name, db) = tt.as_ref();
                 let auth_str = request.headers().get("Authorization")?.to_str().ok()?;
@@ -124,12 +139,13 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                     BTreeMap::from([(String::from("token"), DataValue::from(token))]),
                     ScriptMutability::Immutable,
                 ) {
-                    Ok(rows) => rows.rows.first().map(|val| {
-                        if val[0].get_bool() == Some(true) {
+                    Ok(rows) => rows.rows.first().map(|val| AuthContext {
+                        mutability: if val[0].get_bool() == Some(true) {
                             ScriptMutability::Mutable
                         } else {
                             ScriptMutability::Immutable
-                        }
+                        },
+                        principal: format!("bearer:{token}"),
                     }),
                     Err(err) => {
                         eprintln!("Error: {}", err);
@@ -146,8 +162,10 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                         for pair in q_str.split('&') {
                             if let Some((k, v)) = pair.split_once('=') {
                                 if k == "auth" {
-                                    return (v == auth_guard.as_str())
-                                        .then_some(ScriptMutability::Mutable);
+                                    return (v == auth_guard.as_str()).then_some(AuthContext {
+                                        mutability: ScriptMutability::Mutable,
+                                        principal: "admin".to_string(),
+                                    });
                                 }
                             }
                         }
@@ -158,7 +176,10 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                 Some(data) => match data.to_str() {
                     Ok(s) => {
                         if s == auth_guard.as_str() {
-                            Some(ScriptMutability::Mutable)
+                            Some(AuthContext {
+                                mutability: ScriptMutability::Mutable,
+                                principal: "admin".to_string(),
+                            })
                         } else {
                             None
                         }
@@ -166,8 +187,9 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                     Err(_) => None,
                 },
             };
-            if let Some(mutability) = mutability {
-                request.extensions_mut().insert(mutability);
+            if let Some(auth) = mutability {
+                request.extensions_mut().insert(auth.mutability);
+                request.extensions_mut().insert(auth);
                 Ok(request)
             } else {
                 let unauthorized_response = Response::builder()
@@ -293,23 +315,37 @@ struct StartTransactPayload {
 }
 
 async fn start_transact(
+    Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
     Query(payload): Query<StartTransactPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.write && matches!(auth.mutability, ScriptMutability::Immutable) {
+        return (StatusCode::FORBIDDEN, json!({"ok": false}).into());
+    }
     let tx = st.db.multi_transaction(payload.write);
     let id = st.tx_counter.fetch_add(1, Ordering::SeqCst);
-    st.txs.lock().unwrap().insert(id, Arc::new(tx));
+    st.txs.lock().unwrap().insert(
+        id,
+        StoredTransaction {
+            tx: Arc::new(tx),
+            owner: auth.principal,
+        },
+    );
     (StatusCode::OK, json!({"ok": true, "id": id}).into())
 }
 
 async fn transact_query(
+    Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
     Path(id): Path<u32>,
     Json(payload): Json<QueryPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tx = match st.txs.lock().unwrap().get(&id) {
         None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(tx) => tx.clone(),
+        Some(stored) if stored.owner != auth.principal => {
+            return (StatusCode::FORBIDDEN, json!({"ok": false}).into())
+        }
+        Some(stored) => stored.tx.clone(),
     };
     let src = payload.script.clone();
     let result = spawn_blocking(move || {
@@ -338,13 +374,21 @@ struct FinishTransactPayload {
 }
 
 async fn finish_query(
+    Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
     Path(id): Path<u32>,
     Json(payload): Json<FinishTransactPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tx = match st.txs.lock().unwrap().remove(&id) {
-        None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(tx) => tx,
+    let tx = match st.txs.lock().unwrap().entry(id) {
+        std::collections::btree_map::Entry::Vacant(_) => {
+            return (StatusCode::NOT_FOUND, json!({"ok": false}).into())
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+            if entry.get().owner != auth.principal =>
+        {
+            return (StatusCode::FORBIDDEN, json!({"ok": false}).into())
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => entry.remove().tx,
     };
     let res = if payload.abort {
         tx.abort()
