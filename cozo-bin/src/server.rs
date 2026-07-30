@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderName, Method, Request, Response, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{Html, Sse};
 use axum::routing::{get, post, put};
@@ -89,8 +89,16 @@ struct DbState {
 #[derive(Clone)]
 struct MyAuth {
     skip_auth: bool,
+    allowed_origin: String,
     auth_guard: String,
     token_table: Option<Arc<(String, DbInstance)>>,
+}
+
+fn has_forbidden_origin(request: &Request<Body>, allowed_origin: &str) -> bool {
+    request
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|origin| origin.as_bytes() != allowed_origin.as_bytes())
 }
 
 impl AsyncAuthorizeRequest<Body> for MyAuth {
@@ -100,10 +108,20 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
 
     fn authorize(&mut self, mut request: Request<Body>) -> Self::Future {
         let skip_auth = self.skip_auth;
+        let allowed_origin = self.allowed_origin.clone();
         let auth_guard = self.auth_guard.clone();
         let token_table = self.token_table.clone();
         Box::pin(async move {
             if skip_auth {
+                // Loopback is not an authentication boundary for browsers. Reject
+                // requests originating on another site before granting the
+                // unauthenticated local-server exception.
+                if has_forbidden_origin(&request, &allowed_origin) {
+                    return Err(Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Body::empty())
+                        .unwrap());
+                }
                 request.extensions_mut().insert(ScriptMutability::Mutable);
                 return Ok(request);
             }
@@ -182,7 +200,25 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
 }
 
 #[test]
-fn x() {}
+fn loopback_origin_guard_allows_non_browser_and_same_origin_requests() {
+    let no_origin = Request::new(Body::empty());
+    assert!(!has_forbidden_origin(&no_origin, "http://127.0.0.1:9070"));
+
+    let same_origin = Request::builder()
+        .header(header::ORIGIN, "http://127.0.0.1:9070")
+        .body(Body::empty())
+        .unwrap();
+    assert!(!has_forbidden_origin(&same_origin, "http://127.0.0.1:9070"));
+}
+
+#[test]
+fn loopback_origin_guard_rejects_cross_origin_requests() {
+    let request = Request::builder()
+        .header(header::ORIGIN, "https://attacker.example")
+        .body(Body::empty())
+        .unwrap();
+    assert!(has_forbidden_origin(&request, "http://127.0.0.1:9070"));
+}
 
 pub(crate) async fn server_main(args: ServerArgs) {
     let db = DbInstance::new(&args.engine, &args.path, &args.config).unwrap();
@@ -223,6 +259,7 @@ pub(crate) async fn server_main(args: ServerArgs) {
 
     let auth_obj = MyAuth {
         skip_auth,
+        allowed_origin: format!("http://{}:{}", args.bind, args.port),
         auth_guard,
         token_table: args.token_table.map(|t| Arc::new((t, db.clone()))),
     };
@@ -236,12 +273,20 @@ pub(crate) async fn server_main(args: ServerArgs) {
     };
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_origin(Any)
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
             HeaderName::from_static("x-cozo-auth"),
         ]);
+    let cors = if skip_auth {
+        cors.allow_origin(
+            format!("http://{}:{}", args.bind, args.port)
+                .parse::<HeaderValue>()
+                .unwrap(),
+        )
+    } else {
+        cors.allow_origin(Any)
+    };
 
     let app = Router::new()
         .route("/text-query", post(text_query))
