@@ -7,14 +7,18 @@
  */
 
 pub(crate) mod constant;
+#[cfg(feature = "data-import")]
 pub(crate) mod csv;
+#[cfg(feature = "data-import")]
 pub(crate) mod jlines;
 pub(crate) mod mmr;
 pub(crate) mod reorder_sort;
 pub(crate) mod rrf;
 
+#[cfg(feature = "data-import")]
 pub(crate) use self::csv::CsvReader;
 pub(crate) use constant::Constant;
+#[cfg(feature = "data-import")]
 pub(crate) use jlines::JsonReader;
 pub(crate) use mmr::MaximalMarginalRelevance;
 pub(crate) use reorder_sort::ReorderSort;

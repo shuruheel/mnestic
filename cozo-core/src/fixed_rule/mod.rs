@@ -1114,10 +1114,12 @@ lazy_static! {
                 "MMR".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(MaximalMarginalRelevance)),
             ),
+            #[cfg(feature = "data-import")]
             (
                 "JsonReader".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(JsonReader)),
             ),
+            #[cfg(feature = "data-import")]
             (
                 "CsvReader".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(CsvReader)),
