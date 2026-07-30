@@ -10,6 +10,7 @@ import pytest
 from langchain_core.embeddings import Embeddings
 
 from langchain_mnestic import MnesticVectorStore
+from langchain_mnestic._core import MnesticStore
 
 
 class KeywordEmbeddings(Embeddings):
@@ -35,6 +36,25 @@ TEXTS = [
     "the weather is nice",
 ]
 METAS = [{"src": c} for c in "abcd"]
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("relation", "docs { id } :rm other_docs"),
+        ("id_col", "id] <- [] :rm other_docs { id"),
+        ("vector_index", "vec} :rm other_docs {id"),
+        ("distance", "Cosine} :rm other_docs {id"),
+    ],
+)
+def test_rejects_cozoscript_in_configuration(option, value):
+    with pytest.raises(ValueError, match="bare identifier"):
+        MnesticStore(object(), dim=2, create=False, **{option: value})
+
+
+def test_rejects_non_numeric_index_configuration():
+    with pytest.raises(ValueError):
+        MnesticStore(object(), dim=2, m="16} :rm other_docs {id", create=False)
 
 
 def test_add_and_hybrid_search_mem():
