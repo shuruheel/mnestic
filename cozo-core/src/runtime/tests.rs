@@ -51,6 +51,33 @@ fn test_limit_offset() {
 }
 
 #[test]
+fn hidden_relations_cannot_be_read_indirectly() {
+    let db = DbInstance::default();
+    db.run_default(":create secret {id => value}").unwrap();
+    db.run_default("?[id, value] <- [[1, 'classified']] :put secret {id => value}")
+        .unwrap();
+    db.run_default("::access_level hidden secret").unwrap();
+
+    let negated = db
+        .run_default("candidates[id] <- [[1], [2]] ?[id] := candidates[id], not *secret{id}")
+        .expect_err("negation must not reveal membership in a hidden relation");
+    assert!(
+        format!("{negated:?}").contains("Insufficient access level"),
+        "{negated:?}"
+    );
+
+    let fixed_rule = db
+        .run_default(
+            "?[rank, id, value] <~ ReorderSort(*secret[id, value], out: [id, value], sort_by: id)",
+        )
+        .expect_err("fixed rules must not scan a hidden relation");
+    assert!(
+        format!("{fixed_rule:?}").contains("Insufficient access level"),
+        "{fixed_rule:?}"
+    );
+}
+
+#[test]
 fn test_normal_aggr_empty() {
     let db = DbInstance::default();
     let res = db.run_default("?[count(a)] := a in []").unwrap().rows;
