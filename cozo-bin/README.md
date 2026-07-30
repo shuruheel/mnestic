@@ -85,9 +85,11 @@ and a nicely-formatted diagnostic will be in `"display"` if available.
 * `GET /export/{relations: String}`, where `relations` is a comma-separated list of relations to export.
 * `PUT /import`, import data into the database. Data should be in `application/json` MIME type in the body,
   in the same format as returned in the `data` field in the `/export` API.
-* `POST /backup`, backup database, should supply a JSON body of the form `{"path": <PATH>}`
+* `POST /backup`, backup database, should supply a JSON body of the form `{"path": <PATH>}`.
+  The path is relative to the server's `--backup-dir` (default: `backups`) and cannot escape it.
 * `POST /import-from-backup`, import data into the database from a backup. Should supply a JSON body
-  of the form `{"path": <PATH>, "relations": <ARRAY OF RELATION NAMES>}`.
+  of the form `{"path": <PATH>, "relations": <ARRAY OF RELATION NAMES>}`. The same
+  `--backup-dir` restriction applies.
 * `GET /`, if you open this in your browser and open your developer tools, you will be able to use
   a very simple client to query this database.
 

@@ -9,6 +9,7 @@
 use std::collections::BTreeMap;
 use std::convert::Infallible;
 use std::net::{Ipv6Addr, SocketAddr};
+use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,6 +52,10 @@ pub(crate) struct ServerArgs {
     #[clap(short, long, default_value_t = String::from("cozo.db"))]
     path: String,
 
+    /// Directory containing files exposed by the HTTP backup APIs
+    #[clap(long, default_value_t = String::from("backups"))]
+    backup_dir: String,
+
     /// Restore from the specified backup before starting the server
     #[clap(long)]
     restore: Option<String>,
@@ -81,6 +86,7 @@ pub(crate) struct ServerArgs {
 #[derive(Clone)]
 struct DbState {
     db: DbInstance,
+    backup_dir: Arc<PathBuf>,
     rule_senders: Arc<Mutex<BTreeMap<u32, crossbeam::channel::Sender<miette::Result<NamedRows>>>>>,
     rule_counter: Arc<AtomicU32>,
     tx_counter: Arc<AtomicU32>,
@@ -283,6 +289,9 @@ mod tests {
 
 pub(crate) async fn server_main(args: ServerArgs) {
     let db = DbInstance::new(&args.engine, &args.path, &args.config).unwrap();
+    std::fs::create_dir_all(&args.backup_dir).expect("Cannot create HTTP backup directory");
+    let backup_dir =
+        std::fs::canonicalize(&args.backup_dir).expect("Cannot resolve HTTP backup directory");
     if let Some(secs) = args.default_query_timeout {
         db.set_default_query_timeout(Some(secs));
     }
@@ -327,6 +336,7 @@ pub(crate) async fn server_main(args: ServerArgs) {
 
     let state = DbState {
         db,
+        backup_dir: Arc::new(backup_dir),
         rule_senders: Default::default(),
         rule_counter: Default::default(),
         tx_counter: Default::default(),
@@ -647,6 +657,72 @@ struct BackupPayload {
     path: String,
 }
 
+fn resolve_backup_path(backup_dir: &FsPath, requested: &str) -> miette::Result<PathBuf> {
+    let requested = FsPath::new(requested);
+    if requested.as_os_str().is_empty() || requested.is_absolute() {
+        return Err(miette!(
+            "backup path must be relative to the HTTP backup directory"
+        ));
+    }
+
+    let candidate = backup_dir.join(requested);
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| miette!("backup path has no parent directory"))?;
+    let resolved_parent =
+        std::fs::canonicalize(parent).map_err(|_| miette!("backup path parent does not exist"))?;
+    if !resolved_parent.starts_with(backup_dir) {
+        return Err(miette!("backup path escapes the HTTP backup directory"));
+    }
+
+    // Canonicalize an existing file as well, so a symlink cannot point outside
+    // the configured directory. New files inherit the checked parent.
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(_) => {
+            let resolved = std::fs::canonicalize(&candidate)
+                .map_err(|_| miette!("cannot resolve backup path"))?;
+            if !resolved.starts_with(backup_dir) {
+                return Err(miette!("backup path escapes the HTTP backup directory"));
+            }
+            Ok(resolved)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(resolved_parent.join(candidate.file_name().unwrap()))
+        }
+        Err(_) => Err(miette!("cannot inspect backup path")),
+    }
+}
+
+#[cfg(test)]
+mod backup_path_tests {
+    use super::resolve_backup_path;
+    use std::fs;
+
+    #[test]
+    fn confines_http_backup_paths_to_configured_directory() {
+        let root = std::env::temp_dir().join(format!("cozo-backup-path-{}", std::process::id()));
+        let backups = root.join("backups");
+        fs::create_dir_all(backups.join("nested")).unwrap();
+        let backups = fs::canonicalize(backups).unwrap();
+
+        assert_eq!(
+            resolve_backup_path(&backups, "nested/safe.db").unwrap(),
+            backups.join("nested/safe.db")
+        );
+        assert!(resolve_backup_path(&backups, "/tmp/outside.db").is_err());
+        assert!(resolve_backup_path(&backups, "../outside.db").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("missing-outside.db"), backups.join("link.db"))
+                .unwrap();
+            assert!(resolve_backup_path(&backups, "link.db").is_err());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 async fn backup(
     Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
@@ -656,7 +732,16 @@ async fn backup(
         return response;
     }
 
-    let result = spawn_blocking(move || st.db.backup_db(payload.path)).await;
+    let path = match resolve_backup_path(&st.backup_dir, &payload.path) {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"ok": false, "message": err.to_string()}).into(),
+            );
+        }
+    };
+    let result = spawn_blocking(move || st.db.backup_db(path)).await;
 
     match result {
         Ok(Ok(())) => {
@@ -686,8 +771,16 @@ async fn import_from_backup(
         return response;
     }
 
-    let result =
-        spawn_blocking(move || st.db.import_from_backup(&payload.path, &payload.relations)).await;
+    let path = match resolve_backup_path(&st.backup_dir, &payload.path) {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"ok": false, "message": err.to_string()}).into(),
+            );
+        }
+    };
+    let result = spawn_blocking(move || st.db.import_from_backup(path, &payload.relations)).await;
 
     match result {
         Ok(Ok(())) => {
