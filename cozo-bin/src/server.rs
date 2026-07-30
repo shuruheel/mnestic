@@ -234,14 +234,22 @@ pub(crate) async fn server_main(args: ServerArgs) {
         tx_counter: Default::default(),
         txs: Default::default(),
     };
-    let cors = CorsLayer::new()
-        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_origin(Any)
-        .allow_headers([
-            header::CONTENT_TYPE,
-            header::AUTHORIZATION,
-            HeaderName::from_static("x-cozo-auth"),
-        ]);
+    // Do not opt the unauthenticated loopback server into CORS. Otherwise an
+    // arbitrary website can preflight JSON requests and execute CozoScript in
+    // the visitor's local database. Authenticated servers may remain usable by
+    // cross-origin clients because their requests still require credentials.
+    let cors = if skip_auth {
+        CorsLayer::new()
+    } else {
+        CorsLayer::new()
+            .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
+            .allow_origin(Any)
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                HeaderName::from_static("x-cozo-auth"),
+            ])
+    };
 
     let app = Router::new()
         .route("/text-query", post(text_query))
