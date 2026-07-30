@@ -1008,10 +1008,32 @@ impl<'a> SessionTx<'a> {
         }
 
         let metadata = input_meta.metadata.clone();
+        let tuple = vec![DataValue::Null];
+        let t_encoded = tuple.encode_as_key(RelationId::SYSTEM);
         let last_id = if is_temp {
             self.temp_store_id.fetch_add(1, Ordering::Relaxed) as u64
         } else {
-            self.relation_store_id.fetch_add(1, Ordering::SeqCst)
+            // The persisted counter is the distributed serialization point for
+            // relation IDs. In particular, a TiKV Db may have been opened before
+            // another process created a relation, so its in-process counter can
+            // be stale. Reading the counter for update makes concurrent allocators
+            // conflict (optimistic TiKV) or lock it (pessimistic TiKV).
+            let persisted = self
+                .store_tx
+                .get(&t_encoded, true)?
+                .map(|value| RelationId::raw_decode(&value).0)
+                .unwrap_or(0);
+            loop {
+                let local = self.relation_store_id.load(Ordering::SeqCst);
+                let last_id = local.max(persisted);
+                if self
+                    .relation_store_id
+                    .compare_exchange(local, last_id + 1, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break last_id;
+                }
+            }
         };
         let meta = RelationHandle {
             name: input_meta.name.name,
@@ -1034,9 +1056,6 @@ impl<'a> SessionTx<'a> {
         let mut meta_val = vec![];
         meta.serialize(&mut Serializer::new(&mut meta_val).with_struct_map())
             .unwrap();
-        let tuple = vec![DataValue::Null];
-        let t_encoded = tuple.encode_as_key(RelationId::SYSTEM);
-
         if is_temp {
             self.temp_store_tx.put(&encoded, &meta.id.raw_encode())?;
             self.temp_store_tx.put(&name_key, &meta_val)?;
