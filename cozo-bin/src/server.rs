@@ -12,6 +12,7 @@ use std::net::{Ipv6Addr, SocketAddr};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
@@ -83,8 +84,17 @@ struct DbState {
     rule_senders: Arc<Mutex<BTreeMap<u32, crossbeam::channel::Sender<miette::Result<NamedRows>>>>>,
     rule_counter: Arc<AtomicU32>,
     tx_counter: Arc<AtomicU32>,
-    txs: Arc<Mutex<BTreeMap<u32, Arc<MultiTransaction>>>>,
+    txs: Arc<Mutex<BTreeMap<u32, HttpTransaction>>>,
 }
+
+#[derive(Clone)]
+struct HttpTransaction {
+    tx: Arc<MultiTransaction>,
+    expires_at: Instant,
+}
+
+const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TRANSACTION_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Clone)]
 struct MyAuth {
@@ -234,6 +244,35 @@ pub(crate) async fn server_main(args: ServerArgs) {
         tx_counter: Default::default(),
         txs: Default::default(),
     };
+    let transaction_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TRANSACTION_REAPER_INTERVAL);
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let expired = {
+                let mut txs = transaction_state.txs.lock().unwrap();
+                let expired_ids = txs
+                    .iter()
+                    .filter_map(|(&id, entry)| (entry.expires_at <= now).then_some(id))
+                    .collect_vec();
+                expired_ids
+                    .into_iter()
+                    .filter_map(|id| txs.remove(&id))
+                    .collect_vec()
+            };
+            for entry in expired {
+                // Aborting waits for the database worker, so never do it on the
+                // async runtime thread. Removal first also prevents new work
+                // from extending an already-expired transaction.
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) = entry.tx.abort() {
+                        warn!("Failed to abort expired HTTP transaction: {err}");
+                    }
+                });
+            }
+        }
+    });
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
         .allow_origin(Any)
@@ -298,7 +337,13 @@ async fn start_transact(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tx = st.db.multi_transaction(payload.write);
     let id = st.tx_counter.fetch_add(1, Ordering::SeqCst);
-    st.txs.lock().unwrap().insert(id, Arc::new(tx));
+    st.txs.lock().unwrap().insert(
+        id,
+        HttpTransaction {
+            tx: Arc::new(tx),
+            expires_at: Instant::now() + TRANSACTION_IDLE_TIMEOUT,
+        },
+    );
     (StatusCode::OK, json!({"ok": true, "id": id}).into())
 }
 
@@ -307,9 +352,12 @@ async fn transact_query(
     Path(id): Path<u32>,
     Json(payload): Json<QueryPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tx = match st.txs.lock().unwrap().get(&id) {
+    let tx = match st.txs.lock().unwrap().get_mut(&id) {
         None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(tx) => tx.clone(),
+        Some(entry) => {
+            entry.expires_at = Instant::now() + TRANSACTION_IDLE_TIMEOUT;
+            entry.tx.clone()
+        }
     };
     let src = payload.script.clone();
     let result = spawn_blocking(move || {
@@ -344,7 +392,7 @@ async fn finish_query(
 ) -> (StatusCode, Json<serde_json::Value>) {
     let tx = match st.txs.lock().unwrap().remove(&id) {
         None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(tx) => tx,
+        Some(entry) => entry.tx,
     };
     let res = if payload.abort {
         tx.abort()
