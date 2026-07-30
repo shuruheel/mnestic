@@ -668,6 +668,31 @@ fn test_multi_tx() {
 }
 
 #[test]
+fn read_only_multi_tx_rejects_writes() {
+    let db = DbInstance::default();
+    db.run_default(":create a {a}").unwrap();
+    db.run_default("?[a] <- [[1]] :put a {a}").unwrap();
+
+    let tx = db.multi_transaction(false);
+    let err = tx
+        .run_script("?[a] <- [[2]] :put a {a}", Default::default())
+        .expect_err("a read-only multi-transaction must reject writes");
+    assert!(format!("{err:?}").contains("read-only transaction"));
+    assert_eq!(
+        tx.run_script("?[a] := *a[a]", Default::default())
+            .unwrap()
+            .into_json()["rows"],
+        json!([[1]])
+    );
+    tx.abort().unwrap();
+
+    assert_eq!(
+        db.run_default("?[a] := *a[a]").unwrap().into_json()["rows"],
+        json!([[1]])
+    );
+}
+
+#[test]
 fn durable_writes_not_honored_off_rocksdb() {
     // The knob's contract: backends that don't wire it up return false (the
     // default trait impl). `mem` has nothing to sync; sqlite is already
