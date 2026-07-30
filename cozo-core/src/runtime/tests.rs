@@ -4221,3 +4221,19 @@ fn reconcile_validation() {
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([[1, 99]]), "{res:?}");
 }
+
+#[test]
+fn imperative_return_respects_relation_access_level() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default("?[k, v] <- [[1, 'secret']] :create secret {k => v}")
+        .unwrap();
+    db.run_default("::access_level hidden secret").unwrap();
+
+    let err = db
+        .run_default("%return secret")
+        .expect_err("imperative return must not expose a hidden relation");
+    assert!(
+        format!("{err:?}").contains("Insufficient access level"),
+        "{err:?}"
+    );
+}
