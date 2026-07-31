@@ -23,7 +23,38 @@ use crate::fts::{TokenizerCache, TokenizerConfig};
 use crate::parse::SourceSpan;
 use crate::runtime::callback::CallbackOp;
 use crate::runtime::db::Poison;
+use crate::storage::mem::MemStorage;
+use crate::Db;
 use crate::{DbInstance, FixedRule, RegularTempStore, ScriptMutability};
+
+#[test]
+fn stale_db_handle_does_not_reuse_relation_id() {
+    let storage = MemStorage::default();
+    let stale_db = Db::new(storage.clone()).unwrap();
+    stale_db.initialize().unwrap();
+    let other_db = Db::new(storage).unwrap();
+    other_db.initialize().unwrap();
+
+    other_db
+        .run_script(
+            ":create hidden {k: Int => v: String}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+    stale_db
+        .run_script(
+            ":create alias {k: Int => v: String}",
+            BTreeMap::new(),
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+
+    let tx = stale_db.transact().unwrap();
+    let hidden = tx.get_relation("hidden", false).unwrap();
+    let alias = tx.get_relation("alias", false).unwrap();
+    assert_ne!(hidden.id, alias.id);
+}
 
 #[test]
 fn test_limit_offset() {

@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use itertools::Itertools;
 use lazy_static::lazy_static;
 use miette::{miette, IntoDiagnostic, Result};
-use tikv_client::{RawClient, Transaction, TransactionClient};
+use tikv_client::{Transaction, TransactionClient};
 use tokio::runtime::Runtime;
 
 use crate::data::tuple::Tuple;
@@ -71,6 +71,7 @@ impl Storage<'_> for TiKvStorage {
         };
         Ok(TiKvTx {
             tx: Arc::new(Mutex::new(tx)),
+            finished: false,
         })
     }
 
@@ -94,6 +95,23 @@ impl Storage<'_> for TiKvStorage {
 
 pub struct TiKvTx {
     tx: Arc<Mutex<Transaction>>,
+    finished: bool,
+}
+
+impl Drop for TiKvTx {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
+        }
+
+        // tikv-client treats dropping an active transaction as a programming
+        // error and panics. Query execution can return before commit (for
+        // example, after a transient lock error), so explicitly release any
+        // pessimistic locks and leave the client in a terminal state.
+        if let Ok(mut tx) = self.tx.lock() {
+            let _ = RT.block_on(tx.rollback());
+        }
+    }
 }
 
 impl<'s> StoreTx<'s> for TiKvTx {
@@ -155,6 +173,7 @@ impl<'s> StoreTx<'s> for TiKvTx {
     fn commit(&mut self) -> Result<()> {
         RT.block_on(self.tx.lock().unwrap().commit())
             .into_diagnostic()?;
+        self.finished = true;
         Ok(())
     }
 
