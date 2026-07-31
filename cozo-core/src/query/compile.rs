@@ -22,7 +22,6 @@ use crate::data::symb::Symbol;
 use crate::data::value::DataValue;
 use crate::parse::SourceSpan;
 use crate::query::ra::RelAlgebra;
-use crate::runtime::relation::{AccessLevel, InsufficientAccessLevel};
 use crate::runtime::transact::SessionTx;
 
 pub(crate) type CompiledProgram = BTreeMap<MagicSymbol, CompiledRuleSet>;
@@ -253,14 +252,7 @@ impl<'a> SessionTx<'a> {
                     ret = ret.join(right, prev_joiner_vars, right_joiner_vars, rule_app.span);
                 }
                 MagicAtom::Relation(rel_app) => {
-                    let store = self.get_relation(&rel_app.name, false)?;
-                    if store.access_level < AccessLevel::ReadOnly {
-                        bail!(InsufficientAccessLevel(
-                            store.name.to_string(),
-                            "reading rows".to_string(),
-                            store.access_level
-                        ));
-                    }
+                    let store = self.get_relation_for_read(&rel_app.name, "reading rows")?;
                     ensure!(
                         store.arity() == rel_app.args.len(),
                         ArityMismatch(
@@ -457,7 +449,7 @@ impl<'a> SessionTx<'a> {
                     ret = ret.neg_join(right, prev_joiner_vars, right_joiner_vars, rule_app.span);
                 }
                 MagicAtom::NegatedRelation(rel_app) => {
-                    let store = self.get_relation(&rel_app.name, false)?;
+                    let store = self.get_relation_for_read(&rel_app.name, "reading rows")?;
                     ensure!(
                         store.arity() == rel_app.args.len(),
                         ArityMismatch(

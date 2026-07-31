@@ -1508,7 +1508,7 @@ fn resolve_source(tx: &SessionTx<'_>, name: &str) -> Result<RelationHandle> {
     if name.starts_with('_') {
         bail!(ProjectionTempSourceError(name.to_string()));
     }
-    let handle = tx.get_relation(name, false)?;
+    let handle = tx.get_relation_for_read(name, "reading graph projection source")?;
     // Belt and braces: `is_temp_store_name` is the only way in today, but the
     // id collision this guards against is silent and unrecoverable.
     if handle.is_temp {
