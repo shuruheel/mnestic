@@ -68,11 +68,11 @@ and a nicely-formatted diagnostic will be in `"display"` if available.
 > If you must access Cozo remotely, you are responsible for setting up firewalls, encryptions and proxies yourself.
 >
 > As a guard against users accidentally exposing sensitive data,
-> If you bind Cozo to non-loopback addresses,
-> Cozo will generate a token string and require all queries
+> Cozo generates a token string and requires all queries
 > to provide the token string in the HTTP header field `x-cozo-auth`.
-> The warning printed when you start Cozo with a
-> non-default binding will tell you where to find the token string.
+> The startup log tells you where to find the token string.
+> Authentication may be disabled explicitly with `--insecure-no-auth`,
+> but only when binding to a loopback address.
 > This “security measure” is not considered sufficient for any purpose
 > and is only intended as a last defence against carelessness.
 >
@@ -85,9 +85,11 @@ and a nicely-formatted diagnostic will be in `"display"` if available.
 * `GET /export/{relations: String}`, where `relations` is a comma-separated list of relations to export.
 * `PUT /import`, import data into the database. Data should be in `application/json` MIME type in the body,
   in the same format as returned in the `data` field in the `/export` API.
-* `POST /backup`, backup database, should supply a JSON body of the form `{"path": <PATH>}`
+* `POST /backup`, backup database, should supply a JSON body of the form `{"path": <PATH>}`.
+  The path is relative to the server's `--backup-dir` (default: `backups`) and cannot escape it.
 * `POST /import-from-backup`, import data into the database from a backup. Should supply a JSON body
-  of the form `{"path": <PATH>, "relations": <ARRAY OF RELATION NAMES>}`.
+  of the form `{"path": <PATH>, "relations": <ARRAY OF RELATION NAMES>}`. The same
+  `--backup-dir` restriction applies.
 * `GET /`, if you open this in your browser and open your developer tools, you will be able to use
   a very simple client to query this database.
 

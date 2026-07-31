@@ -518,7 +518,20 @@ impl<'s, S: Storage<'s>> Db<S> {
                             }
                         }
                     };
-                    if let Some(write_lock_name) = p.needs_write_lock() {
+                    let write_lock_name = p.needs_write_lock();
+                    if !is_write && write_lock_name.is_some() {
+                        if results
+                            .send(Err(miette!(
+                                "write lock required for read-only transaction"
+                            )))
+                            .is_err()
+                        {
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+                    if let Some(write_lock_name) = write_lock_name {
                         match write_locks.entry(write_lock_name) {
                             Entry::Vacant(e) => {
                                 let lock = self
