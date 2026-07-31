@@ -44,7 +44,7 @@ impl<'s, S: Storage<'s>> Db<S> {
     ) -> Result<bool> {
         let res = match p {
             Left(rel) => {
-                let relation = tx.get_relation(rel, false)?;
+                let relation = tx.get_relation_for_read(rel, "reading rows")?;
                 relation.as_named_rows(tx)?
             }
             Right(p) => self.execute_single_program(
@@ -101,7 +101,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                                 callback_collector,
                             )?,
                             Right(rel) => {
-                                let relation = tx.get_relation(rel, false)?;
+                                let relation = tx.get_relation_for_read(rel, "reading rows")?;
                                 relation.as_named_rows(tx)?
                             }
                         };
@@ -116,7 +116,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     return Ok(Right(ControlCode::Termination(*current.unwrap())));
                 }
                 ImperativeStmt::TempDebug { temp, .. } => {
-                    let relation = tx.get_relation(temp, false)?;
+                    let relation = tx.get_relation_for_read(temp, "reading rows")?;
                     println!("{}: {:?}", temp, relation.as_named_rows(tx)?);
                     ret = NamedRows::default();
                 }
