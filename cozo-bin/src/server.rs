@@ -8,14 +8,16 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Path, Query, State};
-use axum::http::{header, HeaderName, Method, Request, Response, StatusCode};
+use axum::http::{header, HeaderName, HeaderValue, Method, Request, Response, StatusCode};
 use axum::response::sse::{Event, KeepAlive};
 use axum::response::{Html, Sse};
 use axum::routing::{get, post, put};
@@ -29,6 +31,7 @@ use miette::miette;
 // use miette::miette;
 use rand::Rng;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::spawn_blocking;
 use tower_http::auth::{AsyncAuthorizeRequest, AsyncRequireAuthorizationLayer};
@@ -50,6 +53,10 @@ pub(crate) struct ServerArgs {
     #[clap(short, long, default_value_t = String::from("cozo.db"))]
     path: String,
 
+    /// Directory containing files exposed by the HTTP backup APIs
+    #[clap(long, default_value_t = String::from("backups"))]
+    backup_dir: String,
+
     /// Restore from the specified backup before starting the server
     #[clap(long)]
     restore: Option<String>,
@@ -61,6 +68,11 @@ pub(crate) struct ServerArgs {
     /// Address to bind the service to
     #[clap(short, long, default_value_t = String::from("127.0.0.1"))]
     bind: String,
+
+    /// Disable HTTP authentication. This is intentionally explicit and is
+    /// accepted only for a loopback bind address.
+    #[clap(long, default_value_t = false)]
+    insecure_no_auth: bool,
 
     /// Port to use
     #[clap(short = 'P', long, default_value_t = 9070)]
@@ -80,17 +92,95 @@ pub(crate) struct ServerArgs {
 #[derive(Clone)]
 struct DbState {
     db: DbInstance,
+    backup_dir: Arc<PathBuf>,
     rule_senders: Arc<Mutex<BTreeMap<u32, crossbeam::channel::Sender<miette::Result<NamedRows>>>>>,
     rule_counter: Arc<AtomicU32>,
     tx_counter: Arc<AtomicU32>,
-    txs: Arc<Mutex<BTreeMap<u32, Arc<MultiTransaction>>>>,
+    txs: Arc<Mutex<BTreeMap<u32, StoredTransaction>>>,
+}
+
+struct StoredTransaction {
+    tx: Arc<MultiTransaction>,
+    owner: Principal,
+    write: bool,
+    expires_at: Instant,
+    in_flight: usize,
+}
+
+const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+const TRANSACTION_REAPER_INTERVAL: Duration = Duration::from_secs(1);
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Principal {
+    Local,
+    Admin,
+    Bearer([u8; 32]),
+}
+
+#[derive(Clone)]
+struct AuthContext {
+    mutability: ScriptMutability,
+    principal: Principal,
+}
+
+struct TransactionLease {
+    txs: Arc<Mutex<BTreeMap<u32, StoredTransaction>>>,
+    id: u32,
+}
+
+impl Drop for TransactionLease {
+    fn drop(&mut self) {
+        if let Some(stored) = self.txs.lock().unwrap().get_mut(&self.id) {
+            stored.in_flight = stored.in_flight.saturating_sub(1);
+            if stored.in_flight == 0 {
+                stored.expires_at = Instant::now() + TRANSACTION_IDLE_TIMEOUT;
+            }
+        }
+    }
+}
+
+fn bearer_principal(token: &str) -> Principal {
+    Principal::Bearer(Sha256::digest(token.as_bytes()).into())
+}
+
+fn is_idle_expired(expires_at: Instant, in_flight: usize, now: Instant) -> bool {
+    in_flight == 0 && expires_at <= now
 }
 
 #[derive(Clone)]
 struct MyAuth {
     skip_auth: bool,
+    allowed_origin: String,
     auth_guard: String,
     token_table: Option<Arc<(String, DbInstance)>>,
+}
+
+fn has_forbidden_insecure_request(request: &Request<Body>, allowed_origin: &str) -> bool {
+    let Some(allowed_authority) = allowed_origin.strip_prefix("http://") else {
+        return true;
+    };
+    let request_authority = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().authority().map(|value| value.as_str()));
+    if request_authority != Some(allowed_authority) {
+        return true;
+    }
+
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return true;
+    }
+
+    request
+        .headers()
+        .get(header::ORIGIN)
+        .is_some_and(|origin| origin.as_bytes() != allowed_origin.as_bytes())
 }
 
 impl AsyncAuthorizeRequest<Body> for MyAuth {
@@ -100,11 +190,25 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
 
     fn authorize(&mut self, mut request: Request<Body>) -> Self::Future {
         let skip_auth = self.skip_auth;
+        let allowed_origin = self.allowed_origin.clone();
         let auth_guard = self.auth_guard.clone();
         let token_table = self.token_table.clone();
         Box::pin(async move {
             if skip_auth {
+                // Loopback is not an authentication boundary for browsers. Reject
+                // requests originating on another site before granting the
+                // unauthenticated local-server exception.
+                if has_forbidden_insecure_request(&request, &allowed_origin) {
+                    return Err(Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Body::empty())
+                        .unwrap());
+                }
                 request.extensions_mut().insert(ScriptMutability::Mutable);
+                request.extensions_mut().insert(AuthContext {
+                    mutability: ScriptMutability::Mutable,
+                    principal: Principal::Local,
+                });
                 return Ok(request);
             }
 
@@ -114,7 +218,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
             // that needs query params (e.g. `/transact?write=true`,
             // `/rules/name?arity=2`). Returns None when there's no token table or
             // no usable bearer header, so callers can fall through to deny.
-            let bearer_grant = || -> Option<ScriptMutability> {
+            let bearer_grant = || -> Option<AuthContext> {
                 let tt = token_table.as_ref()?;
                 let (name, db) = tt.as_ref();
                 let auth_str = request.headers().get("Authorization")?.to_str().ok()?;
@@ -124,12 +228,13 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                     BTreeMap::from([(String::from("token"), DataValue::from(token))]),
                     ScriptMutability::Immutable,
                 ) {
-                    Ok(rows) => rows.rows.first().map(|val| {
-                        if val[0].get_bool() == Some(true) {
+                    Ok(rows) => rows.rows.first().map(|val| AuthContext {
+                        mutability: if val[0].get_bool() == Some(true) {
                             ScriptMutability::Mutable
                         } else {
                             ScriptMutability::Immutable
-                        }
+                        },
+                        principal: bearer_principal(token),
                     }),
                     Err(err) => {
                         eprintln!("Error: {}", err);
@@ -146,8 +251,10 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                         for pair in q_str.split('&') {
                             if let Some((k, v)) = pair.split_once('=') {
                                 if k == "auth" {
-                                    return (v == auth_guard.as_str())
-                                        .then_some(ScriptMutability::Mutable);
+                                    return (v == auth_guard.as_str()).then_some(AuthContext {
+                                        mutability: ScriptMutability::Mutable,
+                                        principal: Principal::Admin,
+                                    });
                                 }
                             }
                         }
@@ -158,7 +265,10 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                 Some(data) => match data.to_str() {
                     Ok(s) => {
                         if s == auth_guard.as_str() {
-                            Some(ScriptMutability::Mutable)
+                            Some(AuthContext {
+                                mutability: ScriptMutability::Mutable,
+                                principal: Principal::Admin,
+                            })
                         } else {
                             None
                         }
@@ -166,8 +276,9 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                     Err(_) => None,
                 },
             };
-            if let Some(mutability) = mutability {
-                request.extensions_mut().insert(mutability);
+            if let Some(auth) = mutability {
+                request.extensions_mut().insert(auth.mutability);
+                request.extensions_mut().insert(auth);
                 Ok(request)
             } else {
                 let unauthorized_response = Response::builder()
@@ -181,11 +292,139 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
     }
 }
 
-#[test]
-fn x() {}
+fn require_mutable(
+    mutability: ScriptMutability,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    match mutability {
+        ScriptMutability::Mutable => Ok(()),
+        ScriptMutability::Immutable => Err((
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "message": "this operation requires a mutable token"}).into(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutable_operations_require_mutable_authorization() {
+        assert!(require_mutable(ScriptMutability::Mutable).is_ok());
+
+        let (status, _) = require_mutable(ScriptMutability::Immutable).unwrap_err();
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn bearer_principals_are_stable_without_retaining_tokens() {
+        assert_eq!(bearer_principal("secret"), bearer_principal("secret"));
+        assert_ne!(bearer_principal("secret"), bearer_principal("other"));
+        assert!(matches!(bearer_principal("secret"), Principal::Bearer(_)));
+    }
+
+    #[test]
+    fn active_transactions_are_not_idle_expired() {
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(is_idle_expired(expired, 0, now));
+        assert!(!is_idle_expired(expired, 1, now));
+    }
+
+    #[test]
+    fn loopback_request_guard_allows_non_browser_and_same_origin_requests() {
+        let no_origin = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &no_origin,
+            "http://127.0.0.1:9070"
+        ));
+
+        let same_origin = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
+            .header(header::ORIGIN, "http://127.0.0.1:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &same_origin,
+            "http://127.0.0.1:9070"
+        ));
+
+        let http2_authority = Request::builder()
+            .uri("http://127.0.0.1:9070/")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &http2_authority,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_rejects_cross_origin_requests() {
+        let request = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
+            .header(header::ORIGIN, "https://attacker.example")
+            .body(Body::empty())
+            .unwrap();
+        assert!(has_forbidden_insecure_request(
+            &request,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_rejects_foreign_or_missing_authority() {
+        let foreign_host = Request::builder()
+            .header(header::HOST, "rebind.test:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(has_forbidden_insecure_request(
+            &foreign_host,
+            "http://127.0.0.1:9070"
+        ));
+
+        let missing_host = Request::new(Body::empty());
+        assert!(has_forbidden_insecure_request(
+            &missing_host,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_rejects_cross_site_fetch_metadata() {
+        let request = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
+            .header(header::ORIGIN, "http://127.0.0.1:9070")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        assert!(has_forbidden_insecure_request(
+            &request,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_accepts_ipv6_authority() {
+        let request = Request::builder()
+            .header(header::HOST, "[::1]:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &request,
+            "http://[::1]:9070"
+        ));
+    }
+}
 
 pub(crate) async fn server_main(args: ServerArgs) {
     let db = DbInstance::new(&args.engine, &args.path, &args.config).unwrap();
+    std::fs::create_dir_all(&args.backup_dir).expect("Cannot create HTTP backup directory");
+    let backup_dir =
+        std::fs::canonicalize(&args.backup_dir).expect("Cannot resolve HTTP backup directory");
     if let Some(secs) = args.default_query_timeout {
         db.set_default_query_timeout(Some(secs));
     }
@@ -197,7 +436,18 @@ pub(crate) async fn server_main(args: ServerArgs) {
         }
     }
 
-    let skip_auth = args.bind == "127.0.0.1";
+    let bind_is_loopback = IpAddr::from_str(&args.bind)
+        .map(|address| address.is_loopback())
+        .unwrap_or(false);
+    if args.insecure_no_auth && !bind_is_loopback {
+        panic!("--insecure-no-auth is permitted only with a loopback bind address");
+    }
+    let skip_auth = args.insecure_no_auth;
+    let server_origin = if Ipv6Addr::from_str(&args.bind).is_ok() {
+        format!("http://[{}]:{}", args.bind, args.port)
+    } else {
+        format!("http://{}:{}", args.bind, args.port)
+    };
 
     let conf_path = if skip_auth {
         "".to_string()
@@ -223,25 +473,62 @@ pub(crate) async fn server_main(args: ServerArgs) {
 
     let auth_obj = MyAuth {
         skip_auth,
+        allowed_origin: server_origin.clone(),
         auth_guard,
         token_table: args.token_table.map(|t| Arc::new((t, db.clone()))),
     };
 
     let state = DbState {
         db,
+        backup_dir: Arc::new(backup_dir),
         rule_senders: Default::default(),
         rule_counter: Default::default(),
         tx_counter: Default::default(),
         txs: Default::default(),
     };
+    let transaction_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(TRANSACTION_REAPER_INTERVAL);
+        loop {
+            interval.tick().await;
+            let now = Instant::now();
+            let expired = {
+                let mut txs = transaction_state.txs.lock().unwrap();
+                let expired_ids = txs
+                    .iter()
+                    .filter_map(|(&id, entry)| {
+                        is_idle_expired(entry.expires_at, entry.in_flight, now).then_some(id)
+                    })
+                    .collect_vec();
+                expired_ids
+                    .into_iter()
+                    .filter_map(|id| txs.remove(&id))
+                    .collect_vec()
+            };
+            for entry in expired {
+                // Aborting waits for the database worker, so never do it on the
+                // async runtime thread. Removal first also prevents new work
+                // from extending an already-expired transaction.
+                tokio::task::spawn_blocking(move || {
+                    if let Err(err) = entry.tx.abort() {
+                        warn!("Failed to abort expired HTTP transaction: {err}");
+                    }
+                });
+            }
+        }
+    });
     let cors = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
-        .allow_origin(Any)
         .allow_headers([
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
             HeaderName::from_static("x-cozo-auth"),
         ]);
+    let cors = if skip_auth {
+        cors.allow_origin(server_origin.parse::<HeaderValue>().unwrap())
+    } else {
+        cors.allow_origin(Any)
+    };
 
     let app = Router::new()
         .route("/text-query", post(text_query))
@@ -271,8 +558,12 @@ pub(crate) async fn server_main(args: ServerArgs) {
         SocketAddr::from_str(&format!("{}:{}", args.bind, args.port)).unwrap()
     };
 
-    if args.bind != "127.0.0.1" {
+    if !bind_is_loopback {
         warn!("{}", include_str!("./security.txt"));
+    }
+    if skip_auth {
+        warn!("HTTP authentication is disabled by --insecure-no-auth");
+    } else {
         info!("The auth token is in the file: {conf_path}");
     }
 
@@ -292,27 +583,79 @@ struct StartTransactPayload {
     write: bool,
 }
 
+fn acquire_transaction(
+    st: &DbState,
+    id: u32,
+    auth: &AuthContext,
+) -> Result<(Arc<MultiTransaction>, TransactionLease), (StatusCode, Json<serde_json::Value>)> {
+    let mut txs = st.txs.lock().unwrap();
+    let stored = txs
+        .get_mut(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, json!({"ok": false}).into()))?;
+    if stored.owner != auth.principal {
+        return Err((StatusCode::FORBIDDEN, json!({"ok": false}).into()));
+    }
+    if stored.write && matches!(auth.mutability, ScriptMutability::Immutable) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "message": "write transaction requires a mutable token"}).into(),
+        ));
+    }
+    if stored.in_flight != 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            json!({"ok": false, "message": "transaction already has an operation in progress"})
+                .into(),
+        ));
+    }
+    stored.in_flight += 1;
+    let tx = stored.tx.clone();
+    drop(txs);
+    Ok((
+        tx,
+        TransactionLease {
+            txs: st.txs.clone(),
+            id,
+        },
+    ))
+}
+
 async fn start_transact(
+    Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
     Query(payload): Query<StartTransactPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if payload.write && matches!(auth.mutability, ScriptMutability::Immutable) {
+        return (StatusCode::FORBIDDEN, json!({"ok": false}).into());
+    }
     let tx = st.db.multi_transaction(payload.write);
     let id = st.tx_counter.fetch_add(1, Ordering::SeqCst);
-    st.txs.lock().unwrap().insert(id, Arc::new(tx));
+    st.txs.lock().unwrap().insert(
+        id,
+        StoredTransaction {
+            tx: Arc::new(tx),
+            owner: auth.principal,
+            write: payload.write,
+            expires_at: Instant::now() + TRANSACTION_IDLE_TIMEOUT,
+            in_flight: 0,
+        },
+    );
     (StatusCode::OK, json!({"ok": true, "id": id}).into())
 }
 
 async fn transact_query(
+    Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
     Path(id): Path<u32>,
     Json(payload): Json<QueryPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tx = match st.txs.lock().unwrap().get(&id) {
-        None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(tx) => tx.clone(),
+    let (tx, lease) = match acquire_transaction(&st, id, &auth) {
+        Ok(acquired) => acquired,
+        Err(response) => return response,
     };
     let src = payload.script.clone();
     let result = spawn_blocking(move || {
+        let _lease = lease;
         let params = payload
             .params
             .into_iter()
@@ -338,13 +681,38 @@ struct FinishTransactPayload {
 }
 
 async fn finish_query(
+    Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
     Path(id): Path<u32>,
     Json(payload): Json<FinishTransactPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tx = match st.txs.lock().unwrap().remove(&id) {
-        None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(tx) => tx,
+    let tx = match st.txs.lock().unwrap().entry(id) {
+        std::collections::btree_map::Entry::Vacant(_) => {
+            return (StatusCode::NOT_FOUND, json!({"ok": false}).into())
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+            if entry.get().owner != auth.principal =>
+        {
+            return (StatusCode::FORBIDDEN, json!({"ok": false}).into())
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+            if entry.get().write
+                && matches!(auth.mutability, ScriptMutability::Immutable)
+                && !payload.abort =>
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                json!({"ok": false, "message": "write transaction requires a mutable token"})
+                    .into(),
+            )
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if entry.get().in_flight != 0 => {
+            return (
+                StatusCode::CONFLICT,
+                json!({"ok": false, "message": "transaction has an operation in progress"}).into(),
+            )
+        }
+        std::collections::btree_map::Entry::Occupied(entry) => entry.remove().tx,
     };
     let res = if payload.abort {
         tx.abort()
@@ -437,9 +805,14 @@ async fn export_relations(
 }
 
 async fn import_relations(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Json(payload): Json<serde_json::Value>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if let Err(response) = require_mutable(mutability) {
+        return response;
+    }
+
     let payload = match payload.as_object() {
         None => {
             return (
@@ -481,11 +854,91 @@ struct BackupPayload {
     path: String,
 }
 
+fn resolve_backup_path(backup_dir: &FsPath, requested: &str) -> miette::Result<PathBuf> {
+    let requested = FsPath::new(requested);
+    if requested.as_os_str().is_empty() || requested.is_absolute() {
+        return Err(miette!(
+            "backup path must be relative to the HTTP backup directory"
+        ));
+    }
+
+    let candidate = backup_dir.join(requested);
+    let parent = candidate
+        .parent()
+        .ok_or_else(|| miette!("backup path has no parent directory"))?;
+    let resolved_parent =
+        std::fs::canonicalize(parent).map_err(|_| miette!("backup path parent does not exist"))?;
+    if !resolved_parent.starts_with(backup_dir) {
+        return Err(miette!("backup path escapes the HTTP backup directory"));
+    }
+
+    // Canonicalize an existing file as well, so a symlink cannot point outside
+    // the configured directory. New files inherit the checked parent.
+    match std::fs::symlink_metadata(&candidate) {
+        Ok(_) => {
+            let resolved = std::fs::canonicalize(&candidate)
+                .map_err(|_| miette!("cannot resolve backup path"))?;
+            if !resolved.starts_with(backup_dir) {
+                return Err(miette!("backup path escapes the HTTP backup directory"));
+            }
+            Ok(resolved)
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            Ok(resolved_parent.join(candidate.file_name().unwrap()))
+        }
+        Err(_) => Err(miette!("cannot inspect backup path")),
+    }
+}
+
+#[cfg(test)]
+mod backup_path_tests {
+    use super::resolve_backup_path;
+    use std::fs;
+
+    #[test]
+    fn confines_http_backup_paths_to_configured_directory() {
+        let root = std::env::temp_dir().join(format!("cozo-backup-path-{}", std::process::id()));
+        let backups = root.join("backups");
+        fs::create_dir_all(backups.join("nested")).unwrap();
+        let backups = fs::canonicalize(backups).unwrap();
+
+        assert_eq!(
+            resolve_backup_path(&backups, "nested/safe.db").unwrap(),
+            backups.join("nested/safe.db")
+        );
+        assert!(resolve_backup_path(&backups, "/tmp/outside.db").is_err());
+        assert!(resolve_backup_path(&backups, "../outside.db").is_err());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(root.join("missing-outside.db"), backups.join("link.db"))
+                .unwrap();
+            assert!(resolve_backup_path(&backups, "link.db").is_err());
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+}
+
 async fn backup(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Json(payload): Json<BackupPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let result = spawn_blocking(move || st.db.backup_db(payload.path)).await;
+    if let Err(response) = require_mutable(mutability) {
+        return response;
+    }
+
+    let path = match resolve_backup_path(&st.backup_dir, &payload.path) {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"ok": false, "message": err.to_string()}).into(),
+            );
+        }
+    };
+    let result = spawn_blocking(move || st.db.backup_db(path)).await;
 
     match result {
         Ok(Ok(())) => {
@@ -507,11 +960,24 @@ struct BackupImportPayload {
 }
 
 async fn import_from_backup(
+    Extension(mutability): Extension<ScriptMutability>,
     State(st): State<DbState>,
     Json(payload): Json<BackupImportPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let result =
-        spawn_blocking(move || st.db.import_from_backup(&payload.path, &payload.relations)).await;
+    if let Err(response) = require_mutable(mutability) {
+        return response;
+    }
+
+    let path = match resolve_backup_path(&st.backup_dir, &payload.path) {
+        Ok(path) => path,
+        Err(err) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                json!({"ok": false, "message": err.to_string()}).into(),
+            );
+        }
+    };
+    let result = spawn_blocking(move || st.db.import_from_backup(path, &payload.relations)).await;
 
     match result {
         Ok(Ok(())) => {
