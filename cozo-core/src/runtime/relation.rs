@@ -136,6 +136,26 @@ impl<'a> SessionTx<'a> {
             Ok(handle.access_level)
         }
     }
+
+    /// Resolve a stored relation for a read and enforce its effective ACL.
+    /// Every read surface must use this method so an index can never expose a
+    /// base relation that is hidden.
+    pub(crate) fn get_relation_for_read(
+        &self,
+        name: &str,
+        operation: &str,
+    ) -> Result<RelationHandle> {
+        let handle = self.get_relation(name, false)?;
+        let access_level = self.effective_read_access_level(&handle)?;
+        if access_level < AccessLevel::ReadOnly {
+            bail!(InsufficientAccessLevel(
+                handle.name.to_string(),
+                operation.to_string(),
+                access_level
+            ));
+        }
+        Ok(handle)
+    }
 }
 
 #[derive(

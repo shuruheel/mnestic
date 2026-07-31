@@ -867,6 +867,25 @@ fn j1b_named_gate_binding_parses_and_binds_by_name() {
 }
 
 #[test]
+fn j1c_hidden_gate_is_not_readable_by_fixed_rule() {
+    let (_dir, db) = open_db();
+    run(&db, ":create secret_gate {uid: String => ok: Int}");
+    run(
+        &db,
+        "?[uid, ok] <- [['a',1],['b',1]] :put secret_gate {uid => ok}",
+    );
+    run(&db, "::access_level hidden secret_gate");
+
+    let m = err(
+        &db,
+        "e[f, t, w] <- [['a','b',1.0]]\ns[n] <- [['a']]\n\
+         ?[n, c, p, d] <~ BudgetedTraversal(e[f, t, w], s[n], \
+         *secret_gate{uid, ok}, max_nodes: 10, admit: ok == 1)",
+    );
+    assert!(m.contains("Insufficient access level hidden"), "{m}");
+}
+
+#[test]
 fn j2_gate_not_a_bridge() {
     let (_dir, db) = open_db();
     run(&db, ":create g {uid: String => ok: Int}");

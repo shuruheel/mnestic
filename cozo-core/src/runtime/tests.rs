@@ -559,6 +559,19 @@ fn index_respects_base_relation_access_level() {
         .export_relations(["secret:by_value"].into_iter())
         .is_err());
     assert!(db
+        .run_default(
+            "candidates[value] <- [['classified'], ['public']] \
+             ?[value] := candidates[value], not *secret:by_value{value}"
+        )
+        .is_err());
+    assert!(db
+        .run_default(
+            "?[rank, value, id] <~ ReorderSort(*secret:by_value[value, id], \
+             out: [value, id], sort_by: value)"
+        )
+        .is_err());
+    assert!(db.run_default("%return secret:by_value").is_err());
+    assert!(db
         .run_default("::index create secret:another {value}")
         .is_err());
 }

@@ -22,7 +22,7 @@ use crate::data::symb::Symbol;
 use crate::parse::{ImperativeCondition, ImperativeProgram, ImperativeStmt, SourceSpan};
 use crate::runtime::callback::CallbackCollector;
 use crate::runtime::db::{seconds_since_the_epoch, RunningQueryCleanup, RunningQueryHandle};
-use crate::runtime::relation::{AccessLevel, InputRelationHandle, InsufficientAccessLevel};
+use crate::runtime::relation::InputRelationHandle;
 use crate::runtime::transact::SessionTx;
 use crate::{DataValue, Db, NamedRows, Poison, Storage, ValidityTs};
 
@@ -44,7 +44,7 @@ impl<'s, S: Storage<'s>> Db<S> {
     ) -> Result<bool> {
         let res = match p {
             Left(rel) => {
-                let relation = tx.get_relation(rel, false)?;
+                let relation = tx.get_relation_for_read(rel, "reading rows")?;
                 relation.as_named_rows(tx)?
             }
             Right(p) => self.execute_single_program(
@@ -101,14 +101,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                                 callback_collector,
                             )?,
                             Right(rel) => {
-                                let relation = tx.get_relation(rel, false)?;
-                                if relation.access_level < AccessLevel::ReadOnly {
-                                    bail!(InsufficientAccessLevel(
-                                        relation.name.to_string(),
-                                        "reading rows".to_string(),
-                                        relation.access_level
-                                    ));
-                                }
+                                let relation = tx.get_relation_for_read(rel, "reading rows")?;
                                 relation.as_named_rows(tx)?
                             }
                         };
@@ -123,7 +116,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     return Ok(Right(ControlCode::Termination(*current.unwrap())));
                 }
                 ImperativeStmt::TempDebug { temp, .. } => {
-                    let relation = tx.get_relation(temp, false)?;
+                    let relation = tx.get_relation_for_read(temp, "reading rows")?;
                     println!("{}: {:?}", temp, relation.as_named_rows(tx)?);
                     ret = NamedRows::default();
                 }
