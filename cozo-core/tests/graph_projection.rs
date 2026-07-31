@@ -40,6 +40,11 @@ fn err(db: &DbInstance, script: &str) -> String {
     )
 }
 
+fn assert_access_denied(db: &DbInstance, script: &str) {
+    let msg = err(db, script);
+    assert!(msg.contains("Insufficient access level"), "{msg}");
+}
+
 fn rows(res: &NamedRows) -> Vec<Vec<DataValue>> {
     res.rows.clone()
 }
@@ -396,6 +401,53 @@ fn renaming_a_tt_relation_into_a_source_name_errors_at_use() {
     // Source kinds are re-checked at every use, not only at create.
     let msg = err(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
     assert!(msg.contains("transaction-time relation"), "{msg}");
+}
+
+// -------------------------------------------------------- source read ACLs
+
+#[test]
+fn a_hidden_edge_source_is_rejected_when_the_projection_is_created() {
+    let db = graph_db();
+    run(&db, "::access_level hidden knows");
+    assert_access_denied(&db, "::graph create g {edges: knows}");
+}
+
+#[test]
+fn a_hidden_edge_source_is_rejected_before_a_cold_build() {
+    let db = graph_db();
+    run(&db, "::graph create g {edges: knows}");
+    run(&db, "::access_level hidden knows");
+    assert_access_denied(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+}
+
+#[test]
+fn a_hidden_edge_source_is_rejected_before_a_warm_cache_hit() {
+    let db = graph_db();
+    run(&db, "::graph create g {edges: knows}");
+    run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+    assert_eq!(resident(&db), 1);
+
+    run(&db, "::access_level hidden knows");
+    assert_access_denied(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+}
+
+#[test]
+fn a_hidden_node_source_is_rejected_before_a_cold_build() {
+    let db = graph_db();
+    run(&db, "::graph create g {edges: knows, nodes: person}");
+    run(&db, "::access_level hidden person");
+    assert_access_denied(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+}
+
+#[test]
+fn a_hidden_node_source_is_rejected_before_a_warm_cache_hit() {
+    let db = graph_db();
+    run(&db, "::graph create g {edges: knows, nodes: person}");
+    run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
+    assert_eq!(resident(&db), 1);
+
+    run(&db, "::access_level hidden person");
+    assert_access_denied(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
 }
 
 // --------------------------------------------------------- caching behaviour

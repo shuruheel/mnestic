@@ -102,7 +102,7 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
                 tx_valid_at,
                 ..
             } => {
-                let relation = self.tx.get_relation(name, false)?;
+                let relation = self.tx.get_relation_for_read(name, "reading rows")?;
                 if let Some(tt) = tx_valid_at {
                     // bitemporal input (mnestic fork, 4b): two-level scan
                     Box::new(relation.bitemporal_scan_all(self.tx, *valid_at, *tt))
@@ -130,7 +130,7 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
                 tx_valid_at,
                 ..
             } => {
-                let relation = self.tx.get_relation(name, false)?;
+                let relation = self.tx.get_relation_for_read(name, "reading rows")?;
                 let t = vec![prefix.clone()];
                 if let Some(tt) = tx_valid_at {
                     // bitemporal input (mnestic fork, 4b): two-level scan
@@ -1223,7 +1223,7 @@ impl MagicFixedRuleRuleArg {
                 store.arity
             }
             MagicFixedRuleRuleArg::Stored { name, .. } => {
-                let handle = tx.get_relation(name, false)?;
+                let handle = tx.get_relation_for_read(name, "reading rows")?;
                 handle.arity()
             }
         })
