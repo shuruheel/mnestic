@@ -57,6 +57,7 @@ serde_derive = "1.0.199"
 serde = { version = "1.0.199" }
 chrono = "0.4.38"
 serde_json = "1.0.116"
+sha2 = "0.10.8"
 prettytable = "0.10.0"
 rustyline = "14.0.0"
 minreq = { version = "2.11.2", features = ["https-rustls"] }
