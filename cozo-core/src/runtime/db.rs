@@ -825,16 +825,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         let tx = self.transact()?;
         let mut ret: BTreeMap<String, NamedRows> = BTreeMap::new();
         for rel in relations {
-            let handle = tx.get_relation(rel.as_ref(), false)?;
+            let handle = tx.get_relation_for_read(rel.as_ref(), "data export")?;
             let size_hint = handle.metadata.keys.len() + handle.metadata.non_keys.len();
-
-            if handle.access_level < AccessLevel::ReadOnly {
-                bail!(InsufficientAccessLevel(
-                    handle.name.to_string(),
-                    "data export".to_string(),
-                    handle.access_level
-                ));
-            }
 
             let mut cols = handle
                 .metadata
@@ -2247,16 +2239,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             SysOp::TtHistory(rel, keys, limit, offset) => {
                 // mnestic fork, bitemporality step 5: the introspection
                 // surface — every (vt, tt) record of the given keys.
-                let handle = tx.get_relation(rel, false)?;
+                let handle = tx.get_relation_for_read(rel, "history introspection")?;
                 if !handle.has_txtime() {
                     bail!("::history requires a TxTime relation, {} is not", rel);
-                }
-                if handle.access_level < AccessLevel::ReadOnly {
-                    bail!(InsufficientAccessLevel(
-                        handle.name.to_string(),
-                        "history introspection".to_string(),
-                        handle.access_level
-                    ))
                 }
                 let kpos = handle.metadata.keys.len() - 1;
                 let is_bitemporal = !handle.is_tt_only();

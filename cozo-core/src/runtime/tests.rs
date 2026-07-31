@@ -51,6 +51,33 @@ fn test_limit_offset() {
 }
 
 #[test]
+fn hidden_relations_cannot_be_read_indirectly() {
+    let db = DbInstance::default();
+    db.run_default(":create secret {id => value}").unwrap();
+    db.run_default("?[id, value] <- [[1, 'classified']] :put secret {id => value}")
+        .unwrap();
+    db.run_default("::access_level hidden secret").unwrap();
+
+    let negated = db
+        .run_default("candidates[id] <- [[1], [2]] ?[id] := candidates[id], not *secret{id}")
+        .expect_err("negation must not reveal membership in a hidden relation");
+    assert!(
+        format!("{negated:?}").contains("Insufficient access level"),
+        "{negated:?}"
+    );
+
+    let fixed_rule = db
+        .run_default(
+            "?[rank, id, value] <~ ReorderSort(*secret[id, value], out: [id, value], sort_by: id)",
+        )
+        .expect_err("fixed rules must not scan a hidden relation");
+    assert!(
+        format!("{fixed_rule:?}").contains("Insufficient access level"),
+        "{fixed_rule:?}"
+    );
+}
+
+#[test]
 fn test_normal_aggr_empty() {
     let db = DbInstance::default();
     let res = db.run_default("?[count(a)] := a in []").unwrap().rows;
@@ -512,6 +539,41 @@ fn test_index() {
         .collect_vec();
     assert!(joins.contains(&json!(":friends:rev")));
     db.run_default("::index drop friends:rev").unwrap();
+}
+
+#[test]
+fn index_respects_base_relation_access_level() {
+    let db = DbInstance::default();
+    db.run_default(":create secret {id: Int => value: String}")
+        .unwrap();
+    db.run_default("?[id, value] <- [[1, 'classified']] :put secret {id => value}")
+        .unwrap();
+    db.run_default("::index create secret:by_value {value}")
+        .unwrap();
+    db.run_default("::access_level hidden secret").unwrap();
+
+    assert!(db
+        .run_default("?[id, value] := *secret:by_value{value, id}")
+        .is_err());
+    assert!(db
+        .export_relations(["secret:by_value"].into_iter())
+        .is_err());
+    assert!(db
+        .run_default(
+            "candidates[value] <- [['classified'], ['public']] \
+             ?[value] := candidates[value], not *secret:by_value{value}"
+        )
+        .is_err());
+    assert!(db
+        .run_default(
+            "?[rank, value, id] <~ ReorderSort(*secret:by_value[value, id], \
+             out: [value, id], sort_by: value)"
+        )
+        .is_err());
+    assert!(db.run_default("%return secret:by_value").is_err());
+    assert!(db
+        .run_default("::index create secret:another {value}")
+        .is_err());
 }
 
 #[test]
@@ -4196,4 +4258,20 @@ fn reconcile_validation() {
         .unwrap()
         .into_json();
     assert_eq!(res["rows"], serde_json::json!([[1, 99]]), "{res:?}");
+}
+
+#[test]
+fn imperative_return_respects_relation_access_level() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default("?[k, v] <- [[1, 'secret']] :create secret {k => v}")
+        .unwrap();
+    db.run_default("::access_level hidden secret").unwrap();
+
+    let err = db
+        .run_default("%return secret")
+        .expect_err("imperative return must not expose a hidden relation");
+    assert!(
+        format!("{err:?}").contains("Insufficient access level"),
+        "{err:?}"
+    );
 }
