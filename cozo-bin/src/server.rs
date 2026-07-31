@@ -155,7 +155,28 @@ struct MyAuth {
     token_table: Option<Arc<(String, DbInstance)>>,
 }
 
-fn has_forbidden_origin(request: &Request<Body>, allowed_origin: &str) -> bool {
+fn has_forbidden_insecure_request(request: &Request<Body>, allowed_origin: &str) -> bool {
+    let Some(allowed_authority) = allowed_origin.strip_prefix("http://") else {
+        return true;
+    };
+    let request_authority = request
+        .headers()
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .or_else(|| request.uri().authority().map(|value| value.as_str()));
+    if request_authority != Some(allowed_authority) {
+        return true;
+    }
+
+    if request
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.eq_ignore_ascii_case("cross-site"))
+    {
+        return true;
+    }
+
     request
         .headers()
         .get(header::ORIGIN)
@@ -177,7 +198,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                 // Loopback is not an authentication boundary for browsers. Reject
                 // requests originating on another site before granting the
                 // unauthenticated local-server exception.
-                if has_forbidden_origin(&request, &allowed_origin) {
+                if has_forbidden_insecure_request(&request, &allowed_origin) {
                     return Err(Response::builder()
                         .status(StatusCode::FORBIDDEN)
                         .body(Body::empty())
@@ -311,24 +332,91 @@ mod tests {
     }
 
     #[test]
-    fn loopback_origin_guard_allows_non_browser_and_same_origin_requests() {
-        let no_origin = Request::new(Body::empty());
-        assert!(!has_forbidden_origin(&no_origin, "http://127.0.0.1:9070"));
+    fn loopback_request_guard_allows_non_browser_and_same_origin_requests() {
+        let no_origin = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &no_origin,
+            "http://127.0.0.1:9070"
+        ));
 
         let same_origin = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
             .header(header::ORIGIN, "http://127.0.0.1:9070")
             .body(Body::empty())
             .unwrap();
-        assert!(!has_forbidden_origin(&same_origin, "http://127.0.0.1:9070"));
+        assert!(!has_forbidden_insecure_request(
+            &same_origin,
+            "http://127.0.0.1:9070"
+        ));
+
+        let http2_authority = Request::builder()
+            .uri("http://127.0.0.1:9070/")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &http2_authority,
+            "http://127.0.0.1:9070"
+        ));
     }
 
     #[test]
-    fn loopback_origin_guard_rejects_cross_origin_requests() {
+    fn loopback_request_guard_rejects_cross_origin_requests() {
         let request = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
             .header(header::ORIGIN, "https://attacker.example")
             .body(Body::empty())
             .unwrap();
-        assert!(has_forbidden_origin(&request, "http://127.0.0.1:9070"));
+        assert!(has_forbidden_insecure_request(
+            &request,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_rejects_foreign_or_missing_authority() {
+        let foreign_host = Request::builder()
+            .header(header::HOST, "rebind.test:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(has_forbidden_insecure_request(
+            &foreign_host,
+            "http://127.0.0.1:9070"
+        ));
+
+        let missing_host = Request::new(Body::empty());
+        assert!(has_forbidden_insecure_request(
+            &missing_host,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_rejects_cross_site_fetch_metadata() {
+        let request = Request::builder()
+            .header(header::HOST, "127.0.0.1:9070")
+            .header(header::ORIGIN, "http://127.0.0.1:9070")
+            .header("sec-fetch-site", "cross-site")
+            .body(Body::empty())
+            .unwrap();
+        assert!(has_forbidden_insecure_request(
+            &request,
+            "http://127.0.0.1:9070"
+        ));
+    }
+
+    #[test]
+    fn loopback_request_guard_accepts_ipv6_authority() {
+        let request = Request::builder()
+            .header(header::HOST, "[::1]:9070")
+            .body(Body::empty())
+            .unwrap();
+        assert!(!has_forbidden_insecure_request(
+            &request,
+            "http://[::1]:9070"
+        ));
     }
 }
 
