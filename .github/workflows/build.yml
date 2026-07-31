@@ -45,6 +45,74 @@ jobs:
       - name: Test (newrocksdb)
         run: cargo test -p mnestic --features storage-new-rocksdb --test backend_transaction_contract --verbose
 
+  # TiKV is the only distributed backend. A compile-only check cannot prove
+  # that relation IDs are serialized across independent client processes, so
+  # this job boots real PD/TiKV servers and exercises that boundary directly.
+  tikv:
+    name: test (TiKV multi-client relation IDs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Start PD and TiKV
+        run: |
+          # Official PingCAP v8.5.0 amd64 image manifests, pinned immutably.
+          docker run --detach --name mnestic-pd --network host \
+            pingcap/pd@sha256:51570618f3c4307f73efac23634f40acf42f314b23bd5afae903b3c413e51346 \
+            --name=pd \
+            --data-dir=/tmp/pd \
+            --client-urls=http://127.0.0.1:2379 \
+            --peer-urls=http://127.0.0.1:2380 \
+            --initial-cluster=pd=http://127.0.0.1:2380
+
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:2379/health >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "PD did not become ready" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+
+          docker run --detach --name mnestic-tikv --network host \
+            pingcap/tikv@sha256:eed41be14384a2123b5ffabffae7e8322a027ea94d6482646e1d3a1d0fd8bbac \
+            --pd-endpoints=127.0.0.1:2379 \
+            --addr=127.0.0.1:20160 \
+            --status-addr=127.0.0.1:20180 \
+            --data-dir=/tmp/tikv
+
+          for attempt in {1..60}; do
+            if curl --fail --silent http://127.0.0.1:20180/status >/dev/null; then
+              break
+            fi
+            if [ "$attempt" -eq 60 ]; then
+              echo "TiKV did not become ready" >&2
+              exit 1
+            fi
+            sleep 1
+          done
+      - name: Test two-client relation ID allocation
+        env:
+          MNESTIC_TIKV_PD_ENDPOINT: 127.0.0.1:2379
+        run: >
+          cargo test -p mnestic
+          --no-default-features
+          --features storage-tikv
+          --test tikv_relation_id_concurrency
+          -- --ignored --exact two_clients_allocate_distinct_relation_ids_concurrently
+      - name: Dump TiKV logs on failure
+        if: failure()
+        run: |
+          docker logs mnestic-pd || true
+          docker logs mnestic-tikv || true
+      - name: Stop PD and TiKV
+        if: always()
+        run: docker rm --force mnestic-tikv mnestic-pd
+
   rocksdb:
     name: build (storage-rocksdb, C++ bridge)
     runs-on: ubuntu-latest
