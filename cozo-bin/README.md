@@ -68,11 +68,11 @@ and a nicely-formatted diagnostic will be in `"display"` if available.
 > If you must access Cozo remotely, you are responsible for setting up firewalls, encryptions and proxies yourself.
 >
 > As a guard against users accidentally exposing sensitive data,
-> If you bind Cozo to non-loopback addresses,
-> Cozo will generate a token string and require all queries
+> Cozo generates a token string and requires all queries
 > to provide the token string in the HTTP header field `x-cozo-auth`.
-> The warning printed when you start Cozo with a
-> non-default binding will tell you where to find the token string.
+> The startup log tells you where to find the token string.
+> Authentication may be disabled explicitly with `--insecure-no-auth`,
+> but only when binding to a loopback address.
 > This “security measure” is not considered sufficient for any purpose
 > and is only intended as a last defence against carelessness.
 >

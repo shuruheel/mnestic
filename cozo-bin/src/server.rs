@@ -8,7 +8,7 @@
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::net::{Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::{Path as FsPath, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -31,6 +31,7 @@ use miette::miette;
 // use miette::miette;
 use rand::Rng;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 use tokio::task::spawn_blocking;
 use tower_http::auth::{AsyncAuthorizeRequest, AsyncRequireAuthorizationLayer};
@@ -68,6 +69,11 @@ pub(crate) struct ServerArgs {
     #[clap(short, long, default_value_t = String::from("127.0.0.1"))]
     bind: String,
 
+    /// Disable HTTP authentication. This is intentionally explicit and is
+    /// accepted only for a loopback bind address.
+    #[clap(long, default_value_t = false)]
+    insecure_no_auth: bool,
+
     /// Port to use
     #[clap(short = 'P', long, default_value_t = 9070)]
     port: u16,
@@ -95,17 +101,50 @@ struct DbState {
 
 struct StoredTransaction {
     tx: Arc<MultiTransaction>,
-    owner: String,
+    owner: Principal,
+    write: bool,
     expires_at: Instant,
+    in_flight: usize,
 }
 
 const TRANSACTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const TRANSACTION_REAPER_INTERVAL: Duration = Duration::from_secs(1);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum Principal {
+    Local,
+    Admin,
+    Bearer([u8; 32]),
+}
+
 #[derive(Clone)]
 struct AuthContext {
     mutability: ScriptMutability,
-    principal: String,
+    principal: Principal,
+}
+
+struct TransactionLease {
+    txs: Arc<Mutex<BTreeMap<u32, StoredTransaction>>>,
+    id: u32,
+}
+
+impl Drop for TransactionLease {
+    fn drop(&mut self) {
+        if let Some(stored) = self.txs.lock().unwrap().get_mut(&self.id) {
+            stored.in_flight = stored.in_flight.saturating_sub(1);
+            if stored.in_flight == 0 {
+                stored.expires_at = Instant::now() + TRANSACTION_IDLE_TIMEOUT;
+            }
+        }
+    }
+}
+
+fn bearer_principal(token: &str) -> Principal {
+    Principal::Bearer(Sha256::digest(token.as_bytes()).into())
+}
+
+fn is_idle_expired(expires_at: Instant, in_flight: usize, now: Instant) -> bool {
+    in_flight == 0 && expires_at <= now
 }
 
 #[derive(Clone)]
@@ -147,7 +186,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                 request.extensions_mut().insert(ScriptMutability::Mutable);
                 request.extensions_mut().insert(AuthContext {
                     mutability: ScriptMutability::Mutable,
-                    principal: "local".to_string(),
+                    principal: Principal::Local,
                 });
                 return Ok(request);
             }
@@ -174,7 +213,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                         } else {
                             ScriptMutability::Immutable
                         },
-                        principal: format!("bearer:{token}"),
+                        principal: bearer_principal(token),
                     }),
                     Err(err) => {
                         eprintln!("Error: {}", err);
@@ -193,7 +232,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                                 if k == "auth" {
                                     return (v == auth_guard.as_str()).then_some(AuthContext {
                                         mutability: ScriptMutability::Mutable,
-                                        principal: "admin".to_string(),
+                                        principal: Principal::Admin,
                                     });
                                 }
                             }
@@ -207,7 +246,7 @@ impl AsyncAuthorizeRequest<Body> for MyAuth {
                         if s == auth_guard.as_str() {
                             Some(AuthContext {
                                 mutability: ScriptMutability::Mutable,
-                                principal: "admin".to_string(),
+                                principal: Principal::Admin,
                             })
                         } else {
                             None
@@ -257,21 +296,30 @@ mod tests {
     }
 
     #[test]
+    fn bearer_principals_are_stable_without_retaining_tokens() {
+        assert_eq!(bearer_principal("secret"), bearer_principal("secret"));
+        assert_ne!(bearer_principal("secret"), bearer_principal("other"));
+        assert!(matches!(bearer_principal("secret"), Principal::Bearer(_)));
+    }
+
+    #[test]
+    fn active_transactions_are_not_idle_expired() {
+        let now = Instant::now();
+        let expired = now.checked_sub(Duration::from_secs(1)).unwrap();
+        assert!(is_idle_expired(expired, 0, now));
+        assert!(!is_idle_expired(expired, 1, now));
+    }
+
+    #[test]
     fn loopback_origin_guard_allows_non_browser_and_same_origin_requests() {
         let no_origin = Request::new(Body::empty());
-        assert!(!has_forbidden_origin(
-            &no_origin,
-            "http://127.0.0.1:9070"
-        ));
+        assert!(!has_forbidden_origin(&no_origin, "http://127.0.0.1:9070"));
 
         let same_origin = Request::builder()
             .header(header::ORIGIN, "http://127.0.0.1:9070")
             .body(Body::empty())
             .unwrap();
-        assert!(!has_forbidden_origin(
-            &same_origin,
-            "http://127.0.0.1:9070"
-        ));
+        assert!(!has_forbidden_origin(&same_origin, "http://127.0.0.1:9070"));
     }
 
     #[test]
@@ -280,10 +328,7 @@ mod tests {
             .header(header::ORIGIN, "https://attacker.example")
             .body(Body::empty())
             .unwrap();
-        assert!(has_forbidden_origin(
-            &request,
-            "http://127.0.0.1:9070"
-        ));
+        assert!(has_forbidden_origin(&request, "http://127.0.0.1:9070"));
     }
 }
 
@@ -303,7 +348,18 @@ pub(crate) async fn server_main(args: ServerArgs) {
         }
     }
 
-    let skip_auth = args.bind == "127.0.0.1";
+    let bind_is_loopback = IpAddr::from_str(&args.bind)
+        .map(|address| address.is_loopback())
+        .unwrap_or(false);
+    if args.insecure_no_auth && !bind_is_loopback {
+        panic!("--insecure-no-auth is permitted only with a loopback bind address");
+    }
+    let skip_auth = args.insecure_no_auth;
+    let server_origin = if Ipv6Addr::from_str(&args.bind).is_ok() {
+        format!("http://[{}]:{}", args.bind, args.port)
+    } else {
+        format!("http://{}:{}", args.bind, args.port)
+    };
 
     let conf_path = if skip_auth {
         "".to_string()
@@ -329,7 +385,7 @@ pub(crate) async fn server_main(args: ServerArgs) {
 
     let auth_obj = MyAuth {
         skip_auth,
-        allowed_origin: format!("http://{}:{}", args.bind, args.port),
+        allowed_origin: server_origin.clone(),
         auth_guard,
         token_table: args.token_table.map(|t| Arc::new((t, db.clone()))),
     };
@@ -352,7 +408,9 @@ pub(crate) async fn server_main(args: ServerArgs) {
                 let mut txs = transaction_state.txs.lock().unwrap();
                 let expired_ids = txs
                     .iter()
-                    .filter_map(|(&id, entry)| (entry.expires_at <= now).then_some(id))
+                    .filter_map(|(&id, entry)| {
+                        is_idle_expired(entry.expires_at, entry.in_flight, now).then_some(id)
+                    })
                     .collect_vec();
                 expired_ids
                     .into_iter()
@@ -379,11 +437,7 @@ pub(crate) async fn server_main(args: ServerArgs) {
             HeaderName::from_static("x-cozo-auth"),
         ]);
     let cors = if skip_auth {
-        cors.allow_origin(
-            format!("http://{}:{}", args.bind, args.port)
-                .parse::<HeaderValue>()
-                .unwrap(),
-        )
+        cors.allow_origin(server_origin.parse::<HeaderValue>().unwrap())
     } else {
         cors.allow_origin(Any)
     };
@@ -416,8 +470,12 @@ pub(crate) async fn server_main(args: ServerArgs) {
         SocketAddr::from_str(&format!("{}:{}", args.bind, args.port)).unwrap()
     };
 
-    if args.bind != "127.0.0.1" {
+    if !bind_is_loopback {
         warn!("{}", include_str!("./security.txt"));
+    }
+    if skip_auth {
+        warn!("HTTP authentication is disabled by --insecure-no-auth");
+    } else {
         info!("The auth token is in the file: {conf_path}");
     }
 
@@ -437,6 +495,43 @@ struct StartTransactPayload {
     write: bool,
 }
 
+fn acquire_transaction(
+    st: &DbState,
+    id: u32,
+    auth: &AuthContext,
+) -> Result<(Arc<MultiTransaction>, TransactionLease), (StatusCode, Json<serde_json::Value>)> {
+    let mut txs = st.txs.lock().unwrap();
+    let stored = txs
+        .get_mut(&id)
+        .ok_or_else(|| (StatusCode::NOT_FOUND, json!({"ok": false}).into()))?;
+    if stored.owner != auth.principal {
+        return Err((StatusCode::FORBIDDEN, json!({"ok": false}).into()));
+    }
+    if stored.write && matches!(auth.mutability, ScriptMutability::Immutable) {
+        return Err((
+            StatusCode::FORBIDDEN,
+            json!({"ok": false, "message": "write transaction requires a mutable token"}).into(),
+        ));
+    }
+    if stored.in_flight != 0 {
+        return Err((
+            StatusCode::CONFLICT,
+            json!({"ok": false, "message": "transaction already has an operation in progress"})
+                .into(),
+        ));
+    }
+    stored.in_flight += 1;
+    let tx = stored.tx.clone();
+    drop(txs);
+    Ok((
+        tx,
+        TransactionLease {
+            txs: st.txs.clone(),
+            id,
+        },
+    ))
+}
+
 async fn start_transact(
     Extension(auth): Extension<AuthContext>,
     State(st): State<DbState>,
@@ -452,7 +547,9 @@ async fn start_transact(
         StoredTransaction {
             tx: Arc::new(tx),
             owner: auth.principal,
+            write: payload.write,
             expires_at: Instant::now() + TRANSACTION_IDLE_TIMEOUT,
+            in_flight: 0,
         },
     );
     (StatusCode::OK, json!({"ok": true, "id": id}).into())
@@ -464,18 +561,13 @@ async fn transact_query(
     Path(id): Path<u32>,
     Json(payload): Json<QueryPayload>,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    let tx = match st.txs.lock().unwrap().get_mut(&id) {
-        None => return (StatusCode::NOT_FOUND, json!({"ok": false}).into()),
-        Some(stored) if stored.owner != auth.principal => {
-            return (StatusCode::FORBIDDEN, json!({"ok": false}).into())
-        }
-        Some(stored) => {
-            stored.expires_at = Instant::now() + TRANSACTION_IDLE_TIMEOUT;
-            stored.tx.clone()
-        }
+    let (tx, lease) = match acquire_transaction(&st, id, &auth) {
+        Ok(acquired) => acquired,
+        Err(response) => return response,
     };
     let src = payload.script.clone();
     let result = spawn_blocking(move || {
+        let _lease = lease;
         let params = payload
             .params
             .into_iter()
@@ -514,6 +606,23 @@ async fn finish_query(
             if entry.get().owner != auth.principal =>
         {
             return (StatusCode::FORBIDDEN, json!({"ok": false}).into())
+        }
+        std::collections::btree_map::Entry::Occupied(entry)
+            if entry.get().write
+                && matches!(auth.mutability, ScriptMutability::Immutable)
+                && !payload.abort =>
+        {
+            return (
+                StatusCode::FORBIDDEN,
+                json!({"ok": false, "message": "write transaction requires a mutable token"})
+                    .into(),
+            )
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if entry.get().in_flight != 0 => {
+            return (
+                StatusCode::CONFLICT,
+                json!({"ok": false, "message": "transaction has an operation in progress"}).into(),
+            )
         }
         std::collections::btree_map::Entry::Occupied(entry) => entry.remove().tx,
     };
