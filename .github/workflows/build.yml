@@ -79,6 +79,7 @@ jobs:
           done
 
           docker run --detach --name mnestic-tikv --network host \
+            --ulimit nofile=262144:262144 \
             pingcap/tikv@sha256:eed41be14384a2123b5ffabffae7e8322a027ea94d6482646e1d3a1d0fd8bbac \
             --pd-endpoints=127.0.0.1:2379 \
             --addr=127.0.0.1:20160 \
