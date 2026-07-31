@@ -7,7 +7,16 @@ Vendored per integration package so each is standalone-installable.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+_IDENT = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _identifier(value: str, name: str) -> str:
+    if not isinstance(value, str) or not _IDENT.match(value):
+        raise ValueError(f"{name} must be a bare identifier, got {value!r}")
+    return value
 
 
 class MnesticStore:
@@ -31,17 +40,17 @@ class MnesticStore:
     ) -> None:
         self.db = db
         self.dim = int(dim)
-        self.relation = relation
-        self.id_col = id_col
-        self.text_col = text_col
-        self.emb_col = emb_col
-        self.vector_index = vector_index
-        self.fts_index = fts_index
-        self.distance = distance
-        self.dtype = dtype
-        self.m = m
-        self.ef_construction = ef_construction
-        self.ef_search = ef_search
+        self.relation = _identifier(relation, "relation")
+        self.id_col = _identifier(id_col, "id_col")
+        self.text_col = _identifier(text_col, "text_col")
+        self.emb_col = _identifier(emb_col, "emb_col")
+        self.vector_index = _identifier(vector_index, "vector_index")
+        self.fts_index = _identifier(fts_index, "fts_index")
+        self.distance = _identifier(distance, "distance")
+        self.dtype = _identifier(dtype, "dtype")
+        self.m = int(m)
+        self.ef_construction = int(ef_construction)
+        self.ef_search = int(ef_search)
         if create:
             self.ensure_schema()
 

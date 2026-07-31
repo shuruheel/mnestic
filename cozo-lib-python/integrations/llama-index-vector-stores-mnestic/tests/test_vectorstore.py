@@ -4,10 +4,31 @@ llama-index-core + the package installed)."""
 
 from typing import List
 
+import pytest
 from llama_index.core import Document, StorageContext, VectorStoreIndex
 from llama_index.core.embeddings import BaseEmbedding
 
 from llama_index.vector_stores.mnestic import MnesticRetriever, MnesticVectorStore
+from llama_index.vector_stores.mnestic._core import MnesticStore
+
+
+@pytest.mark.parametrize(
+    ("option", "value"),
+    [
+        ("relation", "docs { id } :rm other_docs"),
+        ("id_col", "id] <- [] :rm other_docs { id"),
+        ("vector_index", "vec} :rm other_docs {id"),
+        ("distance", "Cosine} :rm other_docs {id"),
+    ],
+)
+def test_rejects_cozoscript_in_configuration(option, value):
+    with pytest.raises(ValueError, match="bare identifier"):
+        MnesticStore(object(), dim=2, create=False, **{option: value})
+
+
+def test_rejects_non_numeric_index_configuration():
+    with pytest.raises(ValueError):
+        MnesticStore(object(), dim=2, m="16} :rm other_docs {id", create=False)
 
 
 class KeywordEmbedding(BaseEmbedding):
