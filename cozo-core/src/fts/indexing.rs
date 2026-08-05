@@ -334,10 +334,8 @@ impl<'a> SessionTx<'a> {
                         break;
                     }
                     let delta = tok.position - q0;
-                    let el_res =
-                        self.fts_search_literal(&as_literal(tok), &config.idx_handle)?;
-                    let mut nxt_coll: FxHashMap<Tuple, Vec<(u32, u32, u32)>> =
-                        FxHashMap::default();
+                    let el_res = self.fts_search_literal(&as_literal(tok), &config.idx_handle)?;
+                    let mut nxt_coll: FxHashMap<Tuple, Vec<(u32, u32, u32)>> = FxHashMap::default();
                     for x in el_res {
                         if let Some(anchors) = coll.remove(&x.key) {
                             let at: FxHashMap<u32, u32> = x
@@ -583,11 +581,13 @@ impl<'a> SessionTx<'a> {
             #[error("cannot run a phrase query against index '{0}': its NGram tokenizer stores no usable token positions")]
             #[diagnostic(
                 code(eval::fts::phrase_without_positions),
-                help("NGram assigns every gram position 0, so adjacency cannot be \
+                help(
+                    "NGram assigns every gram position 0, so adjacency cannot be \
                       checked — a phrase would match every document containing the \
                       grams. Term search on this index still works; for phrase \
                       queries, index with a position-preserving tokenizer \
-                      (Simple, Whitespace).")
+                      (Simple, Whitespace)."
+                )
             )]
             struct FtsPhraseWithoutPositions(String);
 

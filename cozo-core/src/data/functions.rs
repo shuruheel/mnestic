@@ -3170,13 +3170,16 @@ pub(crate) fn op_snippet(args: &[DataValue]) -> Result<DataValue> {
     let text = args[0]
         .get_str()
         .ok_or_else(|| miette!("'snippet' expects a string as first argument"))?;
-    let spans_arg = args[1]
-        .get_slice()
-        .ok_or_else(|| miette!("'snippet' expects a list of [from, to] spans as second argument"))?;
+    let spans_arg = args[1].get_slice().ok_or_else(|| {
+        miette!("'snippet' expects a list of [from, to] spans as second argument")
+    })?;
     let window = args[2]
         .get_int()
         .ok_or_else(|| miette!("'snippet' expects an integer window (chars) as third argument"))?;
-    ensure!(window > 0, "'snippet' window must be positive, got {window}");
+    ensure!(
+        window > 0,
+        "'snippet' window must be positive, got {window}"
+    );
     let window = window as usize;
     let (open, close) = match (args.get(3), args.get(4)) {
         (None, None) => (None, None),

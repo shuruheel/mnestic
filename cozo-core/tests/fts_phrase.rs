@@ -59,7 +59,10 @@ fn setup(db: &DbInstance) {
 fn phrase_requires_adjacency() {
     let (_d, db) = db();
     setup(&db);
-    let res = run(&db, r#"?[id] := ~doc:idx{id | query: '"hello world"', k: 10}"#);
+    let res = run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: '"hello world"', k: 10}"#,
+    );
     assert_eq!(ids(&res), vec![1, 3], "non-adjacent doc 2 must be excluded");
 }
 
@@ -68,7 +71,10 @@ fn phrase_requires_adjacency() {
 fn unquoted_stays_and() {
     let (_d, db) = db();
     setup(&db);
-    let res = run(&db, r#"?[id] := ~doc:idx{id | query: 'hello world', k: 10}"#);
+    let res = run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: 'hello world', k: 10}"#,
+    );
     assert_eq!(ids(&res), vec![1, 2, 3]);
 }
 
@@ -90,9 +96,15 @@ fn quoted_single_token_equivalent() {
 fn phrase_is_ordered() {
     let (_d, db) = db();
     setup(&db);
-    let res = run(&db, r#"?[id] := ~doc:idx{id | query: '"world hello"', k: 10}"#);
+    let res = run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: '"world hello"', k: 10}"#,
+    );
     assert_eq!(ids(&res), vec![3]);
-    let res = run(&db, r#"?[id] := ~doc:idx{id | query: '"again hello"', k: 10}"#);
+    let res = run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: '"again hello"', k: 10}"#,
+    );
     assert_eq!(ids(&res), Vec::<i64>::new());
 }
 
@@ -151,7 +163,10 @@ fn all_stopword_phrase_is_empty() {
         &db,
         "::fts create s2:idx { extractor: body, tokenizer: Simple, filters: [Lowercase, Stopwords('en')] }",
     );
-    run(&db, r#"?[id, body] <- [[1, "alpha beta"]] :put s2 {id => body}"#);
+    run(
+        &db,
+        r#"?[id, body] <- [[1, "alpha beta"]] :put s2 {id => body}"#,
+    );
     let res = run(&db, r#"?[id] := ~s2:idx{id | query: '"the of"', k: 10}"#);
     assert_eq!(ids(&res), Vec::<i64>::new());
 }
@@ -161,7 +176,10 @@ fn all_stopword_phrase_is_empty() {
 fn phrase_prefix_is_named_error() {
     let (_d, db) = db();
     setup(&db);
-    let err = run_err(&db, r#"?[id] := ~doc:idx{id | query: '"hello wor"*', k: 10}"#);
+    let err = run_err(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: '"hello wor"*', k: 10}"#,
+    );
     assert!(
         err.contains("phrase_prefix_unsupported"),
         "wrong error: {err}"
@@ -204,9 +222,15 @@ fn ngram_phrase_is_named_error_terms_still_work() {
         &db,
         "::fts create nd:idx { extractor: body, tokenizer: NGram(2, 3) }",
     );
-    run(&db, r#"?[id, body] <- [[1, "hello world"]] :put nd {id => body}"#);
+    run(
+        &db,
+        r#"?[id, body] <- [[1, "hello world"]] :put nd {id => body}"#,
+    );
     let err = run_err(&db, r#"?[id] := ~nd:idx{id | query: '"hel wor"', k: 10}"#);
-    assert!(err.contains("phrase_without_positions"), "wrong error: {err}");
+    assert!(
+        err.contains("phrase_without_positions"),
+        "wrong error: {err}"
+    );
     let ok = run(&db, r#"?[id] := ~nd:idx{id | query: 'hel', k: 10}"#);
     assert_eq!(ids(&ok), vec![1]);
 }
@@ -231,7 +255,11 @@ fn stemmed_phrase_matches_stems() {
         &db,
         r#"?[id] := ~st:idx{id | query: '"connection refused"', k: 10}"#,
     );
-    assert_eq!(ids(&res), vec![1], "stems match in order; reversed doc 2 must not");
+    assert_eq!(
+        ids(&res),
+        vec![1],
+        "stems match in order; reversed doc 2 must not"
+    );
 }
 
 fn spans_of(rows: &cozo::NamedRows, row: usize, col: usize) -> Vec<(i64, i64)> {
@@ -283,7 +311,10 @@ fn bind_spans_multibyte() {
         "::fts create mb:idx { extractor: body, tokenizer: Simple, filters: [Lowercase] }",
     );
     // "héllo wörld": héllo = 6 bytes (é is 2), space at 6, wörld = 7..13.
-    run(&db, r#"?[id, body] <- [[1, "héllo wörld"]] :put mb {id => body}"#);
+    run(
+        &db,
+        r#"?[id, body] <- [[1, "héllo wörld"]] :put mb {id => body}"#,
+    );
     let res = run(
         &db,
         r#"?[id, sp] := ~mb:idx{id | query: '"héllo wörld"', k: 10, bind_spans: sp}"#,
@@ -317,9 +348,18 @@ fn snippet_end_to_end() {
                      snip = snippet(body, sp, 30)"#,
     );
     let snip = res.rows[0][0].get_str().unwrap();
-    assert!(snip.contains("needle phrase"), "window must cover the match: {snip}");
-    assert!(snip.starts_with('…') && snip.ends_with('…'), "both ends truncated: {snip}");
-    assert!(snip.chars().count() <= 32, "window + 2 ellipses at most: {snip}");
+    assert!(
+        snip.contains("needle phrase"),
+        "window must cover the match: {snip}"
+    );
+    assert!(
+        snip.starts_with('…') && snip.ends_with('…'),
+        "both ends truncated: {snip}"
+    );
+    assert!(
+        snip.chars().count() <= 32,
+        "window + 2 ellipses at most: {snip}"
+    );
 
     // Highlight form: markers wrap the matched span.
     let res = run(
@@ -328,7 +368,10 @@ fn snippet_end_to_end() {
                      snip = snippet(body, sp, 30, '<b>', '</b>')"#,
     );
     let snip = res.rows[0][0].get_str().unwrap();
-    assert!(snip.contains("<b>needle phrase</b>"), "markers must wrap: {snip}");
+    assert!(
+        snip.contains("<b>needle phrase</b>"),
+        "markers must wrap: {snip}"
+    );
 }
 
 // snippet is a pure function: no-span and multi-byte edges.
@@ -344,7 +387,10 @@ fn snippet_pure_edges() {
         r#"?[s] := s = snippet('ααββγγδδεε', [[4, 8]], 4, '<', '>')"#,
     );
     let s = res.rows[0][0].get_str().unwrap();
-    assert!(s.contains("<ββ>"), "span [4,8) is the two-byte chars ββ: {s}");
+    assert!(
+        s.contains("<ββ>"),
+        "span [4,8) is the two-byte chars ββ: {s}"
+    );
     // Malformed spans are dropped, not fatal.
     let res = run(
         &db,
@@ -364,12 +410,21 @@ fn near_scans_each_literal_once() {
     setup(&db);
     let count = || cozo::FTS_LITERAL_SCANS.with(|c| c.get());
     let before = count();
-    run(&db, r#"?[id] := ~doc:idx{id | query: 'NEAR/3(hello world)', k: 10}"#);
+    run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: 'NEAR/3(hello world)', k: 10}"#,
+    );
     let near_delta = count() - before;
     let before = count();
-    run(&db, r#"?[id] := ~doc:idx{id | query: '"hello world"', k: 10}"#);
+    run(
+        &db,
+        r#"?[id] := ~doc:idx{id | query: '"hello world"', k: 10}"#,
+    );
     let phrase_delta = count() - before;
-    assert_eq!(near_delta, 2, "NEAR of 2 literals must scan exactly 2 (was 3 pre-fix)");
+    assert_eq!(
+        near_delta, 2,
+        "NEAR of 2 literals must scan exactly 2 (was 3 pre-fix)"
+    );
     assert_eq!(phrase_delta, 2, "phrase of 2 tokens must scan exactly 2");
 }
 
@@ -387,24 +442,24 @@ fn phrase_subset_of_and() {
     let mut puts = String::from("?[id, body] <- [");
     for i in 0..40i64 {
         let w = |k: i64| vocab[((i * 7 + k * 3) % 5) as usize];
-        puts.push_str(&format!(
-            r#"[{i}, "{} {} {} {}"],"#,
-            w(0),
-            w(1),
-            w(2),
-            w(3)
-        ));
+        puts.push_str(&format!(r#"[{i}, "{} {} {} {}"],"#, w(0), w(1), w(2), w(3)));
     }
     puts.push_str("] :put g {id => body}");
     run(&db, &puts);
     for pair in [("red", "blue"), ("blue", "fish"), ("green", "bird")] {
         let phrase = ids(&run(
             &db,
-            &format!(r#"?[id] := ~g:idx{{id | query: '"{} {}"', k: 100}}"#, pair.0, pair.1),
+            &format!(
+                r#"?[id] := ~g:idx{{id | query: '"{} {}"', k: 100}}"#,
+                pair.0, pair.1
+            ),
         ));
         let and = ids(&run(
             &db,
-            &format!(r#"?[id] := ~g:idx{{id | query: '{} {}', k: 100}}"#, pair.0, pair.1),
+            &format!(
+                r#"?[id] := ~g:idx{{id | query: '{} {}', k: 100}}"#,
+                pair.0, pair.1
+            ),
         ));
         for id in &phrase {
             assert!(and.contains(id), "phrase result {id} missing from AND set");

@@ -91,8 +91,12 @@ const BASELINE: &[(&str, &[&str], &[&str])] = &[
     ("reach_seeded", &[":edge", ":edge"], &[":edge", ":edge"]),
     (
         "same_gen",
-        &[":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge"],
-        &[":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge"],
+        &[
+            ":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge",
+        ],
+        &[
+            ":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge", ":edge",
+        ],
     ),
 ];
 
@@ -211,7 +215,11 @@ fn cycle_closure_terminates_and_is_exact() {
     edges.push((n, 1));
     put_edges(&db, &edges);
     assert_eq!(count(&db, TC_COUNT), n * n);
-    assert_eq!(count(&db, REACH_COUNT), n, "seeded reach on a cycle = all n");
+    assert_eq!(
+        count(&db, REACH_COUNT),
+        n,
+        "seeded reach on a cycle = all n"
+    );
 }
 
 /// Seeded reachability on a deterministic pseudo-random sparse digraph,
@@ -223,7 +231,9 @@ fn random_digraph_reach_matches_bfs_oracle() {
     // Deterministic LCG (no external RNG, no ambient entropy).
     let mut state = 0x2545F4914F6CDD1Du64;
     let mut next = move |bound: u64| {
-        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
         (state >> 33) % bound
     };
     let n = 2000u64;

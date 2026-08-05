@@ -96,7 +96,9 @@ fn pagerank_unconverged_warning() {
     );
     let w = run(&db, "::warnings");
     assert!(
-        codes(&w).iter().any(|c| c == "fixed_rule.pagerank.unconverged"),
+        codes(&w)
+            .iter()
+            .any(|c| c == "fixed_rule.pagerank.unconverged"),
         "expected pagerank warning in {w:?}"
     );
 }
