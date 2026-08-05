@@ -13,7 +13,7 @@
 # Auth: crates.io Trusted Publishing (OIDC) via rust-lang/crates-io-auth-action — no
 # stored token/secret. Requires a Trusted Publisher configured on crates.io for BOTH
 # `mnestic` and `mnestic-rocks` (repo shuruheel/mnestic, workflow crates-publish.yml,
-# environment blank).
+# environment `crates-io`).
 
 name: crates-publish
 
@@ -50,6 +50,7 @@ jobs:
     needs: [test]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
+    environment: crates-io
     permissions:
       id-token: write    # OIDC — crates.io Trusted Publishing (no token/secret)
       contents: read
@@ -70,7 +71,7 @@ jobs:
       # Exchange the GitHub OIDC token for a short-lived crates.io token.
       # Requires a Trusted Publisher configured on crates.io for BOTH `mnestic`
       # and `mnestic-rocks`, pointing at repo shuruheel/mnestic + this workflow
-      # file (crates-publish.yml), environment blank.
+      # file (crates-publish.yml), environment `crates-io`.
       - uses: rust-lang/crates-io-auth-action@v1
         id: auth
 
