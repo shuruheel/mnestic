@@ -5,7 +5,7 @@
  * If a copy of the MPL was not distributed with this file,
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
-#![cfg(feature = "graph-algo")]
+#![cfg(all(feature = "graph-algo", feature = "data-import"))]
 // Inherited fixture style; the release gate compiles this target but does not modernize it.
 #![allow(clippy::get_first, clippy::unnecessary_operation)]
 
