@@ -88,7 +88,7 @@ fn build_phrase(pair: Pair<'_>) -> Result<FtsLiteral> {
     let kernel = inner.next().unwrap();
     // Whether the kernel was quoted decides phrase-vs-AND semantics at
     // tokenize time (fts/ast.rs::do_tokenize) — a quoted multi-token literal
-    // is an exact phrase since 0.13.2; a bare word group stays AND-of-terms.
+    // is an exact phrase since 0.14.0; a bare word group stays AND-of-terms.
     let (core_text, is_phrase) = match kernel.as_rule() {
         Rule::fts_phrase_group => (SmartString::from(kernel.as_str().trim()), false),
         Rule::quoted_string | Rule::s_quoted_string | Rule::raw_string => {

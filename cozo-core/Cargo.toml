@@ -1,6 +1,6 @@
 [package]
 name = "mnestic"
-version = "0.13.1"
+version = "0.14.0"
 edition = "2021"
 description = "A transactional relational-graph-vector database using Datalog — a maintained fork of CozoDB, tuned as a substrate for agentic memory"
 authors = ["Shan Rizvi", "Ziyang Hu (original CozoDB author)"]
@@ -50,7 +50,9 @@ graph-algo = ["graph", "rayon"]
 ## process-readable files. With `requests`, they may also make outbound requests.
 ## Only enable this for trusted CozoScript callers.
 data-import = []
-## Allows the utilities to make web requests to fetch data.
+## Allows data-import utilities to make web requests. This does not register
+## CsvReader/JsonReader by itself; enable `data-import` as well, and only for
+## trusted CozoScript callers.
 requests = ["dep:minreq"]
 ## Uses jemalloc as the global allocator, can make a difference in performance.
 jemalloc = ["dep:tikv-jemallocator-global", "cozorocks?/jemalloc"]
@@ -90,8 +92,9 @@ cypher = []
 #! (utilities are still available),
 #! which could be OK if you only want to deal with pure Datalog.
 #!
-#! The `requests` feature allows the database to make outgoing HTTP requests to fetch data
-#! into queries -- only enable it if you need it.
+#! `data-import` registers CsvReader and JsonReader, which can read arbitrary
+#! process-readable files. Pair it with `requests` to allow outbound HTTP(S)
+#! reads. Only enable `data-import` for trusted CozoScript callers.
 #!
 #! The `wasm` feature simply patches some functions so that they can compile on WASM platform,
 #! which lacks some std implementations at the moment. (On WASM you must also enable `nothread`).

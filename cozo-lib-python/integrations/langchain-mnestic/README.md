@@ -12,6 +12,10 @@ one call.
 pip install langchain-mnestic
 ```
 
+Use 0.2.1 or newer. It validates relation, column, index, distance, and dtype
+identifiers and coerces numeric HNSW settings before constructing CozoScript;
+earlier releases interpolated those configuration values directly.
+
 ```python
 from langchain_mnestic import MnesticVectorStore
 from langchain_openai import OpenAIEmbeddings

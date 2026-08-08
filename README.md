@@ -81,34 +81,35 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.13.1
+## New in 0.14.0
 
-A patch release: one planner default flips, and one 0.13.0 feature that a
-dependency upgrade had silently switched off is restored.
+A security-first minor release, plus a retrieval and operations tranche:
 
-**The factorized `count()` rewrite is now ON by default.** An eligible
-single-clause `count()`-over-a-positive-join is counted without materializing
-the join — including the `!=` inclusion–exclusion form restored in 0.13.0
-Measured on LSQB sf0.1 (SQLite, release), both paths returning LDBC's published
-count: **q1 72.4 s → 1.05 s (~69×)** and **q6 42.1 s → 0.31 s (~134×)**.
-**Answers do not change** — the pass fires only on a provably exact
-decomposition and declines on anything unverifiable, leaving declined queries
-byte-identical — but plans do. Restore the previous behaviour with
-`db.set_query_factorization(false)`.
+- **Defense-in-depth security:** stored-relation ACLs now cover indexes,
+  negation, fixed rules, exports, history, and cached graph projections; the
+  HTTP server authenticates loopback by default and binds remote transactions
+  to re-authorized principals; malformed vector bytes are rejected before
+  unsafe decoding; TiKV relation IDs serialize across independent clients; and
+  the LangChain/LlamaIndex adapters validate every identifier interpolated into
+  CozoScript.
+- **Script-controlled data import is opt-in.** `CsvReader` and `JsonReader` are
+  no longer registered by default because they can read process-local files
+  and, with HTTP support, make outbound requests. Trusted Rust deployments can
+  enable `data-import` explicitly (and `requests` for HTTP(S) sources).
+- **Exact-phrase FTS and matched context:** quoted multi-word queries now
+  require adjacency and order; `bind_spans` returns the matching byte offsets;
+  and `snippet(text, spans, window)` formats a tokenizer-consistent window.
+- **Operational controls:** `set_durable_writes(true)` requests fsync-on-commit
+  where the backend supports it, and typed warnings are available through
+  `::warnings` and `Db::recent_warnings`.
+- **Release confidence:** recursive plan shapes and exact results are pinned in
+  CI, including a nightly 10,000-iteration deep-fixpoint guard.
 
-**0.13.0's expected-token parse hints work again on current dependencies.**
-pest 2.8.0 made parse-attempt tracking opt-in and off by default; because our
-requirement was a caret `2.7.9`, anyone resolving fresh built 0.13.0 against
-2.8.x, where the `help:` token list and the corrected caret position silently
-reverted to pre-0.13.0 behaviour. Our own CI never saw it — the committed
-lockfile pinned 2.7.x — so a scheduled fresh-resolve lane now runs. The floor is
-raised to `pest = "2.8"`, and mnestic enables pest's detail tracking **only
-around a re-parse of a script that already failed**, so successful parses pay
-nothing and the process-wide setting is not left on inside your application.
-
-Also: `op_rand_uuid_v1` builds through the version-neutral `uuid::v1::Context`
-alias, so the crate compiles against any uuid resolvable within its declared
-requirement.
+Migration highlights: HTTP clients must now authenticate unless the server is
+deliberately started with loopback-only `--insecure-no-auth`; HTTP backup paths
+are relative to the configured backup directory; indirect reads of `Hidden`
+relations now fail; and quoted multi-word FTS queries are exact phrases (drop
+the quotes to preserve AND-of-terms behavior).
 
 Full detail is in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 

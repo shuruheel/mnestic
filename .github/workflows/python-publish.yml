@@ -2,9 +2,11 @@
 #   - mnestic                              (pyo3 binding, cross-platform abi3 wheels)
 #   - langchain-mnestic                    (pure Python)
 #   - llama-index-vector-stores-mnestic    (pure Python)
+#   - langgraph-store-mnestic               (pure Python)
+#   - mnestic-mcp                           (pure Python)
 #
 # Publishing uses PyPI **trusted publishing** (OIDC) — no API tokens. Each of the
-# three PyPI projects must have a trusted publisher configured pointing at this
+# five PyPI projects must have a trusted publisher configured pointing at this
 # repo, workflow file `python-publish.yml`, environment `pypi`.
 #
 # Triggered by `py-v*` tags (and manually). Build-only on workflow_dispatch unless

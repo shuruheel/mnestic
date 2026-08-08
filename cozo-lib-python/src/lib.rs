@@ -568,7 +568,7 @@ impl CozoDbPy {
         Ok(db.query_factorization())
     }
     /// Request that write transactions **fsync on commit** (mnestic fork,
-    /// 0.13.2). Returns `True` iff the storage backend honors the knob —
+    /// 0.14.0). Returns `True` iff the storage backend honors the knob —
     /// `rocksdb` does (per-transaction `WriteOptions.sync`; note the bulk
     /// import/restore channels are separate non-transactional paths outside
     /// it); `sqlite` returns `False` because its writes are **already

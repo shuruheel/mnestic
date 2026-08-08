@@ -100,7 +100,7 @@ fn tokenize_with_positions(value: &str, tokenizer: &TextAnalyzer) -> Vec<FtsPhra
     code(parser::fts::phrase_prefix_unsupported),
     help(
         "split it: `\"{0}\" OR {1}*` searches the exact phrase or the prefix term. \
-          (Before 0.13.2 this query silently matched nothing: the whole quoted string \
+          (Before 0.14.0 this query silently matched nothing: the whole quoted string \
           was prefix-matched against single-token index entries. True phrase-prefix \
           search is tracked at https://github.com/shuruheel/mnestic/issues/19.)"
     )
@@ -256,7 +256,7 @@ impl FtsExpr {
                     {
                         // A quoted multi-word phrase inside NEAR would silently
                         // degrade to its bag of tokens (adjacency dropped) —
-                        // the bug class 0.13.2 removes. Refuse loudly instead.
+                        // the bug class 0.14.0 removes. Refuse loudly instead.
                         bail!(FtsPhraseInNearUnsupported(l.value.to_string()));
                     }
                     l.tokenize(tokenizer, &mut tokens);
