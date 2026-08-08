@@ -11,6 +11,10 @@ full-text database (a maintained fork of CozoDB). Retrieval is **hybrid**: dense
 pip install llama-index-vector-stores-mnestic
 ```
 
+Use 0.2.1 or newer. It validates relation, column, index, distance, and dtype
+identifiers and coerces numeric HNSW settings before constructing CozoScript;
+earlier releases interpolated those configuration values directly.
+
 ```python
 from llama_index.core import VectorStoreIndex, StorageContext, Document
 from llama_index.vector_stores.mnestic import MnesticVectorStore

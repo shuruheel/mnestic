@@ -52,27 +52,32 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
-## New in 0.13.1
+## New in 0.14.0
 
-A patch release. The Python-facing highlights:
+The Python-facing highlights of this security-first minor release:
 
-- **The factorized `count()` rewrite is ON by default.** Through 0.13.0 you had
-  to opt in with `db.set_query_factorization(True)`; the nightly soak that
-  gated the flip has run green, so an eligible `count()`-over-join — including
-  the inequality form handled by inclusion–exclusion — is now counted without
-  materializing the join (measured on LSQB sf0.1: q1 72.4 s → 1.05 s, q6
-  42.1 s → 0.31 s, both returning LDBC's published count). Answers are unchanged;
-  the rewrite fires only on a provably exact decomposition and leaves every
-  query it declines byte-identical. Opt back out with
-  `db.set_query_factorization(False)`, and read the setting with
-  `db.query_factorization()`.
+- **Safer defaults.** The wheel no longer registers CozoScript's file/network
+  `CsvReader` and `JsonReader` utilities. Stored-relation ACLs now cover
+  indexes, negation, fixed rules, exports, history, and cached graph
+  projections; malformed vector payloads fail before unsafe decoding.
+- **Exact-phrase FTS and matched context.** Quoted multi-word queries require
+  adjacency and order. FTS atoms can bind the matching byte offsets with
+  `bind_spans`, and `snippet(text, spans, window)` formats a window without
+  re-tokenizing the document.
+- **Durability is explicit.** `db.set_durable_writes(True)` requests
+  fsync-on-commit and returns whether the selected backend honors the knob.
+  RocksDB does; SQLite is already durable under its default
+  `synchronous=FULL` policy and reports `False`.
+- **Warnings are queryable.** `::warnings` returns stable warning codes with a
+  message and actionable hint; `::warnings clear` empties the per-database
+  buffer.
+- **Hardened framework adapters.** `langchain-mnestic` 0.2.1 and
+  `llama-index-vector-stores-mnestic` 0.2.1 validate all identifiers and numeric
+  HNSW settings before constructing CozoScript.
 
-- **Parse errors name the expected tokens again.** 0.13.0 shipped the `help:`
-  line listing the literal tokens that would have been accepted, but pest 2.8
-  made the underlying tracking opt-in, so wheels built against it silently lost
-  both the token list and the corrected caret position. Restored, and the
-  tracking is now enabled only around a re-parse of a script that already
-  failed — successful parses pay nothing for it.
+Migration highlights: indirect reads of `Hidden` relations now fail, and
+quoted multi-word FTS queries now mean exact phrases. Drop the quotes to retain
+the previous AND-of-terms behavior.
 
 See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
 for the full accounting, and for 0.13.0's upgrade guidance if you are coming

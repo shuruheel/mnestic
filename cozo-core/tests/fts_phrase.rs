@@ -66,7 +66,7 @@ fn phrase_requires_adjacency() {
     assert_eq!(ids(&res), vec![1, 3], "non-adjacent doc 2 must be excluded");
 }
 
-// Unquoted stays AND-of-terms — byte-identical to pre-0.13.2.
+// Unquoted stays AND-of-terms — byte-identical to pre-0.14.0.
 #[test]
 fn unquoted_stays_and() {
     let (_d, db) = db();
@@ -201,7 +201,7 @@ fn phrase_in_near_is_named_error() {
     );
 }
 
-// A quoted SINGLE token inside NEAR stays legal (pre-0.13.2 behavior).
+// A quoted SINGLE token inside NEAR stays legal (pre-0.14.0 behavior).
 #[test]
 fn single_token_quoted_in_near_still_legal() {
     let (_d, db) = db();
@@ -399,7 +399,7 @@ fn snippet_pure_edges() {
     assert_eq!(res.rows[0][0].get_str().unwrap(), "hello world");
 }
 
-// §7 regression: NEAR must scan each literal ONCE. The pre-0.13.2 bug
+// §7 regression: NEAR must scan each literal ONCE. The pre-0.14.0 bug
 // (first literal seeded the intersection and was then re-scanned by the main
 // loop) was invisible in results — self-distance 0 always survived — so only
 // a scan count can pin the fix. The counter is thread-local and query eval

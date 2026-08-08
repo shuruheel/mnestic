@@ -31,7 +31,7 @@ thread_local! {
     /// Per-thread count of FTS posting-range scans (`fts_search_literal`
     /// calls). One cell bump per *literal*, not per posting — negligible
     /// beside the scan itself. Exists so tests can pin scan counts: the NEAR
-    /// first-literal double-scan (fixed in 0.13.2) was invisible in results by
+    /// first-literal double-scan (fixed in 0.14.0) was invisible in results by
     /// construction, and only a counter regression test can keep it fixed.
     /// Thread-local (query eval runs on the calling thread) so parallel tests
     /// cannot race each other's deltas.

@@ -73,7 +73,7 @@ struct PositionInfo {
     /// Byte offsets of the occurrence in the original indexed text, recorded
     /// by the index-side analyzer (so they point at the source word even when
     /// the posting key is its stem). Written since the fork point; decoded
-    /// and discarded until 0.13.2's `bind_spans`.
+    /// and discarded until 0.14.0's `bind_spans`.
     from: u32,
     to: u32,
     position: u32,

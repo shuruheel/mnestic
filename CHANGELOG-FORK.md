@@ -5,9 +5,102 @@ provenance and licensing.
 
 ## Unreleased
 
-Post-0.13.1 work not yet cut to a release. Keep this section current as
-divergences land (see `CLAUDE.md` release rules) so a release never has to
-reconstruct them.
+Nothing yet.
+
+## 0.14.0 — 2026-08-08
+
+A security-first minor release, with the full-text retrieval, diagnostics,
+durability, planner-regression, and MCP work that had accumulated after
+0.13.1. This is 0.14.0 rather than the previously sketched 0.13.2 patch because
+the bank now includes deliberate default and access-boundary changes that need
+one visible migration point.
+
+### Security — close the engine's indirect-read and deployment boundaries
+
+Six independently reachable security boundaries are now explicit and tested:
+
+- **Stored-relation reads use one checked resolver**
+  ([#40](https://github.com/shuruheel/mnestic/pull/40)). Ordinary indexes
+  inherit their base relation's effective ACL, and positive/negated atoms,
+  fixed-rule inputs and arity checks, imperative returns, exports, history
+  reads, and graph-projection sources all resolve through the same access
+  check. A relation changed to `Hidden` can no longer remain observable through
+  an index or a graph projection's cold or warm cache.
+- **The HTTP server authenticates loopback by default**
+  ([#39](https://github.com/shuruheel/mnestic/pull/39)). The explicit
+  loopback-only `--insecure-no-auth` escape hatch validates the configured
+  HTTP/1 Host or HTTP/2 authority, Origin, and Fetch Metadata before granting
+  local access. Remote transactions are bound to stable principals and
+  re-authorized on every operation; active work cannot be reaped as idle;
+  concurrent finish/query races are rejected; and read-only transactions
+  reject writes. Import and backup require mutable grants, and HTTP backup
+  paths are confined to the configured backup directory.
+- **CozoScript data readers are opt-in**
+  ([#36](https://github.com/shuruheel/mnestic/pull/36)). `CsvReader` and
+  `JsonReader` can read process-local files and, with HTTP support, make
+  outbound requests. They are no longer registered by default; trusted Rust
+  deployments must enable the new `data-import` feature explicitly. The
+  default engine, server, and Python wheels expose no script-controlled file or
+  network reader.
+- **Malformed vectors fail before unsafe decoding**
+  ([#28](https://github.com/shuruheel/mnestic/pull/28)). MessagePack byte
+  payloads whose length is not aligned to the declared `f32` or `f64` element
+  width now return a deserialization error instead of reaching an out-of-bounds
+  unsafe copy.
+- **Python vector-store configuration cannot inject CozoScript**
+  ([#24](https://github.com/shuruheel/mnestic/pull/24)). The LangChain and
+  LlamaIndex adapters accept only bare identifiers for relation, column, index,
+  distance, and dtype fields and coerce numeric HNSW settings before script
+  construction. The fixed packages publish as `langchain-mnestic` 0.2.1 and
+  `llama-index-vector-stores-mnestic` 0.2.1.
+- **Persistent relation IDs serialize across TiKV clients**
+  ([#37](https://github.com/shuruheel/mnestic/pull/37)). Allocation now reads
+  and advances the persisted counter inside the relation-creation transaction,
+  so stale independent clients cannot assign the same ID. A pinned real-cluster
+  CI test races two clients and asserts distinct relations; abandoned TiKV
+  transactions roll back on drop instead of panicking.
+
+The combined security tree passed the complete mnestic CI matrix and
+MindGraph's Linux/macOS, RocksDB-backed core and server acceptance suites. The
+crates.io publishing workflow was hardened too
+([#22](https://github.com/shuruheel/mnestic/pull/22)): its OIDC token is issued
+only after the protected `crates-io` GitHub Environment gate.
+
+**0.14.0 migration notes:**
+
+- HTTP clients, including loopback clients, must authenticate unless the server
+  is deliberately started with loopback-only `--insecure-no-auth`.
+- HTTP backup paths are relative to the configured backup directory.
+- Indirect reads that previously leaked a `Hidden` relation now fail with an
+  access error.
+- Rust callers that intentionally expose `CsvReader` or `JsonReader` to trusted
+  scripts must enable `data-import`; add `requests` too for HTTP(S) sources.
+- Quoted multi-word FTS queries now mean exact phrases. Drop the quotes to keep
+  the old AND-of-terms behavior.
+
+### Added — bounded, resumable MCP output (`mnestic-mcp` 0.2.0)
+
+Every wide-result MCP tool (`search`, `find_related`, `list_recent`, and
+`recall_as_of`) now accepts `max_bytes` (default 20,000). Results cut at item
+boundaries, never inside content, and return `truncated`, `remaining`, and a
+single-use continuation token. `continue_result(token)` walks the remaining
+items under the same bound; an individually oversized first item is returned
+alone and flagged so pagination can never stall on an empty page. Tokens are
+in-process, LRU-capped, and return an actionable re-run hint after expiry or a
+server restart.
+
+### Verification and release operations
+
+- The recursive planner tier now pins transitive closure, seeded reachability,
+  and same-generation plan shapes plus exact-count execution oracles, with a
+  nightly 10,000-iteration deep-fixpoint cap.
+- The temporal-belief benchmark is published in the sibling
+  `mnestic-benchmarks` repository: both time axes are checked against an
+  independent Python oracle across proof search, contradiction, retraction,
+  and reconciliation.
+- The dependency-drift monitor moved to the ecosystem-level `mindgraph-rs`
+  workflow, while this repository keeps its self-contained version and
+  dependency-freshness checks.
 
 ### Changed — a quoted full-text query is now an exact phrase
 
@@ -30,7 +123,7 @@ What "exact phrase" means, precisely:
   fork point**: document matches at anchor `p` iff every query token with
   analyzer position `qᵢ` occurs at exactly `p + (qᵢ − q₀)`. Overlapping
   occurrences are found; tf for scoring = anchor count; df = the phrase's own
-  matching-doc count. No storage-format change in either direction — a 0.13.2
+  matching-doc count. No storage-format change in either direction — a 0.14.0
   index opens under 0.13.0 and vice versa.
 - **A removed stopword is a one-token wildcard slot, symmetrically.** The
   tokenizer numbers tokens before filters run and `Stopwords` skips without
