@@ -24,7 +24,11 @@ provenance and licensing.
   `set_default_query_mem_limit` — **script text can only tighten the budget a
   host set, never raise it** (scripts are increasingly LLM-authored). The
   figures are logical estimates of engine-held bytes, not process RSS, and are
-  not stable across releases. The engine default stays **unset** (a library
+  not stable across releases. **Known-uncharged channels** (spec §4/Q3 — the
+  seam was not clean, so they are documented instead): `materialized_join`'s
+  right-side cache and the normal-aggregate work map; an aggr-heavy or
+  matjoin-heavy query can exceed an armed budget through them. The engine
+  default stays **unset** (a library
   must not change behavior under its hosts), but `cozo-bin` — an application —
   ships with a 4 GiB default budget (`--default-query-mem-limit`, `0` for
   unlimited), and its HTTP query payload accepts a per-request `mem_limit`.
