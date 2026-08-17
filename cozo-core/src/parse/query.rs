@@ -284,6 +284,23 @@ pub(crate) fn parse_query(
                     out_opts.timeout = None;
                 }
             }
+            Rule::mem_limit_option => {
+                // mnestic fork, query memory budget (spec
+                // `docs/specs/memory-budget.md`): estimated-bytes ceiling on
+                // this block's materialization; `0` clears it.
+                let pair = pair.into_inner().next().unwrap();
+                let span = pair.extract_span();
+                let bytes = build_expr(pair, param_pool)?
+                    .eval_to_const()
+                    .map_err(|err| OptionNotConstantError("mem_limit", span, [err]))?
+                    .get_int()
+                    .ok_or(OptionNotNonNegIntError("mem_limit", span))?;
+                if bytes > 0 {
+                    out_opts.mem_limit = Some(bytes as usize);
+                } else {
+                    out_opts.mem_limit = None;
+                }
+            }
             Rule::sleep_option => {
                 #[cfg(target_arch = "wasm32")]
                 bail!(":sleep is not supported under WASM");

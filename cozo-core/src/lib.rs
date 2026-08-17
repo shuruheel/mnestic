@@ -410,6 +410,26 @@ impl DbInstance {
             DbInstance::TiKv(db) => db.set_default_query_timeout(secs),
         }
     }
+
+    /// Set (or clear) the Db-wide default per-query memory budget in estimated
+    /// bytes (mnestic fork, query memory budget; spec
+    /// `docs/specs/memory-budget.md`). See
+    /// [`crate::Db::set_default_query_mem_limit`].
+    pub fn set_default_query_mem_limit(&self, bytes: Option<usize>) {
+        match self {
+            DbInstance::Mem(db) => db.set_default_query_mem_limit(bytes),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.set_default_query_mem_limit(bytes),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.set_default_query_mem_limit(bytes),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.set_default_query_mem_limit(bytes),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.set_default_query_mem_limit(bytes),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.set_default_query_mem_limit(bytes),
+        }
+    }
     /// Test-only dispatcher. See [`crate::Db::fail_next_commit_for_tests`].
     #[cfg(feature = "test-hooks")]
     #[doc(hidden)]

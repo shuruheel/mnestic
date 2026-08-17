@@ -259,6 +259,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         ps: &ImperativeProgram,
         readonly: bool,
         outer_deadline: Option<Instant>,
+        outer_mem_limit: Option<usize>,
     ) -> Result<NamedRows, Report> {
         let mut callback_collector = BTreeMap::new();
         let mut write_lock_names = BTreeSet::new();
@@ -289,6 +290,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // program (one tx), so carry it on the tx and arm the shared poison
             // with the same deadline (mnestic fork, query budget).
             tx.script_deadline = outer_deadline;
+            tx.script_mem_limit = outer_mem_limit;
 
             let poison = Poison::with_deadline(outer_deadline);
             let qid = self.queries_count.fetch_add(1, Ordering::AcqRel);

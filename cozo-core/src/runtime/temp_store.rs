@@ -18,14 +18,34 @@ use itertools::Itertools;
 use miette::{bail, ensure, Result};
 
 use crate::data::aggr::Aggregation;
+use crate::data::memsize::{est_tuple_bytes, BTREE_ENTRY_OVERHEAD};
 use crate::data::tuple::Tuple;
 use crate::data::value::DataValue;
+use crate::runtime::db::MemBudget;
 
 /// A store holding temp data during evaluation of queries.
 /// The public interface is used in custom implementations of algorithms/utilities.
 #[derive(Default, Debug)]
 pub struct RegularTempStore {
     inner: BTreeMap<Tuple, bool>,
+    /// Query memory budget handle (mnestic fork; spec
+    /// `docs/specs/memory-budget.md`). `None` = accounting disabled: every
+    /// charge site is then a single `Option` check. The stores hold the
+    /// handle (rather than threading it through the write methods) so
+    /// `pub fn put`'s signature is unchanged for FixedRule implementations
+    /// and their output writes are charged for free.
+    budget: Option<MemBudget>,
+    /// This store's own live charged bytes; debited wholesale on drop so a
+    /// tripped/aborted query releases exactly what it charged.
+    charged: usize,
+}
+
+impl Drop for RegularTempStore {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget {
+            b.debit(self.charged);
+        }
+    }
 }
 
 const EMPTY_TUPLE_REF: &Tuple = &vec![];
@@ -55,35 +75,104 @@ impl RegularTempStore {
             .range((lower_bound, upper_bound))
             .map(|(t, skip)| TupleInIter(t, EMPTY_TUPLE_REF, *skip))
     }
+    /// Construct with the query memory-budget handle attached (mnestic fork).
+    pub(crate) fn with_budget(budget: Option<MemBudget>) -> Self {
+        Self {
+            inner: Default::default(),
+            budget,
+            charged: 0,
+        }
+    }
+    pub(crate) fn set_budget(&mut self, budget: Option<MemBudget>) {
+        debug_assert_eq!(self.charged, 0, "budget attached to a non-empty store");
+        self.budget = budget;
+    }
+    #[inline]
+    fn charge(&mut self, n: usize) {
+        self.charged += n;
+        if let Some(b) = &self.budget {
+            b.charge(n);
+        }
+    }
+    #[inline]
+    fn debit(&mut self, n: usize) {
+        self.charged = self.charged.saturating_sub(n);
+        if let Some(b) = &self.budget {
+            b.debit(n);
+        }
+    }
+    #[inline]
+    fn reset_charges(&mut self) {
+        let n = self.charged;
+        self.charged = 0;
+        if let Some(b) = &self.budget {
+            b.debit(n);
+        }
+    }
     /// Add a tuple to the store
     pub fn put(&mut self, tuple: Tuple) {
-        self.inner.insert(tuple, false);
+        self.insert_impl(tuple, false);
     }
     pub(crate) fn put_with_skip(&mut self, tuple: Tuple) {
-        self.inner.insert(tuple, true);
+        self.insert_impl(tuple, true);
+    }
+    #[inline]
+    fn insert_impl(&mut self, tuple: Tuple, skip: bool) {
+        // Charge only an insertion that actually inserts: a duplicate-key
+        // insert keeps the old key and drops the incoming tuple — net ~zero.
+        if self.budget.is_some() {
+            let n = est_tuple_bytes(&tuple) + BTREE_ENTRY_OVERHEAD;
+            if self.inner.insert(tuple, skip).is_none() {
+                self.charge(n);
+            }
+        } else {
+            self.inner.insert(tuple, skip);
+        }
     }
     // returns true if prev is guaranteed to be the same as self after this function call,
     // false if we are not sure.
     pub(crate) fn merge_in(&mut self, prev: &mut Self, mut new: Self) -> bool {
+        prev.reset_charges();
         prev.inner.clear();
         if new.inner.is_empty() {
             return false;
         }
         if self.inner.is_empty() {
+            // A whole-struct swap: contents AND accounting travel together,
+            // so this arm is accounting-neutral (a move, not a copy).
             mem::swap(&mut new, self);
             return true;
         }
-        for (k, v) in new.inner {
+        // Transfer new's charges locally (the global counter already holds
+        // them); entries below either move into self or are debited.
+        self.charged += mem::take(&mut new.charged);
+        let moved = mem::take(&mut new.inner);
+        let active = self.budget.is_some();
+        let mut dropped = 0usize;
+        for (k, v) in moved {
+            let n = if active {
+                est_tuple_bytes(&k) + BTREE_ENTRY_OVERHEAD
+            } else {
+                0
+            };
             match self.inner.entry(k) {
                 Entry::Vacant(ent) => {
+                    // The moved entry stays charged in self; prev gains a
+                    // genuine key clone.
+                    if active {
+                        prev.charge(n);
+                    }
                     prev.inner.insert(ent.key().clone(), v);
                     ent.insert(v);
                 }
                 Entry::Occupied(mut ent) => {
+                    // The incoming duplicate key drops here.
+                    dropped += n;
                     ent.insert(v);
                 }
             }
         }
+        self.debit(dropped);
         false
     }
 }
@@ -93,6 +182,17 @@ pub(crate) struct MeetAggrStore {
     inner: BTreeMap<Tuple, Tuple>,
     aggregations: Vec<(Aggregation, Vec<DataValue>)>,
     grouping_len: usize,
+    /// Query memory budget (mnestic fork) — see `RegularTempStore::budget`.
+    budget: Option<MemBudget>,
+    charged: usize,
+}
+
+impl Drop for MeetAggrStore {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget {
+            b.debit(self.charged);
+        }
+    }
 }
 
 impl MeetAggrStore {
@@ -117,7 +217,35 @@ impl MeetAggrStore {
             inner: Default::default(),
             aggregations,
             grouping_len,
+            budget: None,
+            charged: 0,
         })
+    }
+    pub(crate) fn set_budget(&mut self, budget: Option<MemBudget>) {
+        debug_assert_eq!(self.charged, 0, "budget attached to a non-empty store");
+        self.budget = budget;
+    }
+    #[inline]
+    fn charge(&mut self, n: usize) {
+        self.charged += n;
+        if let Some(b) = &self.budget {
+            b.charge(n);
+        }
+    }
+    #[inline]
+    fn debit(&mut self, n: usize) {
+        self.charged = self.charged.saturating_sub(n);
+        if let Some(b) = &self.budget {
+            b.debit(n);
+        }
+    }
+    #[inline]
+    fn reset_charges(&mut self) {
+        let n = self.charged;
+        self.charged = 0;
+        if let Some(b) = &self.budget {
+            b.debit(n);
+        }
     }
     // also need to check if value exists beforehand! use the idempotency!
     // need to think this through more carefully.
@@ -138,6 +266,12 @@ impl MeetAggrStore {
                 Ok(changed)
             }
             None => {
+                if self.budget.is_some() {
+                    let n = est_tuple_bytes(key_part)
+                        + est_tuple_bytes(val_part)
+                        + BTREE_ENTRY_OVERHEAD;
+                    self.charge(n);
+                }
                 self.inner.insert(key_part.to_vec(), val_part.to_vec());
                 Ok(true)
             }
@@ -185,17 +319,33 @@ impl MeetAggrStore {
     /// returns true if prev is guaranteed to be the same as self after this function call,
     /// false if we are not sure.
     pub(crate) fn merge_in(&mut self, prev: &mut Self, mut new: Self) -> Result<bool> {
+        prev.reset_charges();
         prev.inner.clear();
         if new.inner.is_empty() {
             return Ok(false);
         }
         if self.inner.is_empty() {
+            // Whole-struct swap: contents and accounting travel together.
             mem::swap(self, &mut new);
             return Ok(true);
         }
-        for (k, v) in new.inner {
+        self.charged += mem::take(&mut new.charged);
+        let moved = mem::take(&mut new.inner);
+        let active = self.budget.is_some();
+        let mut dropped = 0usize;
+        for (k, v) in moved {
+            let n = if active {
+                est_tuple_bytes(&k) + est_tuple_bytes(&v) + BTREE_ENTRY_OVERHEAD
+            } else {
+                0
+            };
             match self.inner.entry(k) {
                 Entry::Vacant(ent) => {
+                    // prev gains genuine key+value clones; the moved entry
+                    // stays charged in self.
+                    if active {
+                        prev.charge(n);
+                    }
                     prev.inner.insert(ent.key().clone(), v.clone());
                     ent.insert(v);
                 }
@@ -213,12 +363,21 @@ impl MeetAggrStore {
                             changed |= this_changed;
                         }
                     }
+                    // The incoming duplicate entry drops here.
+                    dropped += n;
                     if changed {
+                        if active {
+                            let pn = est_tuple_bytes(ent.key())
+                                + est_tuple_bytes(ent.get())
+                                + BTREE_ENTRY_OVERHEAD;
+                            prev.charge(pn);
+                        }
                         prev.inner.insert(ent.key().clone(), ent.get().clone());
                     }
                 }
             }
         }
+        self.debit(dropped);
         Ok(false)
     }
 }
@@ -245,6 +404,17 @@ pub(crate) struct BoundedMeetStore {
     /// unbounded twin is belt-and-braces for the delta contract, not a
     /// load-bearing path.)
     unbounded: bool,
+    /// Query memory budget (mnestic fork) — see `RegularTempStore::budget`.
+    budget: Option<MemBudget>,
+    charged: usize,
+}
+
+impl Drop for BoundedMeetStore {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget {
+            b.debit(self.charged);
+        }
+    }
 }
 
 impl std::fmt::Debug for BoundedMeetStore {
@@ -274,6 +444,8 @@ impl BoundedMeetStore {
             k,
             grouping_len: total_key_len - 1,
             unbounded: false,
+            budget: None,
+            charged: 0,
         })
     }
     /// An empty twin for the delta slot: same contract, no truncation.
@@ -284,6 +456,34 @@ impl BoundedMeetStore {
             k: self.k,
             grouping_len: self.grouping_len,
             unbounded: true,
+            budget: self.budget.clone(),
+            charged: 0,
+        }
+    }
+    pub(crate) fn set_budget(&mut self, budget: Option<MemBudget>) {
+        debug_assert_eq!(self.charged, 0, "budget attached to a non-empty store");
+        self.budget = budget;
+    }
+    #[inline]
+    fn charge(&mut self, n: usize) {
+        self.charged += n;
+        if let Some(b) = &self.budget {
+            b.charge(n);
+        }
+    }
+    #[inline]
+    fn debit(&mut self, n: usize) {
+        self.charged = self.charged.saturating_sub(n);
+        if let Some(b) = &self.budget {
+            b.debit(n);
+        }
+    }
+    #[inline]
+    fn reset_charges(&mut self) {
+        let n = self.charged;
+        self.charged = 0;
+        if let Some(b) = &self.budget {
+            b.debit(n);
         }
     }
     pub(crate) fn exists(&self, key: &Tuple) -> bool {
@@ -300,22 +500,48 @@ impl BoundedMeetStore {
         self.op.validate(&val_part[0])?;
         let op = self.op.clone();
         let (k, unbounded) = (self.k, self.unbounded);
-        let entry = self.inner.entry(key_part.to_vec()).or_default();
-        match entry.binary_search_by(|held| op.cmp_candidates(&held[0], &val_part[0])) {
-            // Equal under the aggregate's order = duplicate under its ○=
-            Ok(_) => Ok(false),
-            Err(pos) => {
-                if !unbounded && pos >= k {
-                    // worse than the group's k-th best: not a change
-                    return Ok(false);
+        let active = self.budget.is_some();
+        // memory budget (mnestic fork): a brand-new group charges its key
+        // tuple + group-Vec header + entry overhead alongside the candidate.
+        let new_group = active && !self.inner.contains_key(key_part);
+        let mut delta_charge = 0usize;
+        let mut delta_debit = 0usize;
+        let changed = {
+            let entry = self.inner.entry(key_part.to_vec()).or_default();
+            match entry.binary_search_by(|held| op.cmp_candidates(&held[0], &val_part[0])) {
+                // Equal under the aggregate's order = duplicate under its ○=
+                Ok(_) => false,
+                Err(pos) => {
+                    if !unbounded && pos >= k {
+                        // worse than the group's k-th best: not a change
+                        false
+                    } else {
+                        if active {
+                            delta_charge += est_tuple_bytes(val_part);
+                        }
+                        entry.insert(pos, val_part.to_vec());
+                        if !unbounded && entry.len() > k {
+                            if active {
+                                if let Some(worst) = entry.last() {
+                                    // the displaced worst candidate drops
+                                    delta_debit += est_tuple_bytes(worst);
+                                }
+                            }
+                            entry.pop();
+                        }
+                        true
+                    }
                 }
-                entry.insert(pos, val_part.to_vec());
-                if !unbounded && entry.len() > k {
-                    entry.pop();
-                }
-                Ok(true)
             }
+        };
+        if changed && new_group {
+            delta_charge += est_tuple_bytes(key_part)
+                + std::mem::size_of::<Vec<Tuple>>()
+                + BTREE_ENTRY_OVERHEAD;
         }
+        self.charge(delta_charge);
+        self.debit(delta_debit);
+        Ok(changed)
     }
     fn range_iter(
         &self,
@@ -353,6 +579,7 @@ impl BoundedMeetStore {
     /// function call, false if we are not sure. `prev` collects the
     /// candidates that CHANGED a k-set — the delta for the next epoch.
     pub(crate) fn merge_in(&mut self, prev: &mut Self, mut new: Self) -> Result<bool> {
+        prev.reset_charges();
         prev.inner.clear();
         prev.unbounded = true;
         if new.inner.is_empty() {
@@ -360,9 +587,18 @@ impl BoundedMeetStore {
         }
         if self.inner.is_empty() {
             mem::swap(&mut self.inner, &mut new.inner);
+            // inner swapped without the accounting fields: carry them along.
+            mem::swap(&mut self.charged, &mut new.charged);
             return Ok(true);
         }
-        for (k, vs) in new.inner {
+        // The rows below are re-materialized through meet_put, which charges
+        // precisely; release new's own charges first (its entries all drop).
+        let moved = mem::take(&mut new.inner);
+        let released = mem::take(&mut new.charged);
+        if let Some(b) = &self.budget {
+            b.debit(released);
+        }
+        for (k, vs) in moved {
             for v in vs {
                 let mut row = k.clone();
                 row.extend(v.iter().cloned());
@@ -413,6 +649,17 @@ pub(crate) struct DominanceMeetStore {
     /// API is unchanged. `dominates` returns `bool` and cannot report a
     /// malformed operand; this does, loudly.
     validate: Option<fn(&DataValue) -> Result<()>>,
+    /// Query memory budget (mnestic fork) — see `RegularTempStore::budget`.
+    budget: Option<MemBudget>,
+    charged: usize,
+}
+
+impl Drop for DominanceMeetStore {
+    fn drop(&mut self) {
+        if let Some(b) = &self.budget {
+            b.debit(self.charged);
+        }
+    }
 }
 
 impl std::fmt::Debug for DominanceMeetStore {
@@ -450,6 +697,8 @@ impl DominanceMeetStore {
             grouping_len: total_key_len - 1,
             dedup_only: false,
             validate: crate::data::aggr::builtin_skyline_validator(aggr.name),
+            budget: None,
+            charged: 0,
         })
     }
     /// An empty twin for the delta slot: equality-dedup only.
@@ -461,6 +710,34 @@ impl DominanceMeetStore {
             grouping_len: self.grouping_len,
             dedup_only: true,
             validate: self.validate,
+            budget: self.budget.clone(),
+            charged: 0,
+        }
+    }
+    pub(crate) fn set_budget(&mut self, budget: Option<MemBudget>) {
+        debug_assert_eq!(self.charged, 0, "budget attached to a non-empty store");
+        self.budget = budget;
+    }
+    #[inline]
+    fn charge(&mut self, n: usize) {
+        self.charged += n;
+        if let Some(b) = &self.budget {
+            b.charge(n);
+        }
+    }
+    #[inline]
+    fn debit(&mut self, n: usize) {
+        self.charged = self.charged.saturating_sub(n);
+        if let Some(b) = &self.budget {
+            b.debit(n);
+        }
+    }
+    #[inline]
+    fn reset_charges(&mut self) {
+        let n = self.charged;
+        self.charged = 0;
+        if let Some(b) = &self.budget {
+            b.debit(n);
         }
     }
     pub(crate) fn exists(&self, key: &Tuple) -> bool {
@@ -484,51 +761,93 @@ impl DominanceMeetStore {
         if let Some(validate) = self.validate {
             validate(c)?;
         }
+        // memory budget (mnestic fork): charge/debit deltas accumulate in
+        // locals while `entry` borrows the map, and apply after — including
+        // before the max_survivors bail, so the accounting stays consistent
+        // on the error path (the drop debit releases exactly what was
+        // charged).
+        let active = self.budget.is_some();
+        let new_group = active && !self.inner.contains_key(key_part);
+        let mut delta_charge = 0usize;
+        let mut delta_debit = 0usize;
+        let mut overflow = false;
         let entry = self.inner.entry(key_part.to_vec()).or_default();
         // memcmp-order binary search: structural-equality dedup + insertion pos
         let pos = match entry.binary_search_by(|held| held[0].cmp(c)) {
             Ok(_) => return Ok(false),
             Err(pos) => pos,
         };
-        if self.dedup_only {
-            entry.insert(pos, val_part.to_vec());
-            return Ok(true);
-        }
-        let dom = &self.reg.dominates;
-        #[cfg(debug_assertions)]
-        if dom(c, c) {
-            bail!(
-                "dominance for bounded-meet aggregate '{}' violates irreflexivity: dominates(x, x) is true",
-                self.aggr_name
-            );
-        }
-        for held in entry.iter() {
-            if dom(&held[0], c) {
-                #[cfg(debug_assertions)]
-                if dom(c, &held[0]) {
-                    bail!(
-                        "dominance for bounded-meet aggregate '{}' violates asymmetry: dominates(a, b) and dominates(b, a) both hold",
-                        self.aggr_name
-                    );
-                }
-                // a survivor dominates the newcomer: by transitivity the
-                // newcomer cannot dominate any survivor — reject, unchanged
-                return Ok(false);
+        let changed = if self.dedup_only {
+            if active {
+                delta_charge += est_tuple_bytes(val_part);
             }
+            entry.insert(pos, val_part.to_vec());
+            true
+        } else {
+            let dom = &self.reg.dominates;
+            #[cfg(debug_assertions)]
+            if dom(c, c) {
+                bail!(
+                    "dominance for bounded-meet aggregate '{}' violates irreflexivity: dominates(x, x) is true",
+                    self.aggr_name
+                );
+            }
+            let mut rejected = false;
+            for held in entry.iter() {
+                if dom(&held[0], c) {
+                    #[cfg(debug_assertions)]
+                    if dom(c, &held[0]) {
+                        bail!(
+                            "dominance for bounded-meet aggregate '{}' violates asymmetry: dominates(a, b) and dominates(b, a) both hold",
+                            self.aggr_name
+                        );
+                    }
+                    // a survivor dominates the newcomer: by transitivity the
+                    // newcomer cannot dominate any survivor — reject, unchanged
+                    rejected = true;
+                    break;
+                }
+            }
+            if rejected {
+                false
+            } else {
+                if active {
+                    for held in entry.iter() {
+                        if dom(c, &held[0]) {
+                            // this survivor is about to be evicted
+                            delta_debit += est_tuple_bytes(held);
+                        }
+                    }
+                }
+                entry.retain(|held| !dom(c, &held[0]));
+                let pos = entry
+                    .binary_search_by(|held| held[0].cmp(c))
+                    .expect_err("deduped candidate reappeared after retain");
+                if active {
+                    delta_charge += est_tuple_bytes(val_part);
+                }
+                entry.insert(pos, val_part.to_vec());
+                if entry.len() > self.reg.max_survivors {
+                    overflow = true;
+                }
+                true
+            }
+        };
+        if changed && new_group {
+            delta_charge += est_tuple_bytes(key_part)
+                + std::mem::size_of::<Vec<Tuple>>()
+                + BTREE_ENTRY_OVERHEAD;
         }
-        entry.retain(|held| !dom(c, &held[0]));
-        let pos = entry
-            .binary_search_by(|held| held[0].cmp(c))
-            .expect_err("deduped candidate reappeared after retain");
-        entry.insert(pos, val_part.to_vec());
-        if entry.len() > self.reg.max_survivors {
+        self.charge(delta_charge);
+        self.debit(delta_debit);
+        if overflow {
             bail!(
                 "bounded-meet aggregate '{}' exceeded max_survivors = {}: the group's non-dominated set does not fit the registered resource guard (raise it, strengthen the dominance, or aggregate a coarser candidate)",
                 self.aggr_name,
                 self.reg.max_survivors
             );
         }
-        Ok(true)
+        Ok(changed)
     }
     fn range_iter(
         &self,
@@ -566,6 +885,7 @@ impl DominanceMeetStore {
     /// function call, false if we are not sure. `prev` collects the
     /// candidates that CHANGED a survivor set — the delta for the next epoch.
     pub(crate) fn merge_in(&mut self, prev: &mut Self, mut new: Self) -> Result<bool> {
+        prev.reset_charges();
         prev.inner.clear();
         prev.dedup_only = true;
         if new.inner.is_empty() {
@@ -573,9 +893,18 @@ impl DominanceMeetStore {
         }
         if self.inner.is_empty() && new.dedup_only == self.dedup_only {
             mem::swap(&mut self.inner, &mut new.inner);
+            // inner swapped without the accounting fields: carry them along.
+            mem::swap(&mut self.charged, &mut new.charged);
             return Ok(true);
         }
-        for (k, vs) in new.inner {
+        // Rows re-materialize through meet_put (which charges precisely);
+        // release new's own charges first — its entries all drop below.
+        let moved = mem::take(&mut new.inner);
+        let released = mem::take(&mut new.charged);
+        if let Some(b) = &self.budget {
+            b.debit(released);
+        }
+        for (k, vs) in moved {
             for v in vs {
                 let mut row = k.clone();
                 row.extend(v.iter().cloned());
@@ -602,15 +931,22 @@ impl TempStore {
     /// Build the epoch-output store for a bounded-meet rule: a
     /// `DominanceMeetStore` for a registered dominance aggregate, else the
     /// builtin `BoundedMeetStore` (mnestic fork, antichain-bounded-meet spec).
-    pub(crate) fn new_bounded(aggrs: Vec<Option<(Aggregation, Vec<DataValue>)>>) -> Result<Self> {
+    pub(crate) fn new_bounded(
+        aggrs: Vec<Option<(Aggregation, Vec<DataValue>)>>,
+        budget: Option<MemBudget>,
+    ) -> Result<Self> {
         let is_dominance = aggrs
             .iter()
             .flatten()
             .any(|(a, _)| a.bounded_dominance.is_some());
         Ok(if is_dominance {
-            TempStore::DominanceMeet(DominanceMeetStore::new(aggrs)?)
+            let mut st = DominanceMeetStore::new(aggrs)?;
+            st.set_budget(budget);
+            TempStore::DominanceMeet(st)
         } else {
-            TempStore::BoundedMeet(BoundedMeetStore::new(aggrs)?)
+            let mut st = BoundedMeetStore::new(aggrs)?;
+            st.set_budget(budget);
+            TempStore::BoundedMeet(st)
         })
     }
     /// Merge one candidate into a bounded-meet-category store.
@@ -668,18 +1004,25 @@ impl EpochStore {
     pub(crate) fn exists(&self, key: &Tuple) -> bool {
         self.total.exists(key)
     }
-    pub(crate) fn new_normal(arity: usize) -> Self {
+    pub(crate) fn new_normal(arity: usize, budget: Option<MemBudget>) -> Self {
         Self {
-            total: TempStore::Normal(RegularTempStore::default()),
-            delta: TempStore::Normal(RegularTempStore::default()),
+            total: TempStore::Normal(RegularTempStore::with_budget(budget.clone())),
+            delta: TempStore::Normal(RegularTempStore::with_budget(budget)),
             use_total_for_delta: true,
             arity,
         }
     }
-    pub(crate) fn new_meet(aggrs: &[Option<(Aggregation, Vec<DataValue>)>]) -> Result<Self> {
+    pub(crate) fn new_meet(
+        aggrs: &[Option<(Aggregation, Vec<DataValue>)>],
+        budget: Option<MemBudget>,
+    ) -> Result<Self> {
+        let mut total = MeetAggrStore::new(aggrs.to_vec())?;
+        total.set_budget(budget.clone());
+        let mut delta = MeetAggrStore::new(aggrs.to_vec())?;
+        delta.set_budget(budget);
         Ok(Self {
-            total: TempStore::MeetAggr(MeetAggrStore::new(aggrs.to_vec())?),
-            delta: TempStore::MeetAggr(MeetAggrStore::new(aggrs.to_vec())?),
+            total: TempStore::MeetAggr(total),
+            delta: TempStore::MeetAggr(delta),
             use_total_for_delta: true,
             arity: aggrs.len(),
         })
@@ -688,6 +1031,7 @@ impl EpochStore {
     /// sorted/deduped but unbounded (one epoch may surface > k candidates).
     pub(crate) fn new_bounded_meet(
         aggrs: &[Option<(Aggregation, Vec<DataValue>)>],
+        budget: Option<MemBudget>,
     ) -> Result<Self> {
         // antichain-bounded-meet spec: a registered dominance aggregate gets
         // the antichain store; the builtin (min_cost_k) keeps the k-set store.
@@ -696,7 +1040,8 @@ impl EpochStore {
             .flatten()
             .any(|(a, _)| a.bounded_dominance.is_some());
         if is_dominance {
-            let total = DominanceMeetStore::new(aggrs.to_vec())?;
+            let mut total = DominanceMeetStore::new(aggrs.to_vec())?;
+            total.set_budget(budget);
             let delta = total.delta_twin();
             return Ok(Self {
                 total: TempStore::DominanceMeet(total),
@@ -705,7 +1050,8 @@ impl EpochStore {
                 arity: aggrs.len(),
             });
         }
-        let total = BoundedMeetStore::new(aggrs.to_vec())?;
+        let mut total = BoundedMeetStore::new(aggrs.to_vec())?;
+        total.set_budget(budget);
         let delta = total.delta_twin();
         Ok(Self {
             total: TempStore::BoundedMeet(total),
@@ -894,4 +1240,86 @@ fn probe_meet_idempotence(
          semilattice operation)"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::db::MemBudget;
+
+    fn b() -> MemBudget {
+        MemBudget::new(usize::MAX, "test")
+    }
+
+    fn t(x: i64) -> Tuple {
+        vec![DataValue::from(x), DataValue::from(x + 1)]
+    }
+
+    /// Charge events, not write paths (spec §5): real insertions move the
+    /// counter; duplicate-key puts are net-neutral.
+    #[test]
+    fn put_charges_inserts_and_not_duplicates() {
+        let budget = b();
+        let mut st = RegularTempStore::with_budget(Some(budget.clone()));
+        st.put(t(1));
+        let after_first = budget.used();
+        assert!(after_first > 0, "a real insertion charges");
+        st.put(t(1));
+        assert_eq!(budget.used(), after_first, "a duplicate put is net-neutral");
+        st.put(t(2));
+        assert_eq!(budget.used(), 2 * after_first, "uniform tuples charge uniformly");
+    }
+
+    /// The merge swap fast path is a move: exactly zero counter movement.
+    #[test]
+    fn merge_swap_arm_is_accounting_neutral() {
+        let budget = b();
+        let mut total = RegularTempStore::with_budget(Some(budget.clone()));
+        let mut prev = RegularTempStore::with_budget(Some(budget.clone()));
+        let mut new = RegularTempStore::with_budget(Some(budget.clone()));
+        new.put(t(1));
+        new.put(t(2));
+        let before = budget.used();
+        total.merge_in(&mut prev, new);
+        assert_eq!(budget.used(), before, "the swap arm must move, not copy");
+    }
+
+    /// The merge entry arm: the moved entry stays charged in total, the prev
+    /// key-clone is a genuine new copy, and the incoming duplicate is debited.
+    #[test]
+    fn merge_entry_arm_charges_clones_and_debits_duplicates() {
+        let budget = b();
+        let mut total = RegularTempStore::with_budget(Some(budget.clone()));
+        let mut prev = RegularTempStore::with_budget(Some(budget.clone()));
+        total.put(t(1)); // total non-empty ⇒ entry arm, not swap
+        let per_entry = budget.used();
+
+        // one fresh key (charged in new, moves to total; prev clones it) +
+        // one duplicate of total's key (debited when it drops)
+        let mut new = RegularTempStore::with_budget(Some(budget.clone()));
+        new.put(t(1));
+        new.put(t(2));
+        assert_eq!(budget.used(), 3 * per_entry);
+        total.merge_in(&mut prev, new);
+        // total: entries {1, 2}; prev: clone of {2}; duplicate {1} debited.
+        assert_eq!(budget.used(), 3 * per_entry);
+        drop(prev);
+        assert_eq!(budget.used(), 2 * per_entry, "prev's clone debits on drop");
+        drop(total);
+        assert_eq!(budget.used(), 0, "all charges release at drop");
+    }
+
+    /// Drop reconciliation: whatever a store charged, its drop debits.
+    #[test]
+    fn drop_debits_exactly_what_was_charged() {
+        let budget = b();
+        {
+            let mut st = RegularTempStore::with_budget(Some(budget.clone()));
+            for i in 0..100 {
+                st.put(t(i));
+            }
+            assert!(budget.used() > 0);
+        }
+        assert_eq!(budget.used(), 0);
+    }
 }

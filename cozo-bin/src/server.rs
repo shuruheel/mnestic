@@ -87,6 +87,14 @@ pub(crate) struct ServerArgs {
     /// per-request `timeout` or an in-script `:timeout` can only tighten it.
     #[clap(long)]
     default_query_timeout: Option<f64>,
+
+    /// Db-wide default per-query memory budget in estimated bytes (mnestic
+    /// fork, query memory budget; spec `docs/specs/memory-budget.md`).
+    /// cozo-bin is an application, not a library, so it ARMS a budget out of
+    /// the box (4 GiB); pass `0` for unlimited. A per-request `mem_limit` or
+    /// an in-script `:mem_limit` can only tighten it.
+    #[clap(long, default_value_t = 4 * 1024 * 1024 * 1024)]
+    default_query_mem_limit: u64,
 }
 
 #[derive(Clone)]
@@ -425,6 +433,9 @@ pub(crate) async fn server_main(args: ServerArgs) {
     std::fs::create_dir_all(&args.backup_dir).expect("Cannot create HTTP backup directory");
     let backup_dir =
         std::fs::canonicalize(&args.backup_dir).expect("Cannot resolve HTTP backup directory");
+    if args.default_query_mem_limit > 0 {
+        db.set_default_query_mem_limit(Some(args.default_query_mem_limit as usize));
+    }
     if let Some(secs) = args.default_query_timeout {
         db.set_default_query_timeout(Some(secs));
     }
@@ -737,6 +748,10 @@ struct QueryPayload {
     /// Optional; combined via `min` with any in-script `:timeout` and the
     /// server's `--default-query-timeout`. Ignored on the `/transact/:id` path.
     timeout: Option<f64>,
+    /// Per-call memory budget in estimated bytes (mnestic fork, query memory
+    /// budget). Optional; combined via `min` with any in-script `:mem_limit`
+    /// and the server's `--default-query-mem-limit`.
+    mem_limit: Option<usize>,
 }
 
 async fn text_query(
@@ -755,6 +770,7 @@ async fn text_query(
     };
     let options = ScriptRunOptions {
         timeout: payload.timeout,
+        mem_limit: payload.mem_limit,
     };
     let result = spawn_blocking(move || {
         st.db.run_script_fold_err_with_options(

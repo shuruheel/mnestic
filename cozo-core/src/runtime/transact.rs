@@ -72,6 +72,12 @@ pub struct SessionTx<'a> {
     /// trigger) shares one tx, every statement it drives inherits the same
     /// budget — a multi-statement script is bounded as a whole, not per block.
     pub(crate) script_deadline: Option<Instant>,
+    /// Whole-script memory budget in estimated bytes (mnestic fork; spec
+    /// `docs/specs/memory-budget.md`): the minimum of any per-call limit
+    /// (`run_script_with_options`) and the Db default
+    /// (`set_default_query_mem_limit`). `None` = no whole-script budget.
+    /// `run_query` combines it (via `min`) with the block's own `:mem_limit`.
+    pub(crate) script_mem_limit: Option<usize>,
     /// Graph-projection freshness state, shared with the `Db` (mnestic fork;
     /// `runtime/graph_projection.rs`).
     pub(crate) projections: Arc<ProjectionCache>,
