@@ -923,6 +923,226 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
         Ok(ret)
     }
+    /// Export one triple-shaped relation as RDF (mnestic fork,
+    /// `docs/specs/rdf-boundary-io.md` §6 — round-trip export, the inverse of
+    /// `RdfReader`).
+    ///
+    /// The relation must match the reader's 6-column shape **by position**
+    /// (strict, spec §12 Q5): `subject, predicate, object, graph,
+    /// language_tag, datatype` — exactly six columns, `subject`/`predicate`/
+    /// `object` strings, the rest string-or-null. `format` is one of
+    /// `"turtle"`, `"ntriples"`, `"nquads"`, `"trig"`; the triple formats
+    /// reject rows with a non-null `graph`, and `prefixes` (prefix name →
+    /// namespace IRI) apply to Turtle/TriG only.
+    ///
+    /// Term reconstruction: values starting with `_:` are blank nodes; an
+    /// object with null `language_tag` and null `datatype` is emitted as an
+    /// IRI when it parses as an absolute IRI and as a plain literal
+    /// otherwise. (The 6-column shape stores both as bare strings — RDF 1.1
+    /// makes plain and `xsd:string` literals the same term, so the datatype
+    /// column cannot disambiguate; a plain string literal whose lexical form
+    /// is itself a valid absolute IRI will round-trip as an IRI.)
+    ///
+    /// Scan semantics mirror [`Self::export_relations`]: one read transaction,
+    /// full range scan, storage order.
+    #[cfg(feature = "rdf-io")]
+    pub fn export_relation_as_rdf(
+        &'s self,
+        relation: &str,
+        format: &str,
+        prefixes: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        use oxrdf::{BlankNode, GraphName, Literal, NamedNode, NamedOrBlankNode, Term};
+
+        let is_quad_format = match format {
+            "turtle" | "ntriples" => false,
+            "nquads" | "trig" => true,
+            _ => bail!(
+                "unknown RDF export format {format:?}: expected one of 'turtle', 'ntriples', \
+                 'nquads', 'trig'"
+            ),
+        };
+        if !prefixes.is_empty() && matches!(format, "ntriples" | "nquads") {
+            bail!("prefixes are not applicable to the line-oriented format {format:?}");
+        }
+
+        enum Writer {
+            Turtle(oxttl::turtle::WriterTurtleSerializer<Vec<u8>>),
+            NTriples(oxttl::ntriples::WriterNTriplesSerializer<Vec<u8>>),
+            NQuads(oxttl::nquads::WriterNQuadsSerializer<Vec<u8>>),
+            TriG(oxttl::trig::WriterTriGSerializer<Vec<u8>>),
+        }
+        let mut writer = match format {
+            "turtle" => {
+                let mut ser = oxttl::TurtleSerializer::new();
+                for (name, iri) in prefixes {
+                    ser = ser.with_prefix(name.clone(), iri.clone()).map_err(|e| {
+                        miette!("invalid namespace IRI for prefix '{name}': {e}")
+                    })?;
+                }
+                Writer::Turtle(ser.for_writer(Vec::new()))
+            }
+            "ntriples" => Writer::NTriples(oxttl::NTriplesSerializer::new().for_writer(Vec::new())),
+            "nquads" => Writer::NQuads(oxttl::NQuadsSerializer::new().for_writer(Vec::new())),
+            _ => {
+                let mut ser = oxttl::TriGSerializer::new();
+                for (name, iri) in prefixes {
+                    ser = ser.with_prefix(name.clone(), iri.clone()).map_err(|e| {
+                        miette!("invalid namespace IRI for prefix '{name}': {e}")
+                    })?;
+                }
+                Writer::TriG(ser.for_writer(Vec::new()))
+            }
+        };
+
+        let named_or_blank = |v: &DataValue, what: &str, row_n: usize| -> Result<NamedOrBlankNode> {
+            let s = match v {
+                DataValue::Str(s) => s,
+                _ => bail!(
+                    "row {row_n} of '{relation}': {what} must be a string, got {v:?}"
+                ),
+            };
+            Ok(match s.strip_prefix("_:") {
+                Some(label) => BlankNode::new(label)
+                    .map_err(|e| {
+                        miette!("row {row_n} of '{relation}': invalid blank node {s:?}: {e}")
+                    })?
+                    .into(),
+                None => NamedNode::new(s.as_str())
+                    .map_err(|e| miette!("row {row_n} of '{relation}': invalid {what} IRI {s:?}: {e}"))?
+                    .into(),
+            })
+        };
+
+        let tx = self.transact()?;
+        let handle = tx.get_relation_for_read(relation, "data export")?;
+        let n_cols = handle.metadata.keys.len() + handle.metadata.non_keys.len();
+        ensure!(
+            n_cols == 6,
+            "cannot export '{}' as RDF: expected the 6-column triple shape (subject, \
+             predicate, object, graph, language_tag, datatype), got {} columns",
+            relation,
+            n_cols
+        );
+
+        let start = Tuple::default().encode_as_key(handle.id);
+        let end = Tuple::default().encode_as_key(handle.id.next());
+        for (row_n, data) in tx.store_tx.range_scan(&start, &end).enumerate() {
+            let (k, v) = data?;
+            let tuple = try_decode_tuple_from_kv(&k, &v, Some(6))?;
+
+            let subject = named_or_blank(&tuple[0], "subject", row_n)?;
+            let predicate = match &tuple[1] {
+                DataValue::Str(s) if !s.starts_with("_:") => NamedNode::new(s.as_str())
+                    .map_err(|e| {
+                        miette!("row {row_n} of '{relation}': invalid predicate IRI {s:?}: {e}")
+                    })?,
+                other => bail!(
+                    "row {row_n} of '{relation}': predicate must be an IRI string, got {other:?}"
+                ),
+            };
+            let object: Term = match (&tuple[2], &tuple[4], &tuple[5]) {
+                (DataValue::Str(o), DataValue::Str(lang), DataValue::Null) => {
+                    Literal::new_language_tagged_literal(o.as_str(), lang.as_str())
+                        .map_err(|e| {
+                            miette!("row {row_n} of '{relation}': invalid language tag {lang:?}: {e}")
+                        })?
+                        .into()
+                }
+                (DataValue::Str(o), DataValue::Null, DataValue::Str(dt)) => {
+                    Literal::new_typed_literal(
+                        o.as_str(),
+                        NamedNode::new(dt.as_str()).map_err(|e| {
+                            miette!("row {row_n} of '{relation}': invalid datatype IRI {dt:?}: {e}")
+                        })?,
+                    )
+                    .into()
+                }
+                (DataValue::Str(o), DataValue::Null, DataValue::Null) => {
+                    if let Some(label) = o.strip_prefix("_:") {
+                        BlankNode::new(label)
+                            .map_err(|e| {
+                                miette!(
+                                    "row {row_n} of '{relation}': invalid blank node {o:?}: {e}"
+                                )
+                            })?
+                            .into()
+                    } else if oxiri::Iri::parse(o.as_str()).is_ok() {
+                        NamedNode::new_unchecked(o.to_string()).into()
+                    } else {
+                        Literal::new_simple_literal(o.as_str()).into()
+                    }
+                }
+                (DataValue::Str(_), DataValue::Str(_), DataValue::Str(_)) => bail!(
+                    "row {row_n} of '{relation}' carries both a language_tag and a datatype; \
+                     a language-tagged literal must leave the datatype column null"
+                ),
+                (o, lang, dt) => bail!(
+                    "row {row_n} of '{relation}': expected object: Str, language_tag/datatype: \
+                     Str or Null, got {o:?}, {lang:?}, {dt:?}"
+                ),
+            };
+            let graph = match &tuple[3] {
+                DataValue::Null => GraphName::DefaultGraph,
+                DataValue::Str(_) if !is_quad_format => bail!(
+                    "row {row_n} of '{relation}' names a graph, which the triple format \
+                     {format:?} cannot carry: export as 'nquads' or 'trig' instead"
+                ),
+                g @ DataValue::Str(_) => match named_or_blank(g, "graph", row_n)? {
+                    NamedOrBlankNode::NamedNode(n) => GraphName::NamedNode(n),
+                    NamedOrBlankNode::BlankNode(b) => GraphName::BlankNode(b),
+                },
+                other => bail!(
+                    "row {row_n} of '{relation}': graph must be a string or null, got {other:?}"
+                ),
+            };
+
+            match &mut writer {
+                Writer::Turtle(w) => {
+                    let t = oxrdf::Triple {
+                        subject,
+                        predicate,
+                        object,
+                    };
+                    w.serialize_triple(&t).into_diagnostic()?;
+                }
+                Writer::NTriples(w) => {
+                    let t = oxrdf::Triple {
+                        subject,
+                        predicate,
+                        object,
+                    };
+                    w.serialize_triple(&t).into_diagnostic()?;
+                }
+                Writer::NQuads(w) => {
+                    let q = oxrdf::Quad {
+                        subject,
+                        predicate,
+                        object,
+                        graph_name: graph,
+                    };
+                    w.serialize_quad(&q).into_diagnostic()?;
+                }
+                Writer::TriG(w) => {
+                    let q = oxrdf::Quad {
+                        subject,
+                        predicate,
+                        object,
+                        graph_name: graph,
+                    };
+                    w.serialize_quad(&q).into_diagnostic()?;
+                }
+            }
+        }
+
+        let bytes = match writer {
+            Writer::Turtle(w) => w.finish().into_diagnostic()?,
+            Writer::NTriples(w) => w.finish(),
+            Writer::NQuads(w) => w.finish(),
+            Writer::TriG(w) => w.finish().into_diagnostic()?,
+        };
+        String::from_utf8(bytes).into_diagnostic()
+    }
     /// Import relations. The argument `data` accepts data in the shape of
     /// what was returned by [Self::export_relations].
     /// The target stored relations must already exist in the database.

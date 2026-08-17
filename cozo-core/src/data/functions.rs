@@ -3119,6 +3119,105 @@ pub(crate) fn op_ulid_timestamp(args: &[DataValue]) -> Result<DataValue> {
     Ok(DataValue::from(ms))
 }
 
+// --- RDF boundary IRI helpers (mnestic fork, docs/specs/rdf-boundary-io.md §7) --
+// Pure scalar functions for boundary identity handling: RFC 3987 validation and
+// resolution (oxiri — an unconditional dependency by signed decision, spec §12
+// Q3: builtin scalar functions are never feature-gated) and prefix-map-driven
+// CURIE↔IRI conversion. The prefix map is a JSON object (`{"prefix": "iri"}`),
+// passed as a Json value (`parse_json(..)`/`json_object(..)`) or a JSON string.
+
+/// Shared prefix-map extraction for the `curie_*` functions.
+fn iri_prefix_map(arg: &DataValue, fn_name: &str) -> Result<Vec<(String, String)>> {
+    let obj = match arg {
+        DataValue::Json(JsonData(Value::Object(m))) => m.clone(),
+        DataValue::Str(s) => match serde_json::from_str::<Value>(s) {
+            Ok(Value::Object(m)) => m,
+            _ => bail!("'{fn_name}' expects a JSON object mapping prefix names to IRIs"),
+        },
+        _ => bail!("'{fn_name}' expects a JSON object mapping prefix names to IRIs"),
+    };
+    let mut entries = Vec::with_capacity(obj.len());
+    for (name, iri) in obj {
+        match iri {
+            Value::String(iri) => entries.push((name, iri)),
+            _ => bail!("'{fn_name}': prefix '{name}' must map to an IRI string"),
+        }
+    }
+    Ok(entries)
+}
+
+define_op!(OP_IRI_VALID, 1, false);
+pub(crate) fn op_iri_valid(args: &[DataValue]) -> Result<DataValue> {
+    let s = args[0]
+        .get_str()
+        .ok_or_else(|| miette!("'iri_valid' expects a string"))?;
+    // RFC 3987: valid absolute IRI (scheme required; fragment allowed).
+    Ok(DataValue::from(oxiri::Iri::parse(s).is_ok()))
+}
+
+define_op!(OP_IRI_RESOLVE, 2, false);
+pub(crate) fn op_iri_resolve(args: &[DataValue]) -> Result<DataValue> {
+    let base = args[0]
+        .get_str()
+        .ok_or_else(|| miette!("'iri_resolve' expects a base IRI string as first argument"))?;
+    let rel = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'iri_resolve' expects an IRI reference string as second argument"))?;
+    let base = oxiri::Iri::parse(base)
+        .map_err(|e| miette!("'iri_resolve': invalid base IRI {base:?}: {e}"))?;
+    let rel = oxiri::IriRef::parse(rel)
+        .map_err(|e| miette!("'iri_resolve': invalid IRI reference {rel:?}: {e}"))?;
+    let resolved = base
+        .resolve(&rel)
+        .map_err(|e| miette!("'iri_resolve': cannot resolve {} against {base}: {e}", rel.as_str()))?;
+    Ok(DataValue::Str(resolved.into_inner().into()))
+}
+
+define_op!(OP_CURIE_EXPAND, 2, false);
+pub(crate) fn op_curie_expand(args: &[DataValue]) -> Result<DataValue> {
+    let map = iri_prefix_map(&args[0], "curie_expand")?;
+    let curie = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'curie_expand' expects a CURIE string as second argument"))?;
+    let (prefix, local) = curie
+        .split_once(':')
+        .ok_or_else(|| miette!("'curie_expand': {curie:?} is not a CURIE (no ':' separator)"))?;
+    match map.iter().find(|(name, _)| name == prefix) {
+        Some((_, iri)) => Ok(DataValue::Str(format!("{iri}{local}").into())),
+        None => bail!("'curie_expand': prefix '{prefix}' is not in the prefix map"),
+    }
+}
+
+define_op!(OP_CURIE_COMPACT, 2, false);
+pub(crate) fn op_curie_compact(args: &[DataValue]) -> Result<DataValue> {
+    let map = iri_prefix_map(&args[0], "curie_compact")?;
+    let iri = args[1]
+        .get_str()
+        .ok_or_else(|| miette!("'curie_compact' expects an IRI string as second argument"))?;
+    // Longest-namespace-wins; prefix name breaks ties deterministically. An
+    // IRI no namespace covers is returned unchanged (standard compaction
+    // fallback, so the function is total over a partial prefix map).
+    let mut best: Option<(&str, &str)> = None;
+    for (name, ns) in &map {
+        if let Some(local) = iri.strip_prefix(ns.as_str()) {
+            let better = match best {
+                None => true,
+                Some((best_name, best_local)) => {
+                    local.len() < best_local.len()
+                        || (local.len() == best_local.len() && name.as_str() < best_name)
+                }
+            };
+            if better {
+                best = Some((name, local));
+            }
+        }
+    }
+    Ok(match best {
+        Some((name, local)) => DataValue::Str(format!("{name}:{local}").into()),
+        None => DataValue::Str(iri.into()),
+    })
+}
+
 define_op!(OP_VALIDITY, 1, true);
 pub(crate) fn op_validity(args: &[DataValue]) -> Result<DataValue> {
     // `get_int_strict`, not `get_int`: an integral float here is almost always float

@@ -2184,3 +2184,124 @@ fn test_dt_diff_negative_span_is_antisymmetric() {
         DataValue::from(2)
     );
 }
+
+// --- RDF boundary IRI helpers (mnestic fork, docs/specs/rdf-boundary-io.md §7) --
+
+#[test]
+fn test_iri_valid() {
+    let valid = |s: &str| op_iri_valid(&[DataValue::from(s)]).unwrap();
+    assert_eq!(valid("http://example.com/a#b"), DataValue::from(true));
+    assert_eq!(
+        valid("urn:uuid:6e8bc430-9c3a-11d9-9669-0800200c9a66"),
+        DataValue::from(true)
+    );
+    // Unicode is fine in IRIs (RFC 3987, not RFC 3986).
+    assert_eq!(valid("http://example.com/caf\u{e9}"), DataValue::from(true));
+    // Relative references are not absolute IRIs.
+    assert_eq!(valid("/only/a/path"), DataValue::from(false));
+    assert_eq!(valid("not an iri"), DataValue::from(false));
+    assert_eq!(valid(""), DataValue::from(false));
+    // Non-string input is a typed error, not a panic.
+    assert!(op_iri_valid(&[DataValue::from(42)]).is_err());
+}
+
+#[test]
+fn test_iri_resolve() {
+    let resolve =
+        |base: &str, rel: &str| op_iri_resolve(&[DataValue::from(base), DataValue::from(rel)]);
+    assert_eq!(
+        resolve("http://example.com/a/b", "../c").unwrap(),
+        DataValue::from("http://example.com/c")
+    );
+    assert_eq!(
+        resolve("http://example.com/a/b", "#frag").unwrap(),
+        DataValue::from("http://example.com/a/b#frag")
+    );
+    // An absolute reference replaces the base wholesale.
+    assert_eq!(
+        resolve("http://example.com/a/b", "https://other.org/x").unwrap(),
+        DataValue::from("https://other.org/x")
+    );
+    // Invalid base: typed error, never a panic.
+    assert!(resolve("no scheme here", "x").is_err());
+    // Invalid reference: same.
+    assert!(resolve("http://example.com/", "a b").is_err());
+    assert!(op_iri_resolve(&[DataValue::Null, DataValue::from("x")]).is_err());
+}
+
+fn foaf_map() -> DataValue {
+    DataValue::Json(crate::data::value::JsonData(serde_json::json!({
+        "foaf": "http://xmlns.com/foaf/0.1/",
+        "ex": "http://example.com/",
+        "exsub": "http://example.com/sub/"
+    })))
+}
+
+#[test]
+fn test_curie_expand() {
+    assert_eq!(
+        op_curie_expand(&[foaf_map(), DataValue::from("foaf:name")]).unwrap(),
+        DataValue::from("http://xmlns.com/foaf/0.1/name")
+    );
+    // Empty local part is a legal CURIE.
+    assert_eq!(
+        op_curie_expand(&[foaf_map(), DataValue::from("ex:")]).unwrap(),
+        DataValue::from("http://example.com/")
+    );
+    // The map may also arrive as a JSON string.
+    assert_eq!(
+        op_curie_expand(&[
+            DataValue::from(r#"{"foaf": "http://xmlns.com/foaf/0.1/"}"#),
+            DataValue::from("foaf:knows")
+        ])
+        .unwrap(),
+        DataValue::from("http://xmlns.com/foaf/0.1/knows")
+    );
+    // Unknown prefix and non-CURIE input: typed errors.
+    assert!(op_curie_expand(&[foaf_map(), DataValue::from("dc:title")]).is_err());
+    assert!(op_curie_expand(&[foaf_map(), DataValue::from("nocolon")]).is_err());
+    // Non-object map: typed error.
+    assert!(op_curie_expand(&[DataValue::from(1), DataValue::from("a:b")]).is_err());
+}
+
+#[test]
+fn test_curie_compact() {
+    assert_eq!(
+        op_curie_compact(&[foaf_map(), DataValue::from("http://xmlns.com/foaf/0.1/name")]).unwrap(),
+        DataValue::from("foaf:name")
+    );
+    // Longest namespace wins.
+    assert_eq!(
+        op_curie_compact(&[foaf_map(), DataValue::from("http://example.com/sub/x")]).unwrap(),
+        DataValue::from("exsub:x")
+    );
+    // No covering namespace: the IRI passes through unchanged.
+    assert_eq!(
+        op_curie_compact(&[foaf_map(), DataValue::from("http://other.org/y")]).unwrap(),
+        DataValue::from("http://other.org/y")
+    );
+    // expand ∘ compact is identity where a prefix covers the IRI.
+    let iri = DataValue::from("http://example.com/sub/thing");
+    let curie = op_curie_compact(&[foaf_map(), iri.clone()]).unwrap();
+    assert_eq!(op_curie_expand(&[foaf_map(), curie]).unwrap(), iri);
+}
+
+/// The helpers are registered builtins (get_op), reachable from CozoScript in
+/// every build — they are deliberately NOT gated behind `rdf-io` (spec §12 Q3).
+#[test]
+fn test_iri_helpers_registered_unconditionally() {
+    let db = DbInstance::default();
+    let res = db
+        .run_default(
+            "?[a, b, c, d] := a = iri_valid('http://x.com/'), \
+             b = iri_resolve('http://x.com/a/', '../b'), \
+             c = curie_expand(parse_json('{\"ex\": \"http://x.com/\"}'), 'ex:z'), \
+             d = curie_compact(parse_json('{\"ex\": \"http://x.com/\"}'), 'http://x.com/z')",
+        )
+        .unwrap()
+        .into_json();
+    assert_eq!(
+        res["rows"],
+        serde_json::json!([[true, "http://x.com/b", "http://x.com/z", "ex:z"]])
+    );
+}

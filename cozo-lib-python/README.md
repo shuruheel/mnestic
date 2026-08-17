@@ -52,6 +52,30 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
+## RDF at the boundary — and what it means for the wheel's trust posture
+
+The wheel ships the `rdf-io` engine feature: `RdfReader` reads Turtle,
+N-Triples, N-Quads and TriG into a fixed 6-column relational shape
+(`subject, predicate, object, graph, language_tag, datatype`) straight from
+CozoScript, and IRI helper functions (`iri_valid`, `iri_resolve`,
+`curie_expand`, `curie_compact`) handle boundary identity:
+
+```python
+db.run_script("""
+    triples[s, p, o, g, lang, dt] <~ RdfReader(url: 'file://./data.ttl')
+    ?[s, o] := triples[s, 'http://xmlns.com/foaf/0.1/knows', o, _, _, _]
+""", {}, True)
+```
+
+**Read this before running untrusted CozoScript.** `rdf-io` implies the
+engine's `data-import` trust gate, so this wheel — deliberately reversing the
+0.14.0 posture — again registers script-controlled readers: `RdfReader`,
+`CsvReader` and `JsonReader` can read any file the process can read, and
+because the wheel also compiles HTTP support (`requests`), a script can fetch
+non-`file://` URLs. Only run CozoScript from callers you trust with those
+capabilities, or build the binding from source without the `rdf-io` feature
+for a locked-down deployment.
+
 ## New in 0.14.0
 
 The Python-facing highlights of this security-first minor release:
