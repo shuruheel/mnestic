@@ -13,4 +13,7 @@ fn data_readers_require_explicit_opt_in() {
         rules.contains_key("JsonReader"),
         cfg!(feature = "data-import")
     );
+    // The RDF reader rides its own stricter gate (`rdf-io`, which implies
+    // `data-import` — see docs/specs/rdf-boundary-io.md §4).
+    assert_eq!(rules.contains_key("RdfReader"), cfg!(feature = "rdf-io"));
 }
