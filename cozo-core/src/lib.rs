@@ -98,7 +98,11 @@ pub use storage::mem::{new_cozo_mem, MemStorage};
 #[cfg(feature = "storage-new-rocksdb")]
 pub use storage::newrocks::{new_cozo_newrocksdb, NewRocksDbStorage};
 #[cfg(feature = "storage-rocksdb")]
-pub use storage::rocks::{new_cozo_rocksdb, RocksDbStorage};
+pub use storage::rocks::{
+    new_cozo_rocksdb, new_cozo_rocksdb_with_memory, process_default_rocks_memory,
+    RocksDbStorage, RocksMemoryConfig, RocksMemoryConfigError, RocksMemoryResources,
+    RocksMemoryStats, SharedMemoryConfigConflict,
+};
 #[cfg(feature = "storage-sled")]
 pub use storage::sled::{new_cozo_sled, SledStorage};
 #[cfg(feature = "storage-sqlite")]
@@ -189,7 +193,18 @@ impl DbInstance {
     /// some of the engines are available. The `mem` engine is always available.
     ///
     /// `path` is ignored for `mem` and `tikv` engines.
-    /// `options` is ignored for every engine except `tikv`.
+    /// `options` is ignored for every engine except `tikv` and `rocksdb`.
+    ///
+    /// For `rocksdb`, `options` may carry a `shared_memory` key —
+    /// `{"shared_memory": {"total_bytes": 268435456, "memtable_fraction": 0.25}}`
+    /// (`memtable_fraction` optional, default 0.25) — which joins the instance
+    /// to the PROCESS-DEFAULT shared memory envelope: one block cache plus one
+    /// write-buffer manager shared by every instance opened with the same
+    /// config (docs/specs/cross-instance-memory.md §4). The first use fixes
+    /// the canonical config; an identical later config joins, a differing one
+    /// is a typed conflict error naming both. Rust hosts wanting several
+    /// distinct envelopes should use `new_cozo_rocksdb_with_memory` with
+    /// explicit handles instead. Non-RocksDB engines ignore the key.
     #[allow(unused_variables)]
     pub fn new(engine: &str, path: impl AsRef<Path>, options: &str) -> Result<Self> {
         let options = if options.is_empty() { "{}" } else { options };
@@ -198,7 +213,34 @@ impl DbInstance {
             #[cfg(feature = "storage-sqlite")]
             "sqlite" => Self::Sqlite(new_cozo_sqlite(path)?),
             #[cfg(feature = "storage-rocksdb")]
-            "rocksdb" => Self::RocksDb(new_cozo_rocksdb(path)?),
+            "rocksdb" => {
+                fn default_memtable_fraction() -> f64 {
+                    RocksMemoryConfig::DEFAULT_MEMTABLE_FRACTION
+                }
+                #[derive(serde_derive::Deserialize)]
+                struct SharedMemoryOpts {
+                    total_bytes: usize,
+                    #[serde(default = "default_memtable_fraction")]
+                    memtable_fraction: f64,
+                }
+                #[derive(serde_derive::Deserialize)]
+                struct RocksDbOpts {
+                    #[serde(default)]
+                    shared_memory: Option<SharedMemoryOpts>,
+                }
+                let opts: RocksDbOpts = serde_json::from_str(options).into_diagnostic()?;
+                match opts.shared_memory {
+                    None => Self::RocksDb(new_cozo_rocksdb(path)?),
+                    Some(shared) => {
+                        let config = RocksMemoryConfig {
+                            total_bytes: shared.total_bytes,
+                            memtable_fraction: shared.memtable_fraction,
+                        };
+                        let handle = process_default_rocks_memory(config)?;
+                        Self::RocksDb(new_cozo_rocksdb_with_memory(path, &handle)?)
+                    }
+                }
+            }
             #[cfg(feature = "storage-new-rocksdb")]
             "newrocksdb" => Self::NewRocksDb(new_cozo_newrocksdb(path)?),
             #[cfg(feature = "storage-sled")]
@@ -226,6 +268,17 @@ impl DbInstance {
         options: &str,
     ) -> std::result::Result<Self, String> {
         Self::new(engine, path, options).map_err(|err| err.to_string())
+    }
+
+    /// Per-instance RocksDB memory property reads (mnestic fork,
+    /// docs/specs/cross-instance-memory.md §5). Returns a struct whose fields
+    /// are all `None` for every non-RocksDB engine — never an error.
+    #[cfg(feature = "storage-rocksdb")]
+    pub fn rocksdb_memory_stats(&self) -> RocksMemoryStats {
+        match self {
+            DbInstance::RocksDb(db) => db.rocksdb_memory_stats(),
+            _ => RocksMemoryStats::default(),
+        }
     }
 
     /// Dispatcher method.  See [crate::Db::set_durable_writes].

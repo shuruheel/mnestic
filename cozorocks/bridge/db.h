@@ -13,6 +13,60 @@
 #include "common.h"
 #include "tx.h"
 #include "slice.h"
+#include "rocksdb/cache.h"
+// rocksdb/cache.h only forward-declares `Cache` in 8.8; the full class (for
+// GetCapacity/GetUsage) lives in advanced_cache.h.
+#include "rocksdb/advanced_cache.h"
+#include "rocksdb/write_buffer_manager.h"
+
+// Shared cross-instance memory resources (mnestic fork,
+// docs/specs/cross-instance-memory.md): one LRU block cache — THE cache is the
+// byte envelope (`strict_capacity_limit=false`, default high-priority pool) —
+// plus one WriteBufferManager whose memtable budget is charged INTO the cache
+// as dummy entries (cost-to-cache), so the memtable share is a carve-out of
+// the envelope, never an addition beside it. The object is immutable after
+// construction; shared_ptr copies are refcounted handles to the same live
+// cache/WBM. Input validation (nonzero total, fraction strictly in (0,1))
+// happens on the Rust side before construction.
+struct RocksMemoryResources {
+    shared_ptr<Cache> cache;
+    shared_ptr<WriteBufferManager> write_buffer_manager;
+
+    RocksMemoryResources(size_t total_bytes, double memtable_fraction)
+            : cache(NewLRUCache(total_bytes, /*num_shard_bits*/ -1,
+                                /*strict_capacity_limit*/ false,
+                                /*high_pri_pool_ratio*/ 0.5)),
+              write_buffer_manager(make_shared<WriteBufferManager>(
+                      static_cast<size_t>(static_cast<double>(total_bytes) * memtable_fraction),
+                      cache,
+                      /*allow_stall*/ false)) {}
+
+    inline uint64_t wbm_memory_usage() const {
+        return write_buffer_manager->memory_usage();
+    }
+
+    inline uint64_t wbm_mutable_memtable_memory_usage() const {
+        return write_buffer_manager->mutable_memtable_memory_usage();
+    }
+
+    inline uint64_t wbm_dummy_entries_in_cache_usage() const {
+        return write_buffer_manager->dummy_entries_in_cache_usage();
+    }
+
+    inline uint64_t wbm_buffer_size() const {
+        return write_buffer_manager->buffer_size();
+    }
+
+    inline uint64_t cache_capacity() const {
+        return cache->GetCapacity();
+    }
+
+    inline uint64_t cache_usage() const {
+        return cache->GetUsage();
+    }
+};
+
+shared_ptr<RocksMemoryResources> new_memory_resources(size_t total_bytes, double memtable_fraction);
 
 struct SnapshotBridge {
     const Snapshot *snapshot;
@@ -191,10 +245,41 @@ struct RocksDbBridge {
         return db->GetBaseDB();
     }
 
+    // Int-property read on the base DB (mnestic fork,
+    // docs/specs/cross-instance-memory.md §5). Follows the status-out-param
+    // convention: kNotFound is written when RocksDB does not recognise the
+    // property (or has no value for it), kAborted when the DB handle is gone.
+    inline uint64_t get_int_property(rust::Str name, RocksDbStatus &status) const {
+        if (db == nullptr) {
+            write_status(Status::Aborted("database handle is closed"), status);
+            return 0;
+        }
+        uint64_t value = 0;
+        string name_(name);
+        if (get_base_db()->GetIntProperty(name_, &value)) {
+            write_status(Status::OK(), status);
+        } else {
+            write_status(Status::NotFound("unknown or unavailable int property", name_), status);
+        }
+        return value;
+    }
+
     ~RocksDbBridge();
 };
 
 shared_ptr<RocksDbBridge>
 open_db(const DbOpts &opts, RocksDbStatus &status);
+
+// Open with a shared cross-instance memory handle (mnestic fork,
+// docs/specs/cross-instance-memory.md §4): same body as `open_db` via a shared
+// install helper, but the handle's cache is installed as the block cache in
+// both cache branches — OVERRIDING any `block_cache` the options file declares
+// (reported via `report` so the Rust side can log it; a live shared object
+// cannot be expressed in an INI file, so overriding is correct — silence about
+// it is not) — and the handle's WriteBufferManager is installed on DBOptions
+// before `TransactionDB::Open`.
+shared_ptr<RocksDbBridge>
+open_db_with_resources(const DbOpts &opts, shared_ptr<RocksMemoryResources> resources,
+                       RocksDbStatus &status, DbOpenReport &report);
 
 #endif //COZOROCKS_DB_H
