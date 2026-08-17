@@ -946,6 +946,11 @@ pub(crate) fn get_op(name: &str) -> Option<&'static Op> {
         "dt_diff" => &OP_DT_DIFF,
         "dt_format" => &OP_DT_FORMAT,
         "dt_to_validity" => &OP_DT_TO_VALIDITY,
+        // mnestic fork: RDF boundary IRI helpers (docs/specs/rdf-boundary-io.md)
+        "iri_valid" => &OP_IRI_VALID,
+        "iri_resolve" => &OP_IRI_RESOLVE,
+        "curie_expand" => &OP_CURIE_EXPAND,
+        "curie_compact" => &OP_CURIE_COMPACT,
         "vec" => &OP_VEC,
         "rand_vec" => &OP_RAND_VEC,
         _ => return None,

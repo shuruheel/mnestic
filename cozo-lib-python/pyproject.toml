@@ -27,14 +27,17 @@ Repository = "https://github.com/shuruheel/mnestic"
 [tool.maturin]
 # The importable module is the cdylib `[lib] name` ("mnestic"). `compact` pulls
 # storage-sqlite + graph-algo (the latter brings rayon, which the engine
-# requires) + requests.
+# requires) + requests. `rdf-io` ships the RdfReader/export surface AND (via
+# the engine's implied `data-import` gate) CsvReader/JsonReader — a signed
+# posture decision (rdf-boundary-io spec §12 Q6).
 #
 # This pin governs SDIST builds only: released wheels are built by
 # .github/workflows/python-publish.yml with `--no-default-features
-# --features compact,storage-rocksdb` on the maturin CLI. The sdist ships no
-# rocksdb sources (the cozorocks/rocksdb submodule isn't packed), so the
-# persist ("rocksdb") engine is WHEEL-ONLY — keep this at `compact` or sdist
-# installs break. (abi3 wheels — one per platform, not per-Python — come from
-# pyo3's abi3-py37 feature in Cargo.toml, not from any feature choice here.)
+# --features compact,storage-rocksdb,rdf-io` on the maturin CLI. The sdist
+# ships no rocksdb sources (the cozorocks/rocksdb submodule isn't packed), so
+# the persist ("rocksdb") engine is WHEEL-ONLY — keep this at
+# `compact,rdf-io` (both pure-Rust) or sdist installs break. (abi3 wheels —
+# one per platform, not per-Python — come from pyo3's abi3-py37 feature in
+# Cargo.toml, not from any feature choice here.)
 no-default-features = true
-features = ["compact"]
+features = ["compact", "rdf-io"]

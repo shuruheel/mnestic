@@ -1124,6 +1124,11 @@ lazy_static! {
                 "CsvReader".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(CsvReader)),
             ),
+            #[cfg(feature = "rdf-io")]
+            (
+                "RdfReader".to_string(),
+                Arc::<Box<dyn FixedRule>>::new(Box::new(RdfReader)),
+            ),
             (
                 "Constant".to_string(),
                 Arc::<Box<dyn FixedRule>>::new(Box::new(Constant)),

@@ -54,6 +54,14 @@ data-import = []
 ## CsvReader/JsonReader by itself; enable `data-import` as well, and only for
 ## trusted CozoScript callers.
 requests = ["dep:minreq"]
+## Registers RdfReader (Turtle/N-Triples/N-Quads/TriG into a fixed 6-column
+## relational shape) and enables `Db::export_relation_as_rdf`. Implies
+## `data-import` — the reader is a script-controlled file reader and shares
+## that single trust gate, so enabling this also registers CsvReader and
+## JsonReader. With `requests`, non-`file://` URLs become fetchable. Only
+## enable for trusted CozoScript callers. (mnestic fork; see
+## docs/specs/rdf-boundary-io.md.)
+rdf-io = ["data-import", "dep:oxttl", "dep:oxrdf"]
 ## Uses jemalloc as the global allocator, can make a difference in performance.
 jemalloc = ["dep:tikv-jemallocator-global", "cozorocks?/jemalloc"]
 ## Enables io-uring option for the RocksDB storage
@@ -144,6 +152,19 @@ unicode-normalization = "0.1.23"
 thiserror = "1.0.59"
 uuid = { version = "1.8.0", features = ["v1", "v4", "v5", "serde"] }
 csv = "1.3.0"
+# RDF boundary I/O (mnestic fork, docs/specs/rdf-boundary-io.md). oxttl is
+# gated behind `rdf-io` (the default build gains zero bytes); oxiri is an
+# UNCONDITIONAL dep by signed decision (spec §12 Q3): the IRI helper scalar
+# functions are registered unconditionally like every builtin, and RFC 3987
+# correctness is worth one small pure-Rust zero-transitive-dep crate. Neither
+# crate's types are ever re-exported from the public API (public-dependency
+# semver policy — see the `graph` re-export lesson in CLAUDE.md).
+oxttl = { version = "0.2.3", optional = true }
+# oxttl's parse results are oxrdf terms (Triple/Quad/Term enums), so consuming
+# the parser output requires naming oxrdf types; oxttl 0.2.3 pins oxrdf =0.3.3
+# and this requirement unifies with that pin. Same gate as oxttl.
+oxrdf = { version = "0.3.3", optional = true }
+oxiri = "0.3.1"
 document-features = "0.2.8"
 # Upper bound is load-bearing: rayon 1.11 breaks `graph_builder` 0.4.x
 # (the `graph` crate's CSR builder, pulled by `graph-algo`) — its `edges()`

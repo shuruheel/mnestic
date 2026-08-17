@@ -36,6 +36,13 @@ graph-algo = ["cozo/graph-algo"]
 requests = ["cozo/requests"]
 ## Read-only Cypher query surface (mnestic fork): exposes `run_cypher`.
 cypher = ["cozo/cypher"]
+## RDF boundary I/O (mnestic fork): registers the RdfReader fixed rule and the
+## RDF export API. Implies the engine's `data-import` trust gate, so enabling
+## this also registers CsvReader/JsonReader — script-controlled file reads
+## (and, since the wheel compiles `requests`, script-controlled HTTP fetch).
+## The published wheel SHIPS this by signed decision (rdf-boundary-io spec
+## §12 Q6, a deliberate reversal of the 0.14.0 wheel-reader posture).
+rdf-io = ["cozo/rdf-io"]
 ## Uses jemalloc as the global allocator, can make a difference in performance
 jemalloc = ["cozo/jemalloc"]
 ## Enables io-uring option for the RocksDB storage

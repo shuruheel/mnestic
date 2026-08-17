@@ -36,6 +36,58 @@ provenance and licensing.
   `max-memory` is whole-server) — this is the "safe substrate inside your
   process" story made concrete.
 
+### RDF at the boundary: Turtle-family reader, IRI helpers, round-trip export
+
+RDF/OWL/SHACL as interchange languages, Datalog as the implementation: RDF
+converts to ordinary relations at the edge, and nothing inside the engine
+knows it came from RDF. Spec: `docs/specs/rdf-boundary-io.md` (all §12
+decisions signed 2026-08-16; Q6 overridden — see the migration note below).
+Zero grammar changes, zero new sysops, zero new column types.
+
+- **`RdfReader` fixed rule** (new `rdf-io` feature): reads Turtle, N-Triples,
+  N-Quads and TriG (via oxttl) into the fixed 6-column shape
+  `subject, predicate, object, graph, language_tag, datatype` — all
+  `Str`/`Null`. Triple formats emit `Null` graphs; IRIs are plain strings;
+  blank nodes keep their `_:label` form by default, with opt-in
+  `skolemize: <namespace-iri>` minting deterministic source-salted uuid-v5
+  IRIs (same source ⇒ same IRIs, different source ⇒ different). Literals stay
+  lexical with the tag/datatype carried alongside — **no silent coercion**;
+  an explicit `xsd:string` datatype normalizes to `Null` (RDF 1.1: same term
+  as a plain literal). Options: required `url` (`file://` local; anything
+  else needs `requests`, exactly like CsvReader), `format` (defaulting from
+  the `.ttl`/`.nt`/`.nq`/`.trig` extension), `base`, `prefixes`,
+  `prepend_index`. First syntax error aborts with position — no
+  lenient/error-recovery modes. The poison flag is consulted every 4,096
+  statements (an improvement on the shipped readers, which never check it).
+- **IRI helper builtins** (always registered, like every scalar function):
+  `iri_valid(s)`, `iri_resolve(base, rel)` (typed errors, never panics),
+  `curie_expand(prefix_map, curie)`, `curie_compact(prefix_map, iri)` — the
+  prefix map is a JSON object. Backed by oxiri, which becomes an
+  **unconditional dependency** by signed decision (spec §12 Q3; small,
+  pure-Rust, zero transitive deps).
+- **Round-trip export**: `Db::export_relation_as_rdf(relation, format,
+  prefixes)` (Rust API behind `rdf-io`, mirroring `export_relations`' scan
+  semantics) serializes relations that match the 6-column shape by position
+  — strict in v1 (spec §12 Q5) — back to any of the four formats.
+- Feature wiring: `rdf-io = ["data-import", "dep:oxttl", "dep:oxrdf"]` —
+  the parser deps compile only under the feature (stricter than the `csv`
+  precedent; the default build gains zero bytes), and no oxttl/oxrdf/oxiri
+  type ever appears in the public API. `rdf-io` **implies `data-import`**
+  deliberately: an RDF reader is a script-controlled file reader, and there
+  is exactly one trust gate for those.
+
+**Migration note — the PyPI wheel's reader posture is deliberately reversed
+(signed Q6 override).** The published `mnestic` wheel now builds with
+`rdf-io`. Because `rdf-io` implies `data-import`, the wheel **also registers
+`CsvReader` and `JsonReader` again** — the 0.14.0 "wheels expose no
+script-controlled reader" posture is traded for reach (Python users are the
+likeliest RDF-corpus holders). And since the wheel has always compiled
+`requests`, **script-controlled HTTP(S) fetch is reachable from CozoScript in
+the wheel**: any script you run can read process-readable files and make
+outbound requests. Run only trusted CozoScript, or build the binding from
+source without `rdf-io` to restore the locked-down default. Rust consumers
+are unaffected unless they opt into `rdf-io`.
+
 ## 0.14.0 — 2026-08-08
 
 A security-first minor release, with the full-text retrieval, diagnostics,

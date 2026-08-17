@@ -644,6 +644,28 @@ impl DbInstance {
             DbInstance::TiKv(db) => db.export_relations(relations),
         }
     }
+    /// Dispatcher method. See [crate::Db::export_relation_as_rdf].
+    #[cfg(feature = "rdf-io")]
+    pub fn export_relation_as_rdf(
+        &self,
+        relation: &str,
+        format: &str,
+        prefixes: &BTreeMap<String, String>,
+    ) -> Result<String> {
+        match self {
+            DbInstance::Mem(db) => db.export_relation_as_rdf(relation, format, prefixes),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.export_relation_as_rdf(relation, format, prefixes),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.export_relation_as_rdf(relation, format, prefixes),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.export_relation_as_rdf(relation, format, prefixes),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.export_relation_as_rdf(relation, format, prefixes),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.export_relation_as_rdf(relation, format, prefixes),
+        }
+    }
     /// Export relations to JSON-encoded string.
     /// See [crate::Db::export_relations]
     pub fn export_relations_str(&self, data: &str) -> String {
