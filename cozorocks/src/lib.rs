@@ -11,7 +11,11 @@
 
 pub use bridge::db::DbBuilder;
 pub use bridge::db::RocksDb;
+pub use bridge::db::RocksMemoryConfig;
+pub use bridge::db::RocksMemoryConfigError;
+pub use bridge::db::RocksMemoryResources;
 pub use bridge::db::SnapReader;
+pub use bridge::ffi::DbOpenReport;
 pub use bridge::ffi::RocksDbStatus;
 pub use bridge::ffi::SnapshotBridge;
 pub use bridge::ffi::StatusCode;

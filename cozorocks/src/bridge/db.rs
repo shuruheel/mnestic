@@ -132,7 +132,186 @@ impl DbBuilder {
             Err(status)
         }
     }
+
+    /// Open with a shared cross-instance memory handle (mnestic fork,
+    /// docs/specs/cross-instance-memory.md §4). The handle's cache and
+    /// WriteBufferManager are installed on this instance; any `block_cache`
+    /// the options file declares is overridden, which the returned
+    /// [`DbOpenReport`] records so the caller can log it loudly.
+    pub fn build_with_memory(
+        self,
+        memory: &RocksMemoryResources,
+    ) -> Result<(RocksDb, DbOpenReport), RocksDbStatus> {
+        let mut status = RocksDbStatus::default();
+        let mut report = DbOpenReport::default();
+
+        let result =
+            open_db_with_resources(&self.opts, memory.inner.clone(), &mut status, &mut report);
+        if status.is_ok() {
+            Ok((RocksDb { inner: result }, report))
+        } else {
+            Err(status)
+        }
+    }
 }
+
+/// Configuration for a shared cross-instance memory envelope (mnestic fork,
+/// docs/specs/cross-instance-memory.md §3). `total_bytes` is THE envelope: one
+/// LRU block cache of this capacity is shared by every participating
+/// instance, and the WriteBufferManager's budget
+/// (`total_bytes * memtable_fraction`) is charged INTO that cache as dummy
+/// entries (cost-to-cache) — a carve-out of the envelope, not an addition
+/// beside it. Under full memtable pressure, block/index capacity degrades
+/// toward `total_bytes * (1 - memtable_fraction)`.
+///
+/// Charged into the envelope: data blocks, index/filter blocks (high-priority
+/// pool), memtable bytes (as WBM dummy entries). NOT charged: table-reader
+/// memory outside the cache, WAL, allocator retention, iterators/pinned
+/// blocks beyond cache accounting, and everything non-RocksDB. This is a
+/// soft, RocksDB-managed envelope, not a whole-process memory limit.
+///
+/// Pinned in v1 (not configurable): `strict_capacity_limit=false`,
+/// `high_pri_pool_ratio` = RocksDB default (0.5),
+/// `cache_index_and_filter_blocks_with_high_priority=true` on participating
+/// instances, `allow_stall=false`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RocksMemoryConfig {
+    /// Total size of the envelope in bytes. Must be nonzero.
+    pub total_bytes: usize,
+    /// Fraction of the envelope carved out for memtables (the
+    /// WriteBufferManager's buffer size). Must lie strictly within (0, 1) —
+    /// strictly below 1 so block/index capacity survives full memtable
+    /// pressure. Default: [`Self::DEFAULT_MEMTABLE_FRACTION`].
+    pub memtable_fraction: f64,
+}
+
+impl RocksMemoryConfig {
+    /// Default memtable carve-out when only a total budget is given.
+    pub const DEFAULT_MEMTABLE_FRACTION: f64 = 0.25;
+
+    /// A config with the default memtable carve-out.
+    pub fn with_total_bytes(total_bytes: usize) -> Self {
+        Self {
+            total_bytes,
+            memtable_fraction: Self::DEFAULT_MEMTABLE_FRACTION,
+        }
+    }
+
+    /// Explicit and total validation: incoherent configs are a typed error at
+    /// handle construction, never a silent clamp.
+    pub fn validate(&self) -> Result<(), RocksMemoryConfigError> {
+        if self.total_bytes == 0 {
+            return Err(RocksMemoryConfigError::ZeroTotalBytes);
+        }
+        if !(self.memtable_fraction > 0.0 && self.memtable_fraction < 1.0) {
+            return Err(RocksMemoryConfigError::MemtableFractionOutOfRange(
+                self.memtable_fraction,
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Typed validation error for [`RocksMemoryConfig`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum RocksMemoryConfigError {
+    /// `total_bytes` must be nonzero.
+    ZeroTotalBytes,
+    /// `memtable_fraction` must lie strictly within (0, 1); carries the
+    /// rejected value. (NaN is rejected by the same comparison.)
+    MemtableFractionOutOfRange(f64),
+}
+
+impl std::fmt::Display for RocksMemoryConfigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RocksMemoryConfigError::ZeroTotalBytes => {
+                write!(f, "shared memory config: total_bytes must be nonzero")
+            }
+            RocksMemoryConfigError::MemtableFractionOutOfRange(v) => write!(
+                f,
+                "shared memory config: memtable_fraction must lie strictly within (0, 1), got {v}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for RocksMemoryConfigError {}
+
+/// A live shared cross-instance memory handle (mnestic fork,
+/// docs/specs/cross-instance-memory.md §3): one LRU block cache + one
+/// WriteBufferManager charged into it, constructed once from a validated
+/// [`RocksMemoryConfig`]. Clones are refcounted handles to the same live
+/// objects; the handle is immutable after construction. Pass it to
+/// [`DbBuilder::build_with_memory`] for every instance that should share the
+/// envelope.
+#[derive(Clone)]
+pub struct RocksMemoryResources {
+    pub(crate) inner: SharedPtr<crate::bridge::ffi::RocksMemoryResources>,
+    config: RocksMemoryConfig,
+}
+
+impl RocksMemoryResources {
+    /// Validates `config` and constructs the shared cache + WriteBufferManager.
+    pub fn new(config: RocksMemoryConfig) -> Result<Self, RocksMemoryConfigError> {
+        config.validate()?;
+        let inner = new_memory_resources(config.total_bytes, config.memtable_fraction);
+        Ok(Self { inner, config })
+    }
+
+    /// The canonical config this handle was constructed from.
+    pub fn config(&self) -> &RocksMemoryConfig {
+        &self.config
+    }
+
+    /// Total memory used by memtables under this WriteBufferManager (bytes).
+    pub fn memory_usage(&self) -> u64 {
+        self.inner.wbm_memory_usage()
+    }
+
+    /// Memory used by active (mutable) memtables (bytes).
+    pub fn mutable_memtable_memory_usage(&self) -> u64 {
+        self.inner.wbm_mutable_memtable_memory_usage()
+    }
+
+    /// Bytes the WriteBufferManager has charged into the shared cache as
+    /// dummy entries (the cost-to-cache carve-out, visible inside
+    /// [`Self::cache_usage`]).
+    pub fn dummy_entries_in_cache_usage(&self) -> u64 {
+        self.inner.wbm_dummy_entries_in_cache_usage()
+    }
+
+    /// The WriteBufferManager's budget (`total_bytes * memtable_fraction`).
+    pub fn buffer_size(&self) -> u64 {
+        self.inner.wbm_buffer_size()
+    }
+
+    /// The shared cache's capacity — the envelope (`total_bytes`).
+    pub fn cache_capacity(&self) -> u64 {
+        self.inner.cache_capacity()
+    }
+
+    /// The shared cache's current usage (real blocks + WBM dummy entries).
+    pub fn cache_usage(&self) -> u64 {
+        self.inner.cache_usage()
+    }
+}
+
+impl std::fmt::Debug for RocksMemoryResources {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RocksMemoryResources")
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+// SAFETY: the handle only wraps `std::shared_ptr`s to RocksDB's `Cache` and
+// `WriteBufferManager`, both of which are internally synchronised and
+// explicitly designed to be shared across DB instances and threads; the
+// shared_ptr control block is thread-safe. Same discipline as `RocksDb`.
+unsafe impl Send for RocksMemoryResources {}
+
+unsafe impl Sync for RocksMemoryResources {}
 
 #[derive(Clone)]
 pub struct RocksDb {
@@ -204,6 +383,36 @@ impl RocksDb {
         } else {
             Err(status)
         }
+    }
+    /// Int-property read on the base DB (mnestic fork,
+    /// docs/specs/cross-instance-memory.md §5). Errors with `kNotFound` when
+    /// RocksDB does not recognise the property or has no value for it.
+    fn int_property(&self, name: &str) -> Result<u64, RocksDbStatus> {
+        let mut status = RocksDbStatus::default();
+        let value = self.inner.get_int_property(name, &mut status);
+        if status.is_ok() {
+            Ok(value)
+        } else {
+            Err(status)
+        }
+    }
+    /// `rocksdb.block-cache-usage`: memory size of the entries residing in
+    /// this instance's block cache (with a shared handle this is the SHARED
+    /// cache's usage, including the WriteBufferManager's dummy entries — every
+    /// participating instance reports the same value).
+    pub fn block_cache_usage(&self) -> Result<u64, RocksDbStatus> {
+        self.int_property("rocksdb.block-cache-usage")
+    }
+    /// `rocksdb.cur-size-all-mem-tables`: approximate size of this instance's
+    /// active and unflushed immutable memtables (bytes).
+    pub fn cur_size_all_mem_tables(&self) -> Result<u64, RocksDbStatus> {
+        self.int_property("rocksdb.cur-size-all-mem-tables")
+    }
+    /// `rocksdb.estimate-table-readers-mem`: estimated memory this instance
+    /// uses for reading SST tables, EXCLUDING block cache (this share is NOT
+    /// charged into the shared envelope).
+    pub fn estimate_table_readers_mem(&self) -> Result<u64, RocksDbStatus> {
+        self.int_property("rocksdb.estimate-table-readers-mem")
     }
 }
 

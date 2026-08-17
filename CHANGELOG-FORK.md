@@ -88,6 +88,59 @@ outbound requests. Run only trusted CozoScript, or build the binding from
 source without `rdf-io` to restore the locked-down default. Rust consumers
 are unaffected unless they opt into `rdf-io`.
 
+### Cross-instance shared memory for the RocksDB backend
+
+One shared block cache + `WriteBufferManager` envelope for many embedded
+RocksDB instances in one process (spec:
+`docs/specs/cross-instance-memory.md`; the construction Kafka Streams, Flink,
+and TiKV each converged on). **Requires a mnestic-rocks release, which must
+publish before the mnestic crate that pins it.**
+
+- **The handle**: `RocksMemoryResources::new(RocksMemoryConfig { total_bytes,
+  memtable_fraction })` — one LRU cache of `total_bytes` (THE envelope;
+  `strict_capacity_limit=false`, default high-priority pool) plus one
+  `WriteBufferManager` of `total_bytes × memtable_fraction` charged INTO the
+  cache as dummy entries (cost-to-cache: the memtable share is a carve-out of
+  the envelope, not an addition beside it; `allow_stall=false`). Validation
+  is typed and total: nonzero total, fraction strictly in (0, 1). Immutable
+  after construction; clones are refcounted handles to the same live objects.
+- **Entry points**: `new_cozo_rocksdb_with_memory(path, &handle)` beside
+  `new_cozo_rocksdb` for Rust hosts; for bindings and string-configured
+  hosts, `DbInstance::new`'s previously-ignored `options` JSON gains
+  `{"shared_memory": {"total_bytes": …, "memtable_fraction": 0.25}}`
+  (fraction optional, default 0.25) — the first use fixes the process-default
+  config, an identical later config joins, a differing one is a typed
+  conflict error naming both configs. Non-RocksDB engines ignore the key.
+- **Override loudness**: with a handle present, the shared cache overrides
+  any `block_cache` the `<path>/options` file declares — and the open logs a
+  warning naming both capacities (the 0.13.0 lesson: never drop declared
+  options silently). Participating instances also get
+  `cache_index_and_filter_blocks_with_high_priority=true`.
+- **Property surface**: per-instance `rocksdb.block-cache-usage`,
+  `rocksdb.cur-size-all-mem-tables`, `rocksdb.estimate-table-readers-mem`
+  via `Db::rocksdb_memory_stats()` / `DbInstance::rocksdb_memory_stats()`
+  (a struct of `Option<u64>`; all `None` on non-RocksDB engines), plus
+  handle-level accessors (`memory_usage`, `mutable_memtable_memory_usage`,
+  `dummy_entries_in_cache_usage`, `buffer_size`, `cache_capacity`,
+  `cache_usage`). Charged into the envelope: data blocks, index/filter
+  blocks, memtable bytes. NOT charged: table readers outside the cache, WAL,
+  allocator retention — a soft envelope, disjoint from the query memory
+  budget.
+- **Bridge (`cozorocks`, all additive)**: opaque `RocksMemoryResources`
+  crossing cxx as a `SharedPtr` function argument,
+  `open_db_with_resources(...)` beside an untouched `open_db` (both now call
+  one shared install helper), `get_int_property` on `RocksDbBridge`, and a
+  `DbOpenReport` carrying the override facts to Rust for logging. Also fixes
+  the options-file cache-attach CF loop (`bridge/db.cpp`), which indexed
+  descriptor `[0]` on every iteration and dereferenced
+  `GetOptions<BlockBasedTableOptions>()` without the null check its sibling
+  0.13.0 fix block has — a non-block-based table factory in an options file
+  crashed the open (reachable only by direct bridge consumers passing a
+  cache).
+- Tests: `cozo-core/tests/cross_instance_memory.rs` (spec §8 matrix —
+  sharing-is-real, conflict semantics, validation, override loudness,
+  CF-loop regression, non-RocksDB `None`s, over-budget write storm).
+
 ## 0.14.0 — 2026-08-08
 
 A security-first minor release, with the full-text retrieval, diagnostics,

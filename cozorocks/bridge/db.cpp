@@ -54,12 +54,28 @@ ColumnFamilyOptions default_cf_options() {
     return options;
 }
 
-shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
+// Shared body of `open_db` and `open_db_with_resources` (mnestic fork,
+// docs/specs/cross-instance-memory.md §4/§7). `memory` may be null (the plain
+// `open_db` path — behavior bit-identical to before the refactor); when
+// present, its cache and WriteBufferManager are installed in both cache
+// branches and any options-file `block_cache` is overridden, with the
+// override recorded in `report` for the Rust side to log.
+static shared_ptr<RocksDbBridge>
+open_db_impl(const DbOpts &opts, const shared_ptr<RocksMemoryResources> &memory,
+             RocksDbStatus &status, DbOpenReport &report) {
     auto options = default_db_options();
 
+    const bool use_shared = memory != nullptr;
     shared_ptr<Cache> cache = nullptr;
 
-    if (opts.block_cache_size > 0) {
+    if (use_shared) {
+        // The shared cache IS the envelope: it takes precedence over the
+        // programmatic `block_cache_size` path and over any `block_cache` an
+        // options file declares (override reported below).
+        cache = memory->cache;
+        report.used_shared_resources = true;
+        report.shared_cache_capacity = memory->cache->GetCapacity();
+    } else if (opts.block_cache_size > 0) {
         // Honour the size the caller asked for. This used to hardcode 1 GiB and ignore
         // `block_cache_size` entirely, so a caller requesting 64 MB silently got sixteen
         // times that.
@@ -77,13 +93,44 @@ shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
             write_status(s, status);
             return nullptr;
         }
+        if (loaded_cf_descs.empty()) {
+            // Same defect class as the loop fix below: descriptor [0] is
+            // consumed unconditionally, so an empty descriptor list must be a
+            // loud error, not undefined behavior.
+            write_status(Status::InvalidArgument("options file contains no column family"),
+                         status);
+            return nullptr;
+        }
 
         if (cache != nullptr) {
+            // (S13 fix) This loop used to index descriptor [0] on every
+            // iteration and dereference `GetOptions<BlockBasedTableOptions>()`
+            // without the null check its sibling fix block below has — a
+            // non-block-based table factory in the options file crashed the
+            // open. Only descriptor [0] survives into the single-CF
+            // `TransactionDB::Open` below, but attach to every descriptor
+            // honestly and skip the ones that cannot carry a cache.
             for (size_t i = 0; i < loaded_cf_descs.size(); ++i) {
-                auto* loaded_bbt_opt =
-                        loaded_cf_descs[0]
-                                .options.table_factory->GetOptions<BlockBasedTableOptions>();
+                auto &cf_options = loaded_cf_descs[i].options;
+                if (cf_options.table_factory == nullptr) {
+                    continue;
+                }
+                auto *loaded_bbt_opt =
+                        cf_options.table_factory->GetOptions<BlockBasedTableOptions>();
+                if (loaded_bbt_opt == nullptr) {
+                    continue;
+                }
+                if (use_shared && i == 0 && loaded_bbt_opt->block_cache != nullptr) {
+                    // The options file declared its own cache; the shared
+                    // envelope wins. Never silently: report both capacities.
+                    report.overrode_options_file_cache = true;
+                    report.options_file_cache_capacity =
+                            loaded_bbt_opt->block_cache->GetCapacity();
+                }
                 loaded_bbt_opt->block_cache = cache;
+                if (use_shared) {
+                    loaded_bbt_opt->cache_index_and_filter_blocks_with_high_priority = true;
+                }
             }
         }
 
@@ -143,6 +190,12 @@ shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
             // whenever no options file was supplied.
             table_options.block_cache = cache;
         }
+        if (use_shared) {
+            // Index/filter blocks of participating instances go through the
+            // shared cache's high-priority pool so full memtable pressure
+            // (WBM dummy entries) evicts data blocks before metadata.
+            table_options.cache_index_and_filter_blocks_with_high_priority = true;
+        }
         options.table_factory.reset(NewBlockBasedTableFactory(table_options));
     }
     if (opts.use_capped_prefix_extractor) {
@@ -150,6 +203,12 @@ shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
     }
     if (opts.use_fixed_prefix_extractor) {
         options.prefix_extractor.reset(NewFixedPrefixTransform(opts.fixed_prefix_extractor_len));
+    }
+    if (use_shared) {
+        // One WriteBufferManager across every participating instance; its
+        // budget is charged into the shared cache (cost-to-cache dummy
+        // entries). Must be on DBOptions before TransactionDB::Open.
+        options.write_buffer_manager = memory->write_buffer_manager;
     }
     options.create_missing_column_families = true;
 
@@ -166,6 +225,24 @@ shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
 
 
     return db;
+}
+
+shared_ptr <RocksDbBridge> open_db(const DbOpts &opts, RocksDbStatus &status) {
+    // No memory handle: bit-identical to the pre-refactor body (the report is
+    // written but discarded — nothing to override without a handle).
+    DbOpenReport report{};
+    return open_db_impl(opts, nullptr, status, report);
+}
+
+shared_ptr <RocksDbBridge>
+open_db_with_resources(const DbOpts &opts, shared_ptr<RocksMemoryResources> resources,
+                       RocksDbStatus &status, DbOpenReport &report) {
+    report = DbOpenReport{};
+    return open_db_impl(opts, resources, status, report);
+}
+
+shared_ptr <RocksMemoryResources> new_memory_resources(size_t total_bytes, double memtable_fraction) {
+    return make_shared<RocksMemoryResources>(total_bytes, memtable_fraction);
 }
 
 RocksDbBridge::~RocksDbBridge() {
