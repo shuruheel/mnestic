@@ -9,12 +9,13 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use log::info;
+use log::{info, warn};
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
 
 use cozorocks::{DbBuilder, DbIter, RocksDb, SnapReader, Tx};
+pub use cozorocks::{RocksMemoryConfig, RocksMemoryConfigError, RocksMemoryResources};
 
 use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
@@ -32,15 +33,59 @@ const CURRENT_STORAGE_VERSION: u64 = 3;
 /// sustain huge concurrency.
 /// Supports concurrent readers and writers.
 pub fn new_cozo_rocksdb(path: impl AsRef<Path>) -> Result<Db<RocksDbStorage>> {
-    let builder = DbBuilder::default().path(path.as_ref());
-    fs::create_dir_all(path.as_ref()).map_err(|err| {
+    let db_builder = prepare_db_builder(path.as_ref())?;
+    let db = db_builder.build()?;
+
+    let ret = Db::new(RocksDbStorage::new(db))?;
+    ret.initialize()?;
+    Ok(ret)
+}
+
+/// Creates a RocksDB database object participating in a shared cross-instance
+/// memory envelope (mnestic fork, docs/specs/cross-instance-memory.md §4).
+/// Build ONE [`RocksMemoryResources`] handle from a [`RocksMemoryConfig`] and
+/// open every participating instance with a clone of it: they then share one
+/// block cache (the envelope) and one WriteBufferManager charged into it.
+///
+/// The handle OVERRIDES any `block_cache` a `<path>/options` file declares (a
+/// live shared object cannot be expressed in an INI file); the override is
+/// logged loudly with both capacities, never applied silently. Everything
+/// else in the options file is honored as usual.
+pub fn new_cozo_rocksdb_with_memory(
+    path: impl AsRef<Path>,
+    memory: &RocksMemoryResources,
+) -> Result<Db<RocksDbStorage>> {
+    let db_builder = prepare_db_builder(path.as_ref())?;
+    let (db, report) = db_builder.build_with_memory(memory)?;
+    if report.overrode_options_file_cache {
+        warn!(
+            "shared memory envelope overrides the options-file block_cache for {}: \
+             options file declared a {}-byte cache, shared cache capacity is {} bytes",
+            path.as_ref().to_string_lossy(),
+            report.options_file_cache_capacity,
+            report.shared_cache_capacity
+        );
+    }
+
+    let ret = Db::new(RocksDbStorage::new(db))?;
+    ret.initialize()?;
+    Ok(ret)
+}
+
+/// Shared open-path setup for [`new_cozo_rocksdb`] and
+/// [`new_cozo_rocksdb_with_memory`]: directory + manifest handling, options
+/// file discovery, and the `DbBuilder` knobs. Extracted verbatim so the
+/// no-handle path stays bit-identical.
+fn prepare_db_builder(path: &Path) -> Result<DbBuilder> {
+    let builder = DbBuilder::default().path(path);
+    fs::create_dir_all(path).map_err(|err| {
         BadDbInit(format!(
             "cannot create directory {}: {}",
-            path.as_ref().to_string_lossy(),
+            path.to_string_lossy(),
             err
         ))
     })?;
-    let path_buf = PathBuf::from(path.as_ref());
+    let path_buf = PathBuf::from(path);
 
     let is_new = {
         let mut manifest_path = path_buf.clone();
@@ -98,18 +143,89 @@ pub fn new_cozo_rocksdb(path: impl AsRef<Path>) -> Result<Db<RocksDbStorage>> {
         ""
     };
 
-    let db_builder = builder
+    Ok(builder
         .create_if_missing(is_new)
         .use_capped_prefix_extractor(true, KEY_PREFIX_LEN)
         .use_bloom_filter(true, 9.9, true)
         .path(store_path)
-        .options_path(options_path);
+        .options_path(options_path))
+}
 
-    let db = db_builder.build()?;
+/// Typed conflict error for the process-default shared memory envelope
+/// (mnestic fork, docs/specs/cross-instance-memory.md §4): the process
+/// default is constructed once from the first config seen; a later differing
+/// request is refused, naming both configs — never first-writer-wins
+/// silently. An identical config joins the existing handle.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
+#[error(
+    "conflicting `shared_memory` config for the process-default RocksDB memory envelope: \
+     already initialized with {existing:?}; this open requested {requested:?}"
+)]
+#[diagnostic(code(mnestic::rocks::shared_memory_config_conflict))]
+pub struct SharedMemoryConfigConflict {
+    /// The canonical config the process default was constructed from.
+    pub existing: RocksMemoryConfig,
+    /// The differing config this open requested.
+    pub requested: RocksMemoryConfig,
+}
 
-    let ret = Db::new(RocksDbStorage::new(db))?;
-    ret.initialize()?;
-    Ok(ret)
+/// The process-default shared memory envelope: the canonical config plus the
+/// live handle, fixed by the first use. Deliberately not a naked `once_flag`:
+/// config equality is checked on every later request.
+static PROCESS_DEFAULT_MEMORY: Mutex<Option<(RocksMemoryConfig, RocksMemoryResources)>> =
+    Mutex::new(None);
+
+/// Resolves the process-default shared memory handle for `config` (mnestic
+/// fork, docs/specs/cross-instance-memory.md §4 — the entry point reachable
+/// from string-configured hosts via `DbInstance::new`'s options JSON). First
+/// use constructs and stores the canonical (config, handle) pair; an
+/// identical later config joins; a differing one is a typed
+/// [`SharedMemoryConfigConflict`]. The explicit-handle path
+/// ([`new_cozo_rocksdb_with_memory`]) never consults this.
+pub fn process_default_rocks_memory(config: RocksMemoryConfig) -> Result<RocksMemoryResources> {
+    let mut guard = PROCESS_DEFAULT_MEMORY
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    match &*guard {
+        Some((existing, handle)) => {
+            if *existing == config {
+                Ok(handle.clone())
+            } else {
+                Err(SharedMemoryConfigConflict {
+                    existing: existing.clone(),
+                    requested: config,
+                }
+                .into())
+            }
+        }
+        None => {
+            let handle = RocksMemoryResources::new(config.clone()).into_diagnostic()?;
+            *guard = Some((config, handle.clone()));
+            Ok(handle)
+        }
+    }
+}
+
+/// Per-instance RocksDB memory property reads (mnestic fork,
+/// docs/specs/cross-instance-memory.md §5). Each field mirrors the RocksDB
+/// int property of the same name; `None` when the property is unavailable
+/// (and, via the `DbInstance`-level accessor, on non-RocksDB engines).
+///
+/// These measure RocksDB's storage-side memory only. They are disjoint from
+/// the query memory budget's evaluation-time estimate; neither counts the
+/// other's bytes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RocksMemoryStats {
+    /// `rocksdb.block-cache-usage` — with a shared envelope this is the
+    /// SHARED cache's usage (real blocks + WriteBufferManager dummy entries),
+    /// so every participating instance reports the same value.
+    pub block_cache_usage: Option<u64>,
+    /// `rocksdb.cur-size-all-mem-tables` — this instance's active and
+    /// unflushed immutable memtables (bytes).
+    pub cur_size_all_mem_tables: Option<u64>,
+    /// `rocksdb.estimate-table-readers-mem` — table-reader memory outside the
+    /// block cache; NOT charged into the shared envelope.
+    pub estimate_table_readers_mem: Option<u64>,
 }
 
 /// RocksDB storage engine
@@ -128,6 +244,25 @@ impl RocksDbStorage {
             db,
             sync_writes: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// Per-instance memory property reads (mnestic fork,
+    /// docs/specs/cross-instance-memory.md §5). Fields are `None` when
+    /// RocksDB cannot answer for this instance.
+    pub fn memory_stats(&self) -> RocksMemoryStats {
+        RocksMemoryStats {
+            block_cache_usage: self.db.block_cache_usage().ok(),
+            cur_size_all_mem_tables: self.db.cur_size_all_mem_tables().ok(),
+            estimate_table_readers_mem: self.db.estimate_table_readers_mem().ok(),
+        }
+    }
+}
+
+impl Db<RocksDbStorage> {
+    /// Per-instance RocksDB memory property reads (mnestic fork,
+    /// docs/specs/cross-instance-memory.md §5). See [`RocksMemoryStats`].
+    pub fn rocksdb_memory_stats(&self) -> RocksMemoryStats {
+        self.db.memory_stats()
     }
 }
 
