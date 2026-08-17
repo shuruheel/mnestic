@@ -12,6 +12,7 @@ pub(crate) mod expr;
 pub mod functions;
 pub(crate) mod json;
 pub(crate) mod memcmp;
+pub(crate) mod memsize;
 pub mod program;
 pub(crate) mod relation;
 pub mod symb;

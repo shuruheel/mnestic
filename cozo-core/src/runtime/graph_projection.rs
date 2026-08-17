@@ -117,7 +117,7 @@ use thiserror::Error;
 #[cfg(feature = "graph-algo")]
 use crate::data::tuple::TupleIter;
 #[cfg(feature = "graph-algo")]
-use crate::data::value::{DataValue, Vector};
+use crate::data::value::{DataValue};
 #[cfg(feature = "graph-algo")]
 use crate::fixed_rule::{build_unweighted_csr, build_weighted_csr};
 #[cfg(feature = "graph-algo")]
@@ -441,17 +441,11 @@ impl ProjectionCache {
 #[cfg(feature = "graph-algo")]
 pub(crate) const DEFAULT_PROJECTION_CAPACITY: usize = 512 * 1024 * 1024;
 
-/// Charged per `BTreeMap`/`BTreeSet` entry when estimating an id map's size.
-/// B-trees allocate in nodes, not per entry; this is the amortised share.
+// The per-entry/opaque-key estimators moved to `data/memsize.rs` (mnestic
+// fork, query memory budget) so every build has them; this module imports
+// them below.
 #[cfg(feature = "graph-algo")]
-const BTREE_ENTRY_OVERHEAD: usize = 48;
-
-/// Flat charge for the part of a vertex key we cannot see into: a compiled
-/// regex's program. Its pattern text is counted exactly; the compiled
-/// automaton is opaque, and the ceiling only needs the right order of
-/// magnitude for a key type this pathological.
-#[cfg(feature = "graph-algo")]
-const OPAQUE_KEY_ESTIMATE: usize = 64;
+use crate::data::memsize::{value_heap_bytes, BTREE_ENTRY_OVERHEAD};
 
 /// Which concrete CSR a projection has materialised. A projection names its
 /// sources; the variants are built lazily, one per `(direction, weighted)`
@@ -1320,56 +1314,6 @@ fn estimate_bytes(
         .saturating_add(idx)
         .saturating_add(inv)
         .min(usize::MAX as u64) as usize
-}
-
-/// Heap bytes owned by a vertex value, beyond its inline `DataValue`.
-#[cfg(feature = "graph-algo")]
-fn value_heap_bytes(v: &DataValue) -> usize {
-    match v {
-        DataValue::Str(s) => {
-            if s.is_inline() {
-                0
-            } else {
-                s.len()
-            }
-        }
-        DataValue::Bytes(b) => b.len(),
-        DataValue::List(l) => {
-            l.len() * std::mem::size_of::<DataValue>()
-                + l.iter().map(value_heap_bytes).sum::<usize>()
-        }
-        DataValue::Set(s) => s
-            .iter()
-            .map(|v| std::mem::size_of::<DataValue>() + BTREE_ENTRY_OVERHEAD + value_heap_bytes(v))
-            .sum(),
-        DataValue::Vec(Vector::F32(a)) => a.len() * 4,
-        DataValue::Vec(Vector::F64(a)) => a.len() * 8,
-        // Json must be walked, not flat-charged: it is a storable key type, a
-        // single blob vertex can be megabytes, and the build interns every
-        // vertex as two owned deep clones. A flat 64-byte charge let the real
-        // footprint exceed the ceiling without bound while `::graph list`
-        // reported a near-empty cache (Phase 3/4 review, 2026-07-10).
-        DataValue::Json(j) => json_heap_bytes(&j.0),
-        DataValue::Regex(r) => r.0.as_str().len() + OPAQUE_KEY_ESTIMATE,
-        _ => 0,
-    }
-}
-
-/// Heap bytes owned by a JSON value, beyond one inline `serde_json::Value`.
-#[cfg(feature = "graph-algo")]
-fn json_heap_bytes(v: &serde_json::Value) -> usize {
-    let node = std::mem::size_of::<serde_json::Value>();
-    match v {
-        serde_json::Value::String(s) => s.len(),
-        serde_json::Value::Array(a) => {
-            a.len() * node + a.iter().map(json_heap_bytes).sum::<usize>()
-        }
-        serde_json::Value::Object(m) => m
-            .iter()
-            .map(|(k, x)| k.len() + node + BTREE_ENTRY_OVERHEAD + json_heap_bytes(x))
-            .sum(),
-        _ => 0,
-    }
 }
 
 /// `::graph create G {edges: …, nodes: …}`. Validates loudly and immediately;

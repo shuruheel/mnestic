@@ -13,7 +13,7 @@ use std::fmt::{Debug, Formatter};
 use std::iter;
 use std::path::Path;
 #[allow(unused_imports)]
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 #[allow(unused_imports)]
 use std::thread;
@@ -34,6 +34,7 @@ use thiserror::Error;
 
 use crate::data::functions::current_validity;
 use crate::data::json::JsonValue;
+use crate::data::memsize::est_tuple_bytes;
 use crate::data::program::{InputProgram, QueryAssertion, RelationOp, ReturnMutation};
 use crate::data::relation::ColumnDef;
 use crate::data::tuple::{Tuple, TupleT};
@@ -109,6 +110,13 @@ pub struct ScriptRunOptions {
     /// budget, never extend past this guard. It is a single whole-script
     /// deadline: a multi-statement script does not get it afresh per statement.
     pub timeout: Option<f64>,
+    /// Per-call memory budget in estimated bytes (mnestic fork; spec
+    /// `docs/specs/memory-budget.md`). `None` (the default) imposes no
+    /// per-call budget. The effective limit for each block is the minimum of
+    /// this, any per-block `:mem_limit`, and the Db default
+    /// ([`Db::set_default_query_mem_limit`]) — a block can only tighten the
+    /// budget, never extend past this guard.
+    pub mem_limit: Option<usize>,
 }
 
 impl ScriptRunOptions {
@@ -120,6 +128,13 @@ impl ScriptRunOptions {
     /// Set the per-call wall-clock budget in seconds (builder style).
     pub fn with_timeout(mut self, secs: f64) -> Self {
         self.timeout = Some(secs);
+        self
+    }
+
+    /// Set the per-call memory budget in estimated bytes (builder style;
+    /// mnestic fork, query memory budget).
+    pub fn with_mem_limit(mut self, bytes: usize) -> Self {
+        self.mem_limit = Some(bytes);
         self
     }
 }
@@ -178,6 +193,12 @@ pub struct Db<S> {
     /// `:timeout`. Anchored at script start, so it bounds the whole
     /// `run_script` call rather than each statement.
     default_query_timeout_ms: Arc<AtomicU64>,
+    /// Db-wide default per-query memory budget in estimated bytes (mnestic
+    /// fork, query memory budget; spec `docs/specs/memory-budget.md`). `0` =
+    /// unset. Set via [`Db::set_default_query_mem_limit`]; folded (via `min`)
+    /// into every block's effective limit alongside any per-call limit and
+    /// per-block `:mem_limit`.
+    default_query_mem_limit: Arc<AtomicU64>,
     /// Kill switch for the automatic factorized-count rewrite (mnestic fork,
     /// query factorization; `query/factorize.rs`). When `true`, an eligible
     /// single-clause `count()`-over-a-positive-join query is rewritten to
@@ -401,6 +422,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             index_builds_in_progress: Default::default(),
             fts_doc_stats_cache: Default::default(),
             default_query_timeout_ms: Default::default(),
+            default_query_mem_limit: Default::default(),
             // DEFAULT for the automatic factorized-count rewrite: ON as of
             // 0.13.1, after the nightly planner-guard soak. Flip this one line
             // to `AtomicBool::new(false)` to make the rewrite opt-in again.
@@ -620,6 +642,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             cur_vld,
             mutability,
             options.timeout,
+            options.mem_limit,
         )
     }
 
@@ -657,7 +680,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         cur_vld: ValidityTs,
         mutability: ScriptMutability,
     ) -> Result<NamedRows> {
-        self.run_script_ast_inner(payload, cur_vld, mutability, None)
+        self.run_script_ast_inner(payload, cur_vld, mutability, None, None)
     }
 
     /// Dispatch a parsed script, computing the whole-script wall-clock deadline
@@ -670,13 +693,17 @@ impl<'s, S: Storage<'s>> Db<S> {
         cur_vld: ValidityTs,
         mutability: ScriptMutability,
         call_timeout: Option<f64>,
+        call_mem_limit: Option<usize>,
     ) -> Result<NamedRows> {
         let read_only = mutability == ScriptMutability::Immutable;
         let outer_deadline = self.effective_outer_deadline(call_timeout);
+        let outer_mem_limit = self.effective_outer_mem_limit(call_mem_limit);
         let res = match payload {
-            CozoScript::Single(p) => self.execute_single(cur_vld, p, read_only, outer_deadline),
+            CozoScript::Single(p) => {
+                self.execute_single(cur_vld, p, read_only, outer_deadline, outer_mem_limit)
+            }
             CozoScript::Imperative(ps) => {
-                self.execute_imperative(cur_vld, &ps, read_only, outer_deadline)
+                self.execute_imperative(cur_vld, &ps, read_only, outer_deadline, outer_mem_limit)
             }
             CozoScript::Sys(op) => self.run_sys_op(op, read_only),
         };
@@ -732,6 +759,24 @@ impl<'s, S: Storage<'s>> Db<S> {
         deadline
     }
 
+    /// The whole-script memory budget from the per-call option and the Db
+    /// default (mnestic fork, query memory budget): the minimum of whichever
+    /// are set, `None` if neither is.
+    fn effective_outer_mem_limit(&self, call_limit: Option<usize>) -> Option<usize> {
+        let default = {
+            let v = self.default_query_mem_limit.load(Ordering::Relaxed);
+            if v == 0 {
+                None
+            } else {
+                Some(v as usize)
+            }
+        };
+        match (call_limit, default) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+
     /// Commit a multi-transaction. Wraps `SessionTx::commit_tx` so the
     /// `test-hooks` failure switch has one place to live (mnestic fork, 0.12.1;
     /// see [`Db::fail_next_commit_for_tests`]). The injected failure returns
@@ -775,6 +820,16 @@ impl<'s, S: Storage<'s>> Db<S> {
         self.default_query_timeout_ms.store(ms, Ordering::Relaxed);
     }
 
+    /// Set (or clear, with `None`/`Some(0)`) the Db-wide default per-query
+    /// memory budget in estimated bytes (mnestic fork, query memory budget;
+    /// spec `docs/specs/memory-budget.md`). Folded via `min` into every
+    /// block's effective limit; a block's `:mem_limit` or a per-call option
+    /// can only tighten it further.
+    pub fn set_default_query_mem_limit(&self, bytes: Option<usize>) {
+        let v = bytes.unwrap_or(0) as u64;
+        self.default_query_mem_limit.store(v, Ordering::Relaxed);
+    }
+
     /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
     /// query factorization; `query/factorize.rs`). The kill switch is a Db-wide
     /// toggle, **default ON since 0.13.1**. When on, an eligible single-clause
@@ -811,6 +866,17 @@ impl<'s, S: Storage<'s>> Db<S> {
             None
         } else {
             Some(ms as f64 / 1000.0)
+        }
+    }
+
+    /// The Db-wide default per-query memory budget in estimated bytes, or
+    /// `None` if unset (mnestic fork, query memory budget).
+    pub fn default_query_mem_limit(&self) -> Option<usize> {
+        let v = self.default_query_mem_limit.load(Ordering::Relaxed);
+        if v == 0 {
+            None
+        } else {
+            Some(v as usize)
         }
     }
 
@@ -1570,6 +1636,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
+            script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
             dirty_relations: Default::default(),
@@ -1593,6 +1660,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
+            script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
             dirty_relations: Default::default(),
@@ -1628,6 +1696,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         p: InputProgram,
         read_only: bool,
         outer_deadline: Option<Instant>,
+        outer_mem_limit: Option<usize>,
     ) -> Result<NamedRows, Report> {
         let mut callback_collector = BTreeMap::new();
         let write_lock_names = p.needs_write_lock();
@@ -1654,9 +1723,11 @@ impl<'s, S: Storage<'s>> Db<S> {
             } else {
                 self.transact()?
             };
-            // Carry the whole-script wall-clock budget on the tx so run_query
-            // (and any triggers it fires) honour it (mnestic fork, query budget).
+            // Carry the whole-script wall-clock + memory budgets on the tx so
+            // run_query (and any triggers it fires) honour them (mnestic fork,
+            // query budget + memory budget).
             tx.script_deadline = outer_deadline;
+            tx.script_mem_limit = outer_mem_limit;
 
             res = self.execute_single_program(
                 p,
@@ -3057,7 +3128,25 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
             deadline
         };
-        let poison = Poison::with_deadline(effective_deadline);
+        // memory budget (mnestic fork; spec `docs/specs/memory-budget.md`):
+        // the block's effective limit is the minimum of the whole-script limit
+        // carried on the transaction (per-call option + Db default) and this
+        // block's own `:mem_limit` — a block can only tighten the budget.
+        let mem_budget = {
+            let script = tx.script_mem_limit;
+            let block = out_opts.mem_limit;
+            match (script, block) {
+                (None, None) => None,
+                (Some(a), None) => Some(MemBudget::new(a, "the per-call run option or Db default")),
+                (None, Some(b)) => Some(MemBudget::new(b, "the block's `:mem_limit` option")),
+                (Some(a), Some(b)) => Some(if b < a {
+                    MemBudget::new(b, "the block's `:mem_limit` option")
+                } else {
+                    MemBudget::new(a, "the per-call run option or Db default")
+                }),
+            }
+        };
+        let poison = Poison::with_limits(effective_deadline, mem_budget.clone());
         // give the query an ID and store it so that it can be queried and cancelled
         let id = self.queries_count.fetch_add(1, Ordering::AcqRel);
 
@@ -3126,7 +3215,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         if !out_opts.sorters.is_empty() {
             // sort outputs if required
             let sorted_result =
-                tx.sort_and_collect(result_store, &out_opts.sorters, &entry_head_or_default)?;
+                tx.sort_and_collect(
+                result_store,
+                &out_opts.sorters,
+                &entry_head_or_default,
+                mem_budget.as_ref(),
+            )?;
             let sorted_iter = if let Some(offset) = out_opts.offset {
                 Left(sorted_result.into_iter().skip(offset))
             } else {
@@ -3218,7 +3312,23 @@ impl<'s, S: Storage<'s>> Db<S> {
 
                 Ok((returned_rows, clean_ups))
             } else {
-                let rows: Vec<Tuple> = scan.collect_vec();
+                // memory budget (mnestic fork): the final result Vec is a
+                // second copy of the store's rows — charged, fallible here.
+                let rows: Vec<Tuple> = match &mem_budget {
+                    Some(m) => {
+                        let mut rows = Vec::new();
+                        for (i, t) in scan.enumerate() {
+                            m.charge(est_tuple_bytes(&t));
+                            if i & 4095 == 0 {
+                                m.error_if_tripped()?;
+                            }
+                            rows.push(t);
+                        }
+                        m.error_if_tripped()?;
+                        rows
+                    }
+                    None => scan.collect_vec(),
+                };
 
                 Ok((
                     NamedRows::new(
@@ -3484,10 +3594,126 @@ fn _get_variables(src: &str, params: &BTreeMap<String, DataValue>) -> Result<BTr
 /// into fixed rules and the RA enumeration pipeline. The carried deadline
 /// replaces the old detached timer thread: no per-query thread leak, and
 /// `:timeout` no longer depends on spawning a thread.
+/// The query memory budget's trip diagnostic (mnestic fork; spec
+/// `docs/specs/memory-budget.md`). Figures are logical estimates of
+/// engine-held bytes, not process RSS. Retriable: the aborted query holds
+/// nothing after the abort, and the Db and concurrent queries are unaffected.
+#[derive(Debug, Error, Diagnostic)]
+#[error(
+    "Query exceeded its memory budget: estimated {used} bytes held (attempted charge \
+     of {attempted} more) against a limit of {limit} bytes set by {knob}{at}"
+)]
+#[diagnostic(code(eval::mem_budget_exceeded))]
+#[diagnostic(help(
+    "The budget is the minimum of the per-block `:mem_limit` option, the per-call \
+     run option, and the Db default (`set_default_query_mem_limit`) — a block can \
+     only tighten it. Raise the governing knob, or narrow the query (check \
+     `::explain` for full scans and unfactorized counts). The figures are \
+     estimates of engine-held bytes, not process RSS."
+))]
+pub(crate) struct MemBudgetExceeded {
+    pub(crate) used: usize,
+    pub(crate) attempted: usize,
+    pub(crate) limit: usize,
+    pub(crate) knob: &'static str,
+    /// Rule/epoch context, filled in by the evaluator when the trip surfaces
+    /// inside a rule's evaluation (empty otherwise). A field rather than a
+    /// `wrap_err` so the diagnostic code survives `format_error_as_json`.
+    pub(crate) at: String,
+}
+
+/// Shared per-block estimated-bytes accounting for the query memory budget
+/// (mnestic fork; spec `docs/specs/memory-budget.md`). Cheap to clone — one
+/// `Arc`. Charging is infallible (the temp stores' write methods stay
+/// non-`Result`); crossing the limit arms `tripped`, and every shipped check
+/// cadence — the poisoned RA iterators, the per-rule `poison.check()`s —
+/// converts it into the `eval::mem_budget_exceeded` error. The debit path
+/// never trips and never underflows ("free should never throw").
+#[derive(Debug, Clone)]
+pub(crate) struct MemBudget {
+    inner: Arc<MemBudgetInner>,
+}
+
+#[derive(Debug)]
+struct MemBudgetInner {
+    /// Live estimated bytes charged by this block's stores + staging.
+    counter: AtomicUsize,
+    /// Effective limit in bytes (min-composed from the knob triple).
+    limit: usize,
+    /// Which knob produced the effective limit, for the error message.
+    knob: &'static str,
+    tripped: AtomicBool,
+    trip_used: AtomicUsize,
+    trip_attempted: AtomicUsize,
+}
+
+impl MemBudget {
+    pub(crate) fn new(limit: usize, knob: &'static str) -> Self {
+        Self {
+            inner: Arc::new(MemBudgetInner {
+                counter: AtomicUsize::new(0),
+                limit,
+                knob,
+                tripped: AtomicBool::new(false),
+                trip_used: AtomicUsize::new(0),
+                trip_attempted: AtomicUsize::new(0),
+            }),
+        }
+    }
+    /// Infallible charge: add estimated bytes; arm the trip if over limit.
+    #[inline]
+    pub(crate) fn charge(&self, n: usize) {
+        let old = self.inner.counter.fetch_add(n, Ordering::Relaxed);
+        if old.saturating_add(n) > self.inner.limit && !self.inner.tripped.swap(true, Ordering::Relaxed)
+        {
+            self.inner.trip_used.store(old, Ordering::Relaxed);
+            self.inner.trip_attempted.store(n, Ordering::Relaxed);
+        }
+    }
+    /// Infallible debit; never underflows, never trips, never un-trips.
+    #[inline]
+    pub(crate) fn debit(&self, n: usize) {
+        // saturating at zero via fetch_update would cost a CAS loop; a plain
+        // sub is safe because every debit releases a prior charge of the same
+        // estimate (the stores' `charged` fields enforce the pairing).
+        self.inner.counter.fetch_sub(n, Ordering::Relaxed);
+    }
+    /// Fallible charge for staging contexts (sort/result collection), which
+    /// can error directly instead of waiting for a check cadence.
+    #[inline]
+    pub(crate) fn charge_checked(&self, n: usize) -> Result<()> {
+        self.charge(n);
+        self.error_if_tripped()
+    }
+    /// The check-cadence half: raise the trip as its diagnostic.
+    #[inline]
+    pub(crate) fn error_if_tripped(&self) -> Result<()> {
+        if self.inner.tripped.load(Ordering::Relaxed) {
+            bail!(MemBudgetExceeded {
+                used: self.inner.trip_used.load(Ordering::Relaxed),
+                attempted: self.inner.trip_attempted.load(Ordering::Relaxed),
+                limit: self.inner.limit,
+                knob: self.inner.knob,
+                at: String::new(),
+            });
+        }
+        Ok(())
+    }
+    /// Current live estimated bytes (observability; consumed by tests today
+    /// and by the planned `::running` bytes column later).
+    #[allow(dead_code)]
+    pub(crate) fn used(&self) -> usize {
+        self.inner.counter.load(Ordering::Relaxed)
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct Poison {
     pub(crate) flag: Arc<AtomicBool>,
     pub(crate) deadline: Option<Instant>,
+    /// Query memory budget (mnestic fork); `None` = unlimited. Rides the
+    /// poison so every shipped check cadence also checks the budget trip.
+    pub(crate) mem: Option<MemBudget>,
 }
 
 /// A monotonic clock reading for a wall-clock query budget, or `None` where no
@@ -3581,6 +3807,12 @@ impl Poison {
             bail!(ProcessKilled)
         }
 
+        // memory budget (mnestic fork): a charge that crossed the limit
+        // armed the trip; every check cadence surfaces it as its own error.
+        if let Some(mem) = &self.mem {
+            mem.error_if_tripped()?;
+        }
+
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
                 #[derive(Debug, Error, Diagnostic)]
@@ -3611,6 +3843,17 @@ impl Poison {
         Poison {
             flag: Arc::new(AtomicBool::new(false)),
             deadline,
+            mem: None,
+        }
+    }
+    /// Construct a poison carrying an optional wall-clock deadline AND an
+    /// optional memory budget (mnestic fork; spec
+    /// `docs/specs/memory-budget.md`).
+    pub(crate) fn with_limits(deadline: Option<Instant>, mem: Option<MemBudget>) -> Self {
+        Poison {
+            flag: Arc::new(AtomicBool::new(false)),
+            deadline,
+            mem,
         }
     }
 }

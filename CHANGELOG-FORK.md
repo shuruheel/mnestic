@@ -5,7 +5,36 @@ provenance and licensing.
 
 ## Unreleased
 
-Nothing yet.
+- **A per-query memory budget** (spec
+  [`docs/specs/memory-budget.md`](docs/specs/memory-budget.md), signed
+  2026-08-16): the temp stores that hold every intermediate of semi-naive
+  evaluation previously had zero accounting, so a mis-authored join — a
+  cartesian intermediate is the canonical case — would OOM-kill the **host
+  process**. Now every store charges an estimated byte cost per allocation
+  event (real insertions, merge key-clones, bounded/dominance
+  re-materializations; moves are accounting-neutral, evictions and duplicate
+  drops are debited, and each store releases exactly what it charged on
+  drop), the sort and final-result staging copies are charged too, and a
+  budget trip aborts the query with the new
+  **`eval::mem_budget_exceeded`** diagnostic — before the memory is spent and
+  before any commit, so a tripped mutable script leaves no partial writes and
+  the Db keeps serving. The knob is a triple, min-composed exactly like the
+  wall-clock budget: a per-block **`:mem_limit <bytes>`** option, a per-call
+  `ScriptRunOptions::with_mem_limit`, and a Db-wide
+  `set_default_query_mem_limit` — **script text can only tighten the budget a
+  host set, never raise it** (scripts are increasingly LLM-authored). The
+  figures are logical estimates of engine-held bytes, not process RSS, and are
+  not stable across releases. The engine default stays **unset** (a library
+  must not change behavior under its hosts), but `cozo-bin` — an application —
+  ships with a 4 GiB default budget (`--default-query-mem-limit`, `0` for
+  unlimited), and its HTTP query payload accepts a per-request `mem_limit`.
+  Determinism posture, per the signed spec: a query comfortably over budget
+  always errors and one comfortably under always succeeds; at the margin,
+  trip-vs-succeed and the rule named in the error may vary with parallel
+  scheduling. No embedded Datalog engine ships a per-query memory bound
+  (Soufflé has none; Datomic queries can OOM the host JVM; RDFox's
+  `max-memory` is whole-server) — this is the "safe substrate inside your
+  process" story made concrete.
 
 ## 0.14.0 — 2026-08-08
 

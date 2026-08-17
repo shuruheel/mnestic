@@ -63,6 +63,11 @@ pub struct QueryOutOptions {
     pub offset: Option<usize>,
     /// Terminate query with an error if it exceeds this many seconds.
     pub timeout: Option<f64>,
+    /// Terminate query with an error if its materialization exceeds this many
+    /// estimated bytes (mnestic fork, query memory budget; spec
+    /// `docs/specs/memory-budget.md`). Combined via `min` with the per-call
+    /// and Db-default limits — a block can only tighten the budget.
+    pub mem_limit: Option<usize>,
     /// Join-reorder policy (mnestic fork, 0.10.5). Default `Greedy`; `:reorder
     /// written` opts out. A `:limit` without `:sort` also forces `Written` at
     /// normalization time to keep the returned row subset stable.
@@ -92,6 +97,9 @@ impl Display for QueryOutOptions {
         }
         if let Some(l) = self.offset {
             writeln!(f, ":offset {l};")?;
+        }
+        if let Some(l) = self.mem_limit {
+            writeln!(f, ":mem_limit {l};")?;
         }
         if let Some(l) = self.timeout {
             writeln!(f, ":timeout {l};")?;
