@@ -51,6 +51,26 @@ pub(crate) mod ffi {
         pub message: String,
     }
 
+    /// What an open did with a shared memory handle (mnestic fork,
+    /// docs/specs/cross-instance-memory.md §4). Filled by
+    /// `open_db_with_resources`; the interesting bit is the loud override:
+    /// when the options file declared its own `block_cache`, the shared cache
+    /// wins and both capacities are reported so the caller can log them.
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct DbOpenReport {
+        /// A shared memory handle was installed on this open.
+        pub used_shared_resources: bool,
+        /// The `<path>/options` file declared a `block_cache`, which the
+        /// shared cache overrode.
+        pub overrode_options_file_cache: bool,
+        /// Capacity (bytes) of the cache the options file declared; only
+        /// meaningful when `overrode_options_file_cache` is true.
+        pub options_file_cache_capacity: u64,
+        /// Capacity (bytes) of the shared cache that was installed; only
+        /// meaningful when `used_shared_resources` is true.
+        pub shared_cache_capacity: u64,
+    }
+
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
     pub enum StatusCode {
         kOk = 0,
@@ -144,9 +164,37 @@ pub(crate) mod ffi {
             status: &mut RocksDbStatus,
         ) -> &'a [u8];
 
+        /// Shared cross-instance memory resources (mnestic fork,
+        /// docs/specs/cross-instance-memory.md): one LRU block cache (the
+        /// envelope) + one WriteBufferManager charged into it. Opaque;
+        /// crosses only as a `SharedPtr` function argument, never as a
+        /// `DbOpts` field.
+        type RocksMemoryResources;
+        fn new_memory_resources(
+            total_bytes: usize,
+            memtable_fraction: f64,
+        ) -> SharedPtr<RocksMemoryResources>;
+        fn wbm_memory_usage(self: &RocksMemoryResources) -> u64;
+        fn wbm_mutable_memtable_memory_usage(self: &RocksMemoryResources) -> u64;
+        fn wbm_dummy_entries_in_cache_usage(self: &RocksMemoryResources) -> u64;
+        fn wbm_buffer_size(self: &RocksMemoryResources) -> u64;
+        fn cache_capacity(self: &RocksMemoryResources) -> u64;
+        fn cache_usage(self: &RocksMemoryResources) -> u64;
+
         type RocksDbBridge;
         fn get_db_path(self: &RocksDbBridge) -> &CxxString;
         fn open_db(builder: &DbOpts, status: &mut RocksDbStatus) -> SharedPtr<RocksDbBridge>;
+        fn open_db_with_resources(
+            builder: &DbOpts,
+            resources: SharedPtr<RocksMemoryResources>,
+            status: &mut RocksDbStatus,
+            report: &mut DbOpenReport,
+        ) -> SharedPtr<RocksDbBridge>;
+        fn get_int_property(
+            self: &RocksDbBridge,
+            name: &str,
+            status: &mut RocksDbStatus,
+        ) -> u64;
         fn transact(self: &RocksDbBridge) -> UniquePtr<TxBridge>;
         fn snapshot_read(self: &RocksDbBridge) -> UniquePtr<SnapshotReadBridge>;
         fn del_range(self: &RocksDbBridge, lower: &[u8], upper: &[u8], status: &mut RocksDbStatus);
@@ -233,6 +281,18 @@ impl Default for ffi::RocksDbStatus {
             subcode: ffi::StatusSubCode::kNone,
             severity: ffi::StatusSeverity::kNoError,
             message: "".to_string(),
+        }
+    }
+}
+
+impl Default for ffi::DbOpenReport {
+    #[inline]
+    fn default() -> Self {
+        ffi::DbOpenReport {
+            used_shared_resources: false,
+            overrode_options_file_cache: false,
+            options_file_cache_capacity: 0,
+            shared_cache_capacity: 0,
         }
     }
 }

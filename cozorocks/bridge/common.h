@@ -23,6 +23,7 @@ using namespace std;
 
 struct RocksDbStatus;
 struct DbOpts;
+struct DbOpenReport;
 
 typedef Status::Code StatusCode;
 typedef Status::SubCode StatusSubCode;
