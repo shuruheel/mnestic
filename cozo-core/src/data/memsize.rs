@@ -78,7 +78,7 @@ pub(crate) fn json_heap_bytes(v: &serde_json::Value) -> usize {
 /// tuple used as a map *value* inside an existing entry carries no own entry.
 pub(crate) fn est_tuple_bytes(t: &[DataValue]) -> usize {
     std::mem::size_of::<Vec<DataValue>>()
-        + t.len() * std::mem::size_of::<DataValue>()
+        + std::mem::size_of_val(t)
         + t.iter().map(value_heap_bytes).sum::<usize>()
 }
 
