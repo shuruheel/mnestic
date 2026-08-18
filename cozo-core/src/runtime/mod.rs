@@ -17,6 +17,7 @@ pub(crate) mod imperative;
 pub(crate) mod minhash_lsh;
 pub(crate) mod reindex;
 pub(crate) mod relation;
+pub(crate) mod stored_queries;
 pub(crate) mod temp_store;
 #[cfg(test)]
 mod tests;

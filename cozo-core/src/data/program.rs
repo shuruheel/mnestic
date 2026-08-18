@@ -516,6 +516,9 @@ pub struct InputProgram {
     pub prog: BTreeMap<Symbol, InputInlineRulesOrFixed>,
     pub out_opts: QueryOutOptions,
     pub disable_magic_rewrite: bool,
+    /// Invocation-wide parameters, retained for stored-query expansion after
+    /// the caller has been parsed (mnestic fork, stored queries v1).
+    pub param_pool: Arc<BTreeMap<String, DataValue>>,
 }
 
 impl Display for InputProgram {

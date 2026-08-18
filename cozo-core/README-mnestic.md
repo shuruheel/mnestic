@@ -64,6 +64,11 @@ capabilities on top of it:
 - **Read-only Cypher** — an openCypher subset translated to CozoScript (alpha;
   feature `cypher`, off by default).
   ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/cypher-read.md))
+- **Stored / named queries** — `::query create/list/show/run/remove` persists
+  reusable, optionally typed and defaulted read rules. Invoke one by name or as
+  a normal rule atom; atom form is hygienically spliced before magic-set
+  rewriting, so caller bindings specialize through the stored rule chain.
+  ([spec](https://github.com/shuruheel/mnestic/blob/main/docs/specs/stored-queries.md))
 - **Faster lookups and plans** — equality pushdown turns post-filter point
   lookups into keyed seeks (~28× at 5k rows), plus a deterministic greedy join
   reorder and a default-on factorized `count()` rewrite (covering inequalities,

@@ -5,6 +5,23 @@ provenance and licensing.
 
 ## Unreleased
 
+- **Stored / named read queries** ([#9](https://github.com/shuruheel/mnestic/issues/9),
+  [`docs/specs/stored-queries.md`](docs/specs/stored-queries.md)): `::query
+  create/remove/list/show/run` persists reusable CozoScript definitions in the
+  ordinary reserved relation `mnestic_stored_queries`. A stored query can be
+  invoked as a rule atom, where it is hygienically namespace-mangled and enters
+  the normal stratification, magic-set, planner, budget, and relation-ACL path;
+  local rules shadow catalog names with a structured warning. Parameter
+  signatures are declared and introspectable, with optional type coercion and
+  definition-time defaults. Bodies are read-only in v1; atom form loudly
+  rejects program-level options such as `:limit`, while `::query run` honors
+  them. Definitions are transactional snapshot data, survive reopen and
+  export/import, enforce dependency-restricted removal, and carry a depth-32
+  defense against hand-edited catalog cycles. SQLite integration coverage pins
+  chained/diamond expansion, capture hygiene, typed parameters, aggregation,
+  negation, explain output, triggers, imperative scripts, ACLs, tamper defense,
+  and live fixed-rule registry revalidation.
+
 ## 0.15.0 — 2026-08-18
 
 An operations-and-interchange minor release: bounded query memory, RDF at the

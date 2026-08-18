@@ -16,12 +16,13 @@ use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
 use crate::data::program::InputProgram;
-use crate::data::relation::VecElementType;
+use crate::data::relation::{NullableColType, VecElementType};
 use crate::data::symb::Symbol;
 use crate::data::value::{DataValue, ValidityTs};
 use crate::fts::TokenizerConfig;
 use crate::parse::expr::{build_expr, parse_string};
 use crate::parse::query::parse_query;
+use crate::parse::schema::parse_nullable_type;
 use crate::parse::{ExtractSpan, Pairs, Rule, SourceSpan};
 use crate::runtime::relation::AccessLevel;
 use crate::{Expr, FixedRule};
@@ -79,6 +80,29 @@ pub enum SysOp {
     DropGraph(SmartString<LazyCompact>),
     /// mnestic fork, graph projection: one row per built variant
     ListGraphs,
+    CreateStoredQuery {
+        name: Symbol,
+        params: Vec<StoredQueryParam>,
+        body_text: String,
+        cur_vld: ValidityTs,
+    },
+    RemoveStoredQuery(Symbol),
+    ListStoredQueries,
+    ShowStoredQuery(Symbol),
+    RunStoredQuery {
+        name: Symbol,
+        param_pool: Arc<BTreeMap<String, DataValue>>,
+        cur_vld: ValidityTs,
+    },
+}
+
+/// A declared stored-query parameter. Types and defaults are optional, but
+/// every parameter referenced by the stored body must have one declaration.
+#[derive(Debug, Clone, serde_derive::Serialize, serde_derive::Deserialize)]
+pub(crate) struct StoredQueryParam {
+    pub(crate) name: String,
+    pub(crate) typing: Option<NullableColType>,
+    pub(crate) default: Option<DataValue>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -527,6 +551,83 @@ pub(crate) fn parse_sys(
                     SysOp::DropGraph(SmartString::from(name.as_str()))
                 }
                 Rule::graph_list => SysOp::ListGraphs,
+                r => unreachable!("{:?}", r),
+            }
+        }
+        Rule::query_op => {
+            let inner = inner.into_inner().next().unwrap();
+            match inner.as_rule() {
+                Rule::query_create => {
+                    let mut parts = inner.into_inner();
+                    let name_pair = parts.next().unwrap();
+                    let name = Symbol::new(name_pair.as_str(), name_pair.extract_span());
+                    let next = parts.next().unwrap();
+                    let (params, body_pair) = if next.as_rule() == Rule::query_params_decl {
+                        let mut params = Vec::new();
+                        let mut names = std::collections::BTreeSet::new();
+                        for param_pair in next.into_inner() {
+                            let mut fields = param_pair.into_inner();
+                            let param_name_pair = fields.next().unwrap();
+                            let param_name = param_name_pair
+                                .as_str()
+                                .strip_prefix('$')
+                                .unwrap()
+                                .to_string();
+                            ensure!(
+                                names.insert(param_name.clone()),
+                                "stored-query parameter '${param_name}' is declared more than once"
+                            );
+                            let mut typing = None;
+                            let mut default = None;
+                            for field in fields {
+                                match field.as_rule() {
+                                    Rule::col_type => typing = Some(parse_nullable_type(field)?),
+                                    Rule::expr => {
+                                        default =
+                                            Some(build_expr(field, param_pool)?.eval_to_const()?)
+                                    }
+                                    r => unreachable!("{:?}", r),
+                                }
+                            }
+                            if let (Some(typing), Some(value)) = (&typing, default.take()) {
+                                default = Some(typing.coerce(value, cur_vld)?);
+                            }
+                            params.push(StoredQueryParam {
+                                name: param_name,
+                                typing,
+                                default,
+                            });
+                        }
+                        (params, parts.next().unwrap())
+                    } else {
+                        (Vec::new(), next)
+                    };
+                    let raw_body = body_pair.as_str();
+                    let body_text = raw_body[1..raw_body.len() - 1].to_string();
+                    SysOp::CreateStoredQuery {
+                        name,
+                        params,
+                        body_text,
+                        cur_vld,
+                    }
+                }
+                Rule::query_remove => {
+                    let name = inner.into_inner().next().unwrap();
+                    SysOp::RemoveStoredQuery(Symbol::new(name.as_str(), name.extract_span()))
+                }
+                Rule::query_list => SysOp::ListStoredQueries,
+                Rule::query_show => {
+                    let name = inner.into_inner().next().unwrap();
+                    SysOp::ShowStoredQuery(Symbol::new(name.as_str(), name.extract_span()))
+                }
+                Rule::query_run => {
+                    let name = inner.into_inner().next().unwrap();
+                    SysOp::RunStoredQuery {
+                        name: Symbol::new(name.as_str(), name.extract_span()),
+                        param_pool: Arc::new(param_pool.clone()),
+                        cur_vld,
+                    }
+                }
                 r => unreachable!("{:?}", r),
             }
         }
