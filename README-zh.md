@@ -63,26 +63,19 @@
 其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## 0.15.0 新增
+## 0.16.0 新增
 
-一次聚焦运维边界与数据互操作的次版本发布：
+存储查询让可复用的 CozoScript 规则可以持久化并被检查：
 
-- **单查询内存预算：** `:mem_limit`、`ScriptRunOptions::with_mem_limit` 与数据库级默认值
-  按最小值组合，因此脚本只能收紧宿主设置的上限。超限会在提交前返回类型化的
-  `eval::mem_budget_exceeded` 错误。
-- **RDF 只存在于边界：** 可选的 `rdf-io` 功能把 Turtle、N-Triples、N-Quads 与 TriG
-  读入普通六列关系，并支持三元组/四元组导出及 IRI/CURIE 辅助函数；核心不会因此变成
-  原生三元组存储，也不新增 SPARQL 或 OWL 推理。
-- **多个 RocksDB 实例共享同一内存包络：** 块缓存与 write-buffer manager 可在进程内共享，
-  并提供配置冲突检查与每实例内存统计。本功能随 `mnestic-rocks` 0.1.11 发布。
-- **树形数据建模入门：** 可运行的
-  [JSON-LD/树形数据指南](docs/guides/modeling-tree-shaped-data.md)涵盖父子关系、带位置的数组、
-  异构邻接关系，以及保留原始 JSON 时的渐进式迁移。
+- `::query create`、`list`、`show`、`run` 与 `remove` 管理事务型
+  `mnestic_stored_queries` 目录中的命名只读查询。
+- 参数声明可被工具读取，并可选类型与定义时默认值。
+- 存储查询既可按名称运行，也可作为普通规则原子组合进其他查询；卫生式展开发生在
+  magic-set 重写之前，因此调用方绑定可沿规则链向下专化。
+- 定义可跨重启及导出/导入保留；依赖检查会阻止删除仍被其他存储查询引用的查询。
 
-迁移要点：发布的 Python wheel 现在启用 `rdf-io`。由于该功能会启用 `data-import`，且 wheel
-包含 `requests`，受信任的 CozoScript 可通过 `RdfReader`、`CsvReader` 与 `JsonReader`
-读取进程可访问的文件并发起 HTTP(S) 请求。Rust 默认配置仍保持关闭，除非显式启用
-`rdf-io` 或 `data-import`。查询内存上限与 RocksDB 共享内存均为显式启用，且无需迁移存储格式。
+v1 的查询体只读，并始终针对当前事务数据求值。本版本不缓存计划、不物化结果，
+也不需要迁移存储格式。
 
 完整细节见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 

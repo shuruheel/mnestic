@@ -86,33 +86,24 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.15.0
+## New in 0.16.0
 
-An operations-and-interchange minor release:
+Stored queries make reusable CozoScript rules persistent and inspectable:
 
-- **Per-query memory budgets:** `:mem_limit`,
-  `ScriptRunOptions::with_mem_limit`, and a database-wide default min-compose,
-  so script text can tighten but never raise a host limit. A trip returns the
-  typed `eval::mem_budget_exceeded` error before commit.
-- **RDF at the boundary:** the opt-in `rdf-io` feature reads Turtle, N-Triples,
-  N-Quads, and TriG into an ordinary six-column relation, exports triple/quad
-  relations, and adds IRI/CURIE helpers—without adding triple-native storage,
-  SPARQL, or OWL reasoning.
-- **One RocksDB memory envelope across instances:** a shared block cache and
-  write-buffer manager can bound the dominant RocksDB memory pools for every
-  database in a process, with conflict-checked process defaults and observable
-  per-instance statistics. This ships with `mnestic-rocks` 0.1.11.
-- **Tree-shaped data onboarding:** a runnable
-  [JSON-LD/tree modeling guide](docs/guides/modeling-tree-shaped-data.md) covers
-  nested parent/child rows, positional arrays, heterogeneous adjacency, and
-  incremental migration from retained JSON blobs.
+- `::query create`, `list`, `show`, `run`, and `remove` manage named read
+  queries in the transactional `mnestic_stored_queries` catalog.
+- Parameters are declared and introspectable, with optional types and
+  definition-time defaults.
+- A stored query can run by name or compose into another query as a rule atom.
+  Atom expansion is hygienic and happens before magic-set rewriting, so caller
+  bindings specialize through the stored rule chain.
+- Definitions survive reopen and export/import. Removal refuses while another
+  stored query depends on the name, and a depth limit defends against a
+  hand-edited catalog cycle.
 
-Migration highlight: the published Python wheel now enables `rdf-io`. Because
-that feature implies `data-import` and the wheel includes `requests`, trusted
-CozoScript in the wheel can read process-readable files and make HTTP(S)
-requests through `RdfReader`, `CsvReader`, and `JsonReader`. Rust defaults remain
-locked down unless `rdf-io` or `data-import` is enabled explicitly. Query memory
-limits and shared RocksDB memory are opt-in; there is no storage-format migration.
+Stored bodies are read-only in v1. They are always evaluated against current
+transaction data; this release does not cache plans or materialize results.
+There is no storage-format migration, and `mnestic-rocks` remains at 0.1.11.
 
 Full detail is in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 

@@ -76,29 +76,29 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.15.0
+## New in 0.16.0
 
-The Python-facing highlights of this operations-and-interchange release:
+Python callers can now define and invoke persistent named read queries through
+the existing `run_script` API:
 
-- **Bound query memory.** A script may set `:mem_limit <bytes>` and receives the
-  typed `eval::mem_budget_exceeded` error before commit if it trips. Rust and
-  server hosts also expose per-call and database-wide ceilings.
-- **RDF import is included in wheels.** `RdfReader` accepts Turtle, N-Triples,
-  N-Quads, and TriG; IRI/CURIE helpers are available in CozoScript. The raw
-  source remains relational rather than becoming a triple-native store.
-- **Share RocksDB memory across databases.** Pass a `shared_memory` object in
-  the RocksDB options JSON to join the process-wide block-cache/write-buffer
-  envelope. Detailed memory-stat accessors are currently Rust-only.
-- **Model nested data deliberately.** The runnable
-  [JSON-LD/tree guide](https://github.com/shuruheel/mnestic/blob/main/docs/guides/modeling-tree-shaped-data.md)
-  covers parent/child rows, positional arrays, and heterogeneous adjacency.
+```python
+db.run_script("""
+::query create recent_items ($since: Int) {
+    ?[uid, created_at] := *item{uid, created_at}, created_at >= $since
+}
+""", {}, False)
 
-Migration highlight: enabling RDF reach reverses the 0.14.0 wheel-reader
-default. The wheel registers `RdfReader`, `CsvReader`, and `JsonReader`, and its
-compiled HTTP support lets trusted CozoScript fetch non-`file://` URLs. Run only
-trusted scripts, or build from source without `rdf-io` for a locked-down
-deployment. Memory budgets and shared RocksDB resources remain opt-in, and no
-storage migration is required.
+rows = db.run_script(
+    "::query run recent_items",
+    {"since": 1_700_000_000},
+    True,
+)["rows"]
+```
+
+Stored queries have introspectable typed/defaulted parameters, compose as
+ordinary rule atoms, survive reopen and export/import, and always evaluate
+current transaction data. Bodies are read-only in v1; this is not a plan cache
+or a materialized-result feature. No storage migration is required.
 
 See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
 for the full accounting, and for 0.13.0's upgrade guidance if you are coming

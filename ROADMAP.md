@@ -4,7 +4,7 @@ mnestic is a maintained, independently-developed fork of [CozoDB](https://github
 
 This document is the **public, forward-looking roadmap**: where the project is going and how to help.
 
-> **Release status — checked 2026-08-18:** 0.15.0 is the newest Mnestic release on crates.io,
+> **Release status — checked 2026-08-18:** 0.16.0 is the newest Mnestic release on crates.io,
 > PyPI, and GitHub. Mnestic's engine version is independent of the MindGraph SDK's
 > version, even when both happen to use the same number.
 
@@ -26,11 +26,13 @@ Every item is judged against that goal — and described as a general database m
 
 ## Unreleased on main
 
-- **Stored / named queries** ([#9](https://github.com/shuruheel/mnestic/issues/9), [`docs/specs/stored-queries.md`](docs/specs/stored-queries.md)): reusable, optionally typed/defaulted read rules now persist in an ordinary relation and run either by name (`::query run`) or as hygienically spliced Datalog atoms. They participate in magic sets and every existing planner, budget, snapshot, and relation-ACL path; removal is dependency-restricted, v1 bodies are read-only, and program-level options are honored only in standalone form. The implementation includes SQLite coverage for persistence/export-import, dependency diamonds and capture hygiene, parameters, aggregation/negation, explain, triggers, imperative scripts, ACLs, catalog tampering, and live fixed-rule registration. This establishes the stable identity and single parse funnel for a future plan cache without building that cache now.
+_No unreleased engine changes after 0.16.0._
 
-## What's released through 0.15.0
+## What's released through 0.16.0
 
 The agentic-memory *retrieval* foundation is largely in place. Highlights (see [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for detail):
+
+- **Stored / named queries** (0.16.0; [#9](https://github.com/shuruheel/mnestic/issues/9), [spec](docs/specs/stored-queries.md)): reusable, optionally typed/defaulted read rules persist in an ordinary relation and run either by name (`::query run`) or as hygienically spliced Datalog atoms. They participate in magic sets and every existing planner, budget, snapshot, and relation-ACL path; removal is dependency-restricted and v1 bodies are read-only. The stable catalog identity and single parse funnel establish the substrate for a future plan cache without building that cache now. No storage-format migration is required.
 
 - **Bounded query and RocksDB memory, RDF boundary I/O, and runnable tree-data onboarding** (0.15.0; [#46](https://github.com/shuruheel/mnestic/pull/46), [#47](https://github.com/shuruheel/mnestic/pull/47), [#48](https://github.com/shuruheel/mnestic/pull/48), [#7](https://github.com/shuruheel/mnestic/issues/7)): a per-query byte budget min-composes script, per-call, and Db-wide ceilings and aborts with `eval::mem_budget_exceeded` before commit; multiple RocksDB databases can share one block-cache/write-buffer envelope with observable per-instance usage; the opt-in `rdf-io` feature reads and exports Turtle-family RDF through ordinary relations; and the JSON-LD/tree guide pins parent/child, positional-array, and heterogeneous-adjacency patterns with executable examples. `mnestic-rocks` 0.1.11 carries the bridge half. **Python migration note:** the 0.15.0 wheel enables `rdf-io`, which also registers the script-controlled CSV/JSON readers and HTTP(S) fetch support; run only trusted CozoScript or build without `rdf-io`. The memory controls are opt-in and no storage-format migration is required.
 
@@ -64,7 +66,7 @@ The agentic-memory *retrieval* foundation is largely in place. Highlights (see [
 
 ## Current status and what's next
 
-Tiered by value and readiness. This is direction, not a dated commitment. Stored queries are now in the unreleased section above; Parquet/Arrow remains the active high-priority implementation item below.
+Tiered by value and readiness. This is direction, not a dated commitment. Stored queries shipped in 0.16.0; Parquet/Arrow remains the active high-priority implementation item below.
 
 ### Active priorities
 
