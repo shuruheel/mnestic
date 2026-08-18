@@ -89,29 +89,22 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.15.0
+## New in 0.16.0
 
-An operations-and-interchange minor release:
+Stored queries make reusable CozoScript rules persistent and inspectable:
 
-- `:mem_limit`, `ScriptRunOptions::with_mem_limit`, and a database-wide default
-  bound estimated query memory. Limits min-compose, and a trip raises
-  `eval::mem_budget_exceeded` before commit.
-- The opt-in `rdf-io` feature reads Turtle, N-Triples, N-Quads, and TriG into an
-  ordinary six-column relation, exports triple/quad relations, and adds IRI/CURIE
-  helpers—without changing the core relational model.
-- RocksDB instances can share one block cache and write-buffer manager, with
-  conflict-checked process defaults and per-instance memory statistics. This
-  ships with `mnestic-rocks` 0.1.11.
-- A runnable
-  [JSON-LD/tree modeling guide](https://github.com/shuruheel/mnestic/blob/main/docs/guides/modeling-tree-shaped-data.md)
-  covers nested objects, positional arrays, heterogeneous adjacency, and
-  incremental migration from retained JSON.
+- `::query create`, `list`, `show`, `run`, and `remove` manage named read
+  queries in the transactional `mnestic_stored_queries` catalog.
+- Parameters are declared and introspectable, with optional types and
+  definition-time defaults.
+- A stored query can run by name or compose into another query as a rule atom.
+  Hygienic expansion happens before magic-set rewriting, so caller bindings
+  specialize through the stored rule chain.
+- Definitions survive reopen and export/import; dependency checks prevent
+  removing a query that another stored query still uses.
 
-Migration highlight: the Python wheel enables `rdf-io`, which also registers
-the script-controlled CSV/JSON readers and HTTP(S) fetch support. Rust defaults
-remain locked down unless `rdf-io` or `data-import` is enabled explicitly.
-Memory limits and shared RocksDB resources are opt-in; no storage migration is
-required.
+Stored bodies are read-only in v1 and always evaluate current transaction data.
+There is no plan cache, result materialization, or storage-format migration.
 
 Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
@@ -123,7 +116,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.15.0"
+mnestic = "0.16.0"
 ```
 
 ```rust

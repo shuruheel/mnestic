@@ -5,6 +5,12 @@ provenance and licensing.
 
 ## Unreleased
 
+## 0.16.0 — 2026-08-18
+
+A query-reuse minor release: persistent, composable named read queries with
+declared parameter contracts. There is no storage-format migration, and the
+`mnestic-rocks` bridge remains at 0.1.11.
+
 - **Stored / named read queries** ([#9](https://github.com/shuruheel/mnestic/issues/9),
   [`docs/specs/stored-queries.md`](docs/specs/stored-queries.md)): `::query
   create/remove/list/show/run` persists reusable CozoScript definitions in the
