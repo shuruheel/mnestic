@@ -58,6 +58,7 @@ use crate::runtime::graph_projection::ProjectionCache;
 use crate::runtime::relation::{
     try_extend_tuple_from_v, AccessLevel, InsufficientAccessLevel, RelationHandle, RelationId,
 };
+use crate::runtime::stored_queries;
 use crate::runtime::transact::SessionTx;
 use crate::runtime::tt_clock::{wall_clock_micros, TtClock};
 use crate::storage::temp::TempStorage;
@@ -705,7 +706,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             CozoScript::Imperative(ps) => {
                 self.execute_imperative(cur_vld, &ps, read_only, outer_deadline, outer_mem_limit)
             }
-            CozoScript::Sys(op) => self.run_sys_op(op, read_only),
+            CozoScript::Sys(op) => self.run_sys_op(op, read_only, outer_deadline, outer_mem_limit),
         };
         // Structured diagnostics (mnestic fork): move whatever this script
         // emitted into the Db ring, on success AND on error — a failed query's
@@ -2432,7 +2433,21 @@ impl<'s, S: Storage<'s>> Db<S> {
     ) -> Result<NamedRows> {
         match op {
             SysOp::Explain(prog) => {
-                let (normalized_program, _) = prog.clone().into_normalized_program(tx)?;
+                let mut prog = prog.as_ref().clone();
+                let fixed_rules = self.get_fixed_rules();
+                let custom_aggrs = self.get_custom_aggrs();
+                let custom_bounded = self.get_custom_bounded_meets();
+                stored_queries::resolve_stored_queries(
+                    tx,
+                    &mut prog,
+                    &fixed_rules,
+                    crate::data::aggr::CustomAggrRegistries {
+                        meet: &custom_aggrs,
+                        bounded: &custom_bounded,
+                    },
+                    current_validity(),
+                )?;
+                let (normalized_program, _) = prog.into_normalized_program(tx)?;
                 // mnestic fork (query factorization): show the rewritten plan
                 // when the kill switch is on, and surface the detector advisory
                 // as an extra `::explain` row either way.
@@ -2489,6 +2504,91 @@ impl<'s, S: Storage<'s>> Db<S> {
                     ],
                     rows,
                 ))
+            }
+            SysOp::CreateStoredQuery {
+                name,
+                params,
+                body_text,
+                cur_vld,
+            } => {
+                if read_only {
+                    bail!("Cannot create a stored query in read-only mode");
+                }
+                let catalog_name = SmartString::from(stored_queries::STORED_QUERY_CATALOG);
+                let locks = if skip_locking {
+                    vec![]
+                } else {
+                    self.obtain_relation_locks(iter::once(&catalog_name))
+                };
+                let _guards = locks.iter().map(|lock| lock.read().unwrap()).collect_vec();
+                let fixed_rules = self.get_fixed_rules();
+                let custom_aggrs = self.get_custom_aggrs();
+                let custom_bounded = self.get_custom_bounded_meets();
+                stored_queries::create(
+                    tx,
+                    name,
+                    params,
+                    body_text,
+                    &fixed_rules,
+                    crate::data::aggr::CustomAggrRegistries {
+                        meet: &custom_aggrs,
+                        bounded: &custom_bounded,
+                    },
+                    *cur_vld,
+                )
+            }
+            SysOp::RemoveStoredQuery(name) => {
+                if read_only {
+                    bail!("Cannot remove a stored query in read-only mode");
+                }
+                let catalog_name = SmartString::from(stored_queries::STORED_QUERY_CATALOG);
+                let locks = if skip_locking {
+                    vec![]
+                } else {
+                    self.obtain_relation_locks(iter::once(&catalog_name))
+                };
+                let _guards = locks.iter().map(|lock| lock.read().unwrap()).collect_vec();
+                stored_queries::remove(tx, name)
+            }
+            SysOp::ListStoredQueries => stored_queries::list(tx),
+            SysOp::ShowStoredQuery(name) => stored_queries::show(tx, name),
+            SysOp::RunStoredQuery {
+                name,
+                param_pool,
+                cur_vld,
+            } => {
+                let definition = stored_queries::read_definition(tx, &name.name)?
+                    .ok_or_else(|| miette!("stored query '{name}' does not exist"))?;
+                let fixed_rules = self.get_fixed_rules();
+                let custom_aggrs = self.get_custom_aggrs();
+                let custom_bounded = self.get_custom_bounded_meets();
+                let program = stored_queries::parse_definition(
+                    &definition,
+                    param_pool,
+                    &fixed_rules,
+                    crate::data::aggr::CustomAggrRegistries {
+                        meet: &custom_aggrs,
+                        bounded: &custom_bounded,
+                    },
+                    *cur_vld,
+                )?;
+                ensure!(
+                    program.needs_write_lock().is_none(),
+                    "stored query '{name}' is not read-only"
+                );
+                let mut callback_collector = BTreeMap::new();
+                let callback_targets = BTreeSet::new();
+                let mut cleanups = Vec::new();
+                let rows = self.execute_single_program(
+                    program,
+                    tx,
+                    &mut cleanups,
+                    *cur_vld,
+                    &callback_targets,
+                    &mut callback_collector,
+                )?;
+                debug_assert!(cleanups.is_empty());
+                Ok(rows)
             }
             SysOp::ListRelations => self.list_relations(tx),
             SysOp::ListFixedRules => {
@@ -3225,7 +3325,13 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
         }
     }
-    fn run_sys_op(&'s self, op: SysOp, read_only: bool) -> Result<NamedRows> {
+    fn run_sys_op(
+        &'s self,
+        op: SysOp,
+        read_only: bool,
+        outer_deadline: Option<Instant>,
+        outer_mem_limit: Option<usize>,
+    ) -> Result<NamedRows> {
         // ::running and ::kill touch only the in-memory query registry, so
         // they dispatch before any transaction is opened: on mem/sqlite a
         // write tx takes a store-wide lock that queues behind every running
@@ -3269,6 +3375,11 @@ impl<'s, S: Storage<'s>> Db<S> {
         } else {
             self.transact_write()?
         };
+        // `::query run` is a sysop syntactically but evaluates an ordinary
+        // query program. Preserve the same per-call/Db deadline and memory
+        // ceilings that a top-level query receives; other sysops ignore them.
+        tx.script_deadline = outer_deadline;
+        tx.script_mem_limit = outer_mem_limit;
         let res = self.run_sys_op_with_tx(&mut tx, &op, read_only, false)?;
         tx.commit_tx()?;
         Ok(res)
@@ -3283,6 +3394,20 @@ impl<'s, S: Storage<'s>> Db<S> {
         callback_collector: &mut CallbackCollector,
         top_level: bool,
     ) -> Result<(NamedRows, Vec<(Vec<u8>, Vec<u8>)>)> {
+        let mut input_program = input_program;
+        let fixed_rules = self.fixed_rules.read().unwrap().clone();
+        let custom_aggrs = self.custom_aggrs.read().unwrap().clone();
+        let custom_bounded = self.custom_bounded_meets.read().unwrap().clone();
+        stored_queries::resolve_stored_queries(
+            tx,
+            &mut input_program,
+            &fixed_rules,
+            crate::data::aggr::CustomAggrRegistries {
+                meet: &custom_aggrs,
+                bounded: &custom_bounded,
+            },
+            cur_vld,
+        )?;
         // cleanups contain stored relations that should be deleted at the end of query
         let mut clean_ups = vec![];
 

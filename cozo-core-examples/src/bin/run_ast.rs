@@ -47,6 +47,7 @@ fn main() {
                 },
                 out_opts: Default::default(),
                 disable_magic_rewrite: false,
+                param_pool: Default::default(),
             },
             store_as: None,
         },

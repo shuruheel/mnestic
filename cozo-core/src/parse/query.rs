@@ -452,6 +452,7 @@ pub(crate) fn parse_query(
         prog: progs,
         out_opts,
         disable_magic_rewrite,
+        param_pool: Arc::new(param_pool.clone()),
     };
 
     if prog.prog.is_empty() {

@@ -218,6 +218,9 @@ impl ImperativeStmt {
                 SysOp::Reindex(rel) | SysOp::RepairCorrupt(rel) => {
                     collector.insert(rel.name.clone());
                 }
+                SysOp::CreateStoredQuery { .. } | SysOp::RemoveStoredQuery(_) => {
+                    collector.insert(SmartString::from("mnestic_stored_queries"));
+                }
                 _ => {}
             },
         }
@@ -481,6 +484,34 @@ pub fn parse_script(
         )?),
         _ => unreachable!(),
     })
+}
+
+/// Collect the parameter tokens referenced by a syntactically valid single
+/// query without attempting semantic parameter substitution. Stored-query
+/// creation uses this to report the complete declared/used signature mismatch
+/// before `parse_script` would stop at the first missing value.
+pub(crate) fn collect_query_params(src: &str) -> Result<BTreeSet<String>> {
+    fn walk(pair: Pair<'_>, out: &mut BTreeSet<String>) {
+        if pair.as_rule() == Rule::param {
+            out.insert(pair.as_str().trim_start_matches('$').to_string());
+            return;
+        }
+        for child in pair.into_inner() {
+            walk(child, out);
+        }
+    }
+
+    let parsed = CozoScriptParser::parse(Rule::query_script, src)
+        .map_err(|err| {
+            parse_error_with_detail(src, err, || {
+                CozoScriptParser::parse(Rule::query_script, src).map(|_| ())
+            })
+        })?
+        .next()
+        .unwrap();
+    let mut out = BTreeSet::new();
+    walk(parsed, &mut out);
+    Ok(out)
 }
 
 trait ExtractSpan {
