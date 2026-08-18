@@ -4,9 +4,9 @@ mnestic is a maintained, independently-developed fork of [CozoDB](https://github
 
 This document is the **public, forward-looking roadmap**: where the project is going and how to help.
 
-> **Release status — checked 2026-08-18:** 0.14.0 (released 2026-08-08) is the newest Mnestic release on crates.io,
+> **Release status — checked 2026-08-18:** 0.15.0 is the newest Mnestic release on crates.io,
 > PyPI, and GitHub. Mnestic's engine version is independent of the MindGraph SDK's
-> version, even when both happen to use 0.14.0.
+> version, even when both happen to use the same number.
 
 ## Our commitment
 
@@ -24,9 +24,11 @@ Make the engine the best **substrate for agentic memory**: in *one embedded engi
 
 Every item is judged against that goal — and described as a general database mechanism, not in terms of any specific application.
 
-## What's released through 0.14.0
+## What's released through 0.15.0
 
 The agentic-memory *retrieval* foundation is largely in place. Highlights (see [`CHANGELOG-FORK.md`](./CHANGELOG-FORK.md) for detail):
+
+- **Bounded query and RocksDB memory, RDF boundary I/O, and runnable tree-data onboarding** (0.15.0; [#46](https://github.com/shuruheel/mnestic/pull/46), [#47](https://github.com/shuruheel/mnestic/pull/47), [#48](https://github.com/shuruheel/mnestic/pull/48), [#7](https://github.com/shuruheel/mnestic/issues/7)): a per-query byte budget min-composes script, per-call, and Db-wide ceilings and aborts with `eval::mem_budget_exceeded` before commit; multiple RocksDB databases can share one block-cache/write-buffer envelope with observable per-instance usage; the opt-in `rdf-io` feature reads and exports Turtle-family RDF through ordinary relations; and the JSON-LD/tree guide pins parent/child, positional-array, and heterogeneous-adjacency patterns with executable examples. `mnestic-rocks` 0.1.11 carries the bridge half. **Python migration note:** the 0.15.0 wheel enables `rdf-io`, which also registers the script-controlled CSV/JSON readers and HTTP(S) fetch support; run only trusted CozoScript or build without `rdf-io`. The memory controls are opt-in and no storage-format migration is required.
 
 - **Defense-in-depth security hardening across storage, query construction, relation reads, data import, the HTTP server, and the release boundary** (0.14.0; [#40](https://github.com/shuruheel/mnestic/pull/40), [#39](https://github.com/shuruheel/mnestic/pull/39), [#37](https://github.com/shuruheel/mnestic/pull/37), [#36](https://github.com/shuruheel/mnestic/pull/36), [#28](https://github.com/shuruheel/mnestic/pull/28), [#24](https://github.com/shuruheel/mnestic/pull/24), [#22](https://github.com/shuruheel/mnestic/pull/22)): vector decoding now rejects byte payloads that are not aligned to their declared `f32` / `f64` element width before the unsafe copy; the LangChain and LlamaIndex stores accept only bare identifiers in generated CozoScript and coerce numeric index settings before interpolation; and persistent relation IDs now serialize through the stored counter, preventing two stale TiKV clients from assigning the same ID. The TiKV fix is guarded by a pinned, real-cluster test in which two independently opened clients race relation creation and must preserve distinct seed, left, and right relations; abandoned TiKV transactions also roll back instead of panicking on drop. Stored-relation authorization now has one checked read resolver, ordinary indexes inherit their base relation's effective ACL, and graph projections re-check node and edge sources at creation, cold build, and warm cache access — so a relation made `Hidden` cannot remain observable through an index, negation, fixed rule, imperative return, export, history read, or cached projection. Script-controlled `CsvReader` and `JsonReader` access to local files and outbound requests is no longer registered by default; trusted Rust deployments opt in with `data-import` (plus `requests` for HTTP(S)). The HTTP server now authenticates loopback by default; its explicit loopback-only `--insecure-no-auth` mode validates the configured Host / HTTP/2 authority, Origin, and Fetch Metadata before granting local access. Remote transactions are principal-bound, re-authorized on every operation, protected from idle-reaper and concurrent-finish races, and read-only transactions reject writes. Import and backup endpoints require mutable grants, and HTTP backup paths are confined to the configured backup directory. The crates.io OIDC publisher once again sits behind the protected `crates-io` GitHub Environment. The exact combined tree passed the full mnestic CI matrix plus MindGraph's Linux/macOS, RocksDB-backed core and server suites. **Migration notes for 0.14.0:** local HTTP clients must authenticate unless the server is deliberately started with `--insecure-no-auth`; HTTP backup paths are relative to the configured backup directory; indirect reads that previously leaked a `Hidden` relation now fail with an access error; and trusted Rust callers that need `CsvReader` / `JsonReader` must enable `data-import` explicitly.
 
@@ -56,22 +58,12 @@ The agentic-memory *retrieval* foundation is largely in place. Highlights (see [
 - **Corruption resilience & upgrade-safe catalogs** — `::repair_corrupt` and tolerant index builds, so one bad row never makes a database unopenable; and (0.10.6) forward-compatible relation catalogs — a database written by a pre-0.10.0 build keeps opening across engine upgrades (the 0.10.0 bitemporality field addition had made pre-0.10.0 catalogs undeserializable).
 - **Planner & DX fixes** — equality-pushdown keyed lookups (~28× on point queries), keyword-prefixed identifier parsing, ULID functions.
 
-## Banked on `main` after 0.14.0
-
-The following work is merged, documented under [`CHANGELOG-FORK.md`'s Unreleased section](./CHANGELOG-FORK.md#unreleased), and green on the current `main`, but is **not yet available in the published 0.14.0 crates or wheel**. Do not describe it as released until the next tags and registry artifacts exist.
-
-- **Per-query memory budgets** ([#46](https://github.com/shuruheel/mnestic/pull/46)): `:mem_limit`, `ScriptRunOptions::with_mem_limit`, and a Db-wide default min-compose so script text can tighten, but never raise, a host limit. A trip returns `eval::mem_budget_exceeded` before commit. The accounting is intentionally an estimate of engine-held bytes; the materialized-join right-side cache and normal-aggregate work map remain documented uncharged channels. Spec: [`docs/specs/memory-budget.md`](docs/specs/memory-budget.md).
-- **RDF at the boundary** ([#47](https://github.com/shuruheel/mnestic/pull/47)): the `rdf-io` feature adds `RdfReader` for Turtle, N-Triples, N-Quads, and TriG, IRI/CURIE helpers, and strict six-column round-trip export without making RDF a core storage model. **Next-wheel migration:** the Python wheel enables `rdf-io`, which implies `data-import`; trusted CozoScript in that wheel can therefore read process-readable files and, because `requests` is compiled, make HTTP(S) requests. Spec: [`docs/specs/rdf-boundary-io.md`](docs/specs/rdf-boundary-io.md).
-- **A shared RocksDB memory envelope across instances** ([#48](https://github.com/shuruheel/mnestic/pull/48)): one shared block cache plus a `WriteBufferManager` carve-out, conflict-checked process-default configuration for bindings, and per-instance/handle memory statistics. This changes the `mnestic-rocks` bridge, so release order is `mnestic-rocks` first and then the `mnestic` crate that pins it. Spec: [`docs/specs/cross-instance-memory.md`](docs/specs/cross-instance-memory.md).
-- **Tree-shaped and JSON-LD modeling guide** ([#7](https://github.com/shuruheel/mnestic/issues/7)): runnable parent/child, positional-array, and heterogeneous adjacency patterns, with `parse_json()` / `get()` / `json()` guidance for incremental migrations. The examples are pinned by an SQLite integration test.
-
 ## Current status and what's next
 
-Tiered by value and readiness. This is direction, not a dated commitment. After #7 closes, the live issue tracker has two open issues marked `priority: high`; both are represented in the active set below.
+Tiered by value and readiness. This is direction, not a dated commitment. The live issue tracker has two open issues marked `priority: high`; both are represented in the active set below.
 
 ### Active priorities
 
-- **Cut the next engine release.** The implementation tranche above is already merged and green. Release work comes before starting another engine feature: choose the next version, publish the required `mnestic-rocks` bridge first, synchronize immutable registry README/version echoes, then publish and verify the Rust and Python artifacts.
 - **Stored / named queries** ([#9](https://github.com/shuruheel/mnestic/issues/9), `priority: high`). Reusable parameterized read rules would serve agent tooling and establish the substrate for a future plan cache. This remains design-first: parameter contracts, naming, persistence, recursion, permissions, and `::explain` behavior must be settled before implementation.
 - **Parquet/Arrow ingestion and Arrow export** ([#11](https://github.com/shuruheel/mnestic/issues/11), `priority: high`). The bounded first slice is feature-gated, chunked Parquet/Arrow import into stored relations; Arrow record-batch export and Python zero-copy handoff can follow. Dependency weight and the script-controlled reader trust boundary must be designed explicitly.
 - **HNSW verify/repair.** `::reindex` can already rebuild an interrupted index; a targeted integrity check and in-place repair would reduce recovery cost. This is still roadmap-only and needs a tracker issue plus a failure corpus before implementation.

@@ -1,6 +1,6 @@
 {
   "_comment": "Committed plan-shape baseline for the T0 planner gate (cozo-core/tests/planner_shape.rs). The ordered `load_stored` relation sequence per query — i.e. the join order. Regenerate with: cargo test -p mnestic --test planner_shape -- --ignored regenerate. Refresh ONLY in a reviewed commit that explains why the plan changed; CI never writes this file.",
-  "engine_version": "0.14.0",
+  "engine_version": "0.15.0",
   "queries": {
     "lsqb_q1": {
       "greedy": [

@@ -76,32 +76,29 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.14.0
+## New in 0.15.0
 
-The Python-facing highlights of this security-first minor release:
+The Python-facing highlights of this operations-and-interchange release:
 
-- **Safer defaults.** The wheel no longer registers CozoScript's file/network
-  `CsvReader` and `JsonReader` utilities. Stored-relation ACLs now cover
-  indexes, negation, fixed rules, exports, history, and cached graph
-  projections; malformed vector payloads fail before unsafe decoding.
-- **Exact-phrase FTS and matched context.** Quoted multi-word queries require
-  adjacency and order. FTS atoms can bind the matching byte offsets with
-  `bind_spans`, and `snippet(text, spans, window)` formats a window without
-  re-tokenizing the document.
-- **Durability is explicit.** `db.set_durable_writes(True)` requests
-  fsync-on-commit and returns whether the selected backend honors the knob.
-  RocksDB does; SQLite is already durable under its default
-  `synchronous=FULL` policy and reports `False`.
-- **Warnings are queryable.** `::warnings` returns stable warning codes with a
-  message and actionable hint; `::warnings clear` empties the per-database
-  buffer.
-- **Hardened framework adapters.** `langchain-mnestic` 0.2.1 and
-  `llama-index-vector-stores-mnestic` 0.2.1 validate all identifiers and numeric
-  HNSW settings before constructing CozoScript.
+- **Bound query memory.** A script may set `:mem_limit <bytes>` and receives the
+  typed `eval::mem_budget_exceeded` error before commit if it trips. Rust and
+  server hosts also expose per-call and database-wide ceilings.
+- **RDF import is included in wheels.** `RdfReader` accepts Turtle, N-Triples,
+  N-Quads, and TriG; IRI/CURIE helpers are available in CozoScript. The raw
+  source remains relational rather than becoming a triple-native store.
+- **Share RocksDB memory across databases.** Pass a `shared_memory` object in
+  the RocksDB options JSON to join the process-wide block-cache/write-buffer
+  envelope. Detailed memory-stat accessors are currently Rust-only.
+- **Model nested data deliberately.** The runnable
+  [JSON-LD/tree guide](https://github.com/shuruheel/mnestic/blob/main/docs/guides/modeling-tree-shaped-data.md)
+  covers parent/child rows, positional arrays, and heterogeneous adjacency.
 
-Migration highlights: indirect reads of `Hidden` relations now fail, and
-quoted multi-word FTS queries now mean exact phrases. Drop the quotes to retain
-the previous AND-of-terms behavior.
+Migration highlight: enabling RDF reach reverses the 0.14.0 wheel-reader
+default. The wheel registers `RdfReader`, `CsvReader`, and `JsonReader`, and its
+compiled HTTP support lets trusted CozoScript fetch non-`file://` URLs. Run only
+trusted scripts, or build from source without `rdf-io` for a locked-down
+deployment. Memory budgets and shared RocksDB resources remain opt-in, and no
+storage migration is required.
 
 See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
 for the full accounting, and for 0.13.0's upgrade guidance if you are coming

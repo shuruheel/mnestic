@@ -59,27 +59,26 @@
 其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## 0.14.0 新增
+## 0.15.0 新增
 
-一次以安全为主线的次版本发布，同时包含检索与运维能力：
+一次聚焦运维边界与数据互操作的次版本发布：
 
-- **纵深安全加固：** 关系访问控制现已覆盖索引、否定、fixed rule、导出、历史读取与缓存图投影；
-  HTTP 服务器默认要求本机回环连接也进行认证，并将远程事务绑定到每次操作都会重新授权的主体；
-  非法向量字节在进入 unsafe 解码前即被拒绝；TiKV 关系 ID 在独立客户端之间串行分配；
-  LangChain/LlamaIndex 适配器会验证所有插入 CozoScript 的标识符。
-- **脚本控制的数据导入改为显式启用。** `CsvReader` 与 `JsonReader` 能读取进程可访问的本地文件，
-  并可在启用 HTTP 后发出外部请求，因此默认不再注册。受信任的 Rust 部署可显式启用
-  `data-import`（HTTP(S) 数据源还需启用 `requests`）。
-- **精确短语全文检索与命中上下文：** 带引号的多词查询现要求相邻且顺序一致；`bind_spans`
-  返回命中的字节偏移；`snippet(text, spans, window)` 生成与索引分词器一致的上下文窗口。
-- **运维控制：** `set_durable_writes(true)` 在后端支持时请求每次提交执行 fsync；类型化警告可通过
-  `::warnings` 与 `Db::recent_warnings` 读取。
-- **发布可信度：** CI 固定递归查询的计划形状与精确结果，并包含每晚 10,000 次迭代的深层
-  不动点回归门槛。
+- **单查询内存预算：** `:mem_limit`、`ScriptRunOptions::with_mem_limit` 与数据库级默认值
+  按最小值组合，因此脚本只能收紧宿主设置的上限。超限会在提交前返回类型化的
+  `eval::mem_budget_exceeded` 错误。
+- **RDF 只存在于边界：** 可选的 `rdf-io` 功能把 Turtle、N-Triples、N-Quads 与 TriG
+  读入普通六列关系，并支持三元组/四元组导出及 IRI/CURIE 辅助函数；核心不会因此变成
+  原生三元组存储，也不新增 SPARQL 或 OWL 推理。
+- **多个 RocksDB 实例共享同一内存包络：** 块缓存与 write-buffer manager 可在进程内共享，
+  并提供配置冲突检查与每实例内存统计。本功能随 `mnestic-rocks` 0.1.11 发布。
+- **树形数据建模入门：** 可运行的
+  [JSON-LD/树形数据指南](docs/guides/modeling-tree-shaped-data.md)涵盖父子关系、带位置的数组、
+  异构邻接关系，以及保留原始 JSON 时的渐进式迁移。
 
-迁移要点：HTTP 客户端现在必须认证，除非服务器被明确配置为仅回环可用的
-`--insecure-no-auth`；HTTP 备份路径相对于配置的备份目录；此前可间接泄漏 `Hidden` 关系的读取
-现在会失败；带引号的多词 FTS 查询现在表示精确短语（移除引号即可保留 AND-of-terms 行为）。
+迁移要点：发布的 Python wheel 现在启用 `rdf-io`。由于该功能会启用 `data-import`，且 wheel
+包含 `requests`，受信任的 CozoScript 可通过 `RdfReader`、`CsvReader` 与 `JsonReader`
+读取进程可访问的文件并发起 HTTP(S) 请求。Rust 默认配置仍保持关闭，除非显式启用
+`rdf-io` 或 `data-import`。查询内存上限与 RocksDB 共享内存均为显式启用，且无需迁移存储格式。
 
 完整细节见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 

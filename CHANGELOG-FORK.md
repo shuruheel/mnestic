@@ -5,6 +5,14 @@ provenance and licensing.
 
 ## Unreleased
 
+## 0.15.0 — 2026-08-18
+
+An operations-and-interchange minor release: bounded query memory, RDF at the
+relational boundary, one shared RocksDB memory envelope for multi-database
+processes, and a runnable guide for migrating JSON-LD and tree-shaped data.
+`mnestic-rocks` 0.1.11 carries the bridge half of the shared-memory work and
+must be published before the `mnestic` crate.
+
 - **Runnable JSON-LD / tree-shaped modeling guide**
   ([#7](https://github.com/shuruheel/mnestic/issues/7)): documents the stable
   relational shapes for nested objects (parent/child rows with IDs), arrays

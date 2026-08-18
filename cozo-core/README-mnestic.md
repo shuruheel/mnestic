@@ -84,30 +84,29 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.14.0
+## New in 0.15.0
 
-A security-first minor release, plus retrieval and operational improvements:
+An operations-and-interchange minor release:
 
-- Stored-relation ACLs now cover indexes, negation, fixed rules, exports,
-  history, and cached graph projections. Malformed vector bytes fail before
-  unsafe decoding, and TiKV relation IDs serialize across independent clients.
-- `CsvReader` and `JsonReader` are no longer registered by default. Trusted
-  deployments must enable `data-import` explicitly, plus `requests` for
-  HTTP(S) sources.
-- Quoted multi-word FTS queries are exact phrases. `bind_spans` returns the
-  matched byte offsets, and `snippet(text, spans, window)` formats a
-  tokenizer-consistent context window.
-- `set_durable_writes(true)` requests fsync-on-commit where supported. Typed,
-  actionable diagnostics are available through `::warnings` and
-  `Db::recent_warnings`.
-- Recursive plan shapes and exact results are pinned in CI, including a nightly
-  10,000-iteration deep-fixpoint guard.
+- `:mem_limit`, `ScriptRunOptions::with_mem_limit`, and a database-wide default
+  bound estimated query memory. Limits min-compose, and a trip raises
+  `eval::mem_budget_exceeded` before commit.
+- The opt-in `rdf-io` feature reads Turtle, N-Triples, N-Quads, and TriG into an
+  ordinary six-column relation, exports triple/quad relations, and adds IRI/CURIE
+  helpers—without changing the core relational model.
+- RocksDB instances can share one block cache and write-buffer manager, with
+  conflict-checked process defaults and per-instance memory statistics. This
+  ships with `mnestic-rocks` 0.1.11.
+- A runnable
+  [JSON-LD/tree modeling guide](https://github.com/shuruheel/mnestic/blob/main/docs/guides/modeling-tree-shaped-data.md)
+  covers nested objects, positional arrays, heterogeneous adjacency, and
+  incremental migration from retained JSON.
 
-Migration highlights: indirect reads of `Hidden` relations now fail; callers
-that need script-controlled CSV/JSON import must opt in; and quoted multi-word
-FTS queries now require adjacency and order (drop the quotes to preserve the
-old AND-of-terms behavior). The HTTP server's authentication and backup-path
-changes are documented in the full changelog.
+Migration highlight: the Python wheel enables `rdf-io`, which also registers
+the script-controlled CSV/JSON readers and HTTP(S) fetch support. Rust defaults
+remain locked down unless `rdf-io` or `data-import` is enabled explicitly.
+Memory limits and shared RocksDB resources are opt-in; no storage migration is
+required.
 
 Full detail is in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
@@ -119,7 +118,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.14.0"
+mnestic = "0.15.0"
 ```
 
 ```rust

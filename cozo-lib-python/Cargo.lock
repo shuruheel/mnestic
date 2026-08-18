@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "mnestic"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aho-corasick",
  "approx",
@@ -1218,7 +1218,7 @@ dependencies = [
 
 [[package]]
 name = "mnestic-py"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "miette",
  "mnestic",
@@ -1229,7 +1229,7 @@ dependencies = [
 
 [[package]]
 name = "mnestic-rocks"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "cc",
  "cxx",
