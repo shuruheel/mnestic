@@ -5,6 +5,16 @@ provenance and licensing.
 
 ## Unreleased
 
+- **Runnable JSON-LD / tree-shaped modeling guide**
+  ([#7](https://github.com/shuruheel/mnestic/issues/7)): documents the stable
+  relational shapes for nested objects (parent/child rows with IDs), arrays
+  (one row per element with a zero-based position), and heterogeneous trees
+  (node plus adjacency relations). It also shows how to keep a raw `Json`
+  relation queryable with `parse_json()`, `get()`, `maybe_get()`, and `json()`
+  during an incremental migration. An SQLite integration test executes the
+  guide's schemas, writes, joins, and recursive traversal so the examples
+  cannot silently drift from CozoScript.
+
 - **A per-query memory budget** (spec
   [`docs/specs/memory-budget.md`](docs/specs/memory-budget.md), signed
   2026-08-16): the temp stores that hold every intermediate of semi-naive

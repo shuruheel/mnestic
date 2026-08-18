@@ -210,6 +210,8 @@ a complete CozoDB instance in your browser, at near-native speed for most operat
 So open up the [CozoDB in WASM page](https://www.cozodb.org/wasm-demo/), and then:
 
 * Follow the [tutorial](https://docs.cozodb.org/en/latest/tutorial.html).
+* If your source data is JSON-LD or a nested document, follow mnestic's
+  [tree-shaped data modeling guide](docs/guides/modeling-tree-shaped-data.md).
 
 Or you can skip ahead for the information about installing CozoDB into your favourite environment first.
 
