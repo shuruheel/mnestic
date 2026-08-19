@@ -21,8 +21,11 @@ provenance and licensing.
   measured macOS arm64 ABI3 wheel delta is +1,711,642 bytes (+14.92%), and a
   clean source archive builds and exposes the method. Independent PyArrow
   fixtures cover canonical extensions, delta dictionaries, encrypted Parquet,
-  checksums, and a 500,000-row GIL-release smoke. Hosted cross-platform CI is
-  still required before merge.
+  checksums, and a 500,000-row GIL-release smoke. Hosted engine CI passed on
+  PR #51, and the publication-disabled Python build matrix passed on Linux
+  x86/ARM, macOS x86/ARM, and Windows with wheel smoke tests plus the sdist
+  (`python-publish` run 32287514329). Batch A is merged but unreleased; Arrow
+  export remains a separate, unmerged Batch B review unit.
 
 ## 0.16.0 — 2026-08-18
 
