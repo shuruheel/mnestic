@@ -37,8 +37,24 @@ hits = db.hybrid_search({
 
 The `"rocksdb"` persistent backend now ships in the published wheel —
 `CozoDbPy("rocksdb", "./my.db", "{}")` works straight from `pip install mnestic`.
-The source distribution stays SQLite/`compact`-only, so the persistent engine is
+The source distribution ships `compact`, RDF boundary I/O, and host-controlled
+Parquet/Arrow import, but no RocksDB sources, so the persistent engine remains
 wheel-only.
+
+Published wheels and source builds expose atomic local-file copy-in through
+`import_columnar_file`. The target relation must already exist; the format is
+explicit and the call releases Python's GIL while decoding and committing:
+
+```python
+report = db.import_columnar_file(
+    "events",
+    "events.parquet",
+    format="parquet",  # or arrow_ipc_file / arrow_ipc_stream
+    columns={"event_id": "id"},
+    batch_rows=8192,
+    max_rows=1_000_000,
+)
+```
 
 **Upgrade note (0.10.6):** a persistent database whose relation catalogs were
 last written by a build older than 0.10.0 could fail to open with `Cannot

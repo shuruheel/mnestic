@@ -7,6 +7,8 @@
  */
 
 pub(crate) mod callback;
+#[cfg(feature = "columnar-io")]
+pub(crate) mod columnar;
 pub(crate) mod db;
 pub(crate) mod diagnostics;
 pub(crate) mod graph_projection;

@@ -43,6 +43,9 @@ cypher = ["cozo/cypher"]
 ## The published wheel SHIPS this by signed decision (rdf-boundary-io spec
 ## §12 Q6, a deliberate reversal of the 0.14.0 wheel-reader posture).
 rdf-io = ["cozo/rdf-io"]
+## Host-controlled Parquet/Arrow IPC import. Unlike `rdf-io`, this adds no
+## CozoScript reader and does not widen script authority.
+columnar-io = ["cozo/columnar-io"]
 ## Uses jemalloc as the global allocator, can make a difference in performance
 jemalloc = ["cozo/jemalloc"]
 ## Enables io-uring option for the RocksDB storage

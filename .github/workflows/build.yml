@@ -28,6 +28,8 @@ jobs:
       # or they silently never run.
       - name: Test (test-hooks suites)
         run: cargo test -p mnestic --features test-hooks --test commit_fence --test callback_commit_contract --verbose
+      - name: Test (columnar import contract)
+        run: cargo test -p mnestic --features columnar-io,test-hooks --test columnar_import --verbose
 
   # The secondary backends are non-default features, so nothing above compiles
   # them. Both carried a silent transaction-contract bug until 0.12.1 (sled's
@@ -132,6 +134,13 @@ jobs:
       # can run the interleaving suite.
       - name: Test (graph-projection interleaving)
         run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --verbose
+      - name: Test (columnar rollback and concurrency on RocksDB)
+        run: >
+          cargo test -p mnestic
+          --features storage-rocksdb,columnar-io
+          --test columnar_import
+          --verbose
+          rocksdb_
 
   # The `minimal` combination (no `graph-algo`, no `rayon`) is what a
   # `--no-default-features --features minimal` consumer gets — and until this
@@ -168,3 +177,5 @@ jobs:
       # ~178 mostly-upstream files is deferred to a dedicated pass.
       - name: Clippy (all targets)
         run: cargo clippy -p mnestic --all-targets -- -D warnings
+      - name: Clippy (columnar feature)
+        run: cargo clippy -p mnestic --features columnar-io,test-hooks --test columnar_import -- -D warnings

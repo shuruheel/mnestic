@@ -26,7 +26,7 @@ Every item is judged against that goal — and described as a general database m
 
 ## Unreleased on main
 
-_No unreleased engine changes after 0.16.0._
+- **Parquet / Arrow copy-in — Batch A implemented, pending hosted CI/merge** ([#11](https://github.com/shuruheel/mnestic/issues/11), [approved spec](docs/specs/parquet-arrow.md)): the off-by-default `columnar-io` feature adds whole-file-atomic, row-chunked import from one local Parquet or Arrow IPC file into an existing non-`TxTime` relation. The target schema stays authoritative; unsupported logical meaning and lossy numeric conversions fail closed; the host API exposes explicit timeout and source/row/batch/value/nesting ceilings. Local SQLite, real RocksDB, Python wheel/sdist, independent PyArrow, feature-isolation, and lint gates pass. Arrow export remains Batch B and requires a separate owner sign-off.
 
 ## What's released through 0.16.0
 
@@ -97,7 +97,7 @@ Tiered by value and readiness. This is direction, not a dated commitment. Stored
 - **Extending the Cypher-read surface** — variable-length paths, `OPTIONAL MATCH`, `WITH`, and undirected relationships (today these return explicit not-yet-supported errors). Spec: [`docs/specs/cypher-read.md`](docs/specs/cypher-read.md).
 - **A first-class ULID type and sortable auto-keys** ([#8](https://github.com/shuruheel/mnestic/issues/8), `priority: low`; the scalar functions already ship, the type/default syntax does not).
 - **An official schema-migration tool** ([#10](https://github.com/shuruheel/mnestic/issues/10), design-first) — versioned schema, diff, apply, and rollback.
-- **Parquet/Arrow ingestion and Arrow export** ([#11](https://github.com/shuruheel/mnestic/issues/11), `priority: high`) — feature-gated, chunked import first; record-batch and Python zero-copy export after the intake contract is proven.
+- **Parquet/Arrow ingestion and Arrow export** ([#11](https://github.com/shuruheel/mnestic/issues/11), `priority: high`) — Batch A's feature-gated, atomic chunked import is implemented under the [approved D1–D11 contract](docs/specs/parquet-arrow.md), pending hosted CI and merge; record-batch and Python Arrow-buffer handoff remain separately gated Batch B work.
 
 ### Integrations — meeting people where they already are
 
