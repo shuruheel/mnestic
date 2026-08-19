@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::RwLock;
+#[cfg(feature = "columnar-io")]
+use std::time::Duration;
 
 use miette::{IntoDiagnostic, Report, Result};
 use pyo3::exceptions::PyException;
@@ -735,6 +737,87 @@ impl CozoDbPy {
         }
         py.allow_threads(|| db.import_relations(arg))
             .map_err(report2py)
+    }
+    /// Atomically copy a local Parquet or Arrow IPC file into an existing
+    /// stored relation (mnestic fork; feature `columnar-io`).
+    #[cfg(feature = "columnar-io")]
+    #[pyo3(signature = (
+        relation,
+        path,
+        *,
+        format,
+        columns=None,
+        batch_rows=8192,
+        timeout=None,
+        max_source_bytes=None,
+        max_rows=None,
+        max_decoded_batch_bytes=None,
+        max_value_bytes=None,
+        max_nesting_depth=16
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_columnar_file(
+        &self,
+        py: Python<'_>,
+        relation: &str,
+        path: &Bound<'_, PyAny>,
+        format: &str,
+        columns: Option<BTreeMap<String, String>>,
+        batch_rows: usize,
+        timeout: Option<f64>,
+        max_source_bytes: Option<u64>,
+        max_rows: Option<u64>,
+        max_decoded_batch_bytes: Option<usize>,
+        max_value_bytes: Option<usize>,
+        max_nesting_depth: usize,
+    ) -> PyResult<PyObject> {
+        let format = match format {
+            "parquet" => ColumnarFileFormat::Parquet,
+            "arrow_ipc_file" => ColumnarFileFormat::ArrowIpcFile,
+            "arrow_ipc_stream" => ColumnarFileFormat::ArrowIpcStream,
+            other => {
+                return Err(PyException::new_err(format!(
+                    "unknown columnar format '{other}'; expected parquet, arrow_ipc_file, or arrow_ipc_stream"
+                )))
+            }
+        };
+        let timeout = match timeout {
+            Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
+                Some(Duration::from_secs_f64(seconds))
+            }
+            Some(_) => {
+                return Err(PyException::new_err(
+                    "timeout must be a finite number greater than zero",
+                ))
+            }
+            None => None,
+        };
+        let path: String = py
+            .import_bound("os")?
+            .getattr("fspath")?
+            .call1((path,))?
+            .extract()?;
+        let options = ColumnarImportOptions::new(format)
+            .with_columns(columns.unwrap_or_default())
+            .with_batch_rows(batch_rows)
+            .with_timeout(timeout)
+            .with_max_source_bytes(max_source_bytes)
+            .with_max_rows(max_rows)
+            .with_max_decoded_batch_bytes(max_decoded_batch_bytes)
+            .with_max_value_bytes(max_value_bytes)
+            .with_max_nesting_depth(max_nesting_depth);
+        let db = self.db_ref()?;
+        let report = py
+            .allow_threads(|| db.import_columnar_file(relation, path, &options))
+            .map_err(report2py)?;
+        let result = PyDict::new_bound(py);
+        result.set_item("rows_processed", report.rows_processed)?;
+        result.set_item("batches_processed", report.batches_processed)?;
+        result.set_item(
+            "search_indexes_requiring_rebuild",
+            report.search_indexes_requiring_rebuild,
+        )?;
+        Ok(result.into_py(py))
     }
     pub fn backup(&self, py: Python<'_>, path: &str) -> PyResult<()> {
         let db = self.db_ref()?;

@@ -5,6 +5,25 @@ provenance and licensing.
 
 ## Unreleased
 
+- **Parquet / Arrow copy-in, Batch A** ([#11](https://github.com/shuruheel/mnestic/issues/11),
+  [`docs/specs/parquet-arrow.md`](docs/specs/parquet-arrow.md)): the approved
+  D1–D11 contract is implemented behind off-by-default `columnar-io`: one
+  host-controlled local Parquet or Arrow IPC file imports into an existing
+  non-`TxTime` relation through one transaction; target-schema coercion,
+  lossless numeric checks, fail-closed logical types, explicit resource limits,
+  stable `columnar::` diagnostics, and stale search-index reporting are wired
+  through Rust and a GIL-releasing Python method. Coverage includes all five
+  encodings; projection and mapping; scalar, nested, dictionary, run-end, view,
+  UUID/JSON, vector, and fail-closed type behavior; commit and late-batch
+  rollback; put/B-tree equivalence; search-index warnings; access, temporal,
+  callback, projection-cache, timeout, malformed-source, concurrency, and real
+  RocksDB lanes. Published wheels and sdists now compile `columnar-io`; the
+  measured macOS arm64 ABI3 wheel delta is +1,711,642 bytes (+14.92%), and a
+  clean source archive builds and exposes the method. Independent PyArrow
+  fixtures cover canonical extensions, delta dictionaries, encrypted Parquet,
+  checksums, and a 500,000-row GIL-release smoke. Hosted cross-platform CI is
+  still required before merge.
+
 ## 0.16.0 — 2026-08-18
 
 A query-reuse minor release: persistent, composable named read queries with

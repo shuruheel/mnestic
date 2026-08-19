@@ -84,6 +84,8 @@ pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 /// mnestic unresolvable alongside any crate wanting a later `0.3.x`.
 #[cfg(feature = "graph-algo")]
 pub use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, DirectedNeighborsWithValues, Graph};
+#[cfg(feature = "columnar-io")]
+pub use runtime::columnar::{ColumnarFileFormat, ColumnarImportOptions, ColumnarImportReport};
 pub use runtime::db::Db;
 pub use runtime::db::NamedRows;
 pub use runtime::diagnostics::QueryWarning;
@@ -759,6 +761,29 @@ impl DbInstance {
             DbInstance::Sled(db) => db.import_relations(data),
             #[cfg(feature = "storage-tikv")]
             DbInstance::TiKv(db) => db.import_relations(data),
+        }
+    }
+    /// Atomically import a Parquet or Arrow IPC file into an existing relation.
+    #[cfg(feature = "columnar-io")]
+    pub fn import_columnar_file(
+        &self,
+        relation: &str,
+        path: impl AsRef<Path>,
+        options: &ColumnarImportOptions,
+    ) -> Result<ColumnarImportReport> {
+        let path = path.as_ref();
+        match self {
+            DbInstance::Mem(db) => db.import_columnar_file(relation, path, options),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.import_columnar_file(relation, path, options),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.import_columnar_file(relation, path, options),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.import_columnar_file(relation, path, options),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.import_columnar_file(relation, path, options),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.import_columnar_file(relation, path, options),
         }
     }
     /// Import a relation, the data is given as a JSON string, and the returned result is converted into a string.

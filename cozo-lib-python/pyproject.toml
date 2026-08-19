@@ -33,11 +33,13 @@ Repository = "https://github.com/shuruheel/mnestic"
 #
 # This pin governs SDIST builds only: released wheels are built by
 # .github/workflows/python-publish.yml with `--no-default-features
-# --features compact,storage-rocksdb,rdf-io` on the maturin CLI. The sdist
+# --features compact,storage-rocksdb,rdf-io,columnar-io` on the maturin CLI. The sdist
 # ships no rocksdb sources (the cozorocks/rocksdb submodule isn't packed), so
 # the persist ("rocksdb") engine is WHEEL-ONLY — keep this at
-# `compact,rdf-io` (both pure-Rust) or sdist installs break. (abi3 wheels —
+# `compact,rdf-io,columnar-io` (no RocksDB sources required) or sdist installs
+# break. `columnar-io` may compile native Zstandard support, so CI's platform
+# build matrix is authoritative. (abi3 wheels —
 # one per platform, not per-Python — come from pyo3's abi3-py37 feature in
 # Cargo.toml, not from any feature choice here.)
 no-default-features = true
-features = ["compact", "rdf-io"]
+features = ["compact", "rdf-io", "columnar-io"]

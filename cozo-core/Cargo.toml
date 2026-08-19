@@ -62,6 +62,16 @@ requests = ["dep:minreq"]
 ## enable for trusted CozoScript callers. (mnestic fork; see
 ## docs/specs/rdf-boundary-io.md.)
 rdf-io = ["data-import", "dep:oxttl", "dep:oxrdf"]
+## Host-controlled Parquet and Arrow IPC bulk import into existing stored
+## relations (mnestic fork; docs/specs/parquet-arrow.md). This does not register
+## a CozoScript file reader and therefore does not imply `data-import`.
+columnar-io = [
+    "dep:arrow-array",
+    "dep:arrow-data",
+    "dep:arrow-schema",
+    "dep:arrow-ipc",
+    "dep:parquet",
+]
 ## Uses jemalloc as the global allocator, can make a difference in performance.
 jemalloc = ["dep:tikv-jemallocator-global", "cozorocks?/jemalloc"]
 ## Enables io-uring option for the RocksDB storage
@@ -165,6 +175,15 @@ oxttl = { version = "0.2.3", optional = true }
 # and this requirement unifies with that pin. Same gate as oxttl.
 oxrdf = { version = "0.3.3", optional = true }
 oxiri = "0.3.1"
+# Columnar boundary I/O (mnestic fork, docs/specs/parquet-arrow.md). Keep the
+# official arrow-rs family on one exact release so its internal public types
+# cannot split across versions. These crates are fully gated by `columnar-io`;
+# no Arrow type is re-exported from mnestic's public API.
+arrow-array = { version = "=59.2.0", default-features = false, optional = true }
+arrow-data = { version = "=59.2.0", default-features = false, optional = true }
+arrow-schema = { version = "=59.2.0", default-features = false, features = ["canonical_extension_types"], optional = true }
+arrow-ipc = { version = "=59.2.0", default-features = false, features = ["lz4", "zstd"], optional = true }
+parquet = { version = "=59.2.0", default-features = false, features = ["arrow", "arrow_canonical_extension_types", "snap", "zstd", "crc"], optional = true }
 document-features = "0.2.8"
 # Upper bound is load-bearing: rayon 1.11 breaks `graph_builder` 0.4.x
 # (the `graph` crate's CSR builder, pulled by `graph-algo`) — its `edges()`

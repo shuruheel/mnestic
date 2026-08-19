@@ -496,7 +496,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     // (`execute_single`) has always got this right by committing
                     // with `?` before it dispatches. The `Abort` arm below is
                     // likewise correct — it breaks without dispatching.
-                    let commit_result = self.commit_multi_tx(&mut tx);
+                    let commit_result = self.commit_tx_with_test_hook(&mut tx);
                     let committed = commit_result.is_ok();
                     let _ = results.send(commit_result.map(|_| NamedRows::default()));
                     #[cfg(not(target_arch = "wasm32"))]
@@ -720,7 +720,7 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// end of every script run and after the import paths' stranded-index
     /// checks; anything left in the thread-local sink between those points is
     /// simply carried to the next flush on that thread.
-    fn flush_warnings(&self) {
+    pub(crate) fn flush_warnings(&self) {
         let drained = crate::runtime::diagnostics::drain();
         if drained.is_empty() {
             return;
@@ -778,13 +778,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
     }
 
-    /// Commit a multi-transaction. Wraps `SessionTx::commit_tx` so the
-    /// `test-hooks` failure switch has one place to live (mnestic fork, 0.12.1;
-    /// see [`Db::fail_next_commit_for_tests`]). The injected failure returns
-    /// before the storage commit is attempted, so the transaction rolls back —
-    /// which is exactly the state a genuine commit failure leaves behind, and
-    /// the state the change-feed contract is about.
-    fn commit_multi_tx(&'s self, tx: &mut SessionTx<'_>) -> Result<()> {
+    /// Commit a write transaction through the shared `test-hooks` failure seam
+    /// (mnestic fork). The injected failure returns before the storage commit
+    /// is attempted, leaving the same rolled-back state as a genuine commit
+    /// failure. Multi-transactions and feature-gated bulk import both use this
+    /// boundary so their atomicity contracts can be tested directly.
+    pub(crate) fn commit_tx_with_test_hook(&'s self, tx: &mut SessionTx<'_>) -> Result<()> {
         #[cfg(any(test, feature = "test-hooks"))]
         if self.fail_next_commit.swap(false, Ordering::SeqCst) {
             miette::bail!("injected commit failure (test-hooks)");
@@ -1187,8 +1186,6 @@ impl<'s, S: Storage<'s>> Db<S> {
             // relation resolution, so it covers all three import modes: plain
             // put, the `-`-prefixed delete, and the TxTime-buffered branch.
             tx.mark_dirty(&handle);
-            let has_indices = !handle.indices.is_empty();
-
             // Bulk import maintains B-tree secondary indices (below) but NOT
             // the HNSW/FTS/LSH indices, whose maintenance runs off the per-row
             // :put path this bypasses — imported rows silently stay invisible
@@ -1312,24 +1309,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                         col.typing.coerce(v.clone(), cur_vld)
                     })
                     .try_collect()?;
-                let k_store = handle.encode_key_for_store(&keys, Default::default())?;
-                if has_indices {
-                    if let Some(existing) = tx.store_tx.get(&k_store, false)? {
-                        let mut old = keys.clone();
-                        try_extend_tuple_from_v(&mut old, &existing)?;
-                        if is_delete || old != row {
-                            for (idx_rel, extractor) in handle.indices.values() {
-                                let idx_tup =
-                                    extractor.iter().map(|i| old[*i].clone()).collect_vec();
-                                let encoded =
-                                    idx_rel.encode_key_for_store(&idx_tup, Default::default())?;
-                                tx.store_tx.del(&encoded)?;
-                            }
-                        }
-                    }
-                }
                 if is_delete {
-                    tx.store_tx.del(&k_store)?;
+                    write_import_tuple(&mut tx, &handle, keys, true)?;
                 } else {
                     let vals: Vec<_> = val_indices
                         .iter()
@@ -1340,18 +1321,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                             col.typing.coerce(v.clone(), cur_vld)
                         })
                         .try_collect()?;
-                    let v_store = handle.encode_val_only_for_store(&vals, Default::default())?;
-                    tx.store_tx.put(&k_store, &v_store)?;
-                    if has_indices {
-                        let mut kv = keys;
-                        kv.extend(vals);
-                        for (idx_rel, extractor) in handle.indices.values() {
-                            let idx_tup = extractor.iter().map(|i| kv[*i].clone()).collect_vec();
-                            let encoded =
-                                idx_rel.encode_key_for_store(&idx_tup, Default::default())?;
-                            tx.store_tx.put(&encoded, &[])?;
-                        }
-                    }
+                    let mut tuple = keys;
+                    tuple.extend(vals);
+                    write_import_tuple(&mut tx, &handle, tuple, false)?;
                 }
             }
         }
@@ -4077,7 +4049,7 @@ pub struct Poison {
 /// legitimate and common flow, and refusing it would break the very callers who
 /// are doing the right thing. `verb` names the operation for the message
 /// ("bulk import into", "backup restore into").
-fn warn_if_indexes_stranded(handle: &RelationHandle, relation: &str, verb: &str) {
+pub(crate) fn warn_if_indexes_stranded(handle: &RelationHandle, relation: &str, verb: &str) {
     let mut kinds = vec![];
     if !handle.hnsw_indices.is_empty() {
         kinds.push("HNSW");
@@ -4103,6 +4075,75 @@ fn warn_if_indexes_stranded(handle: &RelationHandle, relation: &str, verb: &str)
         ),
         format!("run `::reindex {relation}`"),
     );
+}
+
+/// Write one already-coerced, storage-ordered bulk-import tuple while keeping
+/// ordinary B-tree indexes synchronized. Search indexes, triggers, and
+/// callbacks deliberately remain outside the bulk-import contract.
+///
+/// The equality check is against the coerced tuple, not the caller's source
+/// row. This avoids needless index rewrites for reordered or differently
+/// represented inputs and gives every bulk source one canonical comparison.
+pub(crate) fn write_import_tuple(
+    tx: &mut SessionTx<'_>,
+    handle: &RelationHandle,
+    tuple: Vec<DataValue>,
+    is_delete: bool,
+) -> Result<()> {
+    let n_keys = handle.metadata.keys.len();
+    let expected = if is_delete {
+        n_keys
+    } else {
+        n_keys + handle.metadata.non_keys.len()
+    };
+    ensure!(
+        tuple.len() == expected,
+        "bulk import tuple for relation '{}' has {} columns, expected {}",
+        handle.name,
+        tuple.len(),
+        expected
+    );
+
+    let keys = &tuple[..n_keys];
+    let k_store = handle.encode_key_for_store(keys, Default::default())?;
+    if !handle.indices.is_empty() {
+        if let Some(existing) = tx.store_tx.get(&k_store, false)? {
+            let mut old = keys.to_vec();
+            try_extend_tuple_from_v(&mut old, &existing)?;
+            if is_delete || old != tuple {
+                for (idx_rel, extractor) in handle.indices.values() {
+                    let idx_tup = extractor.iter().map(|i| old[*i].clone()).collect_vec();
+                    let encoded = idx_rel.encode_key_for_store(&idx_tup, Default::default())?;
+                    tx.store_tx.del(&encoded)?;
+                }
+            }
+        }
+    }
+
+    if is_delete {
+        tx.store_tx.del(&k_store)?;
+        return Ok(());
+    }
+
+    let v_store = handle.encode_val_only_for_store(&tuple[n_keys..], Default::default())?;
+    tx.store_tx.put(&k_store, &v_store)?;
+    for (idx_rel, extractor) in handle.indices.values() {
+        let idx_tup = extractor.iter().map(|i| tuple[*i].clone()).collect_vec();
+        let encoded = idx_rel.encode_key_for_store(&idx_tup, Default::default())?;
+        tx.store_tx.put(&encoded, &[])?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "columnar-io")]
+pub(crate) fn stranded_index_names(handle: &RelationHandle) -> Vec<String> {
+    handle
+        .hnsw_indices
+        .keys()
+        .chain(handle.fts_indices.keys())
+        .chain(handle.lsh_indices.keys())
+        .map(ToString::to_string)
+        .collect()
 }
 
 /// monotonic clock is available: wasm has no `std` monotonic `Instant`, so on
