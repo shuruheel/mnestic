@@ -194,7 +194,7 @@ pub(crate) fn op_json_object(args: &[DataValue]) -> Result<DataValue> {
         "json_object requires an even number of arguments"
     );
     let mut obj = serde_json::Map::with_capacity(args.len() / 2);
-    for pair in args.chunks_exact(2) {
+    for pair in args.chunks(2) {
         let key = val2str(&pair[0]);
         let value = to_json(&pair[1]);
         obj.insert(key.to_string(), value);
