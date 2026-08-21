@@ -71,11 +71,12 @@ Tiered by value and readiness. This is direction, not a dated commitment. Stored
 ### Active priorities
 
 - **Parquet/Arrow ingestion and Arrow export** ([#11](https://github.com/shuruheel/mnestic/issues/11), `priority: high`). The bounded first slice is feature-gated, chunked Parquet/Arrow import into stored relations; Arrow record-batch export and Python zero-copy handoff can follow. Dependency weight and the script-controlled reader trust boundary must be designed explicitly.
-- **HNSW verify/repair.** `::reindex` can already rebuild an interrupted index; a targeted integrity check and in-place repair would reduce recovery cost. This is still roadmap-only and needs a tracker issue plus a failure corpus before implementation.
+- **HNSW verify/repair** ([#56](https://github.com/shuruheel/mnestic/issues/56), `priority: high`). `::reindex` can already rebuild an interrupted index; a targeted integrity check and in-place repair would reduce recovery cost. The tracker seeds the failure-corpus work from dormant-upstream reports, but treats those reports as hypotheses to reproduce against Mnestic rather than as confirmed current defects.
 
 ### Detailed status — correctness, cadence & developer experience
 
 - **Phrase-prefix and phrase-in-`NEAR`** ([#19](https://github.com/shuruheel/mnestic/issues/19), [#20](https://github.com/shuruheel/mnestic/issues/20)). Exact-phrase queries shipped in 0.14.0; these two compositions deliberately remain named errors rather than silent wrong answers, with settled eventual designs and documented workarounds. They are contributor-ready follow-ons, not active high-priority work absent a real caller.
+- **Inherited parser and typed-boundary correctness** ([#53](https://github.com/shuruheel/mnestic/issues/53), [#54](https://github.com/shuruheel/mnestic/issues/54), [#55](https://github.com/shuruheel/mnestic/issues/55), `priority: high`). Current Mnestic still rejects JSON-style escaped quotes and `#` inside raw strings, serializes a UUID nested in JSON differently from the same top-level UUID, and lets an FTS prefix bypass compatible analyzer normalization (`di*` matches on a `Lowercase` index while `Di*` silently misses). These are bounded correctness fixes with reproduced cases and upstream provenance, not new language or data-model themes.
 - **An explicit durability knob** (0.14.0): `db.set_durable_writes(true)` makes every write transaction fsync on commit, and returns whether the backend honors the knob (RocksDB does; SQLite is already durable via `synchronous=FULL` and reports false; the bulk import/restore channels are documented as outside it). What made it invisible is now a documented per-backend contract on `Storage::set_durable_writes`.
 - **Steady release cadence** with clear migration notes.
 - **Closing long-open upstream issues** under active maintenance: Sled deletion was fixed in 0.12.1, while Sled transaction-time range scanning remains open ([#5](https://github.com/shuruheel/mnestic/issues/5)); SQLite `WITHOUT ROWID` remains an evidence-gated optimization ([#6](https://github.com/shuruheel/mnestic/issues/6)); and tree-shaped / JSON-LD modeling guidance shipped for [#7](https://github.com/shuruheel/mnestic/issues/7).
@@ -119,7 +120,7 @@ Pursued when a real workload demonstrates the need, always with before/after mea
 - Selectivity-tiered filtered vector search (efficient metadata-filtered ANN).
 - Full-text scale headroom (compact posting-list storage + top-*k* pruning).
 - Tunable/weighted fusion and graph-leg improvements, gated on retrieval benchmarks.
-- Vector quantization with float rescore, gated on corpus-scale evidence.
+- **Vector quantization with float rescore** ([#57](https://github.com/shuruheel/mnestic/issues/57)), gated on corpus-scale evidence. The benchmark must choose among binary, int8, float16, or staying with `F32`; reduced storage alone is not a win if candidate recall or end-to-end hybrid quality falls outside an explicitly accepted bound.
 
 ## Non-goals (deliberate scope)
 
