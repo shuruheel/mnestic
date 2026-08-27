@@ -1267,7 +1267,11 @@ mod tests {
         st.put(t(1));
         assert_eq!(budget.used(), after_first, "a duplicate put is net-neutral");
         st.put(t(2));
-        assert_eq!(budget.used(), 2 * after_first, "uniform tuples charge uniformly");
+        assert_eq!(
+            budget.used(),
+            2 * after_first,
+            "uniform tuples charge uniformly"
+        );
     }
 
     /// The merge swap fast path is a move: exactly zero counter movement.

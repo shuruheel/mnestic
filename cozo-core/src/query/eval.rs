@@ -202,65 +202,66 @@ impl<'a> SessionTx<'a> {
                     // budget trip pick up rule/epoch context on the way out.
                     let compute = || -> Result<TempStore> {
                         Ok(match compiled_ruleset {
-                        CompiledRuleSet::Rules(ruleset) => match compiled_ruleset.aggr_kind()? {
-                            AggrKind::None => {
-                                let res = self.initial_rule_non_aggr_eval(
-                                    k,
-                                    &ruleset,
-                                    borrowed_stores,
-                                    &limiter,
-                                    poison.clone(),
-                                )?;
-                                used_limiter.fetch_or(res.0, Ordering::Relaxed);
-                                res.1.wrap()
+                            CompiledRuleSet::Rules(ruleset) => {
+                                match compiled_ruleset.aggr_kind()? {
+                                    AggrKind::None => {
+                                        let res = self.initial_rule_non_aggr_eval(
+                                            k,
+                                            &ruleset,
+                                            borrowed_stores,
+                                            &limiter,
+                                            poison.clone(),
+                                        )?;
+                                        used_limiter.fetch_or(res.0, Ordering::Relaxed);
+                                        res.1.wrap()
+                                    }
+                                    AggrKind::Normal => {
+                                        let res = self.initial_rule_aggr_eval(
+                                            k,
+                                            &ruleset,
+                                            borrowed_stores,
+                                            &limiter,
+                                            poison.clone(),
+                                        )?;
+                                        used_limiter.fetch_or(res.0, Ordering::Relaxed);
+                                        res.1.wrap()
+                                    }
+                                    AggrKind::Meet => {
+                                        let new = self.initial_rule_meet_eval(
+                                            k,
+                                            &ruleset,
+                                            borrowed_stores,
+                                            poison.clone(),
+                                        )?;
+                                        new.wrap()
+                                    }
+                                    AggrKind::BoundedMeet => self.initial_rule_bounded_meet_eval(
+                                        k,
+                                        &ruleset,
+                                        borrowed_stores,
+                                        poison.clone(),
+                                    )?,
+                                }
                             }
-                            AggrKind::Normal => {
-                                let res = self.initial_rule_aggr_eval(
-                                    k,
-                                    &ruleset,
-                                    borrowed_stores,
-                                    &limiter,
-                                    poison.clone(),
-                                )?;
-                                used_limiter.fetch_or(res.0, Ordering::Relaxed);
-                                res.1.wrap()
+                            CompiledRuleSet::Fixed(fixed) => {
+                                let fixed_impl = fixed.fixed_impl.as_ref();
+                                // memory budget (mnestic fork): the out store holds
+                                // the handle, so a fixed rule's own `put` calls are
+                                // charged; the post-run check catches a trip even
+                                // for implementations that never consult poison.
+                                let mut out = RegularTempStore::with_budget(poison.mem.clone());
+                                let payload = FixedRulePayload {
+                                    manifest: &fixed,
+                                    stores: borrowed_stores,
+                                    tx: self,
+                                };
+                                fixed_impl.run(payload, &mut out, poison.clone())?;
+                                poison.check()?;
+                                out.wrap()
                             }
-                            AggrKind::Meet => {
-                                let new = self.initial_rule_meet_eval(
-                                    k,
-                                    &ruleset,
-                                    borrowed_stores,
-                                    poison.clone(),
-                                )?;
-                                new.wrap()
-                            }
-                            AggrKind::BoundedMeet => self.initial_rule_bounded_meet_eval(
-                                k,
-                                &ruleset,
-                                borrowed_stores,
-                                poison.clone(),
-                            )?,
-                        },
-                        CompiledRuleSet::Fixed(fixed) => {
-                            let fixed_impl = fixed.fixed_impl.as_ref();
-                            // memory budget (mnestic fork): the out store holds
-                            // the handle, so a fixed rule's own `put` calls are
-                            // charged; the post-run check catches a trip even
-                            // for implementations that never consult poison.
-                            let mut out = RegularTempStore::with_budget(poison.mem.clone());
-                            let payload = FixedRulePayload {
-                                manifest: &fixed,
-                                stores: borrowed_stores,
-                                tx: self,
-                            };
-                            fixed_impl.run(payload, &mut out, poison.clone())?;
-                            poison.check()?;
-                            out.wrap()
-                        }
                         })
                     };
-                    let new_store =
-                        compute().map_err(|e| annotate_mem_budget(e, k, epoch))?;
+                    let new_store = compute().map_err(|e| annotate_mem_budget(e, k, epoch))?;
                     Ok((k, new_store))
                 };
                 #[cfg(not(target_arch = "wasm32"))]
@@ -308,50 +309,50 @@ impl<'a> SessionTx<'a> {
                     // memory budget (mnestic fork): see the epoch-0 twin.
                     let compute = || -> Result<TempStore> {
                         Ok(match compiled_ruleset {
-                        CompiledRuleSet::Rules(ruleset) => {
-                            match compiled_ruleset.aggr_kind()? {
-                                AggrKind::None => {
-                                    let res = self.incremental_rule_non_aggr_eval(
-                                        k,
-                                        &ruleset,
-                                        epoch,
-                                        borrowed_stores,
-                                        &limiter,
-                                        poison.clone(),
-                                    )?;
-                                    used_limiter.fetch_or(res.0, Ordering::Relaxed);
-                                    res.1.wrap()
-                                }
-                                AggrKind::Meet => {
-                                    let new = self.incremental_rule_meet_eval(
-                                        k,
-                                        &ruleset,
-                                        borrowed_stores,
-                                        poison.clone(),
-                                    )?;
-                                    new.wrap()
-                                }
-                                AggrKind::BoundedMeet => self.incremental_rule_bounded_meet_eval(
-                                    k,
-                                    &ruleset,
-                                    borrowed_stores,
-                                    poison.clone(),
-                                )?,
-                                AggrKind::Normal => {
-                                    // not doing anything
-                                    RegularTempStore::default().wrap()
+                            CompiledRuleSet::Rules(ruleset) => {
+                                match compiled_ruleset.aggr_kind()? {
+                                    AggrKind::None => {
+                                        let res = self.incremental_rule_non_aggr_eval(
+                                            k,
+                                            &ruleset,
+                                            epoch,
+                                            borrowed_stores,
+                                            &limiter,
+                                            poison.clone(),
+                                        )?;
+                                        used_limiter.fetch_or(res.0, Ordering::Relaxed);
+                                        res.1.wrap()
+                                    }
+                                    AggrKind::Meet => {
+                                        let new = self.incremental_rule_meet_eval(
+                                            k,
+                                            &ruleset,
+                                            borrowed_stores,
+                                            poison.clone(),
+                                        )?;
+                                        new.wrap()
+                                    }
+                                    AggrKind::BoundedMeet => self
+                                        .incremental_rule_bounded_meet_eval(
+                                            k,
+                                            &ruleset,
+                                            borrowed_stores,
+                                            poison.clone(),
+                                        )?,
+                                    AggrKind::Normal => {
+                                        // not doing anything
+                                        RegularTempStore::default().wrap()
+                                    }
                                 }
                             }
-                        }
 
-                        CompiledRuleSet::Fixed(_) => {
-                            // no need to do anything, algos are only calculated once
-                            RegularTempStore::default().wrap()
-                        }
+                            CompiledRuleSet::Fixed(_) => {
+                                // no need to do anything, algos are only calculated once
+                                RegularTempStore::default().wrap()
+                            }
                         })
                     };
-                    let new_store =
-                        compute().map_err(|e| annotate_mem_budget(e, k, epoch))?;
+                    let new_store = compute().map_err(|e| annotate_mem_budget(e, k, epoch))?;
                     Ok((k, new_store))
                 };
                 #[cfg(not(target_arch = "wasm32"))]
@@ -472,8 +473,7 @@ impl<'a> SessionTx<'a> {
         stores: &BTreeMap<MagicSymbol, EpochStore>,
         poison: Poison,
     ) -> Result<TempStore> {
-        let mut out_store =
-            TempStore::new_bounded(ruleset[0].aggr.clone(), poison.mem.clone())?;
+        let mut out_store = TempStore::new_bounded(ruleset[0].aggr.clone(), poison.mem.clone())?;
         for (rule_n, rule) in ruleset.iter().enumerate() {
             debug!("initial calculation for rule {:?}.{}", rule_symb, rule_n);
             for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
@@ -494,8 +494,7 @@ impl<'a> SessionTx<'a> {
         stores: &BTreeMap<MagicSymbol, EpochStore>,
         poison: Poison,
     ) -> Result<TempStore> {
-        let mut out_store =
-            TempStore::new_bounded(ruleset[0].aggr.clone(), poison.mem.clone())?;
+        let mut out_store = TempStore::new_bounded(ruleset[0].aggr.clone(), poison.mem.clone())?;
         for (rule_n, rule) in ruleset.iter().enumerate() {
             let mut need_complete_run = false;
             let mut dependencies_changed = false;

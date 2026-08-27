@@ -190,11 +190,7 @@ pub(crate) mod ffi {
             status: &mut RocksDbStatus,
             report: &mut DbOpenReport,
         ) -> SharedPtr<RocksDbBridge>;
-        fn get_int_property(
-            self: &RocksDbBridge,
-            name: &str,
-            status: &mut RocksDbStatus,
-        ) -> u64;
+        fn get_int_property(self: &RocksDbBridge, name: &str, status: &mut RocksDbStatus) -> u64;
         fn transact(self: &RocksDbBridge) -> UniquePtr<TxBridge>;
         fn snapshot_read(self: &RocksDbBridge) -> UniquePtr<SnapshotReadBridge>;
         fn del_range(self: &RocksDbBridge, lower: &[u8], upper: &[u8], status: &mut RocksDbStatus);

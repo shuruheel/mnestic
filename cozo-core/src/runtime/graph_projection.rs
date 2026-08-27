@@ -117,7 +117,7 @@ use thiserror::Error;
 #[cfg(feature = "graph-algo")]
 use crate::data::tuple::TupleIter;
 #[cfg(feature = "graph-algo")]
-use crate::data::value::{DataValue};
+use crate::data::value::DataValue;
 #[cfg(feature = "graph-algo")]
 use crate::fixed_rule::{build_unweighted_csr, build_weighted_csr};
 #[cfg(feature = "graph-algo")]

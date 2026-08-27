@@ -3160,16 +3160,19 @@ pub(crate) fn op_iri_resolve(args: &[DataValue]) -> Result<DataValue> {
     let base = args[0]
         .get_str()
         .ok_or_else(|| miette!("'iri_resolve' expects a base IRI string as first argument"))?;
-    let rel = args[1]
-        .get_str()
-        .ok_or_else(|| miette!("'iri_resolve' expects an IRI reference string as second argument"))?;
+    let rel = args[1].get_str().ok_or_else(|| {
+        miette!("'iri_resolve' expects an IRI reference string as second argument")
+    })?;
     let base = oxiri::Iri::parse(base)
         .map_err(|e| miette!("'iri_resolve': invalid base IRI {base:?}: {e}"))?;
     let rel = oxiri::IriRef::parse(rel)
         .map_err(|e| miette!("'iri_resolve': invalid IRI reference {rel:?}: {e}"))?;
-    let resolved = base
-        .resolve(&rel)
-        .map_err(|e| miette!("'iri_resolve': cannot resolve {} against {base}: {e}", rel.as_str()))?;
+    let resolved = base.resolve(&rel).map_err(|e| {
+        miette!(
+            "'iri_resolve': cannot resolve {} against {base}: {e}",
+            rel.as_str()
+        )
+    })?;
     Ok(DataValue::Str(resolved.into_inner().into()))
 }
 

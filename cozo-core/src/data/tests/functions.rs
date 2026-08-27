@@ -2267,7 +2267,11 @@ fn test_curie_expand() {
 #[test]
 fn test_curie_compact() {
     assert_eq!(
-        op_curie_compact(&[foaf_map(), DataValue::from("http://xmlns.com/foaf/0.1/name")]).unwrap(),
+        op_curie_compact(&[
+            foaf_map(),
+            DataValue::from("http://xmlns.com/foaf/0.1/name")
+        ])
+        .unwrap(),
         DataValue::from("foaf:name")
     );
     // Longest namespace wins.

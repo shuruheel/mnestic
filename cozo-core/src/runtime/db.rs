@@ -976,9 +976,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             "turtle" => {
                 let mut ser = oxttl::TurtleSerializer::new();
                 for (name, iri) in prefixes {
-                    ser = ser.with_prefix(name.clone(), iri.clone()).map_err(|e| {
-                        miette!("invalid namespace IRI for prefix '{name}': {e}")
-                    })?;
+                    ser = ser
+                        .with_prefix(name.clone(), iri.clone())
+                        .map_err(|e| miette!("invalid namespace IRI for prefix '{name}': {e}"))?;
                 }
                 Writer::Turtle(ser.for_writer(Vec::new()))
             }
@@ -987,32 +987,33 @@ impl<'s, S: Storage<'s>> Db<S> {
             _ => {
                 let mut ser = oxttl::TriGSerializer::new();
                 for (name, iri) in prefixes {
-                    ser = ser.with_prefix(name.clone(), iri.clone()).map_err(|e| {
-                        miette!("invalid namespace IRI for prefix '{name}': {e}")
-                    })?;
+                    ser = ser
+                        .with_prefix(name.clone(), iri.clone())
+                        .map_err(|e| miette!("invalid namespace IRI for prefix '{name}': {e}"))?;
                 }
                 Writer::TriG(ser.for_writer(Vec::new()))
             }
         };
 
-        let named_or_blank = |v: &DataValue, what: &str, row_n: usize| -> Result<NamedOrBlankNode> {
-            let s = match v {
-                DataValue::Str(s) => s,
-                _ => bail!(
-                    "row {row_n} of '{relation}': {what} must be a string, got {v:?}"
-                ),
+        let named_or_blank =
+            |v: &DataValue, what: &str, row_n: usize| -> Result<NamedOrBlankNode> {
+                let s = match v {
+                    DataValue::Str(s) => s,
+                    _ => bail!("row {row_n} of '{relation}': {what} must be a string, got {v:?}"),
+                };
+                Ok(match s.strip_prefix("_:") {
+                    Some(label) => BlankNode::new(label)
+                        .map_err(|e| {
+                            miette!("row {row_n} of '{relation}': invalid blank node {s:?}: {e}")
+                        })?
+                        .into(),
+                    None => NamedNode::new(s.as_str())
+                        .map_err(|e| {
+                            miette!("row {row_n} of '{relation}': invalid {what} IRI {s:?}: {e}")
+                        })?
+                        .into(),
+                })
             };
-            Ok(match s.strip_prefix("_:") {
-                Some(label) => BlankNode::new(label)
-                    .map_err(|e| {
-                        miette!("row {row_n} of '{relation}': invalid blank node {s:?}: {e}")
-                    })?
-                    .into(),
-                None => NamedNode::new(s.as_str())
-                    .map_err(|e| miette!("row {row_n} of '{relation}': invalid {what} IRI {s:?}: {e}"))?
-                    .into(),
-            })
-        };
 
         let tx = self.transact()?;
         let handle = tx.get_relation_for_read(relation, "data export")?;
@@ -1033,10 +1034,11 @@ impl<'s, S: Storage<'s>> Db<S> {
 
             let subject = named_or_blank(&tuple[0], "subject", row_n)?;
             let predicate = match &tuple[1] {
-                DataValue::Str(s) if !s.starts_with("_:") => NamedNode::new(s.as_str())
-                    .map_err(|e| {
+                DataValue::Str(s) if !s.starts_with("_:") => {
+                    NamedNode::new(s.as_str()).map_err(|e| {
                         miette!("row {row_n} of '{relation}': invalid predicate IRI {s:?}: {e}")
-                    })?,
+                    })?
+                }
                 other => bail!(
                     "row {row_n} of '{relation}': predicate must be an IRI string, got {other:?}"
                 ),
@@ -1045,7 +1047,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                 (DataValue::Str(o), DataValue::Str(lang), DataValue::Null) => {
                     Literal::new_language_tagged_literal(o.as_str(), lang.as_str())
                         .map_err(|e| {
-                            miette!("row {row_n} of '{relation}': invalid language tag {lang:?}: {e}")
+                            miette!(
+                                "row {row_n} of '{relation}': invalid language tag {lang:?}: {e}"
+                            )
                         })?
                         .into()
                 }
@@ -3531,8 +3535,7 @@ impl<'s, S: Storage<'s>> Db<S> {
 
         if !out_opts.sorters.is_empty() {
             // sort outputs if required
-            let sorted_result =
-                tx.sort_and_collect(
+            let sorted_result = tx.sort_and_collect(
                 result_store,
                 &out_opts.sorters,
                 &entry_head_or_default,
@@ -3981,7 +3984,8 @@ impl MemBudget {
     #[inline]
     pub(crate) fn charge(&self, n: usize) {
         let old = self.inner.counter.fetch_add(n, Ordering::Relaxed);
-        if old.saturating_add(n) > self.inner.limit && !self.inner.tripped.swap(true, Ordering::Relaxed)
+        if old.saturating_add(n) > self.inner.limit
+            && !self.inner.tripped.swap(true, Ordering::Relaxed)
         {
             self.inner.trip_used.store(old, Ordering::Relaxed);
             self.inner.trip_attempted.store(n, Ordering::Relaxed);
