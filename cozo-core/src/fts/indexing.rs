@@ -193,7 +193,8 @@ impl<'a> SessionTx<'a> {
         &self,
         literal: &FtsLiteral,
         idx_handle: &RelationHandle,
-    ) -> Result<Vec<LiteralStats>> {
+        candidates: Option<&FxHashSet<Tuple>>,
+    ) -> Result<(Vec<LiteralStats>, usize)> {
         crate::fts::FTS_LITERAL_SCANS.with(|c| c.set(c.get() + 1));
         let start_key_str = &literal.value as &str;
         let start_key = vec![DataValue::Str(SmartString::from(start_key_str))];
@@ -203,6 +204,7 @@ impl<'a> SessionTx<'a> {
         let start_key_bytes = idx_handle.encode_partial_key_for_store(&start_key);
         let end_key_bytes = idx_handle.encode_partial_key_for_store(&end_key);
         let mut results = vec![];
+        let mut global_doc_frequency = 0;
         for item in self.store_tx.range_scan(&start_key_bytes, &end_key_bytes) {
             let (kvec, vvec) = item?;
             let key_tuple = decode_tuple_from_key(&kvec, idx_handle.metadata.keys.len());
@@ -213,6 +215,12 @@ impl<'a> SessionTx<'a> {
                 }
             } else if found_str_key != start_key_str {
                 break;
+            }
+
+            global_doc_frequency += 1;
+            let found_key = key_tuple[1..].to_vec();
+            if candidates.is_some_and(|allowed| !allowed.contains(&found_key)) {
+                continue;
             }
 
             let vals = try_decode_val_only(&kvec, &vvec)?;
@@ -251,12 +259,12 @@ impl<'a> SessionTx<'a> {
                 })
                 .collect::<Result<Vec<_>>>()?;
             results.push(LiteralStats {
-                key: key_tuple[1..].to_vec(),
+                key: found_key,
                 position_info,
                 doc_len: total_length as u32,
             });
         }
-        Ok(results)
+        Ok((results, global_doc_frequency))
     }
     fn fts_search_impl(
         &self,
@@ -271,12 +279,12 @@ impl<'a> SessionTx<'a> {
         Ok(match ast {
             FtsExpr::Literal(l) => {
                 let mut res = FxHashMap::default();
-                let found_docs = self.fts_search_literal(l, &config.idx_handle)?;
-                let found_docs_len = found_docs.len();
+                let (found_docs, global_doc_frequency) =
+                    self.fts_search_literal(l, &config.idx_handle, config.candidates.as_deref())?;
                 for el in found_docs {
                     let score = Self::fts_compute_score(
                         el.position_info.len(),
-                        found_docs_len,
+                        global_doc_frequency,
                         n,
                         el.doc_len,
                         avgdl,
@@ -316,8 +324,9 @@ impl<'a> SessionTx<'a> {
                 // to each later matched token's end, so a surviving anchor's
                 // span covers the whole phrase occurrence (spec §6.1).
                 let mut coll: FxHashMap<Tuple, Vec<(u32, u32, u32)>> = FxHashMap::default();
-                for first_el in
-                    self.fts_search_literal(&as_literal(first_tok), &config.idx_handle)?
+                for first_el in self
+                    .fts_search_literal(&as_literal(first_tok), &config.idx_handle, None)?
+                    .0
                 {
                     doc_lens.insert(first_el.key.clone(), first_el.doc_len);
                     coll.insert(
@@ -334,7 +343,9 @@ impl<'a> SessionTx<'a> {
                         break;
                     }
                     let delta = tok.position - q0;
-                    let el_res = self.fts_search_literal(&as_literal(tok), &config.idx_handle)?;
+                    let el_res = self
+                        .fts_search_literal(&as_literal(tok), &config.idx_handle, None)?
+                        .0;
                     let mut nxt_coll: FxHashMap<Tuple, Vec<(u32, u32, u32)>> = FxHashMap::default();
                     for x in el_res {
                         if let Some(anchors) = coll.remove(&x.key) {
@@ -357,6 +368,9 @@ impl<'a> SessionTx<'a> {
                     coll = nxt_coll;
                 }
                 let coll_len = coll.len();
+                if let Some(candidates) = config.candidates.as_deref() {
+                    coll.retain(|key, _| candidates.contains(key));
+                }
                 coll.into_iter()
                     .map(|(k, anchors)| {
                         let doc_len = doc_lens.get(&k).copied().unwrap_or(0);
@@ -432,7 +446,10 @@ impl<'a> SessionTx<'a> {
                 // accumulated from every literal's scan.
                 let mut occ_spans: FxHashMap<Tuple, FxHashMap<u32, (u32, u32)>> =
                     FxHashMap::default();
-                for first_el in self.fts_search_literal(l_it.next().unwrap(), &config.idx_handle)? {
+                for first_el in self
+                    .fts_search_literal(l_it.next().unwrap(), &config.idx_handle, None)?
+                    .0
+                {
                     doc_lens.insert(first_el.key.clone(), first_el.doc_len);
                     if want_spans {
                         occ_spans.entry(first_el.key.clone()).or_default().extend(
@@ -456,7 +473,9 @@ impl<'a> SessionTx<'a> {
                 // it here cost a redundant full posting fetch per NEAR query
                 // (results were unchanged: self-distance 0 always survived).
                 for lit_nxt in l_it {
-                    let el_res = self.fts_search_literal(lit_nxt, &config.idx_handle)?;
+                    let el_res = self
+                        .fts_search_literal(lit_nxt, &config.idx_handle, None)?
+                        .0;
                     coll = el_res
                         .into_iter()
                         .filter_map(|x| match coll.remove(&x.key) {
@@ -496,6 +515,9 @@ impl<'a> SessionTx<'a> {
                     booster += lit.booster.0;
                 }
                 let coll_len = coll.len();
+                if let Some(candidates) = config.candidates.as_deref() {
+                    coll.retain(|key, _| candidates.contains(key));
+                }
                 coll.into_iter()
                     .map(|(k, cands)| {
                         let doc_len = doc_lens.get(&k).copied().unwrap_or(0);
@@ -625,6 +647,7 @@ impl<'a> SessionTx<'a> {
 
         let mut ret = Vec::with_capacity(config.k);
         for (found_key, hit) in result {
+            crate::fts::FTS_BASE_ROW_FETCHES.with(|count| count.set(count.get() + 1));
             let mut cand_tuple = config
                 .base_handle
                 .get(self, &found_key)?

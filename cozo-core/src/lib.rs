@@ -101,9 +101,9 @@ pub use storage::mem::{new_cozo_mem, MemStorage};
 pub use storage::newrocks::{new_cozo_newrocksdb, NewRocksDbStorage};
 #[cfg(feature = "storage-rocksdb")]
 pub use storage::rocks::{
-    new_cozo_rocksdb, new_cozo_rocksdb_with_memory, process_default_rocks_memory,
-    RocksDbStorage, RocksMemoryConfig, RocksMemoryConfigError, RocksMemoryResources,
-    RocksMemoryStats, SharedMemoryConfigConflict,
+    new_cozo_rocksdb, new_cozo_rocksdb_with_memory, process_default_rocks_memory, RocksDbStorage,
+    RocksMemoryConfig, RocksMemoryConfigError, RocksMemoryResources, RocksMemoryStats,
+    SharedMemoryConfigConflict,
 };
 #[cfg(feature = "storage-sled")]
 pub use storage::sled::{new_cozo_sled, SledStorage};
@@ -137,7 +137,7 @@ pub(crate) mod fts;
 /// counter, for scan-count regression tests (the NEAR double-scan class is
 /// invisible in results). Hidden from docs; no stability guarantee.
 #[doc(hidden)]
-pub use fts::FTS_LITERAL_SCANS;
+pub use fts::{FTS_BASE_ROW_FETCHES, FTS_LITERAL_SCANS};
 pub mod parse;
 pub(crate) mod query;
 pub(crate) mod runtime;

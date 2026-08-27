@@ -12,6 +12,7 @@ use std::fmt::{Debug, Display, Formatter};
 use std::sync::Arc;
 
 use miette::{bail, ensure, miette, Diagnostic, Result};
+use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
@@ -20,6 +21,7 @@ use crate::data::aggr::Aggregation;
 use crate::data::expr::Expr;
 use crate::data::relation::StoredRelationMetadata;
 use crate::data::symb::{Symbol, PROG_ENTRY};
+use crate::data::tuple::Tuple;
 use crate::data::value::{DataValue, ValidityTs};
 use crate::fixed_rule::{FixedRule, FixedRuleHandle};
 use crate::fts::FtsIndexManifest;
@@ -1183,6 +1185,10 @@ pub(crate) struct FtsSearch {
     /// index), so they are index-consistent under stemming with no
     /// re-tokenization. Spec: docs/specs/fts-phrase-and-snippets.md §6.1.
     pub(crate) bind_spans: Option<Symbol>,
+    /// Optional base-relation primary keys eligible for this search. The set is
+    /// built once while normalizing the search atom and shared by every parent
+    /// tuple through `Arc`; scoring still uses corpus-global BM25 statistics.
+    pub(crate) candidates: Option<Arc<FxHashSet<Tuple>>>,
     // pub(crate) lax_mode: bool,
     pub(crate) filter: Option<Expr>,
     pub(crate) span: SourceSpan,
@@ -1501,6 +1507,47 @@ impl SearchInput {
 
         let filter = self.parameters.remove("filter");
 
+        let candidates = match self.parameters.remove("candidates") {
+            None => None,
+            Some(expr) => {
+                let value = expr.eval_to_const()?;
+                let values = match value {
+                    DataValue::List(values) => values,
+                    value => bail!("`candidates` for FTS must be a list, got {value:?}"),
+                };
+                let key_columns = &base_handle.metadata.keys;
+                let mut set = FxHashSet::default();
+                for value in values {
+                    let raw_key = if key_columns.len() == 1 {
+                        vec![value]
+                    } else {
+                        match value {
+                            DataValue::List(key) if key.len() == key_columns.len() => key,
+                            DataValue::List(key) => bail!(
+                                "FTS candidate key arity mismatch: expected {}, got {}",
+                                key_columns.len(),
+                                key.len()
+                            ),
+                            value => bail!(
+                                "FTS candidates for a composite-key relation must be lists; got {value:?}"
+                            ),
+                        }
+                    };
+                    let key = raw_key
+                        .into_iter()
+                        .zip(key_columns)
+                        .map(|(value, column)| {
+                            column
+                                .typing
+                                .coerce(value, crate::data::functions::MAX_VALIDITY_TS)
+                        })
+                        .collect::<Result<Tuple>>()?;
+                    set.insert(key);
+                }
+                Some(Arc::new(set))
+            }
+        };
+
         let bind_score = match self.parameters.remove("bind_score") {
             None => None,
             Some(Expr::Binding { var, .. }) => Some(var),
@@ -1551,6 +1598,7 @@ impl SearchInput {
             score_kind,
             bind_score,
             bind_spans,
+            candidates,
             // lax_mode,
             filter,
             span: self.span,

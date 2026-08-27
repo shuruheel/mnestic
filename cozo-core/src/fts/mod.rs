@@ -36,6 +36,11 @@ thread_local! {
     /// Thread-local (query eval runs on the calling thread) so parallel tests
     /// cannot race each other's deltas.
     pub static FTS_LITERAL_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Per-thread count of base-relation row fetches performed after FTS
+    /// ranking. Candidate-aware tests use it to prove rejected postings do not
+    /// become storage reads; it is diagnostic test support, not a stable API.
+    pub static FTS_BASE_ROW_FETCHES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Debug, Clone, PartialEq, serde_derive::Serialize, serde_derive::Deserialize)]

@@ -5,6 +5,17 @@ provenance and licensing.
 
 ## Unreleased
 
+- **Candidate-aware FTS**
+  ([`docs/specs/fts-candidates.md`](docs/specs/fts-candidates.md)): FTS search
+  atoms accept a constant `candidates:` list of base-relation primary keys.
+  Keys are type-coerced once into a shared hash set, non-members are removed
+  before scoring, sorting, and base-row fetches, and top-k is therefore scoped
+  rather than globally truncated. BM25 `N`, average document length, and term
+  document frequencies remain corpus-global, so a candidate restriction never
+  changes a retained document's score. Composite keys, numeric coercion,
+  boolean/proximity operators, filters, empty sets, multi-parent queries, error
+  cases, rank safety, and score invariance have stored-path coverage.
+
 - **Parquet / Arrow copy-in, Batch A** ([#11](https://github.com/shuruheel/mnestic/issues/11),
   [`docs/specs/parquet-arrow.md`](docs/specs/parquet-arrow.md)): the approved
   D1–D11 contract is implemented behind off-by-default `columnar-io`: one
