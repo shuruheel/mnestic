@@ -1,6 +1,6 @@
 # Spec — Parquet / Arrow boundary I/O: atomic, chunked copy-in first; record-batch copy-out second
 
-_Created 2026-08-18. Status: **BATCH A MERGED — D1–D11 signed by the owner 2026-08-18; local Rust, SQLite, RocksDB, Python wheel/sdist, and interoperability gates passed; hosted engine CI passed on PR #51; the publication-disabled cross-platform Python wheel/sdist matrix passed in run 32287514329. The feature remains unreleased.** Tracks [issue #11](https://github.com/shuruheel/mnestic/issues/11). Batch B export retains its separate sign-off gate in §8 and §11 and is not merged._
+_Created 2026-08-18. Status: **BATCH A MERGED — D1–D11 signed by the owner 2026-08-18; local Rust, SQLite, RocksDB, Python wheel/sdist, and interoperability gates passed; hosted engine CI passed on PR #51; the publication-disabled cross-platform Python wheel/sdist matrix passed in run 32287514329. The feature remains unreleased and is the planned 0.17.0 release unit.** Tracks [issue #11](https://github.com/shuruheel/mnestic/issues/11). Batch B export is not merged and is deferred until released Batch A produces a concrete consumer need; activation still requires the separate sign-off gate in §8 and §11._
 
 ## 1. Outcome and scope
 
@@ -188,7 +188,9 @@ The Python crate gains a matching `columnar-io = ["cozo/columnar-io"]` passthrou
 
 Batch A's local release-profile measurement on 2026-08-18 used the real macOS arm64 wheel feature set (`compact,storage-rocksdb,rdf-io`) and then added `columnar-io`. The abi3 wheel grew from 11,473,515 to 13,185,157 bytes: +1,711,642 bytes (+14.92%). The baseline was a cold release build (283.92 seconds wall time); the columnar build reused that native cache and took 114.92 seconds, so those timings prove successful builds but are not presented as a controlled performance ratio. The sdist grew from 5,738,111 to 5,738,177 bytes: +66 bytes; warm archive builds took 1.90 and 1.65 seconds respectively. A clean Python 3.12 environment built and installed the columnar-enabled sdist in 148.22 seconds and exposed the method. A wheel-installed Python 3.12 smoke imported 500,000 IPC rows and a competing Python thread advanced 14,586,942 iterations during the call, proving the binding released the GIL. PyArrow 25 independently produced canonical UUID/JSON fields and a delta-dictionary IPC stream that imported successfully; its encrypted Parquet and a damaged checksummed Parquet were rejected with `columnar::` diagnostics. Cross-platform CI remains the authority for the other advertised targets.
 
-## 8. Phase 2 — Arrow export and Python handoff (separate review unit)
+## 8. Phase 2 — Arrow export and Python handoff (deferred, separate review unit)
+
+Phase 2 is not active implementation. Release and observe Batch A first. Reopen this unit only for a concrete Arrow-native consumer workflow—such as a PyArrow/Polars integration or a demonstrated copy-cost constraint—that can settle the public Rust type/API, requested-schema behavior, and Python ownership/lifetime decisions below. General interest in “zero copy” is not an activation signal.
 
 Phase 2 is architecturally reserved here but is **not build-authorized by signing the V1 import decisions**. Its required contract is:
 
@@ -253,7 +255,7 @@ Stored-relation behavior is tested primarily on SQLite per the repository rule i
 
 ### Batch B — export (new sign-off required)
 
-Before implementation, turn §8's reserved contract into its own exact API/type matrix and acceptance tests. At minimum: stable per-stream schema, bounded chunks, concrete stored-type mapping, `Any`/nested-`Any` rejection, a query typed-output prerequisite, exact requested-schema behavior, capsule ownership/destructor behavior, database-close independence, PyArrow/Polars interoperability, and proof that the Python boundary adds no buffer copy.
+After the demand gate in §8 is met and before implementation, turn §8's reserved contract into its own exact API/type matrix and acceptance tests. At minimum: stable per-stream schema, bounded chunks, concrete stored-type mapping, `Any`/nested-`Any` rejection, a query typed-output prerequisite, exact requested-schema behavior, capsule ownership/destructor behavior, database-close independence, PyArrow/Polars interoperability, and proof that the Python boundary adds no buffer copy.
 
 ## 12. Owner decisions — approved 2026-08-18
 
