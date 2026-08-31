@@ -1,6 +1,6 @@
 # Spec — Parquet / Arrow boundary I/O: atomic, chunked copy-in first; record-batch copy-out second
 
-_Created 2026-08-18. Status: **BATCH A MERGED — D1–D11 signed by the owner 2026-08-18; local Rust, SQLite, RocksDB, Python wheel/sdist, and interoperability gates passed; hosted engine CI passed on PR #51; the publication-disabled cross-platform Python wheel/sdist matrix passed in run 32287514329. The feature remains unreleased and is the planned 0.17.0 release unit.** Tracks [issue #11](https://github.com/shuruheel/mnestic/issues/11). Batch B export is not merged and is deferred until released Batch A produces a concrete consumer need; activation still requires the separate sign-off gate in §8 and §11._
+_Created 2026-08-18. Status: **BATCH A RELEASED IN 0.17.0 ON 2026-08-31 — D1–D11 signed by the owner 2026-08-18; local Rust, SQLite, RocksDB, Python wheel/sdist, and interoperability gates passed; hosted engine CI passed on PR #51; the publication-disabled cross-platform Python wheel/sdist matrix passed in run 32287514329.** Tracks [issue #11](https://github.com/shuruheel/mnestic/issues/11). Batch B export is not merged and is deferred until released Batch A produces a concrete consumer need; activation still requires the separate sign-off gate in §8 and §11._
 
 ## 1. Outcome and scope
 

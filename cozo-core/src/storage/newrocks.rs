@@ -1,13 +1,12 @@
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
-use log::info;
 use miette::{miette, IntoDiagnostic, Result, WrapErr};
 
 use rocksdb::{
     OptimisticTransactionDB, OptimisticTransactionOptions, Options, WriteBatchWithTransaction,
-    WriteOptions, DB,
+    WriteOptions,
 };
 
 use crate::data::tuple::{check_key_for_validity, Tuple};
@@ -391,18 +390,16 @@ impl<'a> Iterator for NewRocksDbIterator<'a> {
     type Item = Result<Tuple>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while let Some(result) = self.inner.next() {
-            match result {
-                Ok((k, v)) => {
-                    if k.as_ref() >= self.upper_bound.as_slice() {
-                        return None;
-                    }
-                    return Some(try_decode_tuple_from_kv(&k, &v, None));
+        match self.inner.next() {
+            Some(Ok((k, v))) => {
+                if k.as_ref() >= self.upper_bound.as_slice() {
+                    return None;
                 }
-                Err(e) => return Some(Err(miette!("Iterator error: {}", e))),
+                Some(try_decode_tuple_from_kv(&k, &v, None))
             }
+            Some(Err(e)) => Some(Err(miette!("Iterator error: {}", e))),
+            None => None,
         }
-        None
     }
 }
 

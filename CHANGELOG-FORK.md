@@ -5,38 +5,78 @@ provenance and licensing.
 
 ## Unreleased
 
-- **Candidate-aware FTS**
-  ([`docs/specs/fts-candidates.md`](docs/specs/fts-candidates.md)): FTS search
-  atoms accept a constant `candidates:` list of base-relation primary keys.
-  Keys are type-coerced once into a shared hash set, non-members are removed
-  before scoring, sorting, and base-row fetches, and top-k is therefore scoped
-  rather than globally truncated. BM25 `N`, average document length, and term
-  document frequencies remain corpus-global, so a candidate restriction never
-  changes a retained document's score. Composite keys, numeric coercion,
-  boolean/proximity operators, filters, empty sets, multi-parent queries, error
-  cases, rank safety, and score invariance have stored-path coverage.
+## 0.17.0 — 2026-08-31
 
-- **Parquet / Arrow copy-in, Batch A** ([#11](https://github.com/shuruheel/mnestic/issues/11),
-  [`docs/specs/parquet-arrow.md`](docs/specs/parquet-arrow.md)): the approved
-  D1–D11 contract is implemented behind off-by-default `columnar-io`: one
-  host-controlled local Parquet or Arrow IPC file imports into an existing
-  non-`TxTime` relation through one transaction; target-schema coercion,
-  lossless numeric checks, fail-closed logical types, explicit resource limits,
-  stable `columnar::` diagnostics, and stale search-index reporting are wired
-  through Rust and a GIL-releasing Python method. Coverage includes all five
-  encodings; projection and mapping; scalar, nested, dictionary, run-end, view,
-  UUID/JSON, vector, and fail-closed type behavior; commit and late-batch
-  rollback; put/B-tree equivalence; search-index warnings; access, temporal,
-  callback, projection-cache, timeout, malformed-source, concurrency, and real
-  RocksDB lanes. Published wheels and sdists now compile `columnar-io`; the
-  measured macOS arm64 ABI3 wheel delta is +1,711,642 bytes (+14.92%), and a
-  clean source archive builds and exposes the method. Independent PyArrow
-  fixtures cover canonical extensions, delta dictionaries, encrypted Parquet,
-  checksums, and a 500,000-row GIL-release smoke. Hosted engine CI passed on
-  PR #51, and the publication-disabled Python build matrix passed on Linux
-  x86/ARM, macOS x86/ARM, and Windows with wheel smoke tests plus the sdist
-  (`python-publish` run 32287514329). Batch A is merged but unreleased; Arrow
-  export remains a separate, unmerged Batch B review unit.
+This release adds atomic, host-controlled copy-in from Parquet and Arrow IPC,
+plus candidate-scoped full-text retrieval. Enable Rust's `columnar-io` feature
+and call `db.import_columnar_file("events", "events.parquet", &options)`, or use
+the same `import_columnar_file` method from the published Python package. An
+import commits all decoded rows in one transaction or leaves the target
+relation unchanged. FTS `candidates:` changes which documents are eligible for
+top-k without changing a retained document's corpus-global BM25 score. There is
+no storage-format migration. The `mnestic-rocks` bridge advances to 0.1.12 and
+must be published before the `mnestic` crate.
+
+### Added
+
+- **Atomic Parquet and Arrow IPC copy-in**
+  ([#11](https://github.com/shuruheel/mnestic/issues/11),
+  [`docs/specs/parquet-arrow.md`](docs/specs/parquet-arrow.md)): the
+  off-by-default `columnar-io` feature adds `Db::import_columnar_file` and the
+  backend-erased `DbInstance` equivalent. One local Parquet, Arrow IPC file, or
+  Arrow IPC stream is projected into an existing non-`TxTime` relation using
+  put/upsert semantics, target-schema coercion, lossless numeric checks, and
+  fail-closed handling for unsupported logical types. Column mappings and
+  explicit ceilings for source bytes, rows, decoded-batch bytes, value bytes,
+  nesting depth, and wall-clock time let hosts bound admitted work. The report
+  returns processed rows and batches plus any HNSW, FTS, or LSH indexes that
+  require `::reindex` after the bulk load.
+
+- **Candidate-scoped full-text retrieval**
+  ([`docs/specs/fts-candidates.md`](docs/specs/fts-candidates.md)): an FTS atom
+  accepts a constant `candidates:` list of base-relation primary keys. Candidate
+  membership is applied before sorting, top-k truncation, and base-row fetches;
+  noncandidate literal hits are also removed before scoring and result-map
+  growth. An eligible document below the global top-k can therefore surface.
+  One-column and composite keys are coerced through their declared types; empty
+  lists return no rows and malformed or nonconstant inputs fail loudly. Queries
+  without `candidates:` retain their previous behavior.
+
+### Changed
+
+- **Python distributions include columnar copy-in:** published wheels and
+  source distributions compile `columnar-io`, and
+  `CozoDbPy.import_columnar_file` releases the GIL while decoding and committing.
+  On the measured macOS arm64 ABI3 wheel, the added Arrow/Parquet support
+  increases the artifact by 1,711,642 bytes (14.92%).
+- **Bridge build maintenance:** `mnestic-rocks` 0.1.12 carries no-behavior-change
+  Rust 1.98 Clippy fixes in its build script. Publish it before `mnestic` 0.17.0,
+  which pins the new bridge version.
+
+### API and compatibility
+
+- The Rust surface is additive and feature-gated:
+  `ColumnarFileFormat`, `ColumnarImportOptions`, `ColumnarImportReport`, and
+  `import_columnar_file` exist only with `columnar-io`. The Python method accepts
+  `parquet`, `arrow_ipc_file`, or `arrow_ipc_stream` explicitly; format inference
+  from a path extension is deliberately absent.
+- Older engines reject the new FTS `candidates:` option instead of silently
+  falling back to a global top-k. BM25 document count, average document length,
+  and term document frequencies remain corpus-global, so candidate scopes are
+  eligibility boundaries rather than statistical-isolation boundaries.
+
+### Known limitations
+
+- Columnar import accepts one process-readable local regular file and requires
+  an existing relation. It does not infer schemas, read remote or partitioned
+  datasets, import into `TxTime` relations, run triggers or callbacks, or
+  maintain search indexes during the load. Arrow export is not included.
+- `batch_rows` bounds conversion-loop slices, not peak memory. A decoder may
+  allocate a full record batch before `max_decoded_batch_bytes` is checked, and
+  the single atomic storage transaction can exceed the conversion batch size.
+- Candidate-aware FTS still scans matching posting ranges to preserve global
+  document-frequency statistics; its cost is not strictly proportional to the
+  allowlist size. Callers remain responsible for bounding candidate lists.
 
 ## 0.16.0 — 2026-08-18
 

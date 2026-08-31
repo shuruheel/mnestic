@@ -92,29 +92,34 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.16.0
+## New in 0.17.0
 
-Python callers can now define and invoke persistent named read queries through
-the existing `run_script` API:
+0.17.0 adds atomic local Parquet/Arrow copy-in and candidate-scoped full-text
+retrieval. `import_columnar_file` accepts an explicit format, projects into an
+existing non-`TxTime` relation, and commits every decoded row or none of them:
 
 ```python
-db.run_script("""
-::query create recent_items ($since: Int) {
-    ?[uid, created_at] := *item{uid, created_at}, created_at >= $since
-}
-""", {}, False)
-
-rows = db.run_script(
-    "::query run recent_items",
-    {"since": 1_700_000_000},
-    True,
-)["rows"]
+report = db.import_columnar_file(
+    "events",
+    "events.parquet",
+    format="parquet",
+    columns={"event_id": "id"},
+    max_rows=1_000_000,
+)
 ```
 
-Stored queries have introspectable typed/defaulted parameters, compose as
-ordinary rule atoms, survive reopen and export/import, and always evaluate
-current transaction data. Bodies are read-only in v1; this is not a plan cache
-or a materialized-result feature. No storage migration is required.
+The report gives `rows_processed`, `batches_processed`, and the HNSW/FTS/LSH
+indexes that require `::reindex`. The method releases the GIL while decoding
+and committing; published wheels and source distributions both include it.
+
+FTS atoms used through `run_script` now accept a constant `candidates:` list of
+base-relation primary keys. The allowlist is applied before sorting and top-k,
+while BM25 statistics remain corpus-global, so an eligible document keeps the
+same score and can surface even when it falls below the unrestricted top-k.
+
+Columnar import requires one process-readable local file and an existing
+relation. It does not infer schemas, import into `TxTime` relations, maintain
+search indexes, or export Arrow. No storage migration is required.
 
 See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
 for the full accounting, and for 0.13.0's upgrade guidance if you are coming

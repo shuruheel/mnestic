@@ -49,6 +49,13 @@
   参数可选类型与默认值。既可按名称运行，也可像普通规则原子一样调用；原子形式会在 magic-set
   重写前进行卫生式命名空间拼接，因此调用方绑定可沿整条存储规则链向下专化。
   （[规格说明](docs/specs/stored-queries.md)）
+- **原子化 Parquet / Arrow 导入** —— 受 feature 控制的宿主 API 可在单个事务中，
+  将一个本地 Parquet 或 Arrow IPC 文件导入已有关系；调用方可显式设置转换与资源上限，
+  返回报告会列出需要重建的搜索索引。
+  （[规格说明](docs/specs/parquet-arrow.md)）
+- **候选集限定的全文检索** —— `candidates:` 可在 top-k 截断之前，将 FTS 原子的
+  合格文档限制为一组基础关系主键，同时保留合格文档基于全语料库统计的 BM25 分数。
+  （[规格说明](docs/specs/fts-candidates.md)）
 - **更快的查找与计划** —— 等值下推把后置过滤的点查转为按键定位（5k 行实测约 28×），
   另有确定性贪心连接重排序与默认开启的因子化 `count()` 重写。
 - **非阻塞的向量索引构建** —— HNSW 改为内存中并行构建，不再让读操作阻塞数分钟；
@@ -63,19 +70,23 @@
 其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## 0.16.0 新增
+## 0.17.0 新增
 
-存储查询让可复用的 CozoScript 规则可以持久化并被检查：
+0.17.0 新增原子化列式文件导入与候选集限定的全文检索：
 
-- `::query create`、`list`、`show`、`run` 与 `remove` 管理事务型
-  `mnestic_stored_queries` 目录中的命名只读查询。
-- 参数声明可被工具读取，并可选类型与定义时默认值。
-- 存储查询既可按名称运行，也可作为普通规则原子组合进其他查询；卫生式展开发生在
-  magic-set 重写之前，因此调用方绑定可沿规则链向下专化。
-- 定义可跨重启及导出/导入保留；依赖检查会阻止删除仍被其他存储查询引用的查询。
+- 启用 `columnar-io` 后，`Db::import_columnar_file` 可将一个本地 Parquet、
+  Arrow IPC file 或 Arrow IPC stream 导入已有的非 `TxTime` 关系。模式转换以及可选的
+  源文件/行数/批次/值大小/嵌套深度/超时上限一旦失败，整个事务都会回滚；返回报告会列出
+  需要执行 `::reindex` 的搜索索引。
+- FTS 原子接受由基础关系主键组成的常量 `candidates:` 列表。候选资格在排序与 top-k
+  之前生效，而 BM25 统计仍基于全语料库，因此保留下来的文档分数不变。
+- 发布的 Python wheel 与源代码分发包均提供 `CozoDbPy.import_columnar_file`；
+  解码与提交期间会释放 GIL。实测 macOS arm64 ABI3 wheel 增加 1,711,642 字节
+  （14.92%）。
 
-v1 的查询体只读，并始终针对当前事务数据求值。本版本不缓存计划、不物化结果，
-也不需要迁移存储格式。
+列式导入仅支持“本地文件到已有关系”的复制：它不会推断模式、维护 HNSW/FTS/LSH
+索引或导出 Arrow。本版本不需要迁移存储格式。`mnestic-rocks` 因桥接构建维护升至
+0.1.12，必须先于引擎 crate 发布。
 
 完整细节见 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md)。
 

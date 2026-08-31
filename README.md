@@ -67,6 +67,15 @@ capabilities on top of it:
   a normal rule atom; atom form is hygienically spliced before magic-set
   rewriting, so caller bindings specialize through the stored rule chain.
   ([spec](docs/specs/stored-queries.md))
+- **Atomic Parquet / Arrow copy-in** — the feature-gated host API imports one
+  local Parquet or Arrow IPC file into an existing relation in a single
+  transaction, with explicit conversion/resource limits and a report naming
+  search indexes that require rebuilding.
+  ([spec](docs/specs/parquet-arrow.md))
+- **Candidate-scoped full-text retrieval** — `candidates:` restricts an FTS
+  atom to an allowlist of base-relation primary keys before top-k truncation,
+  while retaining corpus-global BM25 scores for eligible documents.
+  ([spec](docs/specs/fts-candidates.md))
 - **Faster lookups and plans** — equality pushdown turns post-filter point
   lookups into keyed seeks (~28× at 5k rows), plus a deterministic greedy join
   reorder and a default-on factorized `count()` rewrite.
@@ -86,24 +95,26 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.16.0
+## New in 0.17.0
 
-Stored queries make reusable CozoScript rules persistent and inspectable:
+0.17.0 adds atomic columnar copy-in and candidate-scoped full-text retrieval:
 
-- `::query create`, `list`, `show`, `run`, and `remove` manage named read
-  queries in the transactional `mnestic_stored_queries` catalog.
-- Parameters are declared and introspectable, with optional types and
-  definition-time defaults.
-- A stored query can run by name or compose into another query as a rule atom.
-  Atom expansion is hygienic and happens before magic-set rewriting, so caller
-  bindings specialize through the stored rule chain.
-- Definitions survive reopen and export/import. Removal refuses while another
-  stored query depends on the name, and a depth limit defends against a
-  hand-edited catalog cycle.
+- With `columnar-io`, `Db::import_columnar_file` copies one local Parquet,
+  Arrow IPC file, or Arrow IPC stream into an existing non-`TxTime` relation.
+  Schema coercion and optional source/row/batch/value/depth/time limits fail the
+  whole transaction; the report names search indexes requiring `::reindex`.
+- FTS atoms accept a constant `candidates:` list of base-relation primary keys.
+  Eligibility is applied before sorting and top-k, while BM25 statistics remain
+  corpus-global, so a retained document keeps the same score.
+- Published Python wheels and source distributions expose
+  `CozoDbPy.import_columnar_file`; the call releases the GIL while decoding and
+  committing. The measured macOS arm64 ABI3 wheel grows by 1,711,642 bytes
+  (14.92%).
 
-Stored bodies are read-only in v1. They are always evaluated against current
-transaction data; this release does not cache plans or materialize results.
-There is no storage-format migration, and `mnestic-rocks` remains at 0.1.11.
+Columnar import is local-file, existing-relation copy-in: it does not infer a
+schema, maintain HNSW/FTS/LSH indexes, or export Arrow. There is no
+storage-format migration. `mnestic-rocks` advances to 0.1.12 for bridge build
+maintenance and must be published before the engine crate.
 
 Full detail is in [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 

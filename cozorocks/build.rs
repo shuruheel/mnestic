@@ -22,7 +22,7 @@ fn main() {
         builder.flag_if_supported("-EHsc");
         builder.flag_if_supported("-std:c++17");
     } else {
-        builder.flag(&cxx_standard());
+        builder.flag(cxx_standard());
         builder.define("HAVE_UINT128_EXTENSION", Some("1"));
         builder.flag("-Wsign-compare");
         builder.flag("-Wshadow");
@@ -302,7 +302,7 @@ fn build_rocksdb() {
         config.flag("-EHsc");
         config.flag("-std:c++17");
     } else {
-        config.flag(&cxx_standard());
+        config.flag(cxx_standard());
         // matches the flags in CMakeLists.txt from rocksdb
         config.define("HAVE_UINT128_EXTENSION", Some("1"));
         config.flag("-Wsign-compare");
@@ -317,7 +317,7 @@ fn build_rocksdb() {
     }
 
     for file in lib_sources {
-        config.file(&format!("rocksdb/{file}"));
+        config.file(format!("rocksdb/{file}"));
     }
 
     config.file("build_version.cc");

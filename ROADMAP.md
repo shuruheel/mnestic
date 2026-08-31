@@ -20,24 +20,26 @@ Every new feature must fit that agentic-memory wedge as a general engine mechani
 
 ## Current state
 
-- `mnestic` 0.16.0 is the latest published engine release.
-- Atomic Parquet/Arrow import is merged on `main` and CI-accepted, but unreleased.
+- `mnestic` 0.17.0 and `mnestic-rocks` 0.1.12 are the latest published releases.
+- Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
 - LangChain, LlamaIndex, LangGraph, and MCP integrations are published.
+
+### Already shipped through 0.17.0
+
+| Capability | Release | Boundary |
+|---|---:|---|
+| Atomic Parquet/Arrow copy-in | 0.17.0 | One local file into an existing non-`TxTime` relation; Arrow export remains demand-gated |
+| Candidate-aware FTS | 0.17.0 | Exact primary-key allowlist before top-k; BM25 statistics remain corpus-global |
 
 ## Active priorities
 
 | Order | Work | State | Gate |
 |---:|---|---|---|
-| 1 | Release 0.17.0 | Import merged, unreleased | Verify crates.io, PyPI, GitHub, and clean-install artifacts |
-| 2 | [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Ready | Analyzer regressions and compatibility review |
-| 3 | Candidate-aware FTS | Implemented in working tree, unreleased | Filter before top-k while preserving global BM25 statistics; land and release evidence pending |
-| 4 | [String-literal correctness #53](https://github.com/shuruheel/mnestic/issues/53) | Ready for design | Migration note and compatibility soak |
-| 5 | [Canonical nested JSON #54](https://github.com/shuruheel/mnestic/issues/54) | Ready for design | Explicit output compatibility contract |
-| 6 | [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Evidence-first | Reproduce a current failure before authorizing repair |
-
-Release 0.17.0 is a boundary, not a development pause. Prefix normalization and candidate-aware
-FTS may proceed immediately after it.
+| 1 | [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Ready | Analyzer regressions and compatibility review |
+| 2 | [String-literal correctness #53](https://github.com/shuruheel/mnestic/issues/53) | Ready for design | Migration note and compatibility soak |
+| 3 | [Canonical nested JSON #54](https://github.com/shuruheel/mnestic/issues/54) | Ready for design | Explicit output compatibility contract |
+| 4 | [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Evidence-first | Reproduce a current failure before authorizing repair |
 
 ## Adoption work
 

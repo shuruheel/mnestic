@@ -1,6 +1,6 @@
 # Candidate-aware full-text search
 
-Status: implemented in the unreleased working tree on 2026-08-27.
+Status: released in mnestic 0.17.0 on 2026-08-31.
 
 ## Contract
 
