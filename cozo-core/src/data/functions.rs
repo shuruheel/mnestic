@@ -80,17 +80,17 @@ pub(crate) fn op_list(args: &[DataValue]) -> Result<DataValue> {
 
 define_op!(OP_JSON, 1, false);
 pub(crate) fn op_json(args: &[DataValue]) -> Result<DataValue> {
-    Ok(DataValue::Json(JsonData(to_json(&args[0]))))
+    Ok(DataValue::Json(JsonData(JsonValue::from(&args[0]))))
 }
 
 define_op!(OP_SET_JSON_PATH, 3, false);
 pub(crate) fn op_set_json_path(args: &[DataValue]) -> Result<DataValue> {
-    let mut result = to_json(&args[0]);
+    let mut result = JsonValue::from(&args[0]);
     let path = args[1]
         .get_slice()
         .ok_or_else(|| miette!("json path must be a string"))?;
     let pointer = get_json_path(&mut result, path)?;
-    let new_val = to_json(&args[2]);
+    let new_val = JsonValue::from(&args[2]);
     *pointer = new_val;
     Ok(DataValue::Json(JsonData(result)))
 }
@@ -160,7 +160,7 @@ fn get_json_path<'a>(
 
 define_op!(OP_REMOVE_JSON_PATH, 2, false);
 pub(crate) fn op_remove_json_path(args: &[DataValue]) -> Result<DataValue> {
-    let mut result = to_json(&args[0]);
+    let mut result = JsonValue::from(&args[0]);
     let path = args[1]
         .get_slice()
         .ok_or_else(|| miette!("json path must be a string"))?;
@@ -196,78 +196,10 @@ pub(crate) fn op_json_object(args: &[DataValue]) -> Result<DataValue> {
     let mut obj = serde_json::Map::with_capacity(args.len() / 2);
     for pair in args.chunks(2) {
         let key = val2str(&pair[0]);
-        let value = to_json(&pair[1]);
+        let value = JsonValue::from(&pair[1]);
         obj.insert(key.to_string(), value);
     }
     Ok(DataValue::Json(JsonData(Value::Object(obj))))
-}
-
-fn to_json(d: &DataValue) -> JsonValue {
-    match d {
-        DataValue::Null => {
-            json!(null)
-        }
-        DataValue::Bool(b) => {
-            json!(b)
-        }
-        DataValue::Num(n) => match n {
-            Num::Int(i) => {
-                json!(i)
-            }
-            Num::Float(f) => {
-                json!(f)
-            }
-        },
-        DataValue::Str(s) => {
-            json!(s)
-        }
-        DataValue::Bytes(b) => {
-            json!(b)
-        }
-        DataValue::Uuid(u) => {
-            json!(u.0.as_bytes())
-        }
-        DataValue::Regex(r) => {
-            json!(r.0.as_str())
-        }
-        DataValue::List(l) => {
-            let mut arr = Vec::with_capacity(l.len());
-            for el in l {
-                arr.push(to_json(el));
-            }
-            arr.into()
-        }
-        DataValue::Set(l) => {
-            let mut arr = Vec::with_capacity(l.len());
-            for el in l {
-                arr.push(to_json(el));
-            }
-            arr.into()
-        }
-        DataValue::Vec(v) => {
-            let mut arr = Vec::with_capacity(v.len());
-            match v {
-                Vector::F32(a) => {
-                    for el in a {
-                        arr.push(json!(el));
-                    }
-                }
-                Vector::F64(a) => {
-                    for el in a {
-                        arr.push(json!(el));
-                    }
-                }
-            }
-            arr.into()
-        }
-        DataValue::Json(j) => j.0.clone(),
-        DataValue::Validity(vld) => {
-            json!([vld.timestamp.0, vld.is_assert.0])
-        }
-        DataValue::Bot => {
-            json!(null)
-        }
-    }
 }
 
 define_op!(OP_PARSE_JSON, 1, false);
@@ -2084,13 +2016,9 @@ pub(crate) fn op_to_string(args: &[DataValue]) -> Result<DataValue> {
 }
 
 fn val2str(arg: &DataValue) -> String {
-    match arg {
-        DataValue::Str(s) => s.to_string(),
-        DataValue::Json(JsonData(JsonValue::String(s))) => s.clone(),
-        v => {
-            let jv = to_json(v);
-            jv.to_string()
-        }
+    match JsonValue::from(arg) {
+        JsonValue::String(s) => s,
+        other => other.to_string(),
     }
 }
 

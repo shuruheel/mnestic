@@ -5,6 +5,63 @@ provenance and licensing.
 
 ## Unreleased
 
+Target: 0.18.0. These changes are not yet published.
+
+### Changed — string literals (#53)
+
+Double-quoted strings now decode the existing quoted escape grammar; fenced raw
+strings preserve hashes, comment markers, newlines and edge whitespace. Raw
+fences require one or more underscores on both sides, with no gaps. Choose a
+fence longer than any underscore run after a quote in the contents.
+
+**Upgrade guidance:**
+
+- `"a\nb"` now contains three characters. Use `_"a\nb"_` when a literal
+  backslash is intended. Unknown escapes now fail at the character after the
+  backslash; this also applies to quoted FTS phrases. A final backslash can
+  escape the closing quote, producing an error later or at end of input.
+- Whitespace and comment-like text at either end of double-quoted and raw
+  strings is now retained. Trim explicitly when intended. Spaced fences such
+  as `__ "abc" __` are no longer accepted.
+- Comment markers inside strings can no longer hide a quote. Audit scripts
+  containing quotes inside apparent block/line comments within a literal:
+  a formerly single string can become multiple expressions.
+- `\uXXXX` remains BMP-only: surrogate pairs and lone surrogates are rejected.
+  Literal non-BMP characters work; Python encoders can use `ensure_ascii=False`.
+  Parameters and single-quoted value semantics are unchanged.
+- Stored strings/descriptions are unchanged until written again. Stored query
+  bodies are reparsed when invoked and require the same script audit.
+
+For 0.18, `parser.string_decoding_changed` warns once per script warning drain
+about potentially changed escapes/edge trivia. It reports a byte offset and
+never literal contents. It is conservative, can flag already-correct FTS or
+hash-containing literals, and cannot detect every hidden-quote case. Warnings
+emitted before AST or execution failures are retained by the correct database.
+**Release follow-up: remove this temporary warning in 0.19.0.**
+
+### Changed — canonical JSON conversion (#54)
+
+Nested values, JSON builtins, `to_string`, value-derived object keys and paths,
+and new writes into `Json` columns now use the existing top-level JSON forms:
+UUID strings, base64 byte strings, and `"INFINITY"`/`"NEGATIVE_INFINITY"` for
+scalar infinities. String-valued `to_string` results remain unquoted. Lists and
+sets recurse through one conversion policy. Non-contiguous vectors no longer
+panic during conversion; the internal bottom sentinel renders as null.
+
+**Stored JSON is not rewritten.** Old UUID/byte arrays and infinity-derived
+nulls can coexist with new strings. Audit known typed fields and migrate them
+client-side if needed: `uuid.UUID(bytes=bytes(arr))` for UUIDs and
+`base64.b64encode(bytes(arr)).decode()` for bytes. Do not guess the type of
+arbitrary arrays. Infinity values already reduced to null cannot be recovered
+without another source of truth. Persisted `to_string` output also stays as it was.
+
+Top-level forms remain unchanged except the internal bottom sentinel. NaN and
+non-finite vector elements remain null; F32 elements retain their widened f64
+representation. Existing JSON payloads stay opaque, integers stay exact i64,
+and inbound JSON conversion remains lossy. Native binding conversions and
+MindGraph's separately persisted snapshot format are unchanged. There is no
+storage-format change or new bridge version.
+
 ## 0.17.0 — 2026-08-31
 
 This release adds atomic, host-controlled copy-in from Parquet and Arrow IPC,

@@ -449,6 +449,7 @@ struct InvalidUtf8Error(u32, #[label] SourceSpan);
 struct InvalidEscapeSeqError(String, #[label] SourceSpan);
 
 fn parse_quoted_string(pair: Pair<'_>) -> Result<SmartString<LazyCompact>> {
+    warn_string_decoding_changed(&pair, true);
     let pairs = pair.into_inner().next().unwrap().into_inner();
     let mut ret = SmartString::new();
     for pair in pairs {
@@ -507,7 +508,30 @@ fn parse_s_quoted_string(pair: Pair<'_>) -> Result<SmartString<LazyCompact>> {
 }
 
 fn parse_raw_string(pair: Pair<'_>) -> Result<SmartString<LazyCompact>> {
+    warn_string_decoding_changed(&pair, false);
     Ok(SmartString::from(
         pair.into_inner().next().unwrap().as_str(),
     ))
+}
+
+// Temporary migration signal for 0.18; remove in 0.19. Some valid FTS escapes
+// and hash-containing literals already decoded this way. Never log contents.
+fn warn_string_decoding_changed(pair: &Pair<'_>, quoted: bool) {
+    let inner = pair.clone().into_inner().next().unwrap();
+    let text = inner.as_str();
+    if (quoted && text.contains('\\'))
+        || text.starts_with(char::is_whitespace)
+        || text.ends_with(char::is_whitespace)
+        || text.starts_with("/*")
+        || text.ends_with("*/")
+    {
+        crate::runtime::diagnostics::emit_once(
+            "parser.string_decoding_changed",
+            format!(
+                "literal at byte offset {} may decode differently in 0.18.0 (JSON escapes applied; edge whitespace kept)",
+                pair.as_span().start()
+            ),
+            "Use a fenced raw string for verbatim backslashes; trim explicitly if intended. If the new value is intended, ignore this warning; it is removed in 0.19.0.",
+        );
+    }
 }

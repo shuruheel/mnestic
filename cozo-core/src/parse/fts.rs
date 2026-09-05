@@ -151,6 +151,40 @@ mod tests {
     use crate::parse::fts::parse_fts_query;
 
     #[test]
+    fn quoted_string_contract() {
+        let parsed = parse_fts_query(r#""a \"b\" c""#).unwrap();
+        match parsed {
+            FtsExpr::Literal(lit) => {
+                assert_eq!(lit.value.as_str(), "a \"b\" c");
+                assert!(lit.is_phrase);
+            }
+            other => panic!("expected phrase: {other:?}"),
+        }
+        assert!(parse_fts_query(r#""C:\Users""#).is_err());
+        let parsed = parse_fts_query(r###"___"#tag"___"###).unwrap().flatten();
+        match parsed {
+            FtsExpr::And(parts) => {
+                assert_eq!(parts.len(), 3);
+                for (part, text, phrase) in [
+                    (parts[0].clone(), "___", false),
+                    (parts[1].clone(), "#tag", true),
+                    (parts[2].clone(), "___", false),
+                ] {
+                    match part {
+                        FtsExpr::Literal(lit) => {
+                            assert_eq!(lit.value.as_str(), text);
+                            assert_eq!(lit.is_phrase, phrase);
+                        }
+                        other => panic!("expected literal: {other:?}"),
+                    }
+                }
+            }
+            other => panic!("expected conjunction: {other:?}"),
+        }
+        crate::runtime::diagnostics::drain();
+    }
+
+    #[test]
     fn test_parse() {
         let src = " hello world OR bye bye world";
         let res = parse_fts_query(src).unwrap().flatten();

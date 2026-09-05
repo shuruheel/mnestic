@@ -32,14 +32,24 @@ Every new feature must fit that agentic-memory wedge as a general engine mechani
 | Atomic Parquet/Arrow copy-in | 0.17.0 | One local file into an existing non-`TxTime` relation; Arrow export remains demand-gated |
 | Candidate-aware FTS | 0.17.0 | Exact primary-key allowlist before top-k; BM25 statistics remain corpus-global |
 
-## Active priorities
+## Next release: 0.18.0
 
-| Order | Work | State | Gate |
-|---:|---|---|---|
-| 1 | [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Ready | Analyzer regressions and compatibility review |
-| 2 | [String-literal correctness #53](https://github.com/shuruheel/mnestic/issues/53) | Ready for design | Migration note and compatibility soak |
-| 3 | [Canonical nested JSON #54](https://github.com/shuruheel/mnestic/issues/54) | Ready for design | Explicit output compatibility contract |
-| 4 | [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Evidence-first | Reproduce a current failure before authorizing repair |
+The owner selected #53 and #54 for implementation on September 5. Their existing draft contracts
+have been reviewed and revised; both changes are implemented and validated locally, and are not released.
+Local evidence is recorded in the [implementation review](docs/reviews/2026-09-05-string-json.md).
+No storage-format or bridge change is planned. Migration notes and consumer checks are part of
+this release scope, because existing literal values and newly constructed JSON can change.
+
+| Work | State | Remaining gate |
+|---|---|---|
+| [String-literal correctness #53](https://github.com/shuruheel/mnestic/issues/53) | Implemented locally; [reviewed contract](docs/specs/string-literals.md) | Review/merge, hosted CI and release checks |
+| [Canonical nested JSON #54](https://github.com/shuruheel/mnestic/issues/54) | Implemented locally; [reviewed contract](docs/specs/json-canonical.md) | Review/merge, hosted CI and published-wheel acceptance |
+| [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Next queued correctness item; not part of the current implementation batch | Analyzer regressions and compatibility review before release inclusion |
+| [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Investigation only | Reproduce a current failure before committing repair; confirmed corruption overrides order |
+
+[Columnar I/O #11](https://github.com/shuruheel/mnestic/issues/11) combines two different states:
+import shipped in 0.17.0; export is unimplemented and demand-gated. Treat only export as remaining
+scope. The tracker has not yet been split.
 
 ## Adoption work
 

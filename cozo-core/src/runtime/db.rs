@@ -629,17 +629,27 @@ impl<'s, S: Storage<'s>> Db<S> {
         options: ScriptRunOptions,
     ) -> Result<NamedRows> {
         let cur_vld = current_validity();
+        let parsed = parse_script(
+            payload,
+            &params,
+            &self.get_fixed_rules(),
+            crate::data::aggr::CustomAggrRegistries {
+                meet: &self.get_custom_aggrs(),
+                bounded: &self.get_custom_bounded_meets(),
+            },
+            cur_vld,
+        );
+        let script = match parsed {
+            Ok(script) => script,
+            Err(error) => {
+                // Literal decoding can emit a migration warning before a
+                // later AST error. Keep it with this Db, not the next caller.
+                self.flush_warnings();
+                return Err(error);
+            }
+        };
         self.run_script_ast_inner(
-            parse_script(
-                payload,
-                &params,
-                &self.get_fixed_rules(),
-                crate::data::aggr::CustomAggrRegistries {
-                    meet: &self.get_custom_aggrs(),
-                    bounded: &self.get_custom_bounded_meets(),
-                },
-                cur_vld,
-            )?,
+            script,
             cur_vld,
             mutability,
             options.timeout,

@@ -58,6 +58,13 @@ pub(crate) fn emit(code: &'static str, message: String, hint: impl Into<String>)
     });
 }
 
+/// Emit at most once for this code between script warning drains.
+pub(crate) fn emit_once(code: &'static str, message: String, hint: impl Into<String>) {
+    if !SINK.with(|sink| sink.borrow().iter().any(|warning| warning.code == code)) {
+        emit(code, message, hint);
+    }
+}
+
 /// Take everything the current thread has emitted since the last drain.
 pub(crate) fn drain() -> Vec<QueryWarning> {
     SINK.with(|s| std::mem::take(&mut *s.borrow_mut()))

@@ -52,50 +52,53 @@ impl<'a> From<&'a JsonValue> for DataValue {
     }
 }
 
+// The single outbound JSON policy, shared by result cells and nested values.
+impl From<&DataValue> for JsonValue {
+    fn from(v: &DataValue) -> Self {
+        match v {
+            DataValue::Null | DataValue::Bot => JsonValue::Null,
+            DataValue::Bool(b) => JsonValue::Bool(*b),
+            DataValue::Num(Num::Int(i)) => JsonValue::Number((*i).into()),
+            DataValue::Num(Num::Float(f)) => {
+                if f.is_infinite() {
+                    json!(if f.is_sign_negative() {
+                        "NEGATIVE_INFINITY"
+                    } else {
+                        "INFINITY"
+                    })
+                } else {
+                    json!(f)
+                }
+            }
+            DataValue::Str(t) => JsonValue::String(t.to_string()),
+            DataValue::Bytes(bytes) => JsonValue::String(STANDARD.encode(bytes)),
+            DataValue::List(l) => JsonValue::Array(l.iter().map(JsonValue::from).collect()),
+            DataValue::Set(l) => JsonValue::Array(l.iter().map(JsonValue::from).collect()),
+            DataValue::Regex(r) => json!(r.0.as_str()),
+            DataValue::Uuid(u) => json!(u.0),
+            DataValue::Vec(arr) => {
+                // Preserve F32 widening and non-finite -> null, including
+                // arrays whose logical elements are not contiguous in memory.
+                let number = |f: f64| {
+                    serde_json::Number::from_f64(f).map_or(JsonValue::Null, JsonValue::Number)
+                };
+                JsonValue::Array(match arr {
+                    Vector::F32(a) => a.iter().map(|f| number(*f as f64)).collect(),
+                    Vector::F64(a) => a.iter().map(|f| number(*f)).collect(),
+                })
+            }
+            DataValue::Validity(v) => json!([v.timestamp.0, v.is_assert.0]),
+            DataValue::Json(j) => j.0.clone(),
+        }
+    }
+}
+
 impl From<DataValue> for JsonValue {
     fn from(v: DataValue) -> Self {
         match v {
-            DataValue::Null => JsonValue::Null,
-            DataValue::Bool(b) => JsonValue::Bool(b),
-            DataValue::Num(Num::Int(i)) => JsonValue::Number(i.into()),
-            DataValue::Num(Num::Float(f)) => {
-                if f.is_finite() {
-                    json!(f)
-                } else if f.is_nan() {
-                    json!(())
-                } else if f.is_infinite() {
-                    if f.is_sign_negative() {
-                        json!("NEGATIVE_INFINITY")
-                    } else {
-                        json!("INFINITY")
-                    }
-                } else {
-                    unreachable!()
-                }
-            }
-            DataValue::Str(t) => JsonValue::String(t.into()),
-            DataValue::Bytes(bytes) => JsonValue::String(STANDARD.encode(bytes)),
-            DataValue::List(l) => {
-                JsonValue::Array(l.iter().map(|v| JsonValue::from(v.clone())).collect())
-            }
-            DataValue::Bot => panic!("found bottom"),
-            DataValue::Set(l) => {
-                JsonValue::Array(l.iter().map(|v| JsonValue::from(v.clone())).collect())
-            }
-            DataValue::Regex(r) => {
-                json!(r.0.as_str())
-            }
-            DataValue::Uuid(u) => {
-                json!(u.0)
-            }
-            DataValue::Vec(arr) => match arr {
-                Vector::F32(a) => json!(a.as_slice().unwrap()),
-                Vector::F64(a) => json!(a.as_slice().unwrap()),
-            },
-            DataValue::Validity(v) => {
-                json!([v.timestamp.0, v.is_assert])
-            }
+            // Move opaque JSON result cells without cloning their payload.
             DataValue::Json(j) => j.0,
+            other => JsonValue::from(&other),
         }
     }
 }

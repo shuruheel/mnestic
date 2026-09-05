@@ -49,7 +49,6 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use crossbeam::channel::{bounded, Receiver, Sender};
-use data::functions::current_validity;
 use lazy_static::lazy_static;
 pub use miette::Error;
 use miette::Report;
@@ -58,7 +57,6 @@ use miette::{
     bail, miette, GraphicalReportHandler, GraphicalTheme, IntoDiagnostic, JSONReportHandler,
     Result, ThemeCharacters, ThemeStyles,
 };
-use parse::parse_script;
 use parse::CozoScript;
 use serde_json::json;
 
@@ -356,22 +354,9 @@ impl DbInstance {
         params: BTreeMap<String, DataValue>,
         mutability: ScriptMutability,
     ) -> Result<NamedRows> {
-        let cur_vld = current_validity();
-        self.run_script_ast(
-            parse_script(
-                payload,
-                &params,
-                &self.get_fixed_rules(),
-                CustomAggrRegistries {
-                    meet: &self.get_custom_aggrs(),
-                    bounded: &self.get_custom_bounded_meets(),
-                },
-                cur_vld,
-            )?,
-            cur_vld,
-            mutability,
-        )
+        self.run_script_with_options(payload, params, mutability, ScriptRunOptions::default())
     }
+
     /// `run_script` with mutable script and no parameters
     pub fn run_default(&self, payload: &str) -> Result<NamedRows> {
         self.run_script(payload, BTreeMap::new(), ScriptMutability::Mutable)

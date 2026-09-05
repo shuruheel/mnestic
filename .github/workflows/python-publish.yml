@@ -197,6 +197,7 @@ jobs:
           - { os: macos-14,         artifact: mnestic-wheels-macos-14-aarch64 }
           - { os: windows-latest,   artifact: mnestic-wheels-windows-latest-x64 }
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - uses: actions/download-artifact@v4
@@ -205,6 +206,8 @@ jobs:
           path: dist
       - name: Install wheel
         run: python -m pip install --no-index --find-links dist mnestic
+      - name: String and JSON compatibility contract
+        run: python cozo-lib-python/tests/test_string_json_contract.py
       # `shell: python` runs the block under the setup-python interpreter on
       # every OS — no bash/pwsh quoting hazards.
       - name: Smoke test (rocksdb + mem engines)

@@ -204,8 +204,8 @@ s_char = {
     | "\\" ~ ("\'" | "\\" | "/" | "b" | "f" | "n" | "r" | "t")
     | "\\" ~ ("u" ~ ASCII_HEX_DIGIT{4})
 }
-raw_string = {
-    PUSH("_"*) ~ "\""    // push the number signs onto the stack
+raw_string = ${
+    PUSH("_"+) ~ "\""    // push the number signs onto the stack
     ~ raw_string_inner
     ~ "\"" ~ POP               // match a quotation mark and the number signs
 }

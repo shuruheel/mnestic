@@ -16,14 +16,13 @@ use base64::Engine;
 use chrono::DateTime;
 use itertools::Itertools;
 use miette::{bail, ensure, Diagnostic, Result};
-use serde_json::json;
+use serde_json::Value as JsonValue;
 use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
 use crate::data::expr::Expr;
 use crate::data::functions::system_time_to_micros;
 use crate::data::value::{DataValue, JsonData, UuidWrapper, Validity, ValidityTs, Vector};
-use crate::Num;
 
 #[derive(Debug, Clone, Eq, PartialEq, serde_derive::Deserialize, serde_derive::Serialize)]
 pub struct NullableColType {
@@ -437,71 +436,7 @@ impl NullableColType {
                     v => bail!(InvalidValidity(v)),
                 }
             }
-            ColType::Json => DataValue::Json(JsonData(match data {
-                DataValue::Null => {
-                    json!(null)
-                }
-                DataValue::Bool(b) => {
-                    json!(b)
-                }
-                DataValue::Num(n) => match n {
-                    Num::Int(i) => {
-                        json!(i)
-                    }
-                    Num::Float(f) => {
-                        json!(f)
-                    }
-                },
-                DataValue::Str(s) => {
-                    json!(s)
-                }
-                DataValue::Bytes(b) => {
-                    json!(b)
-                }
-                DataValue::Uuid(u) => {
-                    json!(u.0.as_bytes())
-                }
-                DataValue::Regex(r) => {
-                    json!(r.0.as_str())
-                }
-                DataValue::List(l) => {
-                    let mut arr = Vec::with_capacity(l.len());
-                    for el in l {
-                        arr.push(self.coerce(el, cur_vld)?);
-                    }
-                    arr.into()
-                }
-                DataValue::Set(l) => {
-                    let mut arr = Vec::with_capacity(l.len());
-                    for el in l {
-                        arr.push(self.coerce(el, cur_vld)?);
-                    }
-                    arr.into()
-                }
-                DataValue::Vec(v) => {
-                    let mut arr = Vec::with_capacity(v.len());
-                    match v {
-                        Vector::F32(a) => {
-                            for el in a {
-                                arr.push(json!(el));
-                            }
-                        }
-                        Vector::F64(a) => {
-                            for el in a {
-                                arr.push(json!(el));
-                            }
-                        }
-                    }
-                    arr.into()
-                }
-                DataValue::Json(j) => j.0,
-                DataValue::Validity(vld) => {
-                    json!([vld.timestamp.0, vld.is_assert.0])
-                }
-                DataValue::Bot => {
-                    json!(null)
-                }
-            })),
+            ColType::Json => DataValue::Json(JsonData(JsonValue::from(data))),
         })
     }
 }
