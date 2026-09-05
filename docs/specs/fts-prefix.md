@@ -1,6 +1,6 @@
 # Single-term FTS prefix normalization (#55)
 
-Target: 0.18.0. Reviewed September 5, 2026.
+Status: released in Mnestic 0.18.0 (commit `1d13aedc`). Reviewed September 5, 2026.
 
 A trailing `*` searches prefixes of indexed terms. Before 0.18, the prefix bypassed all
 filters: `Di*` missed `Diwank` on a `Simple + Lowercase` index, while `di*` and exact

@@ -20,41 +20,41 @@ Every new feature must fit that agentic-memory wedge as a general engine mechani
 
 ## Current state
 
-- `mnestic` 0.17.0 and `mnestic-rocks` 0.1.12 are the latest published releases.
+- `mnestic` 0.18.0 and `mnestic-rocks` 0.1.12 are the latest published releases.
 - Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
 - LangChain, LlamaIndex, LangGraph, and MCP integrations are published.
 
-### Already shipped through 0.17.0
+### Already shipped through 0.18.0
 
 | Capability | Release | Boundary |
 |---|---:|---|
+| String-literal correctness (#53) | 0.18.0 | Quoted escapes decode and raw strings preserve contents; audit scripts and stored-query bodies |
+| Canonical nested JSON (#54) | 0.18.0 | UUID/base64/infinity forms match top-level JSON; stored JSON is not rewritten |
+| FTS prefix normalization (#55) | 0.18.0 | Lowercase and ASCII folding apply to prefixes of indexed terms; integer boosts no longer panic |
 | Atomic Parquet/Arrow copy-in | 0.17.0 | One local file into an existing non-`TxTime` relation; Arrow export remains demand-gated |
 | Candidate-aware FTS | 0.17.0 | Exact primary-key allowlist before top-k; BM25 statistics remain corpus-global |
 
-## Next release: 0.18.0
+## After 0.18.0
 
-The owner selected #53 and #54 on September 5; reviewed implementations are pushed to `main`
-in `ff3fa2d3`. Commit `59c100ca` adds #55 and fixes the reproduced integer-FTS-boost
-parser panic. The 0.18.0 release candidate is undergoing release checks; none of these
-changes is published yet.
-Implementation evidence is recorded in the [string/JSON review](docs/reviews/2026-09-05-string-json.md)
-and [FTS review](docs/reviews/2026-09-05-fts-prefix.md).
-No storage-format or bridge change is planned. Migration notes and consumer checks are part of
-this release scope, because existing literal values and newly constructed JSON can change.
+0.18.0 ships the reviewed [string-literal](docs/specs/string-literals.md),
+[canonical JSON](docs/specs/json-canonical.md), and
+[FTS prefix](docs/specs/fts-prefix.md) contracts, plus the integer-FTS-boost panic fix.
+The crate and Python release tags identify commit `1d13aedc`; storage format and bridge
+version are unchanged. Read the [migration notes](CHANGELOG-FORK.md) before upgrading:
+existing script literals and newly constructed JSON can change.
 
-| Work | State | Remaining gate |
+Implementation evidence remains in the [string/JSON review](docs/reviews/2026-09-05-string-json.md)
+and [FTS review](docs/reviews/2026-09-05-fts-prefix.md); these are historical implementation
+snapshots, separate from release evidence. Consumer compatibility changes are merged in core
+PR #80. Engine publication does not establish downstream release or site deployment status.
+
+| Work | State | Gate |
 |---|---|---|
-| [String-literal correctness #53](https://github.com/shuruheel/mnestic/issues/53) | Pushed to main; [reviewed contract](docs/specs/string-literals.md) | Hosted CI and release checks |
-| [Canonical nested JSON #54](https://github.com/shuruheel/mnestic/issues/54) | Pushed to main; [reviewed contract](docs/specs/json-canonical.md) | Hosted CI and published-wheel acceptance |
-| [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Pushed to main; [reviewed contract](docs/specs/fts-prefix.md) | Release checks and packaged-wheel acceptance |
-| [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Investigation only | Reproduce a current failure before committing repair; confirmed corruption overrides order |
+| Remove temporary `parser.string_decoding_changed` warning | Scheduled for 0.19.0 | Keep the migration guidance after removing the diagnostic |
+| [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Investigation only | Reproduce a current failure before committing repair; confirmed corruption takes priority |
 
-Keep 0.18.0 focused on these correctness changes. The integer-boost fix is covered by the
-new prefix suite. Consumer compatibility changes are merged in core PR #80; candidate-engine validation is
-part of release checks. Site PR #3 remains
-a draft for publication with the release. Broader HNSW, Arrow export and quantization
-work does not enter this release without the evidence gates below.
+Broader HNSW, Arrow export and quantization work remains subject to the evidence gates below.
 
 [Columnar I/O #11](https://github.com/shuruheel/mnestic/issues/11) combines two different states:
 import shipped in 0.17.0; export is unimplemented and demand-gated. Treat only export as remaining

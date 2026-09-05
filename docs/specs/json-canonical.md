@@ -1,10 +1,10 @@
 # Canonical DataValue-to-JSON conversion (#54)
 
-Status: implementation authorized by the owner on 2026-09-05, including the output compatibility contract and review improvements. Implemented and validated locally; target: 0.18.0, not released. Replaces the 2026-08-28 draft (audit retained in git history).
+Status: released in Mnestic 0.18.0 (commit `1d13aedc`). The owner authorized the implementation and output compatibility contract on 2026-09-05. Replaces the 2026-08-28 draft (audit retained in git history).
 
 ## Outcome and boundary
 
-One outbound representation applies to result cells, nested objects/lists, JSON builtins, JSON-derived keys, `to_string`, and writes into `Json` columns. The published 0.17.0 wheel still renders nested UUIDs as integer arrays.
+One outbound representation applies to result cells, nested objects/lists, JSON builtins, JSON-derived keys, `to_string`, and writes into `Json` columns. The released 0.17.0 wheel renders nested UUIDs as integer arrays.
 
 Preserve existing top-level JSON forms; nested values adopt those forms. The conversion is lossy and one-way, not a typed serialization format. Native binding conversions, CozoScript Display, inbound JSON conversion and MindGraph's persisted snapshot converter retain their own contracts.
 

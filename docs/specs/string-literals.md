@@ -1,6 +1,6 @@
 # CozoScript string-literal correctness (#53)
 
-Status: implementation authorized by the owner on 2026-09-05, including contract review and improvements. Implemented and validated locally; target: 0.18.0, not released. Replaces the 2026-08-28 draft (audit retained in git history).
+Status: released in Mnestic 0.18.0 (commit `1d13aedc`). The owner authorized the implementation and reviewed contract on 2026-09-05. Replaces the 2026-08-28 draft (audit retained in git history).
 
 ## Outcome
 
@@ -47,7 +47,7 @@ Route `DbInstance::run_script` through the existing options dispatcher so both p
 
 Replace the three MindGraph interpolated type lists with one parameter-building helper and test quoted/backslash-containing types. This is a separate consumer change; its current in-tree caller uses constants, so it does not create a downstream deployment gate for the engine.
 
-Keep changes independently reviewable. Update changelog and migration docs now; version bump, registry readmes, tags and publication belong to the release procedure. No bridge change is required. #55 stays separately queued and is not an implementation prerequisite.
+The implementation and migration documentation shipped in 0.18.0 alongside the independently reviewed FTS prefix changes (#55). No bridge change was required. Keep the temporary migration warning removal scheduled for 0.19.0.
 
 ## Review decisions, 2026-09-05
 
