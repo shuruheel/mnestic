@@ -92,39 +92,32 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.17.0
+## New in 0.18.0
 
-0.17.0 adds atomic local Parquet/Arrow copy-in and candidate-scoped full-text
-retrieval. `import_columnar_file` accepts an explicit format, projects into an
-existing non-`TxTime` relation, and commits every decoded row or none of them:
+This release corrects string decoding,
+nested JSON conversion and single-term FTS prefixes. Review these result changes
+before upgrading:
 
-```python
-report = db.import_columnar_file(
-    "events",
-    "events.parquet",
-    format="parquet",
-    columns={"event_id": "id"},
-    max_rows=1_000_000,
-)
-```
+- **BREAKING (results):** double-quoted `"a\nb"` now contains a newline. Use
+  `_"a\nb"_` for a literal backslash or bind parameters. Literal edge whitespace
+  and comments are preserved; trim explicitly when intended. Raw fences require
+  adjacent matching underscores. Audit stored-query bodies as well as scripts.
+- **BREAKING (results):** nested UUIDs become strings, bytes become base64 strings,
+  and scalar infinities become `"INFINITY"` / `"NEGATIVE_INFINITY"`, including new
+  `Json`-column writes and `to_string`. Stored JSON stays unchanged; migrate only
+  known typed fields or adapt consumers. Old infinity-derived nulls are irreversible.
+- FTS prefixes apply configured lowercase and ASCII-folding filters: `Di*` matches
+  `Diwank` on a lowercase index without rebuilding it. Prefixes match indexed terms,
+  including stems; exact terms retain the full analyzer pipeline. Use an index
+  without those filters when case/accent distinctions must be preserved.
+- Integer FTS boosts such as `Di*^3` no longer panic.
 
-The report gives `rows_processed`, `batches_processed`, and the HNSW/FTS/LSH
-indexes that require `::reindex`. The method releases the GIL while decoding
-and committing; published wheels and source distributions both include it.
+There is no storage-format migration or bridge release. Python native conversions
+remain unchanged; `\uXXXX` escapes remain BMP-only (bind parameters or use literal
+non-BMP text). The temporary string migration warning is scheduled for removal
+in 0.19.0.
 
-FTS atoms used through `run_script` now accept a constant `candidates:` list of
-base-relation primary keys. The allowlist is applied before sorting and top-k,
-while BM25 statistics remain corpus-global, so an eligible document keeps the
-same score and can surface even when it falls below the unrestricted top-k.
-
-Columnar import requires one process-readable local file and an existing
-relation. It does not infer schemas, import into `TxTime` relations, maintain
-search indexes, or export Arrow. No storage migration is required.
-
-See the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md)
-for the full accounting, and for 0.13.0's upgrade guidance if you are coming
-from an earlier release (`::reindex` for HNSW/FTS indexes, pre-1970 timestamps,
-and the hybrid-leg ranking changes).
+Full upgrade guidance is in the [fork changelog](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
 For idiomatic LangChain / LlamaIndex usage, install the integration packages
 (`langchain-mnestic`, `llama-index-vector-stores-mnestic`).

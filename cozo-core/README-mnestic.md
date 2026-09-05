@@ -98,29 +98,32 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.17.0
+## New in 0.18.0
 
-0.17.0 adds atomic columnar copy-in and candidate-scoped full-text retrieval:
+This release corrects string decoding,
+nested JSON conversion and single-term FTS prefixes. Review these result changes
+before upgrading:
 
-- With `columnar-io`, `Db::import_columnar_file` copies one local Parquet,
-  Arrow IPC file, or Arrow IPC stream into an existing non-`TxTime` relation.
-  Schema coercion and optional source/row/batch/value/depth/time limits fail the
-  whole transaction; the report names search indexes requiring `::reindex`.
-- FTS atoms accept a constant `candidates:` list of base-relation primary keys.
-  Eligibility is applied before sorting and top-k, while BM25 statistics remain
-  corpus-global, so a retained document keeps the same score.
-- Published Python wheels and source distributions expose
-  `CozoDbPy.import_columnar_file`; the call releases the GIL while decoding and
-  committing. The measured macOS arm64 ABI3 wheel grows by 1,711,642 bytes
-  (14.92%).
+- **BREAKING (results):** double-quoted `"a\nb"` now contains a newline. Use
+  `_"a\nb"_` for a literal backslash or bind parameters. Literal edge whitespace
+  and comments are preserved; trim explicitly when intended. Raw fences require
+  adjacent matching underscores. Audit stored-query bodies as well as scripts.
+- **BREAKING (results):** nested UUIDs become strings, bytes become base64 strings,
+  and scalar infinities become `"INFINITY"` / `"NEGATIVE_INFINITY"`, including new
+  `Json`-column writes and `to_string`. Stored JSON stays unchanged; migrate only
+  known typed fields or adapt consumers. Old infinity-derived nulls are irreversible.
+- FTS prefixes apply configured lowercase and ASCII-folding filters: `Di*` matches
+  `Diwank` on a lowercase index without rebuilding it. Prefixes match indexed terms,
+  including stems; exact terms retain the full analyzer pipeline. Use an index
+  without those filters when case/accent distinctions must be preserved.
+- Integer FTS boosts such as `Di*^3` no longer panic.
 
-Columnar import is local-file, existing-relation copy-in: it does not infer a
-schema, maintain HNSW/FTS/LSH indexes, or export Arrow. There is no
-storage-format migration. `mnestic-rocks` advances to 0.1.12 for bridge build
-maintenance and must be published before the engine crate.
+There is no storage-format migration or bridge release. Python native conversions
+remain unchanged; `\uXXXX` escapes remain BMP-only (bind parameters or use literal
+non-BMP text). The temporary string migration warning is scheduled for removal
+in 0.19.0.
 
-Full detail is in
-[`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
+Full upgrade guidance is in the [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
 ## Importable name
 
@@ -129,7 +132,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.17.0"
+mnestic = "0.18.0"
 ```
 
 ```rust

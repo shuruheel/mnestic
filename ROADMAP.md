@@ -35,9 +35,11 @@ Every new feature must fit that agentic-memory wedge as a general engine mechani
 ## Next release: 0.18.0
 
 The owner selected #53 and #54 on September 5; reviewed implementations are pushed to `main`
-in `ff3fa2d3`. The next authorized batch adds #55 and fixes the reproduced integer-FTS-boost
-parser panic. These changes are not released.
-Local evidence is recorded in the [implementation review](docs/reviews/2026-09-05-string-json.md).
+in `ff3fa2d3`. Commit `59c100ca` adds #55 and fixes the reproduced integer-FTS-boost
+parser panic. The 0.18.0 release candidate is undergoing release checks; none of these
+changes is published yet.
+Implementation evidence is recorded in the [string/JSON review](docs/reviews/2026-09-05-string-json.md)
+and [FTS review](docs/reviews/2026-09-05-fts-prefix.md).
 No storage-format or bridge change is planned. Migration notes and consumer checks are part of
 this release scope, because existing literal values and newly constructed JSON can change.
 
@@ -45,11 +47,12 @@ this release scope, because existing literal values and newly constructed JSON c
 |---|---|---|
 | [String-literal correctness #53](https://github.com/shuruheel/mnestic/issues/53) | Pushed to main; [reviewed contract](docs/specs/string-literals.md) | Hosted CI and release checks |
 | [Canonical nested JSON #54](https://github.com/shuruheel/mnestic/issues/54) | Pushed to main; [reviewed contract](docs/specs/json-canonical.md) | Hosted CI and published-wheel acceptance |
-| [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Implemented; [reviewed contract](docs/specs/fts-prefix.md) | Regression checks, hosted CI and release checks |
+| [FTS prefix normalization #55](https://github.com/shuruheel/mnestic/issues/55) | Pushed to main; [reviewed contract](docs/specs/fts-prefix.md) | Release checks and packaged-wheel acceptance |
 | [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Investigation only | Reproduce a current failure before committing repair; confirmed corruption overrides order |
 
 Keep 0.18.0 focused on these correctness changes. The integer-boost fix is covered by the
-new prefix suite. Consumer compatibility is tracked in core PR #80; site PR #3 remains
+new prefix suite. Consumer compatibility changes are merged in core PR #80; candidate-engine validation is
+part of release checks. Site PR #3 remains
 a draft for publication with the release. Broader HNSW, Arrow export and quantization
 work does not enter this release without the evidence gates below.
 

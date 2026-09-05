@@ -148,12 +148,12 @@ jobs:
           name: dist-${{ matrix.pkg }}
           path: cozo-lib-python/integrations/${{ matrix.pkg }}/dist
 
-  # --- adapter test suites (against the latest published mnestic wheel) ---
-  # Runs each integration package's pytest suite with mnestic installed from
-  # PyPI — the adapters ship independently of the engine wheel, so this is the
-  # environment users actually get. Also guards the vendored-copy invariant.
+  # --- adapter test suites against this run's candidate wheel ---
+  # Published-wheel tests do not prove compatibility with unreleased engine changes.
+  # Install the wheel built above first; also guard the vendored-copy invariant.
   test-integrations:
     name: test ${{ matrix.pkg }}
+    needs: [build-mnestic]
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -176,7 +176,12 @@ jobs:
           cozo-lib-python/integrations/llama-index-vector-stores-mnestic/llama_index/vector_stores/mnestic/_core.py
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: python -m pip install mnestic pytest ${{ matrix.deps }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: mnestic-wheels-ubuntu-latest-x86_64
+          path: candidate-wheels
+      - run: python -m pip install --no-index --find-links candidate-wheels mnestic
+      - run: python -m pip install pytest ${{ matrix.deps }}
       - run: python -m pip install -e cozo-lib-python/integrations/${{ matrix.pkg }}
       - run: python -m pytest cozo-lib-python/integrations/${{ matrix.pkg }}/tests -q
 
@@ -185,12 +190,13 @@ jobs:
   # no native runner (Intel-mac runners are retired); it was validated locally
   # under Rosetta when this pipeline was designed.
   test-wheels:
-    name: smoke test wheels (${{ matrix.platform.os }})
+    name: smoke test wheels (${{ matrix.platform.os }} / Python ${{ matrix.python }})
     needs: [build-mnestic]
     runs-on: ${{ matrix.platform.os }}
     strategy:
       fail-fast: false
       matrix:
+        python: ["3.8", "3.12"]
         platform:
           - { os: ubuntu-latest,    artifact: mnestic-wheels-ubuntu-latest-x86_64 }
           - { os: ubuntu-24.04-arm, artifact: mnestic-wheels-ubuntu-latest-aarch64 }
@@ -199,15 +205,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with: { python-version: "3.12" }
+        with: { python-version: "${{ matrix.python }}" }
       - uses: actions/download-artifact@v4
         with:
           name: ${{ matrix.platform.artifact }}
           path: dist
       - name: Install wheel
         run: python -m pip install --no-index --find-links dist mnestic
-      - name: String and JSON compatibility contract
+      - name: String, JSON and FTS compatibility contract
         run: python cozo-lib-python/tests/test_string_json_contract.py
+      - name: Install columnar test producer
+        run: python -m pip install pyarrow
+      - name: Columnar distribution contract
+        run: python cozo-lib-python/tests/test_columnar_distribution.py
+      - name: Upgrade databases written by released 0.17.0
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys, tempfile
+          with tempfile.TemporaryDirectory() as work:
+              old = str(pathlib.Path(work) / "old-wheel")
+              data = str(pathlib.Path(work) / "databases")
+              subprocess.run([sys.executable, "-m", "pip", "install", "--target", old, "mnestic==0.17.0"], check=True)
+              env = os.environ.copy()
+              env["PYTHONPATH"] = old
+              script = "cozo-lib-python/tests/test_upgrade_018.py"
+              subprocess.run([sys.executable, script, "create", data], env=env, check=True)
+              subprocess.run([sys.executable, script, "verify", data], check=True)
       # `shell: python` runs the block under the setup-python interpreter on
       # every OS — no bash/pwsh quoting hazards.
       - name: Smoke test (rocksdb + mem engines)
@@ -236,9 +259,28 @@ jobs:
           assert rows == [[1, "hello-rocksdb"], [2, "world"]], rows
           print("ROCKSDB OK:", rows)
 
+  test-sdist:
+    name: build and smoke the isolated sdist
+    needs: [build-mnestic-sdist]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: mnestic-sdist
+          path: candidate-sdist
+      - name: Build and install from source distribution
+        run: python -m pip install candidate-sdist/*.tar.gz
+      - run: python -m pip install pyarrow
+      - run: python cozo-lib-python/tests/test_string_json_contract.py
+      - run: python cozo-lib-python/tests/test_columnar_distribution.py
+
   # --- publish (OIDC trusted publishing); one job per PyPI project ---
   publish-mnestic:
-    needs: [build-mnestic, build-mnestic-sdist, test-wheels]
+    needs: [build-mnestic, build-mnestic-sdist, test-wheels, test-sdist, test-integrations]
     if: github.event_name == 'push' || inputs.publish
     runs-on: ubuntu-latest
     environment: pypi

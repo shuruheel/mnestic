@@ -5,78 +5,86 @@ provenance and licensing.
 
 ## Unreleased
 
-Target: 0.18.0. These changes are not yet published.
+## 0.18.0
 
-### Changed — string literals (#53)
+This release corrects string-literal decoding, makes nested JSON conversions
+consistent with top-level results, and normalizes single-term FTS prefixes.
+For example, `Di*` now matches `Diwank` on a lowercase index without rebuilding
+that index. **Existing scripts and JSON consumers may need changes:** audit
+escaped literals, whitespace-sensitive values, and typed fields before upgrading.
+Stored values are not rewritten, and the storage format and `mnestic-rocks`
+0.1.12 dependency are unchanged.
 
-Double-quoted strings now decode the existing quoted escape grammar; fenced raw
-strings preserve hashes, comment markers, newlines and edge whitespace. Raw
-fences require one or more underscores on both sides, with no gaps. Choose a
-fence longer than any underscore run after a quote in the contents.
+### Changed
 
-**Upgrade guidance:**
+- **BREAKING (results): String literals (#53).** Double-quoted strings now
+  decode the existing quoted escape grammar: `"a\nb"` contains three characters.
+  Use `_"a\nb"_` for a literal backslash, or bind a parameter. Double-quoted
+  and fenced raw strings retain edge whitespace and comment-like text; trim
+  explicitly when intended. Raw fences require matching runs of one or more
+  underscores, adjacent to the quotes. Choose a fence longer than any underscore
+  run after a quote in its contents. Spaced fences such as `__ "abc" __` now fail.
+  Unknown quoted escapes now fail, including in FTS phrases. A trailing backslash
+  can escape the closing quote and cause an error later or at end of input.
+  Comment markers inside a literal can no longer hide a quote: audit affected
+  scripts because an old single literal can become multiple expressions.
+  Stored strings and descriptions stay unchanged, but stored-query bodies are
+  reparsed on invocation and require the same audit. Parameters and single-quoted
+  value semantics are unchanged. See [the contract](docs/specs/string-literals.md).
+- **BREAKING (results): Canonical JSON conversion (#54).** Nested values, JSON
+  builtins, `to_string`, value-derived object keys and paths, and new writes into
+  `Json` columns now use UUID strings, padded standard-base64 byte strings, and
+  `"INFINITY"` / `"NEGATIVE_INFINITY"` for scalar infinities. Lists and sets recurse
+  through the same conversion. String-valued `to_string` results stay unquoted.
+  **Stored JSON and persisted `to_string` output are not rewritten.** Old array/null
+  forms can coexist with new strings. Audit known typed fields and migrate them
+  client-side if needed: `uuid.UUID(bytes=bytes(arr))` for UUIDs and
+  `base64.b64encode(bytes(arr)).decode()` for bytes. Do not infer types from
+  arbitrary arrays. Infinity values previously reduced to null cannot be recovered
+  without another source of truth. Consumers requiring old array forms must
+  explicitly convert known UUID/base64 string fields back to byte arrays; there is
+  no legacy-output flag. See [the contract](docs/specs/json-canonical.md).
+- **BREAKING (results): FTS prefix normalization (#55).** Prefix queries apply
+  configured `Lowercase` / `LowerCase` and `AsciiFolding` filters in order, so `Di*`
+  matches `Diwank` on a lowercase index. Incomplete prefixes remain one token;
+  tokenization, stemming, stopword removal, length limits and compound splitting
+  are skipped. Existing indexes need no rebuild. Applications requiring
+  case-sensitive prefix matching must use an index without `Lowercase` (and omit
+  `AsciiFolding` if accent distinctions must be preserved). Exact terms retain
+  their full analyzer pipeline. See [the contract](docs/specs/fts-prefix.md).
 
-- `"a\nb"` now contains three characters. Use `_"a\nb"_` when a literal
-  backslash is intended. Unknown escapes now fail at the character after the
-  backslash; this also applies to quoted FTS phrases. A final backslash can
-  escape the closing quote, producing an error later or at end of input.
-- Whitespace and comment-like text at either end of double-quoted and raw
-  strings is now retained. Trim explicitly when intended. Spaced fences such
-  as `__ "abc" __` are no longer accepted.
-- Comment markers inside strings can no longer hide a quote. Audit scripts
-  containing quotes inside apparent block/line comments within a literal:
-  a formerly single string can become multiple expressions.
-- `\uXXXX` remains BMP-only: surrogate pairs and lone surrogates are rejected.
-  Literal non-BMP characters work; Python encoders can use `ensure_ascii=False`.
-  Parameters and single-quoted value semantics are unchanged.
-- Stored strings/descriptions are unchanged until written again. Stored query
-  bodies are reparsed when invoked and require the same script audit.
+### Fixed
 
-For 0.18, `parser.string_decoding_changed` warns once per script warning drain
-about potentially changed escapes/edge trivia. It reports a byte offset and
-never literal contents. It is conservative, can flag already-correct FTS or
-hash-containing literals, and cannot detect every hidden-quote case. Warnings
-emitted before AST or execution failures are retained by the correct database.
-**Release follow-up: remove this temporary warning in 0.19.0.**
+- Integer FTS boosts such as `Di*^3` no longer panic; integer and decimal boosts
+  use the same scoring behavior.
+- Unsupported quoted multi-token prefixes are rejected before filters can remove
+  a word, including inside NEAR. Empty prefixes cannot scan all postings.
+- Non-contiguous vectors no longer panic during JSON conversion. The internal
+  bottom sentinel renders as null instead of panicking.
 
-### Changed — canonical JSON conversion (#54)
+### API and compatibility
 
-Nested values, JSON builtins, `to_string`, value-derived object keys and paths,
-and new writes into `Json` columns now use the existing top-level JSON forms:
-UUID strings, base64 byte strings, and `"INFINITY"`/`"NEGATIVE_INFINITY"` for
-scalar infinities. String-valued `to_string` results remain unquoted. Lists and
-sets recurse through one conversion policy. Non-contiguous vectors no longer
-panic during conversion; the internal bottom sentinel renders as null.
+- The temporary `parser.string_decoding_changed` warning reports potentially
+  changed escapes or edge trivia once per script warning drain, using a byte
+  offset without literal contents. It is conservative, may flag already-correct
+  FTS or hash-containing literals, and cannot detect every hidden-quote case.
+  Warnings preceding AST or execution failures remain with the correct database.
+  **Remove this migration warning in 0.19.0.**
+- Top-level JSON forms remain unchanged except the internal bottom sentinel.
+  NaN and non-finite vector elements remain null; F32 elements retain widened-f64
+  representation. Existing JSON payloads remain opaque, integers remain exact i64,
+  and inbound JSON conversion remains lossy. Native binding conversions and
+  MindGraph's separately persisted snapshot format are unchanged.
 
-**Stored JSON is not rewritten.** Old UUID/byte arrays and infinity-derived
-nulls can coexist with new strings. Audit known typed fields and migrate them
-client-side if needed: `uuid.UUID(bytes=bytes(arr))` for UUIDs and
-`base64.b64encode(bytes(arr)).decode()` for bytes. Do not guess the type of
-arbitrary arrays. Infinity values already reduced to null cannot be recovered
-without another source of truth. Persisted `to_string` output also stays as it was.
+### Known limitations
 
-Top-level forms remain unchanged except the internal bottom sentinel. NaN and
-non-finite vector elements remain null; F32 elements retain their widened f64
-representation. Existing JSON payloads stay opaque, integers stay exact i64,
-and inbound JSON conversion remains lossy. Native binding conversions and
-MindGraph's separately persisted snapshot format are unchanged. There is no
-storage-format change or new bridge version.
-
-### Fixed — single-term FTS prefix normalization (#55)
-
-Prefix queries now apply configured `Lowercase`/`LowerCase` and `AsciiFolding`
-filters in order: `Di*` matches `Diwank` on a lowercase index. An incomplete
-prefix remains one token; tokenization, stemming, stopword removal, length
-limits and compound splitting are skipped. Prefixes search indexed terms,
-so a stemmed index may match `run*` but not `running*`. No index rebuild is
-needed. Exact terms retain their full analyzer pipeline.
-
-Quoted multi-token prefixes are rejected even when filters would remove a
-word, including inside NEAR. Empty prefixes cannot scan all postings.
-Integer FTS boosts such as `Di*^3` no longer panic (the grammar emits
-`pos_int`, which the parser previously failed to handle). Leading wildcards
-remain unsupported. Candidate restrictions and bounded
-posting-key scans are unchanged. See [the contract](docs/specs/fts-prefix.md).
+- `\uXXXX` escapes remain BMP-only: surrogate pairs and lone surrogates are
+  rejected. Literal non-BMP characters work; use Python `ensure_ascii=False` when
+  embedding JSON-encoded strings in scripts, or bind parameters.
+- Prefixes search indexed terms, including stems: `run*` may match an indexed
+  `run` while `running*` does not. Leading wildcards, substring search and
+  multi-token phrase-prefix search remain unsupported. Candidate restrictions
+  and bounded posting-key scans are unchanged.
 
 ## 0.17.0 — 2026-08-31
 
