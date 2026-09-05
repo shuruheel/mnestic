@@ -25,21 +25,37 @@ pub(crate) struct FtsLiteral {
 }
 
 impl FtsLiteral {
-    pub(crate) fn tokenize(self, tokenizer: &TextAnalyzer, coll: &mut Vec<Self>) {
-        if self.is_prefix {
-            coll.push(self);
-            return;
+    pub(crate) fn tokenize(self, tokenizer: &TextAnalyzer, coll: &mut Vec<Self>) -> Result<()> {
+        if self.is_prefix && self.is_phrase {
+            // Inspect boundaries before stopwords/stemming can hide a phrase.
+            let mut stream = tokenizer.tokenizer.token_stream(&self.value);
+            if stream.next().is_some() {
+                if let Some(second) = stream.next() {
+                    bail!(FtsPhrasePrefixUnsupported(
+                        self.value.to_string(),
+                        second.text.clone()
+                    ));
+                }
+            }
         }
 
-        let mut tokens = tokenizer.token_stream(&self.value);
+        let mut tokens = if self.is_prefix {
+            tokenizer.prefix_token_stream(&self.value)
+        } else {
+            tokenizer.token_stream(&self.value)
+        };
         while let Some(t) = tokens.next() {
+            if self.is_prefix && t.text.is_empty() {
+                continue;
+            }
             coll.push(FtsLiteral {
                 value: SmartString::from(&t.text),
-                is_prefix: false,
+                is_prefix: self.is_prefix,
                 booster: self.booster,
                 is_phrase: false,
             })
         }
+        Ok(())
     }
 }
 
@@ -216,28 +232,22 @@ impl FtsExpr {
     fn do_tokenize(self, tokenizer: &TextAnalyzer) -> Result<Self> {
         Ok(match self {
             FtsExpr::Literal(l) => {
-                if l.is_phrase && !l.value.is_empty() {
+                if l.is_phrase && !l.is_prefix && !l.value.is_empty() {
                     // A quoted literal. Tokenize position-aware to decide what
                     // it is: ≥ 2 tokens ⇒ an exact phrase; 1 token ⇒ plain
-                    // Literal (so `"fox"` ≡ `fox`, including `"fox"*` prefix);
+                    // Literal (so `"fox"` ≡ `fox`);
                     // 0 tokens (e.g. all stopwords) ⇒ empty, culled by flatten.
                     let toks = tokenize_with_positions(&l.value, tokenizer);
                     if toks.len() >= 2 {
-                        if l.is_prefix {
-                            let last = toks.last().unwrap().value.to_string();
-                            bail!(FtsPhrasePrefixUnsupported(l.value.to_string(), last));
-                        }
                         return Ok(FtsExpr::Phrase(FtsPhrase {
                             tokens: toks,
                             booster: l.booster,
                         }));
                     }
-                    // Fall through to the single-term path below, preserving
-                    // today's semantics exactly (including prefix matching on
-                    // the raw value when `is_prefix` short-circuits).
+                    // Fall through to the single-term path below.
                 }
                 let mut tokens = vec![];
-                l.tokenize(tokenizer, &mut tokens);
+                l.tokenize(tokenizer, &mut tokens)?;
                 if tokens.len() == 1 {
                     FtsExpr::Literal(tokens.into_iter().next().unwrap())
                 } else {
@@ -259,7 +269,7 @@ impl FtsExpr {
                         // the bug class 0.14.0 removes. Refuse loudly instead.
                         bail!(FtsPhraseInNearUnsupported(l.value.to_string()));
                     }
-                    l.tokenize(tokenizer, &mut tokens);
+                    l.tokenize(tokenizer, &mut tokens)?;
                 }
                 FtsExpr::Near(FtsNear {
                     literals: tokens,

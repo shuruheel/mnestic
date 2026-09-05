@@ -9,6 +9,10 @@ use super::{BoxTokenStream, Token, TokenFilter, TokenStream};
 pub(crate) struct AsciiFoldingFilter;
 
 impl TokenFilter for AsciiFoldingFilter {
+    fn transform_prefix<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
+        self.transform(token_stream)
+    }
+
     fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
         From::from(AsciiFoldingFilterTokenStream {
             tail: token_stream,

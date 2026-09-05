@@ -62,6 +62,22 @@ and inbound JSON conversion remains lossy. Native binding conversions and
 MindGraph's separately persisted snapshot format are unchanged. There is no
 storage-format change or new bridge version.
 
+### Fixed — single-term FTS prefix normalization (#55)
+
+Prefix queries now apply configured `Lowercase`/`LowerCase` and `AsciiFolding`
+filters in order: `Di*` matches `Diwank` on a lowercase index. An incomplete
+prefix remains one token; tokenization, stemming, stopword removal, length
+limits and compound splitting are skipped. Prefixes search indexed terms,
+so a stemmed index may match `run*` but not `running*`. No index rebuild is
+needed. Exact terms retain their full analyzer pipeline.
+
+Quoted multi-token prefixes are rejected even when filters would remove a
+word, including inside NEAR. Empty prefixes cannot scan all postings.
+Integer FTS boosts such as `Di*^3` no longer panic (the grammar emits
+`pos_int`, which the parser previously failed to handle). Leading wildcards
+remain unsupported. Candidate restrictions and bounded
+posting-key scans are unchanged. See [the contract](docs/specs/fts-prefix.md).
+
 ## 0.17.0 — 2026-08-31
 
 This release adds atomic, host-controlled copy-in from Parquet and Arrow IPC,

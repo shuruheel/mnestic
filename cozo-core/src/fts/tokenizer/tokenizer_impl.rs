@@ -102,6 +102,15 @@ impl TextAnalyzer {
         }
         token_stream
     }
+
+    /// Normalize an incomplete term without splitting, stemming or discarding it.
+    pub(crate) fn prefix_token_stream<'a>(&self, text: &'a str) -> BoxTokenStream<'a> {
+        let mut stream = super::RawTokenizer.token_stream(text);
+        for filter in &self.token_filters {
+            stream = filter.transform_prefix(stream);
+        }
+        stream
+    }
     pub(crate) fn unique_ngrams(
         &self,
         text: &str,
@@ -308,6 +317,11 @@ pub(crate) trait TokenFilterClone {
 pub(crate) trait TokenFilter: 'static + Send + Sync + TokenFilterClone {
     /// Wraps a token stream and returns the modified one.
     fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a>;
+
+    /// Only filters valid for incomplete terms opt in; full-word filters stay out.
+    fn transform_prefix<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
+        token_stream
+    }
 }
 
 impl<T: TokenFilter + Clone> TokenFilterClone for T {

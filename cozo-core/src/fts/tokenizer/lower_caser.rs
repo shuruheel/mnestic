@@ -4,6 +4,10 @@ use super::{Token, TokenFilter, TokenStream};
 use crate::fts::tokenizer::BoxTokenStream;
 
 impl TokenFilter for LowerCaser {
+    fn transform_prefix<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
+        self.transform(token_stream)
+    }
+
     fn transform<'a>(&self, token_stream: BoxTokenStream<'a>) -> BoxTokenStream<'a> {
         BoxTokenStream::from(LowerCaserTokenStream {
             tail: token_stream,

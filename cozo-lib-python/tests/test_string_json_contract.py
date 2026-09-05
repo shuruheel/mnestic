@@ -1,4 +1,4 @@
-"""0.18 string/JSON acceptance for a freshly built or installed Mnestic binding."""
+"""0.18 string/JSON/FTS acceptance for a freshly built or installed binding."""
 import unittest
 
 from mnestic import CozoDbPy
@@ -41,6 +41,16 @@ class StringJsonContract(unittest.TestCase):
         self.assertEqual(other.run_script("::warnings", {}, False)["rows"], [])
         warnings = self.rows("::warnings")
         self.assertEqual(sum(row[1] == "parser.string_decoding_changed" for row in warnings), 1)
+
+    def test_prefix_normalization_and_integer_boost(self):
+        self.rows(":create docs {id: Int => text: String}")
+        self.rows("::fts create docs:idx {extractor: text, tokenizer: Simple, "
+                  "filters: [Lowercase, AsciiFolding]}")
+        self.rows("?[id,text] <- [[1,'Diwank'],[2,'Éléphant']] :put docs {id => text}")
+        for query, expected in [("DI*^3", [[1]]), ('"ÉL"*', [[2]])]:
+            self.assertEqual(self.rows(
+                "?[id] := ~docs:idx{id | query: $q, k: 10}", {"q": query}
+            ), expected)
 
 
 if __name__ == "__main__":
