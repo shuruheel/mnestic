@@ -47,18 +47,28 @@ existing script literals and newly constructed JSON can change.
 Implementation evidence remains in the [string/JSON review](docs/reviews/2026-09-05-string-json.md)
 and [FTS review](docs/reviews/2026-09-05-fts-prefix.md); these are historical implementation
 snapshots, separate from release evidence. Consumer compatibility changes are merged in core
-PR #80. Engine publication does not establish downstream release or site deployment status.
+PR #80; core adoption of `v0.18.0` merged in
+[PR #81](https://github.com/shuruheel/mindgraph-rs/pull/81). The
+[documentation update](https://github.com/shuruheel/mnestic-site/pull/3) is deployed.
+These are separately verified delivery states; no cloud deployment is implied.
+
+### 0.19 planning
+
+The [0.19 planning record](docs/plans/0.19-planning.md) separates the existing warning-removal
+commitment from proposed maintenance, investigation and demand-gated work. Reconciliation on
+September 6 establishes current status; it does not select a final feature scope or release date.
 
 | Work | State | Gate |
 |---|---|---|
 | Remove temporary `parser.string_decoding_changed` warning | Scheduled for 0.19.0 | Keep the migration guidance after removing the diagnostic |
-| [HNSW verification/repair #56](https://github.com/shuruheel/mnestic/issues/56) | Investigation only | Reproduce a current failure before committing repair; confirmed corruption takes priority |
+| [HNSW integrity #56](https://github.com/shuruheel/mnestic/issues/56) | Proposed first investigation | Failure fixtures and verified invariants before a read-only verifier; reproduce a current failure before committing repair |
+| [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Proposed maintenance candidate | Agree warning behavior and preserve legitimate transaction-scoped relations |
+| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Conditional benchmark candidate | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
 
 Broader HNSW, Arrow export and quantization work remains subject to the evidence gates below.
 
-[Columnar I/O #11](https://github.com/shuruheel/mnestic/issues/11) combines two different states:
-import shipped in 0.17.0; export is unimplemented and demand-gated. Treat only export as remaining
-scope. The tracker has not yet been split.
+[Arrow export #11](https://github.com/shuruheel/mnestic/issues/11) tracks the unimplemented,
+demand-gated export work. Its import half shipped in 0.17.0 and is retained as completed history.
 
 ## Adoption work
 
@@ -77,6 +87,7 @@ scope. The tracker has not yet been split.
 | Plan cache | Repeated planning cost on a real high-frequency workload |
 | Filtered-vector redesign | A measured low-selectivity failure beyond bounded widening |
 | FTS scale work | User-visible latency or documented corpus-scale pressure |
+| Phrase-prefix / phrases inside NEAR | Concrete demand beyond current named errors and workarounds; agree matching and resource-limit contracts |
 | Vector quantization | Corpus-scale storage pressure plus accepted recall bounds |
 | Shared-cache expansion | Multi-instance memory evidence |
 | Extended Cypher read | Observed evaluator friction |
