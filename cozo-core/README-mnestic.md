@@ -93,6 +93,11 @@ capabilities on top of it:
   drop a database that fails an integrity check.
 - **Interruptibility that works** — `::kill` and `:timeout` abort running
   queries, including long graph-adjacency builds.
+- **Governed multi-transactions (unreleased)** — a host-owned worker retains
+  admission through cancellation and cleanup, with one transaction deadline,
+  bounded idle waiting, inherited statement memory limits and warning flushes.
+  Any query error aborts the transaction. The legacy API remains available.
+  ([contract](https://github.com/shuruheel/mnestic/blob/main/docs/specs/governed-transactions.md))
 
 Everything else — CozoScript, the storage engines, the data model — is upstream
 CozoDB, unchanged unless noted in

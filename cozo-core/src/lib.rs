@@ -125,6 +125,11 @@ pub use crate::runtime::db::Poison;
 pub use crate::runtime::db::ScriptMutability;
 pub use crate::runtime::db::ScriptRunOptions;
 pub use crate::runtime::db::TransactionPayload;
+#[cfg(not(target_arch = "wasm32"))]
+pub use crate::runtime::governed_transaction::{
+    GovernedTransaction, GovernedTransactionCancellation, GovernedTransactionOptions,
+    GovernedTransactionWorker,
+};
 
 #[cfg(feature = "cypher")]
 pub mod cypher;
@@ -1060,8 +1065,36 @@ impl DbInstance {
             DbInstance::TiKv(db) => db.run_multi_transaction(write, payloads, results),
         }
     }
+    /// Prepare a governed client and host-owned worker. The worker must be run
+    /// on a dedicated blocking thread. Limits are captured now, before any
+    /// scheduling delay; Db defaults only tighten the supplied limits.
+    /// See [`GovernedTransactionWorker`] for admission and cancellation ownership.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn governed_transaction(
+        &self,
+        write: bool,
+        options: GovernedTransactionOptions,
+    ) -> Result<(GovernedTransaction, GovernedTransactionWorker)> {
+        let options = match self {
+            DbInstance::Mem(db) => db.governed_limits(options),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.governed_limits(options),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.governed_limits(options),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.governed_limits(options),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.governed_limits(options),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.governed_limits(options),
+        };
+        GovernedTransactionWorker::pair(self.clone(), write, options)
+    }
+
     /// A higher-level, blocking wrapper for [crate::Db::run_multi_transaction]. Runs the transaction on a dedicated thread.
     /// Write transactions _may_ block other reads, but we guarantee that this does not happen for the RocksDB backend.
+    /// This legacy API does not inherit script budgets, bound idle waiting or
+    /// flush query warnings. Native hosts should use `governed_transaction`.
     pub fn multi_transaction(&self, write: bool) -> MultiTransaction {
         let (app2db_send, app2db_recv) = bounded(1);
         let (db2app_send, db2app_recv) = bounded(1);
