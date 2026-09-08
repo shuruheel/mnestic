@@ -5,6 +5,24 @@ provenance and licensing.
 
 ## Unreleased
 
+### Added
+
+- Native Rust governed multi-transactions: a serialized client and host-owned
+  worker with an absolute deadline, bounded idle waiting, inherited statement
+  memory limits, cooperative cancellation and per-query warning flushes. Every
+  query error rolls back the whole transaction; the legacy API remains unchanged.
+  Hosts can retain admission until the actual worker exits. Stalled bounded
+  callbacks are disconnected with `callback.delivery_timeout` after a successful
+  commit, without undoing committed data. See
+  [the contract](docs/specs/governed-transactions.md), including SQLite/RocksDB
+  concurrency differences and uncertain outcomes when cancellation races commit.
+
+### Fixed
+
+- `::warnings` reads and clears the in-memory ring without opening a storage
+  transaction. It no longer waits behind an active multi-transaction on memory
+  or SQLite backends, which could otherwise stall inspection until idle expiry.
+
 ## 0.18.0
 
 This release corrects string-literal decoding, makes nested JSON conversions

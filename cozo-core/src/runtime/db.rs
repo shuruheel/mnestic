@@ -753,6 +753,42 @@ impl<'s, S: Storage<'s>> Db<S> {
         self.warnings.lock().unwrap().iter().cloned().collect()
     }
 
+    /// Diagnostics do not need a storage transaction. In particular, a
+    /// warning read must not wait for the transaction being inspected to end.
+    fn list_warnings(&self, clear: bool) -> Result<NamedRows> {
+        // Structured diagnostics (mnestic fork): list — or with
+        // `clear`, empty — the Db's recent-warnings ring. Read-only
+        // safe in both forms: the ring is diagnostics state, not data.
+        if clear {
+            self.warnings.lock().unwrap().clear();
+            return Ok(NamedRows::new(
+                vec![STATUS_STR.to_string()],
+                vec![vec![DataValue::from(OK_STR)]],
+            ));
+        }
+        let rows = self
+            .recent_warnings()
+            .into_iter()
+            .map(|(seq, w)| {
+                vec![
+                    DataValue::from(seq as i64),
+                    DataValue::from(w.code),
+                    DataValue::from(w.message.as_str()),
+                    DataValue::from(w.hint.as_str()),
+                ]
+            })
+            .collect_vec();
+        Ok(NamedRows::new(
+            vec![
+                "seq".to_string(),
+                "code".to_string(),
+                "message".to_string(),
+                "hint".to_string(),
+            ],
+            rows,
+        ))
+    }
+
     /// Compute the whole-script deadline from the per-call timeout and the Db
     /// default (mnestic fork, query budget), both anchored at one clock reading.
     /// Returns the earliest (`min`) of whichever are set; `None` if neither is
@@ -785,6 +821,120 @@ impl<'s, S: Storage<'s>> Db<S> {
         match (call_limit, default) {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn governed_limits(
+        &self,
+        mut options: crate::GovernedTransactionOptions,
+    ) -> crate::GovernedTransactionOptions {
+        if let Some(default) = self.effective_outer_deadline(None) {
+            options.deadline = options.deadline.min(default);
+        }
+        options.mem_limit = self.effective_outer_mem_limit(options.mem_limit);
+        options
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn run_governed_transaction(
+        &'s self,
+        worker: &crate::GovernedTransactionWorker,
+    ) -> Result<()> {
+        worker.poison.check()?;
+        let mut tx = if worker.write {
+            self.transact_write()?
+        } else {
+            self.transact()?
+        };
+        tx.script_deadline = Some(worker.options.deadline);
+        tx.script_mem_limit = worker.options.mem_limit;
+        tx.script_cancellation = Some(worker.poison.flag.clone());
+        let ts = current_validity();
+        let callback_targets = self.current_callback_targets();
+        let mut callback_collector = BTreeMap::new();
+        let mut cleanups: Vec<(Vec<u8>, Vec<u8>)> = vec![];
+
+        loop {
+            match worker.next()? {
+                TransactionPayload::Abort => {
+                    drop(tx);
+                    return worker.reply(NamedRows::default());
+                }
+                TransactionPayload::Commit => {
+                    for (lower, upper) in cleanups {
+                        worker.poison.check()?;
+                        tx.store_tx.del_range_from_persisted(&lower, &upper)?;
+                    }
+                    worker.poison.check()?;
+                    self.commit_tx_with_test_hook(&mut tx)?;
+                    drop(tx);
+                    // The commit already succeeded. Its success is independent
+                    // of caller disconnect or change-feed backpressure.
+                    let reply = worker.reply(NamedRows::default());
+                    self.send_callbacks_until(callback_collector, worker.options.deadline);
+                    self.flush_warnings();
+                    return reply;
+                }
+                TransactionPayload::Query((script, params)) => {
+                    let result = (|| {
+                        let mut p = parse_script(
+                            &script,
+                            &params,
+                            &self.fixed_rules.read().unwrap(),
+                            crate::data::aggr::CustomAggrRegistries {
+                                meet: &self.custom_aggrs.read().unwrap(),
+                                bounded: &self.custom_bounded_meets.read().unwrap(),
+                            },
+                            ts,
+                        )?
+                        .get_single_program()?;
+                        let lock_name = p.needs_write_lock();
+                        ensure!(
+                            worker.write || lock_name.is_none(),
+                            "write lock required for read-only transaction"
+                        );
+                        let locks = self.obtain_relation_locks(lock_name.iter());
+                        let _guard = if let Some(lock) = locks.first() {
+                            Some(loop {
+                                worker.poison.check()?;
+                                if let Ok(guard) = lock.try_read() {
+                                    break guard;
+                                }
+                                worker.sleep(Duration::from_millis(2), None)?;
+                            })
+                        } else {
+                            None
+                        };
+                        worker.poison.check()?;
+                        let sleep = p.out_opts.sleep.take();
+                        let block_deadline = p
+                            .out_opts
+                            .timeout
+                            .and_then(|seconds| deadline_from_secs(Instant::now(), seconds));
+                        let rows = self.execute_single_program(
+                            p,
+                            &mut tx,
+                            &mut cleanups,
+                            ts,
+                            &callback_targets,
+                            &mut callback_collector,
+                        )?;
+                        if let Some(seconds) = sleep {
+                            worker.sleep(
+                                Duration::from_micros((seconds * 1_000_000.) as u64),
+                                block_deadline,
+                            )?;
+                        }
+                        worker.poison.check()?;
+                        Ok(rows)
+                    })();
+                    // Includes parse/compile/evaluation failures. Any error
+                    // exits this worker and drops all uncommitted writes.
+                    self.flush_warnings();
+                    worker.reply(result?)?;
+                }
+            }
         }
     }
 
@@ -1843,6 +1993,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
+            script_cancellation: None,
             script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
@@ -1867,6 +2018,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_hwm_dirty: false,
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
+            script_cancellation: None,
             script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
@@ -2458,39 +2610,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     vec![vec![DataValue::from(OK_STR)]],
                 ))
             }
-            SysOp::Warnings(clear) => {
-                // Structured diagnostics (mnestic fork): list — or with
-                // `clear`, empty — the Db's recent-warnings ring. Read-only
-                // safe in both forms: the ring is diagnostics state, not data.
-                if *clear {
-                    self.warnings.lock().unwrap().clear();
-                    return Ok(NamedRows::new(
-                        vec![STATUS_STR.to_string()],
-                        vec![vec![DataValue::from(OK_STR)]],
-                    ));
-                }
-                let rows = self
-                    .recent_warnings()
-                    .into_iter()
-                    .map(|(seq, w)| {
-                        vec![
-                            DataValue::from(seq as i64),
-                            DataValue::from(w.code),
-                            DataValue::from(w.message.as_str()),
-                            DataValue::from(w.hint.as_str()),
-                        ]
-                    })
-                    .collect_vec();
-                Ok(NamedRows::new(
-                    vec![
-                        "seq".to_string(),
-                        "code".to_string(),
-                        "message".to_string(),
-                        "hint".to_string(),
-                    ],
-                    rows,
-                ))
-            }
+            SysOp::Warnings(clear) => self.list_warnings(*clear),
             SysOp::CreateStoredQuery {
                 name,
                 params,
@@ -3318,7 +3438,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         outer_deadline: Option<Instant>,
         outer_mem_limit: Option<usize>,
     ) -> Result<NamedRows> {
-        // ::running and ::kill touch only the in-memory query registry, so
+        // ::warnings, ::running and ::kill touch only in-memory state, so
         // they dispatch before any transaction is opened: on mem/sqlite a
         // write tx takes a store-wide lock that queues behind every running
         // read query — a ::kill would otherwise block until the query it is
@@ -3326,6 +3446,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         // in run_sys_op_with_tx stay for the imperative in-script path)
         match &op {
             SysOp::ListRunning => return self.list_running(),
+            SysOp::Warnings(clear) => return self.list_warnings(*clear),
             SysOp::KillRunning(id) => {
                 let queries = self.running_queries.lock().unwrap();
                 return Ok(match queries.get(id) {
@@ -3477,7 +3598,11 @@ impl<'s, S: Storage<'s>> Db<S> {
                 }),
             }
         };
-        let poison = Poison::with_limits(effective_deadline, mem_budget.clone());
+        let mut poison = Poison::with_limits(effective_deadline, mem_budget.clone());
+        poison.parent_cancellation = tx.script_cancellation.clone();
+        if poison.parent_cancellation.is_some() {
+            poison.check()?;
+        }
         // give the query an ID and store it so that it can be queried and cancelled
         let id = self.queries_count.fetch_add(1, Ordering::AcqRel);
 
@@ -3507,6 +3632,11 @@ impl<'s, S: Storage<'s>> Db<S> {
         } else {
             None
         };
+
+        // A custom fixed rule may be uncooperative while running. Governed
+        // transactions also check its query poison after it returns, before
+        // the query is reported successful or any transaction can commit.
+        let governed_poison = tx.script_cancellation.as_ref().map(|_| poison.clone());
 
         // the real evaluation
         let (result_store, early_return) = tx.stratified_magic_evaluate(
@@ -3543,7 +3673,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
         }
 
-        if !out_opts.sorters.is_empty() {
+        let result = if !out_opts.sorters.is_empty() {
             // sort outputs if required
             let sorted_result = tx.sort_and_collect(
                 result_store,
@@ -3671,7 +3801,11 @@ impl<'s, S: Storage<'s>> Db<S> {
                     clean_ups,
                 ))
             }
+        };
+        if let Some(poison) = governed_poison {
+            poison.check()?;
         }
+        result
     }
     pub(crate) fn list_running(&self) -> Result<NamedRows> {
         let rows = self
@@ -4041,6 +4175,7 @@ impl MemBudget {
 #[derive(Clone, Default)]
 pub struct Poison {
     pub(crate) flag: Arc<AtomicBool>,
+    pub(crate) parent_cancellation: Option<Arc<AtomicBool>>,
     pub(crate) deadline: Option<Instant>,
     /// Query memory budget (mnestic fork); `None` = unlimited. Rides the
     /// poison so every shipped check cadence also checks the budget trip.
@@ -4206,6 +4341,17 @@ impl Poison {
         if self.flag.load(Ordering::Relaxed) {
             bail!(ProcessKilled)
         }
+        if self
+            .parent_cancellation
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::Relaxed))
+        {
+            #[derive(Debug, Error, Diagnostic)]
+            #[error("Parent transaction was cancelled")]
+            #[diagnostic(code(eval::killed))]
+            struct TransactionCancelled;
+            bail!(TransactionCancelled)
+        }
 
         // memory budget (mnestic fork): a charge that crossed the limit
         // armed the trip; every check cadence surfaces it as its own error.
@@ -4242,6 +4388,7 @@ impl Poison {
     pub(crate) fn with_deadline(deadline: Option<Instant>) -> Self {
         Poison {
             flag: Arc::new(AtomicBool::new(false)),
+            parent_cancellation: None,
             deadline,
             mem: None,
         }
@@ -4252,6 +4399,7 @@ impl Poison {
     pub(crate) fn with_limits(deadline: Option<Instant>, mem: Option<MemBudget>) -> Self {
         Poison {
             flag: Arc::new(AtomicBool::new(false)),
+            parent_cancellation: None,
             deadline,
             mem,
         }

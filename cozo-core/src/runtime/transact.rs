@@ -7,7 +7,7 @@
  */
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::atomic::{AtomicU32, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -72,6 +72,9 @@ pub struct SessionTx<'a> {
     /// trigger) shares one tx, every statement it drives inherits the same
     /// budget — a multi-statement script is bounded as a whole, not per block.
     pub(crate) script_deadline: Option<Instant>,
+    /// Parent cancellation for governed multi-transactions. Query cleanup
+    /// kills only its own poison; it must not cancel subsequent queries.
+    pub(crate) script_cancellation: Option<Arc<AtomicBool>>,
     /// Whole-script memory budget in estimated bytes (mnestic fork; spec
     /// `docs/specs/memory-budget.md`): the minimum of any per-call limit
     /// (`run_script_with_options`) and the Db default

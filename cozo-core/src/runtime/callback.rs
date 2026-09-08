@@ -77,7 +77,45 @@ impl<'s, S: Storage<'s>> Db<S> {
     }
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn send_callbacks(&'s self, collector: CallbackCollector) {
+        self.send_callbacks_inner(collector, None);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn send_callbacks_until(
+        &'s self,
+        collector: CallbackCollector,
+        deadline: std::time::Instant,
+    ) {
+        self.send_callbacks_inner(collector, Some(deadline));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn send_callbacks_inner(
+        &'s self,
+        collector: CallbackCollector,
+        deadline: Option<std::time::Instant>,
+    ) {
         let mut to_remove = vec![];
+        let send = |sender: &Sender<(CallbackOp, NamedRows, NamedRows)>, message| {
+            if let Some(deadline) = deadline {
+                match sender.send_deadline(message, deadline) {
+                    Ok(()) => true,
+                    Err(crossbeam::channel::SendTimeoutError::Timeout(_)) => {
+                        crate::runtime::diagnostics::emit(
+                            "callback.delivery_timeout",
+                            "A committed change could not be delivered before the governed \
+                             transaction deadline; the stalled subscription was disconnected"
+                                .into(),
+                            "resubscribe and reconcile the change feed with stored data",
+                        );
+                        false
+                    }
+                    Err(crossbeam::channel::SendTimeoutError::Disconnected(_)) => false,
+                }
+            } else {
+                sender.send(message).is_ok()
+            }
+        };
 
         for (table, vals) in collector {
             for (op, new, old) in vals {
@@ -87,14 +125,14 @@ impl<'s, S: Storage<'s>> Db<S> {
                     if let Some(fst) = it.next() {
                         for cb_id in it {
                             if let Some(cb) = cbs.get(cb_id) {
-                                if cb.sender.send((op, new.clone(), old.clone())).is_err() {
+                                if !send(&cb.sender, (op, new.clone(), old.clone())) {
                                     to_remove.push(*cb_id)
                                 }
                             }
                         }
 
                         if let Some(cb) = cbs.get(fst) {
-                            if cb.sender.send((op, new, old)).is_err() {
+                            if !send(&cb.sender, (op, new, old)) {
                                 to_remove.push(*fst)
                             }
                         }
