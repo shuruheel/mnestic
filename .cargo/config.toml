@@ -1,0 +1,17 @@
+# Workspace build configuration.
+
+[env]
+# The two vendored copies of RocksDB in this tree — the submodule under `cozorocks/` (8.8.1)
+# and the one bundled by `librocksdb-sys` (8.10) — declare `uint64_t` in their public headers
+# without including <cstdint>, relying on it arriving transitively. GCC 13 tightened that and
+# GCC 15 does not provide it at all, so both fail to compile with:
+#
+#   error: 'uint64_t' does not name a type
+#   note: 'uint64_t' is defined in header '<cstdint>'
+#
+# Upstream RocksDB added the includes in later releases; until the submodule and the crate are
+# both moved forward, force the header in. `cc`/`cxx_build` honour CXXFLAGS, so this reaches
+# every C++ translation unit in the workspace.
+#
+# Not forced: an existing CXXFLAGS in the environment takes precedence over this.
+CXXFLAGS = "-include cstdint"

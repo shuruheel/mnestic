@@ -51,6 +51,17 @@ pub fn decode_tuple_from_key(key: &[u8], size_hint: usize) -> Tuple {
 
 pub(crate) const DEFAULT_SIZE_HINT: usize = 16;
 
+/// Whether the last component of an encoded key is a validity, determined by decoding the
+/// whole key. The layered storage engine uses a byte-level probe for this in the hot path;
+/// this is the slow, exact version it asserts against in debug builds.
+#[allow(dead_code)]
+pub(crate) fn key_ends_in_validity(key: &[u8]) -> bool {
+    matches!(
+        decode_tuple_from_key(key, DEFAULT_SIZE_HINT).last(),
+        Some(DataValue::Validity(_))
+    )
+}
+
 /// Check if the tuple key passed in should be a valid return for a validity query.
 ///
 /// Returns two elements, the first element contains `Some(tuple)` if the key should be included

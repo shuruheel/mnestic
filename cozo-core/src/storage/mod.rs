@@ -12,6 +12,27 @@ use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
 use crate::try_decode_tuple_from_kv;
 
+// `storage-rocksdb` links a RocksDB built from the vendored submodule through `cozorocks`.
+// `storage-new-rocksdb` and `storage-layered` link a second one through `librocksdb-sys`. Both
+// are static, both export the same C++ symbols, and they are built from different RocksDB
+// releases, so a binary holding both resolves calls across mismatched layouts and dies with a
+// segmentation fault rather than a test failure.
+//
+// Cargo features are additive and cannot express the exclusion, so it is rejected here. This
+// makes `--all-features` fail to build, which is the point: it used to segfault.
+#[cfg(all(feature = "storage-rocksdb", feature = "storage-new-rocksdb"))]
+compile_error!(
+    "features `storage-rocksdb` and `storage-new-rocksdb` cannot be enabled together: each \
+     links its own static build of RocksDB, and the two export the same symbols"
+);
+#[cfg(all(feature = "storage-rocksdb", feature = "storage-layered"))]
+compile_error!(
+    "features `storage-rocksdb` and `storage-layered` cannot be enabled together: each links \
+     its own static build of RocksDB, and the two export the same symbols"
+);
+
+#[cfg(feature = "storage-layered")]
+pub mod layered;
 pub(crate) mod mem;
 #[cfg(feature = "storage-new-rocksdb")]
 pub mod newrocks;
@@ -33,6 +54,16 @@ pub trait Storage<'s>: Send + Sync + Clone {
 
     /// Returns a string that identifies the storage kind
     fn storage_kind(&self) -> &'static str;
+
+    /// What `'NOW'` means to this engine when a script is run.
+    ///
+    /// The default is wall-clock time, which is what a single-store engine has to use. An
+    /// engine that assigns validity itself (the layered engine stamps commit order) returns
+    /// its own marker instead, so that scripts run through the ordinary entry points are
+    /// stamped the same way as those run through the engine's own.
+    fn now_validity(&self) -> ValidityTs {
+        crate::data::functions::current_validity()
+    }
 
     /// Create a transaction object. Write ops will only be called when `write == true`.
     fn transact(&'s self, write: bool) -> Result<Self::Tx>;

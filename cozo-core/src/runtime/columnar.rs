@@ -42,7 +42,6 @@ use smartstring::SmartString;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::data::functions::current_validity;
 use crate::data::relation::{ColType, ColumnDef, NullableColType, VecElementType};
 use crate::data::value::{DataValue, JsonData, UuidWrapper};
 use crate::runtime::db::{stranded_index_names, warn_if_indexes_stranded, write_import_tuple, Db};
@@ -389,7 +388,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         let mut reader = source.build(options, &mut bindings)?;
         let stale_indexes = stranded_index_names(&handle);
         tx.mark_dirty(&handle);
-        let cur_vld = current_validity();
+        let cur_vld = self.db.now_validity();
 
         let mut rows_processed = 0_u64;
         let mut batches_processed = 0_u64;
