@@ -31,7 +31,7 @@ use crate::data::program::{
 };
 use crate::data::relation::{ColType, ColumnDef, NullableColType, StoredRelationMetadata};
 use crate::data::symb::{Symbol, PROG_ENTRY};
-use crate::data::value::{DataValue, ValidityTs};
+use crate::data::value::{DataValue, Validity, ValidityTs};
 use crate::fixed_rule::utilities::constant::Constant;
 use crate::fixed_rule::{FixedRuleHandle, FixedRuleNotFoundError};
 use crate::parse::expr::build_expr;
@@ -774,9 +774,27 @@ fn parse_atom(
                 .into_inner()
                 .map(|arg| extract_named_apply_arg(arg, param_pool))
                 .try_collect()?;
-            let parameters: BTreeMap<SmartString<LazyCompact>, Expr> = src
+            let mut parameters: BTreeMap<SmartString<LazyCompact>, Expr> = src
                 .map(|arg| extract_named_apply_arg(arg, param_pool))
                 .try_collect()?;
+
+            // `validity` takes the same spellings as the `@` clause on a stored relation,
+            // including `'NOW'`, which only this stage knows how to resolve.
+            if let Entry::Occupied(entry) = parameters.entry(SmartString::from("validity")) {
+                let (name, expr) = entry.remove_entry();
+                let expr_span = expr.span();
+                let timestamp = expr2vld_spec(expr, cur_vld)?;
+                parameters.insert(
+                    name,
+                    Expr::Const {
+                        val: DataValue::Validity(Validity {
+                            timestamp,
+                            is_assert: Reverse(true),
+                        }),
+                        span: expr_span,
+                    },
+                );
+            }
 
             let opts = SearchInput {
                 relation,

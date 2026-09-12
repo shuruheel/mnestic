@@ -32,7 +32,6 @@ use serde_json::json;
 use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
-use crate::data::functions::current_validity;
 use crate::data::json::JsonValue;
 use crate::data::memsize::est_tuple_bytes;
 use crate::data::program::{InputProgram, QueryAssertion, RelationOp, ReturnMutation};
@@ -397,6 +396,18 @@ pub enum TransactionPayload {
     Query(Payload),
 }
 
+impl<S: Clone> Db<S> {
+    /// The same database, reached through a different storage handle. Everything else
+    /// (relation locks, callbacks, running queries, the temp store) is shared, so the two
+    /// handles are the same database in every respect except how storage is addressed.
+    #[allow(dead_code)]
+    pub(crate) fn with_storage(&self, db: S) -> Self {
+        let mut ret = self.clone();
+        ret.db = db;
+        ret
+    }
+}
+
 impl<'s, S: Storage<'s>> Db<S> {
     /// Create a new database object with the given storage.
     /// You must call [`initialize`](Self::initialize) immediately after creation.
@@ -470,7 +481,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
         };
 
-        let ts = current_validity();
+        let ts = self.db.now_validity();
         let callback_targets = self.current_callback_targets();
         let mut callback_collector = BTreeMap::new();
         let mut write_locks = BTreeMap::new();
@@ -628,7 +639,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         mutability: ScriptMutability,
         options: ScriptRunOptions,
     ) -> Result<NamedRows> {
-        let cur_vld = current_validity();
+        let cur_vld = self.db.now_validity();
         let parsed = parse_script(
             payload,
             &params,
@@ -850,7 +861,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         tx.script_deadline = Some(worker.options.deadline);
         tx.script_mem_limit = worker.options.mem_limit;
         tx.script_cancellation = Some(worker.poison.flag.clone());
-        let ts = current_validity();
+        let ts = self.db.now_validity();
         let callback_targets = self.current_callback_targets();
         let mut callback_collector = BTreeMap::new();
         let mut cleanups: Vec<(Vec<u8>, Vec<u8>)> = vec![];
@@ -1326,7 +1337,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         let locks = self.obtain_relation_locks(rel_names.iter());
         let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
 
-        let cur_vld = current_validity();
+        let cur_vld = self.db.now_validity();
 
         let mut tx = self.transact_write()?;
 
@@ -1980,8 +1991,13 @@ impl<'s, S: Storage<'s>> Db<S> {
         // struct-literal field would be evaluated in source order, which is
         // too easy to reorder by accident — hence the separate binding.
         let watermark = self.graph_projections.watermark();
+        // The pin happens here, after the watermark capture above. The view is read off the
+        // pinned transaction: it says which content this transaction will see, which is the
+        // other half of what a cache needs to key an entry.
+        let store_tx = self.db.transact(false)?;
+        let storage_view = crate::storage::StoreTx::storage_view(&store_tx);
         let ret = SessionTx {
-            store_tx: Box::new(self.db.transact(false)?),
+            store_tx: Box::new(store_tx),
             temp_store_tx: self.temp_db.transact(true)?,
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
@@ -1997,6 +2013,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
+            storage_view,
             dirty_relations: Default::default(),
             commit_inflight: false,
         };
@@ -2005,8 +2022,13 @@ impl<'s, S: Storage<'s>> Db<S> {
     pub(crate) fn transact_write(&'s self) -> Result<SessionTx<'s>> {
         // See `transact`: the watermark capture must precede the pin.
         let watermark = self.graph_projections.watermark();
+        // The pin happens here, after the watermark capture above. The view is read off the
+        // pinned transaction: it says which content this transaction will see, which is the
+        // other half of what a cache needs to key an entry.
+        let store_tx = self.db.transact(true)?;
+        let storage_view = crate::storage::StoreTx::storage_view(&store_tx);
         let ret = SessionTx {
-            store_tx: Box::new(self.db.transact(true)?),
+            store_tx: Box::new(store_tx),
             temp_store_tx: self.temp_db.transact(true)?,
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
@@ -2022,6 +2044,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
+            storage_view,
             dirty_relations: Default::default(),
             commit_inflight: false,
         };
@@ -2583,7 +2606,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         meet: &custom_aggrs,
                         bounded: &custom_bounded,
                     },
-                    current_validity(),
+                    self.db.now_validity(),
                 )?;
                 let (normalized_program, _) = prog.into_normalized_program(tx)?;
                 // mnestic fork (query factorization): show the rewritten plan

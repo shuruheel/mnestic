@@ -864,14 +864,16 @@ impl RelationHandle {
     pub(crate) fn skip_scan_bounded_prefix<'a>(
         &self,
         tx: &'a SessionTx<'_>,
-        prefix: &Tuple,
+        prefix: &[DataValue],
         lower: &[DataValue],
         upper: &[DataValue],
         valid_at: ValidityTs,
     ) -> impl Iterator<Item = Result<Tuple>> + 'a {
-        let mut lower_t = prefix.clone();
+        let mut lower_t = Vec::with_capacity(prefix.len() + lower.len());
+        lower_t.extend_from_slice(prefix);
         lower_t.extend_from_slice(lower);
-        let mut upper_t = prefix.clone();
+        let mut upper_t = Vec::with_capacity(prefix.len() + upper.len() + 1);
+        upper_t.extend_from_slice(prefix);
         upper_t.extend_from_slice(upper);
         upper_t.push(DataValue::Bot);
         let lower_encoded = lower_t.encode_as_key(self.id);

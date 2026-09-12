@@ -135,3 +135,73 @@ fn encode_decode_datavalues() {
     assert!(remaining.is_empty());
     assert_eq!(decoded, v);
 }
+
+/// An encoded validity, ten bytes: tag, order-encoded timestamp, assertion byte.
+fn encoded_validity(ts: i64) -> Vec<u8> {
+    use crate::data::value::{Validity, ValidityTs};
+    use std::cmp::Reverse;
+    let mut out = vec![];
+    out.encode_datavalue(&DataValue::Validity(Validity {
+        timestamp: ValidityTs(Reverse(ts)),
+        is_assert: Reverse(true),
+    }));
+    out
+}
+
+#[test]
+fn validity_markers_are_found_wherever_they_sit() {
+    use crate::data::memcmp::contains_validity_ts;
+
+    let vld = encoded_validity(7);
+    assert!(contains_validity_ts(&vld, 7));
+    assert!(!contains_validity_ts(&vld, 8), "a different stamp matched");
+
+    // At the very start, at the very end, and surrounded.
+    let mut at_end = vec![0xAA; 5];
+    at_end.extend_from_slice(&vld);
+    assert!(contains_validity_ts(&at_end, 7));
+
+    let mut surrounded = vec![0xAA; 3];
+    surrounded.extend_from_slice(&vld);
+    surrounded.extend_from_slice(&[0xBB; 4]);
+    assert!(contains_validity_ts(&surrounded, 7));
+
+    // Shorter than a marker, and empty.
+    assert!(!contains_validity_ts(&vld[..4], 7));
+    assert!(!contains_validity_ts(&[], 7));
+}
+
+#[test]
+fn a_near_miss_does_not_match() {
+    use crate::data::memcmp::contains_validity_ts;
+
+    // The tag byte is present but the timestamp that follows is a different one, so the
+    // candidate must be rejected and the search must continue past it.
+    let mut buf = encoded_validity(11);
+    buf.extend_from_slice(&encoded_validity(7));
+    assert!(contains_validity_ts(&buf, 7), "the second marker was missed");
+    assert!(contains_validity_ts(&buf, 11));
+    assert!(!contains_validity_ts(&buf, 9));
+}
+
+#[test]
+fn restamping_rewrites_every_occurrence() {
+    use crate::data::memcmp::{contains_validity_ts, restamp_all_validity};
+
+    // Three markers: at the start, adjacent to the second, and after a gap.
+    let mut buf = encoded_validity(7);
+    buf.extend_from_slice(&encoded_validity(7));
+    buf.extend_from_slice(&[0xAA; 6]);
+    buf.extend_from_slice(&encoded_validity(7));
+    let before = buf.clone();
+
+    assert_eq!(restamp_all_validity(&mut buf, 7, 42), 3);
+    assert!(!contains_validity_ts(&buf, 7), "an old stamp survived");
+    assert!(contains_validity_ts(&buf, 42));
+    assert_eq!(buf.len(), before.len(), "restamping changed the length");
+
+    // Restamping a stamp that is not there rewrites nothing and changes nothing.
+    let untouched = buf.clone();
+    assert_eq!(restamp_all_validity(&mut buf, 7, 99), 0);
+    assert_eq!(buf, untouched);
+}

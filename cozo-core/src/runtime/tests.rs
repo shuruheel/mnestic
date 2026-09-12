@@ -17,7 +17,7 @@ use smartstring::{LazyCompact, SmartString};
 
 use crate::data::expr::Expr;
 use crate::data::symb::Symbol;
-use crate::data::value::DataValue;
+use crate::data::value::{DataValue, Vector};
 use crate::fixed_rule::FixedRulePayload;
 use crate::fts::{TokenizerCache, TokenizerConfig};
 use crate::parse::SourceSpan;
@@ -25,6 +25,7 @@ use crate::runtime::callback::CallbackOp;
 use crate::runtime::db::Poison;
 use crate::storage::mem::MemStorage;
 use crate::Db;
+use crate::NamedRows;
 use crate::{DbInstance, FixedRule, RegularTempStore, ScriptMutability};
 
 #[test]
@@ -1190,6 +1191,155 @@ fn test_insertions() {
     for row in res.into_json()["rows"].as_array().unwrap() {
         println!("{} {}", row[0], row[1]);
     }
+}
+
+/// Twenty-five points along a diagonal, with an HNSW index over them.
+fn line_db() -> DbInstance {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create pt {k: Int => v: <F32; 2>}")
+        .unwrap();
+    db.run_default("?[k, v] := k in int_range(25), v = vec([k, k]) :put pt {k => v}")
+        .unwrap();
+    db.run_default(
+        "::hnsw create pt:i {fields: [v], dim: 2, dtype: F32, m: 16, ef_construction: 20}",
+    )
+    .unwrap();
+    db
+}
+
+fn ints(rows: NamedRows) -> Vec<i64> {
+    rows.rows
+        .iter()
+        .map(|r| r[0].get_int().unwrap())
+        .collect_vec()
+}
+
+/// A search asked for `k` results returns `k` whenever `k` of them pass the filter, however
+/// few of the nearest `ef` do. The filter selects three points far from the probe, so a search
+/// that only sifts the candidates it happened to collect first comes back empty.
+#[test]
+fn hnsw_filter_does_not_truncate_the_result() {
+    let db = line_db();
+    for ef in [3, 5, 50] {
+        let found = ints(
+            db.run_default(&format!(
+                "?[k] := ~pt:i{{k | query: q, k: 3, ef: {ef}, \
+                 filter: k == 20 || k == 22 || k == 24}}, q = vec([0.0, 0.0])"
+            ))
+            .unwrap(),
+        );
+        assert_eq!(found, vec![20, 22, 24], "ef {ef} returned {found:?}");
+    }
+}
+
+/// A radius still cuts what a search returns, and still does so over results the filter had to
+/// walk past its `ef` nearest nodes to find.
+#[test]
+fn hnsw_radius_and_filter_compose() {
+    let db = line_db();
+    // Squared L2 along the diagonal: point k sits at distance 2*k*k from the origin, so the
+    // radius admits everything up to k = 10 and nothing beyond it.
+    let found = ints(
+        db.run_default(
+            "?[k] := ~pt:i{k | query: q, k: 5, ef: 3, radius: 200.0, \
+             filter: k == 8 || k == 10 || k == 12}, q = vec([0.0, 0.0])",
+        )
+        .unwrap(),
+    );
+    assert_eq!(found, vec![8, 10], "got {found:?}");
+}
+
+/// Without `validity` every version of a record is its own node, so a search over a
+/// time-travelling relation ranks superseded and retracted versions alongside current ones.
+#[test]
+fn hnsw_ranks_every_version_without_a_validity() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create doc {id: String, at: Validity => v: <F32; 2>}")
+        .unwrap();
+    db.run_default(
+        "?[id, at, v] <- [['a', 'ASSERT', [1.0, 1.0]], ['b', 'ASSERT', [2.0, 2.0]]] \
+         :put doc {id, at => v}",
+    )
+    .unwrap();
+    db.run_default(
+        "::hnsw create doc:i {fields: [v], dim: 2, dtype: F32, m: 16, ef_construction: 20}",
+    )
+    .unwrap();
+    // Supersede `a`, then retract `b`.
+    db.run_default("?[id, at, v] <- [['a', 'ASSERT', [1.5, 1.5]]] :put doc {id, at => v}")
+        .unwrap();
+    db.run_default("?[id, at, v] <- [['b', 'RETRACT', [2.0, 2.0]]] :put doc {id, at => v}")
+        .unwrap();
+
+    // Binding the validity as well, because projecting to the id alone would collapse the
+    // versions of one record into a single row and hide exactly what this is measuring.
+    let all = db
+        .run_default("?[id, at] := ~doc:i{id, at | query: q, k: 10, ef: 50}, q = vec([1.0, 1.0])")
+        .unwrap();
+    assert_eq!(all.rows.len(), 4, "expected one node per version");
+
+    // Binding the vector too: `a` has two assertions, and only the later one is live, so this
+    // pins down which version came back and not merely how many did.
+    let live = db
+        .run_default(
+            "?[id, v] := ~doc:i{id, v | query: q, k: 10, ef: 50, validity: 'NOW'}, \
+             q = vec([1.0, 1.0])",
+        )
+        .unwrap();
+    assert_eq!(live.rows.len(), 1, "got {:?}", live.rows);
+    assert_eq!(
+        live.rows[0][0].get_str().unwrap(),
+        "a",
+        "retracted and superseded versions leaked"
+    );
+    assert_eq!(
+        live.rows[0][1],
+        DataValue::Vec(Vector::F32(ndarray::arr1(&[1.5f32, 1.5f32]))),
+        "the superseded version of `a` came back instead of the live one"
+    );
+}
+
+/// Liveness is asked during the walk, so it costs no results: `k` live records come back even
+/// when the nodes nearest the probe are all dead.
+#[test]
+fn hnsw_validity_does_not_truncate_the_result() {
+    let db = DbInstance::new("mem", "", "").unwrap();
+    db.run_default(":create doc {id: Int, at: Validity => v: <F32; 2>}")
+        .unwrap();
+    db.run_default("?[id, at, v] := id in int_range(25), at = 'ASSERT', v = vec([id, id]) :put doc {id, at => v}")
+        .unwrap();
+    db.run_default(
+        "::hnsw create doc:i {fields: [v], dim: 2, dtype: F32, m: 16, ef_construction: 20}",
+    )
+    .unwrap();
+    // Retract everything but the three furthest from the probe.
+    db.run_default(
+        "?[id, at, v] := *doc{id, v @ 'NOW'}, id < 22, at = 'RETRACT' :put doc {id, at => v}",
+    )
+    .unwrap();
+
+    let found = ints(
+        db.run_default(
+            "?[id] := ~doc:i{id | query: q, k: 3, ef: 5, validity: 'NOW'}, q = vec([0.0, 0.0])",
+        )
+        .unwrap(),
+    );
+    assert_eq!(found, vec![22, 23, 24], "got {found:?}");
+}
+
+/// `validity` only means something where there is a validity column to read.
+#[test]
+fn hnsw_validity_needs_a_validity_column() {
+    let db = line_db();
+    let err = db
+        .run_default(
+            "?[k] := ~pt:i{k | query: q, k: 3, ef: 5, validity: 'NOW'}, q = vec([0.0, 0.0])",
+        )
+        .unwrap_err();
+    assert!(
+        format!("{err:?}").contains("no validity column"),
+        "unexpected error: {err:?}"
+    );
 }
 
 #[test]

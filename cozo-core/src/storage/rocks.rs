@@ -21,7 +21,7 @@ use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
 use crate::runtime::db::{BadDbInit, DbManifest};
 use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
-use crate::storage::{Storage, StoreTx};
+use crate::storage::{Storage, StoreCursor, StoreTx};
 use crate::utils::swap_option_result;
 use crate::Db;
 
@@ -530,19 +530,14 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         })
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        lower: &[u8],
-        upper: &[u8],
-        valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        let inner = self.iter_builder().upper_bound(upper).start();
-        Box::new(RocksDbSkipIterator {
-            inner,
+    fn cursor<'a>(&'a self, _lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        Ok(Box::new(RocksDbCursor {
+            inner: self.iter_builder().upper_bound(upper).start(),
             upper_bound: upper.to_vec(),
-            next_bound: lower.to_owned(),
-            valid_at,
-        })
+        }))
     }
 
     fn range_bitemporal_scan_tuple<'a>(
@@ -682,42 +677,34 @@ impl crate::data::bitemporal::SeekCursor for RocksSeekCursor {
     }
 }
 
-pub(crate) struct RocksDbSkipIterator {
+/// A positioned scan. The iterator's own upper bound stops it, and the explicit compare
+/// guards the case where the bound was not honoured.
+pub(crate) struct RocksDbCursor {
     inner: DbIter,
     upper_bound: Vec<u8>,
-    next_bound: Vec<u8>,
-    valid_at: ValidityTs,
 }
 
-impl RocksDbSkipIterator {
-    #[inline]
-    fn next_inner(&mut self) -> Result<Option<Tuple>> {
-        loop {
-            self.inner.seek(&self.next_bound);
-            match self.inner.pair()? {
-                None => return Ok(None),
-                Some((k_slice, v_slice)) => {
-                    if self.upper_bound.as_slice() <= k_slice {
-                        return Ok(None);
-                    }
-
-                    let (ret, nxt_bound) = check_key_for_validity(k_slice, self.valid_at, None);
-                    self.next_bound = nxt_bound;
-                    if let Some(mut tup) = ret {
-                        try_extend_tuple_from_v(&mut tup, v_slice)?;
-                        return Ok(Some(tup));
-                    }
-                }
-            }
+impl StoreCursor for RocksDbCursor {
+    fn seek(&mut self, from: &[u8]) -> Result<bool> {
+        self.inner.seek(from);
+        match self.inner.key()? {
+            None => Ok(false),
+            Some(key) => Ok(key < self.upper_bound.as_slice()),
         }
     }
-}
 
-impl Iterator for RocksDbSkipIterator {
-    type Item = Result<Tuple>;
-    #[inline]
-    fn next(&mut self) -> Option<Self::Item> {
-        swap_option_result(self.next_inner())
+    fn key(&self) -> &[u8] {
+        self.inner
+            .key()
+            .expect("cursor key after a successful seek")
+            .expect("cursor key after a successful seek")
+    }
+
+    fn value(&mut self) -> Result<&[u8]> {
+        Ok(self
+            .inner
+            .val()?
+            .expect("cursor value after a successful seek"))
     }
 }
 

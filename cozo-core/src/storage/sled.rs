@@ -12,13 +12,13 @@ use std::iter::Fuse;
 use std::path::Path;
 
 use itertools::Itertools;
-use miette::{miette, IntoDiagnostic, Result};
+use miette::{bail, miette, IntoDiagnostic, Result};
 use sled::{Batch, Config, Db, IVec, Iter, Mode};
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
 use crate::runtime::relation::try_decode_tuple_from_kv;
-use crate::storage::{Storage, StoreTx};
+use crate::storage::{Storage, StoreCursor, StoreTx};
 use crate::utils::{swap_option_result, TempCollector};
 
 /// Creates a Sled database object. Experimental.
@@ -217,15 +217,11 @@ impl<'s> StoreTx<'s> for SledTx {
         }
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        _lower: &[u8],
-        _upper: &[u8],
-        _valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        Box::new(iter::once(Err(miette!(
-            "Sled backend does not support time travelling."
-        ))))
+    fn cursor<'a>(&'a self, _lower: &[u8], _upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        bail!("Sled backend does not support time travelling.")
     }
 
     fn range_scan<'a>(

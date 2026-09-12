@@ -39,6 +39,144 @@ const BOT_TAG: u8 = 0xFF;
 const VEC_F32: u8 = 0x01;
 const VEC_F64: u8 = 0x02;
 
+/// The encoded width of a [`DataValue::Validity`]: tag byte, order-encoded timestamp,
+/// assertion byte.
+pub(crate) const VLD_ENCODED_LEN: usize = 1 + 8 + 1;
+
+/// Read the validity that terminates an encoded key, if the key ends in one.
+///
+/// This is a byte-level probe rather than a decode: it recognises the fixed ten-byte
+/// tail that [`MemCmpEncoder::encode_datavalue`] writes for a validity. A key whose final
+/// component is *not* a validity can in principle end in the same shape. See
+/// [`key_ends_in_validity`] for the exact check that debug builds assert against.
+pub(crate) fn tail_validity(key: &[u8]) -> Option<Validity> {
+    if key.len() < VLD_ENCODED_LEN {
+        return None;
+    }
+    let tail = &key[key.len() - VLD_ENCODED_LEN..];
+    if tail[0] != VLD_TAG {
+        return None;
+    }
+    // The stored form is the order-encoded timestamp with every bit complemented, which is
+    // what sorts it descending. Neither step is a byte-order change; that is the read itself.
+    let complemented = BigEndian::read_u64(&tail[1..9]);
+    let ts = order_decode_i64(!complemented);
+    Some(Validity {
+        timestamp: ValidityTs(Reverse(ts)),
+        is_assert: Reverse(tail[9] == 0),
+    })
+}
+
+/// The identity of an encoded key: everything before the trailing validity.
+pub(crate) fn validity_identity(key: &[u8]) -> &[u8] {
+    debug_assert!(key.len() >= VLD_ENCODED_LEN);
+    &key[..key.len() - VLD_ENCODED_LEN]
+}
+
+/// A reusable buffer holding the scan range that covers every version of one key's identity.
+///
+/// A validity is always the last key component of the relation that has one, so
+/// `[identity ++ VLD_TAG, identity ++ VLD_TAG+1)` is exactly that key's version chain.
+///
+/// The two bounds are packed end to end in one allocation rather than held in a vector each:
+/// they are always the same length, so the whole range is sized and reserved once per fill.
+/// Refilling reuses the buffer, so a caller walking many keys allocates only while it grows to
+/// the longest identity it has seen.
+#[derive(Default)]
+pub(crate) struct KeyBounds {
+    /// `[lower][upper]`, each `identity + 1` bytes long.
+    buf: Vec<u8>,
+    /// Where the lower bound ends and the upper begins.
+    split: usize,
+}
+
+impl KeyBounds {
+    /// Point the buffer at `key`'s identity, reusing whatever capacity it already holds.
+    pub(crate) fn fill(&mut self, key: &[u8]) {
+        let identity = validity_identity(key);
+        self.split = identity.len() + 1;
+        self.buf.clear();
+        // Both bounds up front, so neither half can trigger a growth part way through.
+        self.buf.reserve(self.split * 2);
+        self.buf.extend_from_slice(identity);
+        self.buf.push(VLD_TAG);
+        self.buf.extend_from_slice(identity);
+        self.buf.push(VLD_TAG + 1);
+    }
+
+    pub(crate) fn lower(&self) -> &[u8] {
+        &self.buf[..self.split]
+    }
+
+    pub(crate) fn upper(&self) -> &[u8] {
+        &self.buf[self.split..]
+    }
+}
+
+/// The nine bytes an encoded validity with timestamp `ts` begins with: the tag and the
+/// order-encoded timestamp. The tenth byte, the assertion bit, is not part of the marker.
+fn validity_marker(ts: i64) -> [u8; 9] {
+    let mut marker = [0u8; 9];
+    marker[0] = VLD_TAG;
+    BigEndian::write_u64(&mut marker[1..9], !order_encode_i64(ts));
+    marker
+}
+
+/// Whether a buffer contains an encoded validity stamped `ts`, anywhere.
+///
+/// Cozo's derived structures, an HNSW index's neighbour lists for one, embed the key of the
+/// row they describe, validity included, rather than referring to it. A stamp assigned at
+/// commit therefore has to be rewritten wherever it was copied to, not only where the row's own
+/// key ends.
+pub(crate) fn contains_validity_ts(buf: &[u8], ts: i64) -> bool {
+    let marker = validity_marker(ts);
+    find_marker(buf, &marker, 0).is_some()
+}
+
+/// Rewrite every encoded validity stamped `from` to be stamped `to`, in place. Returns how many
+/// were rewritten. Assertion bits are left alone.
+pub(crate) fn restamp_all_validity(buf: &mut [u8], from: i64, to: i64) -> usize {
+    let old = validity_marker(from);
+    let new = validity_marker(to);
+    let mut rewritten = 0;
+    let mut at = 0;
+    while let Some(found) = find_marker(buf, &old, at) {
+        buf[found..found + old.len()].copy_from_slice(&new);
+        at = found + old.len();
+        rewritten += 1;
+    }
+    rewritten
+}
+
+/// The first offset at or after `from` where `marker` occurs in `buf`.
+///
+/// A marker always begins with `VLD_TAG`, so candidate offsets are found by searching for that
+/// byte rather than by comparing at every position.
+fn find_marker(buf: &[u8], marker: &[u8; 9], from: usize) -> Option<usize> {
+    let last = buf.len().checked_sub(marker.len())?;
+    let mut at = from;
+    while at <= last {
+        let found = at + memchr::memchr(VLD_TAG, &buf[at..=last])?;
+        if buf[found..found + marker.len()] == *marker {
+            return Some(found);
+        }
+        at = found + 1;
+    }
+    None
+}
+
+/// Overwrite the timestamp of the validity that terminates an encoded key.
+///
+/// The caller must have established that the key does end in a validity, normally by way of
+/// [`tail_validity`]. Only the timestamp moves; the assertion bit is left alone.
+pub(crate) fn restamp_tail_validity(key: &mut [u8], ts: i64) {
+    debug_assert!(key.len() >= VLD_ENCODED_LEN);
+    let at = key.len() - VLD_ENCODED_LEN;
+    debug_assert_eq!(key[at], VLD_TAG);
+    let ts_flipped = !order_encode_i64(ts);
+    BigEndian::write_u64(&mut key[at + 1..at + 9], ts_flipped);
+}
+
 const IS_FLOAT: u8 = 0b00010000;
 const IS_APPROX_INT: u8 = 0b00000100;
 const IS_EXACT_INT: u8 = 0b00000000;

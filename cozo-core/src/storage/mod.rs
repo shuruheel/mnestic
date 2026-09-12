@@ -6,12 +6,39 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::any::Any;
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::sync::Arc;
+
 use miette::{bail, Result};
 
-use crate::data::tuple::Tuple;
+use crate::data::tuple::{check_key_for_validity, Tuple};
+use crate::runtime::relation::try_extend_tuple_from_v;
 use crate::data::value::ValidityTs;
 use crate::try_decode_tuple_from_kv;
 
+// `storage-rocksdb` links a RocksDB built from the vendored submodule through `cozorocks`.
+// `storage-new-rocksdb` and `storage-layered` link a second one through `librocksdb-sys`. Both
+// are static, both export the same C++ symbols, and they are built from different RocksDB
+// releases, so a binary holding both resolves calls across mismatched layouts and dies with a
+// segmentation fault rather than a test failure.
+//
+// Cargo features are additive and cannot express the exclusion, so it is rejected here. This
+// makes `--all-features` fail to build, which is the point: it used to segfault.
+#[cfg(all(feature = "storage-rocksdb", feature = "storage-new-rocksdb"))]
+compile_error!(
+    "features `storage-rocksdb` and `storage-new-rocksdb` cannot be enabled together: each \
+     links its own static build of RocksDB, and the two export the same symbols"
+);
+#[cfg(all(feature = "storage-rocksdb", feature = "storage-layered"))]
+compile_error!(
+    "features `storage-rocksdb` and `storage-layered` cannot be enabled together: each links \
+     its own static build of RocksDB, and the two export the same symbols"
+);
+
+#[cfg(feature = "storage-layered")]
+pub mod layered;
 pub(crate) mod mem;
 #[cfg(feature = "storage-new-rocksdb")]
 pub mod newrocks;
@@ -26,6 +53,77 @@ pub(crate) mod temp;
 pub(crate) mod tikv;
 // pub(crate) mod re;
 
+/// An engine's identity for one of the views it presents.
+///
+/// Implemented by the engine, never inspected outside it. The only thing anything else may do
+/// with one is compare it to another, and the only promise an engine makes is that two of its
+/// transactions get equal identities exactly when they see equal content.
+///
+/// An implementor orders only against its own type and answers `None` otherwise; [`StorageView`]
+/// settles those by concrete type instead. So no implementor has to invent an order against
+/// types it has never heard of, and the common case costs one downcast rather than a type
+/// comparison followed by one.
+pub trait ViewIdentity: Any + Debug + Send + Sync {
+    /// Order this identity against another, or `None` if `other` is not the same type.
+    fn view_cmp(&self, other: &dyn ViewIdentity) -> Option<Ordering>;
+}
+
+/// Which view of the store a transaction reads.
+///
+/// Engine-level caches key their entries on relation identity plus a content version, which is
+/// sound only while every transaction sees the same content for a relation at a given version.
+/// An engine whose transactions can disagree without any write between them breaks that, so it
+/// distinguishes its views here and the caches key on this as well.
+///
+/// The identity type belongs to the engine: what divides a store is the engine's business, and
+/// differs entirely between one that shards, one that reads a replica with lag, and one that
+/// composes layers. An engine that presents its store whole reports [`StorageView::undivided`],
+/// which is what the default implementation does.
+#[derive(Clone, Debug, Default)]
+pub struct StorageView(Option<Arc<dyn ViewIdentity>>);
+
+impl StorageView {
+    /// The store presented whole: one view, nothing to tell apart.
+    pub fn undivided() -> Self {
+        StorageView(None)
+    }
+
+    /// An engine's identity for one of several views it presents.
+    pub fn of(identity: Arc<dyn ViewIdentity>) -> Self {
+        StorageView(Some(identity))
+    }
+}
+
+impl Ord for StorageView {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&self.0, &other.0) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(a), Some(b)) => a.view_cmp(b.as_ref()).unwrap_or_else(|| {
+                // Different engines' identities, which only meet if a process runs more than
+                // one engine. Ordering by concrete type keeps the total order total; nothing
+                // depends on which type sorts first.
+                Any::type_id(a.as_ref()).cmp(&Any::type_id(b.as_ref()))
+            }),
+        }
+    }
+}
+
+impl PartialOrd for StorageView {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for StorageView {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for StorageView {}
+
 /// Swappable storage trait for Cozo's storage engine
 pub trait Storage<'s>: Send + Sync + Clone {
     /// The associated transaction type used by this engine
@@ -33,6 +131,16 @@ pub trait Storage<'s>: Send + Sync + Clone {
 
     /// Returns a string that identifies the storage kind
     fn storage_kind(&self) -> &'static str;
+
+    /// What `'NOW'` means to this engine when a script is run.
+    ///
+    /// The default is wall-clock time, which is what a single-store engine has to use. An
+    /// engine that assigns validity itself (the layered engine stamps commit order) returns
+    /// its own marker instead, so that scripts run through the ordinary entry points are
+    /// stamped the same way as those run through the engine's own.
+    fn now_validity(&self) -> ValidityTs {
+        crate::data::functions::current_validity()
+    }
 
     /// Create a transaction object. Write ops will only be called when `write == true`.
     fn transact(&'s self, write: bool) -> Result<Self::Tx>;
@@ -104,6 +212,134 @@ pub trait Storage<'s>: Send + Sync + Clone {
 
 /// Trait for the associated transaction type of a storage engine.
 /// A transaction needs to guarantee MVCC semantics for all operations.
+/// The validity skip scan: seek, test the key, read the value only if the test asks for it,
+/// and resume wherever the test says.
+struct SkipScan<'a> {
+    cursor: Box<dyn StoreCursor + 'a>,
+    matcher: Box<dyn SkipMatch + 'a>,
+    valid_at: ValidityTs,
+    next_bound: Vec<u8>,
+    done: bool,
+}
+
+impl SkipScan<'_> {
+    /// Resume just past `key`, the smallest bound that cannot land on it again.
+    fn after(key: &[u8]) -> Vec<u8> {
+        let mut bound = Vec::with_capacity(key.len() + 1);
+        bound.extend_from_slice(key);
+        bound.push(0);
+        bound
+    }
+
+    fn next_inner(&mut self) -> Result<Option<Tuple>> {
+        while self.cursor.seek(&self.next_bound)? {
+            // The validity rule reads the key alone, and the bound it returns clears every
+            // remaining row of this key prefix.
+            let (admitted, past_group) =
+                check_key_for_validity(self.cursor.key(), self.valid_at, None);
+            self.next_bound = past_group;
+            let Some(mut row) = admitted else { continue };
+            // A row the key test kept is offered its value, which only the matcher can
+            // decide to decode. The borrow ends with the call, leaving the key reachable below.
+            let step = match self.matcher.match_key(&row)? {
+                Step::Yield => self.matcher.match_value(&mut row, self.cursor.value()?)?,
+                declined => declined,
+            };
+            match step {
+                Step::Yield => return Ok(Some(row)),
+                Step::SkipGroup => continue,
+                Step::NextKey => {
+                    self.next_bound = Self::after(self.cursor.key());
+                    continue;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Iterator for SkipScan<'_> {
+    type Item = Result<Tuple>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.next_inner() {
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Ok(Some(tuple)) => Some(Ok(tuple)),
+            Err(err) => {
+                self.done = true;
+                Some(Err(err))
+            }
+        }
+    }
+}
+
+/// A scan positioned on one row at a time, able to jump to an arbitrary key.
+///
+/// The value is fetched separately from the key because reading it is not free everywhere: the
+/// SQLite backend copies the blob out of the row, and a scan that decides from the key alone
+/// should not pay for it.
+pub trait StoreCursor {
+    /// Move to the first entry at or after `from`. `false` once nothing is left below the
+    /// upper bound the cursor was built with.
+    fn seek(&mut self, from: &[u8]) -> Result<bool>;
+
+    /// The key at the current position. Only valid after `seek` returned `true`.
+    fn key(&self) -> &[u8];
+
+    /// The value at the current position. Only valid after `seek` returned `true`.
+    fn value(&mut self) -> Result<&[u8]>;
+}
+
+/// Whether a scan returns a row, and where it resumes afterwards.
+pub enum Step {
+    /// Return the row.
+    Yield,
+    /// Discard it and resume past every row sharing its key prefix.
+    SkipGroup,
+    /// Discard it and resume at the key immediately after it.
+    NextKey,
+}
+
+/// Which rows a validity scan returns, and where it resumes after each one it declines.
+///
+/// The two halves run in order, and the second only when the first asks for it, so a scan that
+/// decides from key columns never pays to materialize a value it would discard. Each decision
+/// names where the scan resumes, so declining on a value is not silently assumed to resume
+/// wherever declining on a key would have.
+pub trait SkipMatch {
+    /// Decide from the key columns of a row the validity rule admitted. A row declined here
+    /// never has its value read.
+    fn match_key(&mut self, key: &Tuple) -> Result<Step>;
+
+    /// Decide again for a row `match_key` kept, given its value bytes.
+    ///
+    /// Decoding them into `row` is what costs, not receiving them, so this is where a scan
+    /// that only wants key columns declines to pay: override it to ignore `value`. The default
+    /// appends them, which is what a scan returning whole tuples wants.
+    fn match_value(&mut self, row: &mut Tuple, value: &[u8]) -> Result<Step> {
+        try_extend_tuple_from_v(row, value)?;
+        Ok(Step::Yield)
+    }
+}
+
+/// The rule every stored relation's time-travel scan follows: of the rows sharing a key prefix,
+/// the newest assertion no later than `valid_at`, and nothing else.
+///
+/// Left alone it reproduces `range_skip_scan_tuple`; wrap it to add conditions of your own.
+pub struct LiveAt;
+
+impl SkipMatch for LiveAt {
+    fn match_key(&mut self, _key: &Tuple) -> Result<Step> {
+        Ok(Step::Yield)
+    }
+}
+
 pub trait StoreTx<'s>: Sync {
     /// Get a key. If `for_update` is `true` (only possible in a write transaction),
     /// then the database needs to guarantee that `commit()` can only succeed if
@@ -113,6 +349,13 @@ pub trait StoreTx<'s>: Sync {
     /// Get multiple keys. If `for_update` is `true` (only possible in a write transaction),
     /// then the database needs to guarantee that `commit()` can only succeed if
     /// the keys have not been modified outside the transaction.
+    /// Which view of the store this transaction reads, for caches that would otherwise
+    /// conflate two transactions seeing different content. Defaults to
+    /// [`StorageView::undivided`]; only the layered backend composes more than one view.
+    fn storage_view(&self) -> StorageView {
+        StorageView::undivided()
+    }
+
     fn multi_get(&self, keys: &[Vec<u8>], for_update: bool) -> Result<Vec<Option<Vec<u8>>>> {
         keys.iter().map(|k| self.get(k, for_update)).collect()
     }
@@ -188,6 +431,15 @@ pub trait StoreTx<'s>: Sync {
         }))
     }
 
+    /// A positioned scan over `[lower, upper)` that can jump.
+    ///
+    /// A skip rule rejects a key and then resumes from a position it computes, which a forward
+    /// iterator cannot express. This is the only part of such a scan that depends on the
+    /// backend; the rules themselves are shared.
+    fn cursor<'a>(&'a self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a;
+
     /// Scan on a range with a certain validity.
     ///
     /// `lower` is inclusive whereas `upper` is exclusive.
@@ -209,7 +461,39 @@ pub trait StoreTx<'s>: Sync {
         lower: &[u8],
         upper: &[u8],
         valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>;
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>
+    where
+        's: 'a,
+    {
+        self.range_skip_scan_matched(lower, upper, valid_at, Box::new(LiveAt))
+    }
+
+    /// The same scan, with a say in which rows come back and where it resumes after the ones
+    /// that do not. See [`SkipMatch`].
+    ///
+    /// This is where the validity rule actually lives, written once over [`cursor`](Self::cursor)
+    /// rather than per backend.
+    fn range_skip_scan_matched<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        valid_at: ValidityTs,
+        matcher: Box<dyn SkipMatch + 'a>,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>
+    where
+        's: 'a,
+    {
+        match self.cursor(lower, upper) {
+            Ok(cursor) => Box::new(SkipScan {
+                cursor,
+                matcher,
+                valid_at,
+                next_bound: lower.to_vec(),
+                done: false,
+            }),
+            Err(err) => Box::new(std::iter::once(Err(err))),
+        }
+    }
 
     /// Two-level bitemporal scan (mnestic fork, bitemporality step 4b; see
     /// `data/bitemporal.rs`). The default implementation drives the generic
@@ -262,4 +546,90 @@ pub trait StoreTx<'s>: Sync {
     fn total_scan<'a>(&'a self) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>
     where
         's: 'a;
+}
+
+#[cfg(test)]
+mod view_tests {
+    use std::cmp::Ordering;
+    use std::sync::Arc;
+
+    use super::{StorageView, ViewIdentity};
+
+    /// Two engines, so the cross-type path is reachable. Neither knows the other exists, which
+    /// is the point: each answers only for its own type.
+    #[derive(Debug)]
+    struct Alpha(u64);
+    #[derive(Debug)]
+    struct Beta(u64);
+
+    impl ViewIdentity for Alpha {
+        fn view_cmp(&self, other: &dyn ViewIdentity) -> Option<Ordering> {
+            (other as &dyn std::any::Any)
+                .downcast_ref::<Alpha>()
+                .map(|other| self.0.cmp(&other.0))
+        }
+    }
+    impl ViewIdentity for Beta {
+        fn view_cmp(&self, other: &dyn ViewIdentity) -> Option<Ordering> {
+            (other as &dyn std::any::Any)
+                .downcast_ref::<Beta>()
+                .map(|other| self.0.cmp(&other.0))
+        }
+    }
+
+    fn alpha(n: u64) -> StorageView {
+        StorageView::of(Arc::new(Alpha(n)))
+    }
+    fn beta(n: u64) -> StorageView {
+        StorageView::of(Arc::new(Beta(n)))
+    }
+
+    #[test]
+    fn an_engine_orders_its_own_views() {
+        assert_eq!(alpha(1), alpha(1));
+        assert_ne!(alpha(1), alpha(2));
+        assert!(alpha(1) < alpha(2));
+    }
+
+    #[test]
+    fn the_undivided_store_is_its_own_view() {
+        assert_eq!(StorageView::undivided(), StorageView::undivided());
+        assert_ne!(StorageView::undivided(), alpha(0));
+        assert!(StorageView::undivided() < alpha(0));
+    }
+
+    /// Identities from different engines never compare equal, and the order between them is
+    /// antisymmetric. A `BTreeMap` keyed on these would corrupt silently otherwise.
+    #[test]
+    fn identities_from_different_engines_are_ordered_not_conflated() {
+        assert_ne!(alpha(7), beta(7), "same number, different engines");
+        assert_eq!(
+            alpha(7).cmp(&beta(7)).reverse(),
+            beta(7).cmp(&alpha(7)),
+            "the order between two engines is not antisymmetric"
+        );
+        // Whichever way the types sort, it must be consistent across values.
+        let first = alpha(0).cmp(&beta(0));
+        for (a, b) in [(0, 99), (99, 0), (5, 5)] {
+            assert_eq!(
+                alpha(a).cmp(&beta(b)),
+                first,
+                "type ordering must not depend on the values"
+            );
+        }
+    }
+
+    /// The ordering is total, which is what a map keyed on it requires.
+    #[test]
+    fn mixed_identities_sort_into_a_stable_total_order() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        for v in [alpha(2), beta(1), StorageView::undivided(), alpha(1), beta(2)] {
+            assert!(set.insert(v), "a distinct view collided with one already present");
+        }
+        assert_eq!(set.len(), 5);
+        // Re-inserting an equal identity must be recognised as already present.
+        assert!(!set.insert(alpha(1)));
+        assert!(!set.insert(StorageView::undivided()));
+    }
 }
