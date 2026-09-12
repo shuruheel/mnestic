@@ -88,6 +88,10 @@ pub struct SessionTx<'a> {
     /// A source relation whose token exceeds this was mutated by a commit this
     /// transaction cannot see, so no cached projection over it may be served.
     pub(crate) watermark: u64,
+    /// Which composed view of the store this transaction reads. Paired with
+    /// `watermark`: the watermark says when the content was last written, this says whose
+    /// content it is. Caches need both to key an entry soundly.
+    pub(crate) storage_view: crate::storage::StorageView,
     /// Every persistent relation this transaction has mutated, marked at
     /// mutation-function entry. Drives the commit-time token bump, and marks
     /// the transaction's own uncommitted writes so it never consults or

@@ -10,7 +10,7 @@ use std::borrow::Cow;
 use crate::data::memcmp::tail_validity;
 use crate::data::tuple::{check_key_for_validity, key_ends_in_validity, Tuple};
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::{decode_tuple_from_kv, extend_tuple_from_v};
+use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
 use crate::storage::layered::Seq;
 
 pub(crate) type LayeredDb = OptimisticTransactionDB<MultiThreaded>;
@@ -325,9 +325,11 @@ impl<'a> Iterator for StackTupleIter<'a> {
     type Item = Result<Tuple>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Decoding reads through the borrows, so the row is never copied.
+        // Decoding reads through the borrows, so the row is never copied. A value blob that
+        // will not decode is an error, never a panic: a corrupt row must leave the rest of the
+        // history readable.
         match self.inner.next_borrowed() {
-            Some(Ok((k, v))) => Some(Ok(decode_tuple_from_kv(k, v, None))),
+            Some(Ok((k, v))) => Some(try_decode_tuple_from_kv(k, v, None)),
             Some(Err(err)) => Some(Err(err)),
             None => None,
         }
@@ -361,10 +363,13 @@ impl<'a> Iterator for StackSkipIter<'a> {
                     // Everything needing the borrows happens first; a skipped row, which is
                     // the common case here, is never copied.
                     let (ret, nxt_bound) = check_key_for_validity(k, self.valid_at, None);
-                    let tup = ret.map(|mut tup| {
-                        extend_tuple_from_v(&mut tup, v);
-                        tup
-                    });
+                    let tup = match ret {
+                        Some(mut tup) => match try_extend_tuple_from_v(&mut tup, v) {
+                            Ok(()) => Some(tup),
+                            Err(err) => return Some(Err(err)),
+                        },
+                        None => None,
+                    };
                     self.next_bound = nxt_bound;
                     if let Some(tup) = tup {
                         return Some(Ok(tup));

@@ -13,7 +13,7 @@ use std::ops::ControlFlow;
 use crate::data::memcmp::{restamp_tail_validity, tail_validity, validity_identity};
 use crate::data::tuple::decode_tuple_from_key;
 use crate::data::value::DataValue;
-use crate::runtime::relation::extend_tuple_from_v;
+use crate::runtime::relation::try_extend_tuple_from_v;
 use crate::storage::layered::iter::{LayeredTxn, StackMerge};
 use crate::storage::layered::catalog::{catalog_relations, Catalog, RelInfo};
 use crate::storage::layered::tx::{bind_layers, BoundLayer, BoundStack};
@@ -210,13 +210,13 @@ where
         let mut claims = Vec::with_capacity(done.others.len() + 2);
         if let Some((val, at)) = &done.asserted {
             claims.push(Claim {
-                value: decode_values(val),
+                value: decode_values(val)?,
                 layer: layer_name(src_layers, *at),
             });
         }
         for (val, at) in &done.others {
             claims.push(Claim {
-                value: decode_values(val),
+                value: decode_values(val)?,
                 layer: layer_name(src_layers, *at),
             });
         }
@@ -229,7 +229,7 @@ where
                 .any(|v| v == val);
             if !already {
                 claims.push(Claim {
-                    value: decode_values(val),
+                    value: decode_values(val)?,
                     layer: layer_name(&dst.layers, state.asserted_layer),
                 });
             }
@@ -406,10 +406,12 @@ where
     Ok(None)
 }
 
-fn decode_values(val: &[u8]) -> Vec<DataValue> {
+/// A stored value blob, decoded. Fallible for the same reason the read path is: a row that
+/// will not decode must not take the whole scan down with it.
+fn decode_values(val: &[u8]) -> Result<Vec<DataValue>> {
     let mut ret = vec![];
-    extend_tuple_from_v(&mut ret, val);
-    ret
+    try_extend_tuple_from_v(&mut ret, val)?;
+    Ok(ret)
 }
 
 /// Everything a scan needs, bound for the life of one call.
@@ -431,7 +433,7 @@ impl Db<LayeredStorage> {
         let inner = &*self.db.inner;
         let txn = inner.db.transaction();
         let src_layers = bind_layers(inner, &src_spec)?;
-        let dst = BoundStack::new(bind_layers(inner, &dst_spec)?);
+        let dst = BoundStack::new(bind_layers(inner, &dst_spec)?, dst_spec.view.clone());
         let catalog = inner
             .db
             .cf_handle(DEFAULT_LAYER)
@@ -513,7 +515,7 @@ impl Db<LayeredStorage> {
                     RowEffect::Effective { key, val, asserts } => FlattenItem::Copy {
                         relation,
                         key: decode_tuple_from_key(key, rel.n_keys),
-                        value: decode_values(val),
+                        value: decode_values(val)?,
                         asserts,
                     },
                     RowEffect::Redundant { key } => FlattenItem::Dedupe {

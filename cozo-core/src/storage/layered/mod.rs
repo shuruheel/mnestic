@@ -21,7 +21,7 @@ use crate::parse::parse_script;
 use crate::runtime::db::{BadDbInit, DbManifest, ScriptMutability};
 use crate::storage::layered::iter::{LayeredDb, Window};
 use crate::storage::layered::tx::{bind_layers, is_catalog_key, LayeredTx};
-use crate::storage::Storage;
+use crate::storage::{Storage, StorageView};
 use crate::{Db, NamedRows};
 
 pub(crate) mod catalog;
@@ -115,25 +115,49 @@ impl LayerRef {
 /// An ordered list of layers. Index 0 is the top, and the only one written to.
 pub type Stack = Vec<LayerRef>;
 
+/// This engine's identity for a resolved stack: the interned number the stack was assigned.
+///
+/// Opaque to everything above: nothing outside decides what makes two stacks the same, and the
+/// number itself never escapes.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct StackView(u64);
+
+impl crate::storage::ViewIdentity for StackView {
+    fn view_cmp(&self, other: &dyn crate::storage::ViewIdentity) -> Option<std::cmp::Ordering> {
+        (other as &dyn std::any::Any)
+            .downcast_ref::<StackView>()
+            .map(|other| self.0.cmp(&other.0))
+    }
+}
+
 /// A stack that has been checked against the open store: layers exist, windows are coherent.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct StackSpec {
     pub(crate) layers: Vec<LayerSpec>,
+    /// Which view this stack is, for caches that must not serve one stack's work to another.
+    pub(crate) view: StorageView,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct LayerSpec {
     pub(crate) name: String,
+    /// The incarnation this name resolved to, so a stack resolved before a drop-and-recreate
+    /// is not mistaken for one resolved after it.
+    pub(crate) incarnation: u64,
     pub(crate) window: Window,
 }
 
 impl StackSpec {
+    /// The store read whole: one layer, no window. Every other engine presents exactly this,
+    /// so it reports [`StorageView::undivided`] rather than a view of its own.
     fn single(name: &str) -> Self {
         Self {
             layers: vec![LayerSpec {
                 name: name.to_string(),
+                incarnation: 0,
                 window: Window::OPEN,
             }],
+            view: StorageView::undivided(),
         }
     }
 }
@@ -145,7 +169,18 @@ pub struct LayeredInner {
     pub(crate) db: LayeredDb,
     /// Serializes commits so that the sequence read at commit really is commit order.
     pub(crate) commit_lock: Mutex<()>,
-    pub(crate) layers: RwLock<BTreeSet<String>>,
+    /// Every layer that exists, with the incarnation it was opened or created at. A name is
+    /// reusable after a drop, so the incarnation is what distinguishes the new layer from the
+    /// one it replaced for anything that caches per view.
+    pub(crate) layers: RwLock<BTreeMap<String, u64>>,
+    /// Mints layer incarnations, distinct for every layer this process ever opens or creates.
+    /// In-process uniqueness is the requirement: what reads it is in-memory caching, which does
+    /// not outlive the process.
+    pub(crate) layer_incarnation: std::sync::atomic::AtomicU64,
+    /// Every distinct stack this store has resolved, and the opaque view identity it was given.
+    /// Interned rather than rendered: engine-level caches only ever compare these, so a number
+    /// is both cheaper than a name and impossible to forge by naming a layer after one.
+    pub(crate) views: RwLock<BTreeMap<Vec<(u64, Option<Seq>, Option<Seq>)>, u64>>,
 }
 
 /// The layered RocksDB storage engine.
@@ -203,6 +238,8 @@ pub fn new_cozo_layered(path: impl AsRef<Path>) -> Result<Db<LayeredStorage>> {
     let existing_cfs = DB::list_cf(&Options::default(), store_path_str)
         .unwrap_or_else(|_| vec![DEFAULT_LAYER.to_string()]);
 
+    let existing_len = existing_cfs.len();
+
     let mut options = Options::default();
     options.create_if_missing(true);
     options.create_missing_column_families(true);
@@ -219,7 +256,17 @@ pub fn new_cozo_layered(path: impl AsRef<Path>) -> Result<Db<LayeredStorage>> {
         inner: std::sync::Arc::new(LayeredInner {
             db,
             commit_lock: Mutex::new(()),
-            layers: RwLock::new(existing_cfs.into_iter().collect()),
+            // Every layer gets a distinct incarnation, the ones already on disk included: a
+            // shared value would make two layers indistinguishable to anything keyed on it.
+            layers: RwLock::new(
+                existing_cfs
+                    .into_iter()
+                    .enumerate()
+                    .map(|(at, name)| (name, at as u64))
+                    .collect(),
+            ),
+            layer_incarnation: std::sync::atomic::AtomicU64::new(existing_len as u64),
+            views: RwLock::new(BTreeMap::new()),
         }),
         stack: std::sync::Arc::new(StackSpec::single(DEFAULT_LAYER)),
     };
@@ -240,6 +287,32 @@ impl LayeredStorage {
 
     /// Check a stack against the open store. Errors here are cheap and deterministic, which is
     /// why the checks live at stack construction rather than mid-query.
+    /// The identity of a resolved stack, interned so that two resolutions of the same stack
+    /// compare equal and no two different stacks do.
+    ///
+    /// A lone unwindowed default layer is the store read whole, which is what every other
+    /// engine presents, so it is undivided and shares cache entries with the ordinary path.
+    fn view_of(&self, layers: &[LayerSpec]) -> StorageView {
+        if let [only] = layers {
+            if only.name == DEFAULT_LAYER && only.window == Window::OPEN {
+                return StorageView::undivided();
+            }
+        }
+        let shape: Vec<(u64, Option<Seq>, Option<Seq>)> = layers
+            .iter()
+            .map(|l| (l.incarnation, l.window.since, l.window.bound))
+            .collect();
+        if let Some(&id) = self.inner.views.read().unwrap().get(&shape) {
+            return StorageView::of(std::sync::Arc::new(StackView(id)));
+        }
+        let mut views = self.inner.views.write().unwrap();
+        // Another writer may have interned this shape while the read lock was released, so take
+        // whatever is there rather than minting a second number for one stack.
+        let next = views.len() as u64;
+        let id = *views.entry(shape).or_insert(next);
+        StorageView::of(std::sync::Arc::new(StackView(id)))
+    }
+
     pub(crate) fn resolve(&self, stack: &Stack) -> Result<StackSpec> {
         if stack.is_empty() {
             bail!("a stack must name at least one layer");
@@ -249,9 +322,9 @@ impl LayeredStorage {
         let mut layers = Vec::with_capacity(stack.len());
         for layer in stack {
             let name = layer.id.0.clone();
-            if !known.contains(&name) {
+            let Some(&incarnation) = known.get(&name) else {
                 bail!("no such layer: '{}'", name);
-            }
+            };
             if !seen.insert(name.clone()) {
                 bail!("layer '{}' appears twice in the same stack", name);
             }
@@ -267,13 +340,15 @@ impl LayeredStorage {
             }
             layers.push(LayerSpec {
                 name,
+                incarnation,
                 window: Window {
                     since: layer.since,
                     bound: layer.bound,
                 },
             });
         }
-        Ok(StackSpec { layers })
+        let view = self.view_of(&layers);
+        Ok(StackSpec { layers, view })
     }
 }
 
@@ -301,7 +376,7 @@ impl<'s> Storage<'s> for LayeredStorage {
         Ok(LayeredTx {
             inner,
             tx: Some(inner.db.transaction()),
-            stack: crate::storage::layered::tx::BoundStack::new(layers),
+            stack: crate::storage::layered::tx::BoundStack::new(layers, self.stack.view.clone()),
             catalog,
             pending: vec![],
             relations: Default::default(),
@@ -386,7 +461,7 @@ impl Db<LayeredStorage> {
     pub fn create_layer(&self, id: impl Into<LayerId>) -> Result<()> {
         let id = id.into();
         let mut known = self.db.inner.layers.write().unwrap();
-        if known.contains(&id.0) {
+        if known.contains_key(&id.0) {
             bail!("layer '{}' already exists", id);
         }
         self.db
@@ -395,7 +470,13 @@ impl Db<LayeredStorage> {
             .create_cf(&id.0, &Options::default())
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to create layer '{}'", id))?;
-        known.insert(id.0);
+        known.insert(
+            id.0,
+            self.db
+                .inner
+                .layer_incarnation
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        );
         Ok(())
     }
 
@@ -406,7 +487,7 @@ impl Db<LayeredStorage> {
             bail!("the default layer cannot be dropped: it carries the catalog");
         }
         let mut known = self.db.inner.layers.write().unwrap();
-        if !known.contains(&id.0) {
+        if !known.contains_key(&id.0) {
             bail!("no such layer: '{}'", id);
         }
         self.db
@@ -428,7 +509,7 @@ impl Db<LayeredStorage> {
             .read()
             .unwrap()
             .iter()
-            .map(|n| LayerId(n.clone()))
+            .map(|(n, _)| LayerId(n.clone()))
             .collect())
     }
 
@@ -459,7 +540,16 @@ impl Db<LayeredStorage> {
             Some(seq) => vld_at(seq),
             None => vld_at(PENDING_SEQ),
         };
-        let ast = parse_script(script, &params, &view.get_fixed_rules(), cur_vld)?;
+        let ast = parse_script(
+            script,
+            &params,
+            &view.get_fixed_rules(),
+            crate::data::aggr::CustomAggrRegistries {
+                meet: &view.get_custom_aggrs(),
+                bounded: &view.get_custom_bounded_meets(),
+            },
+            cur_vld,
+        )?;
         view.run_script_ast(ast, cur_vld, mutability)
     }
 }

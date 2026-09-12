@@ -1991,8 +1991,13 @@ impl<'s, S: Storage<'s>> Db<S> {
         // struct-literal field would be evaluated in source order, which is
         // too easy to reorder by accident — hence the separate binding.
         let watermark = self.graph_projections.watermark();
+        // The pin happens here, after the watermark capture above. The view is read off the
+        // pinned transaction: it says which content this transaction will see, which is the
+        // other half of what a cache needs to key an entry.
+        let store_tx = self.db.transact(false)?;
+        let storage_view = crate::storage::StoreTx::storage_view(&store_tx);
         let ret = SessionTx {
-            store_tx: Box::new(self.db.transact(false)?),
+            store_tx: Box::new(store_tx),
             temp_store_tx: self.temp_db.transact(true)?,
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
@@ -2008,6 +2013,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
+            storage_view,
             dirty_relations: Default::default(),
             commit_inflight: false,
         };
@@ -2016,8 +2022,13 @@ impl<'s, S: Storage<'s>> Db<S> {
     pub(crate) fn transact_write(&'s self) -> Result<SessionTx<'s>> {
         // See `transact`: the watermark capture must precede the pin.
         let watermark = self.graph_projections.watermark();
+        // The pin happens here, after the watermark capture above. The view is read off the
+        // pinned transaction: it says which content this transaction will see, which is the
+        // other half of what a cache needs to key an entry.
+        let store_tx = self.db.transact(true)?;
+        let storage_view = crate::storage::StoreTx::storage_view(&store_tx);
         let ret = SessionTx {
-            store_tx: Box::new(self.db.transact(true)?),
+            store_tx: Box::new(store_tx),
             temp_store_tx: self.temp_db.transact(true)?,
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
@@ -2033,6 +2044,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             script_mem_limit: None,
             projections: self.graph_projections.clone(),
             watermark,
+            storage_view,
             dirty_relations: Default::default(),
             commit_inflight: false,
         };

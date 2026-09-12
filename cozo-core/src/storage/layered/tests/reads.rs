@@ -232,3 +232,43 @@ fn results_are_independent_of_layer_creation_order() -> Result<()> {
     );
     Ok(())
 }
+
+/// A batched read agrees with the one-at-a-time read, for every position in the stack.
+///
+/// The batched path resolves a layer at a time rather than a key at a time, so it has its own
+/// chance to get the shadowing order wrong, to mishandle a key no layer holds, or to ignore a
+/// layer's window. It is checked against `get`, which is what the default implementation does.
+#[test]
+fn a_batched_read_agrees_with_reading_one_at_a_time() -> Result<()> {
+    use crate::storage::{StoreTx, Storage};
+
+    let f = Fixture::new()?;
+    let (base_stack, mid, top) = three_layers(&f)?;
+    f.assert_rec(&base_stack, "in-base", "vb")?;
+    f.assert_rec(&mid, "in-mid", "vm")?;
+    f.assert_rec(&top, "in-top", "vt")?;
+    // Held by two layers at once, so the batched path has to prefer the topmost.
+    f.assert_rec(&base_stack, "shared", "same")?;
+    f.assert_rec(&top, "shared", "same")?;
+
+    // Collect every stored key, plus one that does not exist.
+    let spec = f.db.db.resolve(&top)?;
+    let view = f.db.db.with_stack(spec);
+    let tx = view.transact(false)?;
+    let mut keys: Vec<Vec<u8>> = tx
+        .range_scan(&[0u8; 8], &[0xffu8; 8])
+        .map(|kv| kv.map(|(k, _)| k))
+        .collect::<Result<Vec<_>>>()?;
+    assert!(keys.len() >= 5, "expected the written rows, got {}", keys.len());
+    let mut absent = keys[0].clone();
+    *absent.last_mut().unwrap() = absent.last().unwrap().wrapping_add(1);
+    keys.push(absent);
+
+    let batched = tx.multi_get(&keys, false)?;
+    let singly: Vec<Option<Vec<u8>>> = keys
+        .iter()
+        .map(|k| tx.get(k, false))
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(batched, singly, "batched and single reads disagreed");
+    Ok(())
+}

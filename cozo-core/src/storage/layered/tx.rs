@@ -20,7 +20,7 @@ use crate::storage::layered::iter::{
     LayeredTxn, StackMerge, StackRawIter, StackSkipIter, StackTupleIter, Window,
 };
 use crate::storage::layered::{LayeredInner, StackSpec, Seq, PENDING_SEQ};
-use crate::storage::StoreTx;
+use crate::storage::{StorageView, StoreTx};
 
 /// A resolved stack, together with the scratch space its per-key lookups reuse.
 ///
@@ -28,13 +28,17 @@ use crate::storage::StoreTx;
 /// consumed inside a single call, so nothing outside this type sees them.
 pub(crate) struct BoundStack<'a> {
     pub(crate) layers: Vec<BoundLayer<'a>>,
+    /// The identity of the stack these layers came from, carried so a transaction can report
+    /// which view it reads without re-deriving it.
+    pub(crate) view: StorageView,
     bounds: KeyBounds,
 }
 
 impl<'a> BoundStack<'a> {
-    pub(crate) fn new(layers: Vec<BoundLayer<'a>>) -> Self {
+    pub(crate) fn new(layers: Vec<BoundLayer<'a>>, view: StorageView) -> Self {
         Self {
             layers,
+            view,
             bounds: KeyBounds::default(),
         }
     }
@@ -93,6 +97,8 @@ impl<'a> BoundStack<'a> {
 /// A layer, resolved against the open database for the life of one transaction.
 pub(crate) struct BoundLayer<'a> {
     pub(crate) name: String,
+    /// The incarnation the name resolved to; part of this stack's view identity.
+    pub(crate) incarnation: u64,
     pub(crate) cf: Arc<BoundColumnFamily<'a>>,
     pub(crate) window: Window,
 }
@@ -290,6 +296,73 @@ impl<'s> StoreTx<'s> for LayeredTx<'s> {
             }
         }
         Ok(None)
+    }
+
+    /// Resolve many keys at once: one batched read per layer rather than one point lookup per
+    /// key per layer.
+    ///
+    /// Layers are visited top first and a slot is filled only once, so the result is the same
+    /// as calling [`StoreTx::get`] on each key, which is what the default implementation does.
+    /// Which view this transaction reads, decided when the stack was resolved.
+    ///
+    /// Interning happens in `resolve`, which already holds the layer registry, so this is a
+    /// field read: the identity costs nothing to hand out and nothing to compare.
+    fn storage_view(&self) -> StorageView {
+        self.stack.view.clone()
+    }
+
+    fn multi_get(&self, keys: &[Vec<u8>], _for_update: bool) -> Result<Vec<Option<Vec<u8>>>> {
+        for key in keys {
+            self.gate(key, false)?;
+        }
+        let txn = self.txn()?;
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; keys.len()];
+
+        // The catalog is global, so its keys are resolved against the default layer whatever
+        // stack is in play.
+        let catalog_at: Vec<usize> = (0..keys.len())
+            .filter(|&i| is_catalog_key(&keys[i]))
+            .collect();
+        if !catalog_at.is_empty() {
+            let found = txn.multi_get_cf(
+                catalog_at
+                    .iter()
+                    .map(|&i| (&self.catalog, keys[i].as_slice())),
+            );
+            for (&at, res) in catalog_at.iter().zip(found) {
+                out[at] = res.into_diagnostic().wrap_err("failed to read catalog")?;
+            }
+        }
+
+        let mut pending: Vec<usize> = (0..keys.len())
+            .filter(|&i| !is_catalog_key(&keys[i]) )
+            .collect();
+        for layer in self.stack.layers.iter() {
+            if pending.is_empty() {
+                break;
+            }
+            // A key this layer's window excludes contributes nothing here, but a lower layer
+            // with a different window may still hold it.
+            let asking: Vec<usize> = pending
+                .iter()
+                .copied()
+                .filter(|&i| layer.window.admits(&keys[i]))
+                .collect();
+            if asking.is_empty() {
+                continue;
+            }
+            let found = txn.multi_get_cf(asking.iter().map(|&i| (&layer.cf, keys[i].as_slice())));
+            for (&at, res) in asking.iter().zip(found) {
+                if let Some(val) = res
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to read layer {}", layer.name))?
+                {
+                    out[at] = Some(val);
+                }
+            }
+            pending.retain(|&i| out[i].is_none());
+        }
+        Ok(out)
     }
 
     fn put(&mut self, key: &[u8], val: &[u8]) -> Result<()> {
@@ -524,6 +597,7 @@ pub(crate) fn bind_layers<'a>(
             })?;
             Ok(BoundLayer {
                 name: layer.name.clone(),
+                incarnation: layer.incarnation,
                 cf,
                 window: layer.window,
             })

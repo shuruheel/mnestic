@@ -99,6 +99,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use crate::runtime::relation::RelationId;
+use crate::storage::StorageView;
 
 #[cfg(feature = "graph-algo")]
 use std::sync::atomic::AtomicUsize;
@@ -687,7 +688,7 @@ struct Definition {
     generation: u64,
     edges: SmartString<LazyCompact>,
     nodes: Option<SmartString<LazyCompact>>,
-    variants: BTreeMap<VariantKey, Entry>,
+    variants: BTreeMap<EntryKey, Entry>,
 }
 
 /// A cached variant, bound to the exact relation ids and content versions it
@@ -739,10 +740,14 @@ impl Registry {
         self.defs.values().map(|d| d.variants.len()).sum()
     }
 
-    fn lru_victim(&self) -> Option<(SmartString<LazyCompact>, VariantKey)> {
+    fn lru_victim(&self) -> Option<(SmartString<LazyCompact>, EntryKey)> {
         self.defs
             .iter()
-            .flat_map(|(name, def)| def.variants.iter().map(move |(k, e)| (name, *k, e.lru_seq)))
+            .flat_map(|(name, def)| {
+                def.variants
+                    .iter()
+                    .map(move |(k, e)| (name, k.clone(), e.lru_seq))
+            })
             .min_by_key(|(_, _, seq)| *seq)
             .map(|(name, k, _)| (name.clone(), k))
     }
@@ -768,6 +773,21 @@ impl Registry {
     }
 }
 
+/// What distinguishes one cached CSR from another inside a projection: the shape it was built
+/// in, and the view of the store it was built from.
+///
+/// The view is part of the key because the freshness protocol reasons entirely about
+/// *mutation*, and mutation is not the only thing that can make two transactions disagree. A
+/// backend that composes views (`StorageView::Composed`) has readers seeing different content
+/// for one relation with no write between them; keying on the view is what keeps the
+/// always-fresh guarantee true there.
+#[cfg(feature = "graph-algo")]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct EntryKey {
+    view: StorageView,
+    variant: VariantKey,
+}
+
 /// The single-flight key. Includes the generation, so a `::graph drop` +
 /// re-create never shares a build slot with the projection it replaced.
 #[cfg(feature = "graph-algo")]
@@ -775,7 +795,7 @@ impl Registry {
 struct BuildKey {
     name: SmartString<LazyCompact>,
     generation: u64,
-    variant: VariantKey,
+    key: EntryKey,
 }
 
 /// One row of `::graph list` (§3.1): one per built variant, or a single row
@@ -1028,7 +1048,7 @@ impl ProjectionCache {
                     name: name.to_string(),
                     edges: def.edges.to_string(),
                     nodes: def.nodes.as_ref().map(|n| n.to_string()),
-                    variant: Some(key.label()),
+                    variant: Some(key.variant.label()),
                     est_bytes: Some(entry.est_bytes),
                     built_at: Some(entry.built_at),
                     last_used: Some(entry.last_used_at),
@@ -1051,7 +1071,7 @@ impl ProjectionCache {
         &self,
         name: &str,
         generation: u64,
-        key: VariantKey,
+        key: &EntryKey,
         edges_id: RelationId,
         nodes_id: Option<RelationId>,
         watermark: u64,
@@ -1062,7 +1082,7 @@ impl ProjectionCache {
             if def.generation != generation {
                 return None;
             }
-            let entry = def.variants.get(&key)?;
+            let entry = def.variants.get(key)?;
             if entry.edges_id != edges_id || entry.nodes_id != nodes_id {
                 return None;
             }
@@ -1088,7 +1108,7 @@ impl ProjectionCache {
         if let Some(entry) = reg
             .defs
             .get_mut(name)
-            .and_then(|d| d.variants.get_mut(&key))
+            .and_then(|d| d.variants.get_mut(key))
         {
             entry.lru_seq = seq;
             entry.last_used_at = now;
@@ -1107,7 +1127,7 @@ impl ProjectionCache {
         &self,
         name: &str,
         generation: u64,
-        key: VariantKey,
+        key: &EntryKey,
         edges_id: RelationId,
         nodes_id: Option<RelationId>,
         watermark: u64,
@@ -1161,7 +1181,7 @@ impl ProjectionCache {
                             "graph projection '{name}' variant {} needs ~{est_bytes} bytes, over the \
                              whole {} byte cache ceiling; building it fresh for every query. Raise \
                              the ceiling with `Db::set_graph_projection_capacity`.",
-                            key.label(),
+                            key.variant.label(),
                             reg.capacity
                         ),
                         "raise the ceiling with `Db::set_graph_projection_capacity`",
@@ -1191,7 +1211,7 @@ impl ProjectionCache {
         &self,
         reg: &mut Registry,
         name: &str,
-        key: VariantKey,
+        key: &EntryKey,
         edges_id: RelationId,
         nodes_id: Option<RelationId>,
         edges_token: u64,
@@ -1201,7 +1221,7 @@ impl ProjectionCache {
     ) {
         // Replace any older entry for this exact variant before making room,
         // so its bytes are not counted twice.
-        if let Some(old) = reg.defs.get_mut(name).and_then(|d| d.variants.remove(&key)) {
+        if let Some(old) = reg.defs.get_mut(name).and_then(|d| d.variants.remove(key)) {
             reg.used_bytes = reg.used_bytes.saturating_sub(old.est_bytes);
         }
         let target = reg.capacity - est_bytes;
@@ -1214,7 +1234,7 @@ impl ProjectionCache {
             return;
         };
         def.variants.insert(
-            key,
+            key.clone(),
             Entry {
                 source: source.clone(),
                 edges_id,
@@ -1515,7 +1535,12 @@ pub(crate) fn graph_source(
         return build();
     }
 
-    if let Some(hit) = cache.consume(name, generation, key, edges_id, nodes_id, tx.watermark) {
+    let entry_key = EntryKey {
+        view: tx.storage_view.clone(),
+        variant: key,
+    };
+    if let Some(hit) = cache.consume(name, generation, &entry_key, edges_id, nodes_id, tx.watermark)
+    {
         return Ok(hit);
     }
 
@@ -1541,7 +1566,7 @@ pub(crate) fn graph_source(
     let build_key = BuildKey {
         name: name.into(),
         generation,
-        variant: key,
+        key: entry_key.clone(),
     };
     let slot = cache.acquire_slot(&build_key);
     let outcome = {
@@ -1550,7 +1575,7 @@ pub(crate) fn graph_source(
             cache,
             name,
             generation,
-            key,
+            &entry_key,
             edges_id,
             nodes_id,
             &sources,
@@ -1566,7 +1591,7 @@ pub(crate) fn graph_source(
                 cache.produce(
                     name,
                     generation,
-                    key,
+                    &entry_key,
                     edges_id,
                     nodes_id,
                     tx.watermark,
@@ -1610,7 +1635,7 @@ fn slot_action(
     cache: &ProjectionCache,
     name: &str,
     generation: u64,
-    key: VariantKey,
+    key: &EntryKey,
     edges_id: RelationId,
     nodes_id: Option<RelationId>,
     sources: &[RelationId],
@@ -2406,13 +2431,23 @@ mod cache_tests {
 
     use graph::prelude::Graph;
 
-    use super::{create_projection, graph_source, GraphSource, GraphVariant, VariantKey};
+    use super::{create_projection, graph_source, EntryKey, GraphSource, GraphVariant, VariantKey};
+    use crate::storage::StorageView;
     use crate::data::value::DataValue;
     use crate::parse::SourceSpan;
     use crate::runtime::db::Poison;
     use crate::runtime::relation::RelationId;
     use crate::storage::mem::MemStorage;
     use crate::{new_cozo_mem, Db, NamedRows, ScriptMutability};
+
+    /// These tests exercise the mutation axis of the key; the view axis is held at the one
+    /// value every single-view backend reports.
+    fn global(variant: VariantKey) -> EntryKey {
+        EntryKey {
+            view: StorageView::undivided(),
+            variant,
+        }
+    }
 
     const DIRECTED: VariantKey = VariantKey {
         undirected: false,
@@ -2671,7 +2706,7 @@ mod cache_tests {
     ///
     /// The isolate must take the **highest** dense id, which is why `person`
     /// lists every edge endpoint before `99`. Interned earlier, it would sit
-    /// below some edge endpoint, `max_edge_endpoint + 1` would happen to equal
+    /// below some edge endpoint, `max_edge_endpoint + 1` would happen to equaso it can downcast infalliblyl
     /// the true vertex count, and the plain `.edges()` sizing would cover it by
     /// accident — leaving the test green against a builder that had dropped the
     /// `node_values` route entirely.
@@ -3074,7 +3109,7 @@ mod cache_tests {
         );
         assert!(
             cache
-                .consume("g", generation, DIRECTED, edges, None, watermark)
+                .consume("g", generation, &global(DIRECTED), edges, None, watermark)
                 .is_none(),
             "yet the entry's token no longer names the relation's content"
         );
@@ -3147,13 +3182,13 @@ mod cache_tests {
 
         assert!(
             cache
-                .consume("g", generation, DIRECTED, edges, None, token)
+                .consume("g", generation, &global(DIRECTED), edges, None, token)
                 .is_some(),
             "a reader that pinned at or after the entry's token hits"
         );
         assert!(
             cache
-                .consume("g", generation, DIRECTED, edges, None, token - 1)
+                .consume("g", generation, &global(DIRECTED), edges, None, token - 1)
                 .is_none(),
             "a reader that pinned before it must miss and rebuild"
         );
@@ -3173,10 +3208,10 @@ mod cache_tests {
         assert!(token > 0, "the fixture's writes gave `knows` a token");
         assert_eq!(cached(&db), 1);
 
-        cache.produce("h", h_generation, DIRECTED, edges, None, token - 1, &source);
+        cache.produce("h", h_generation, &global(DIRECTED), edges, None, token - 1, &source);
         assert_eq!(cached(&db), 1, "an unfresh producer must not publish");
 
-        cache.produce("h", h_generation, DIRECTED, edges, None, token, &source);
+        cache.produce("h", h_generation, &global(DIRECTED), edges, None, token, &source);
         assert_eq!(cached(&db), 2, "a fresh one may");
     }
 
@@ -3199,7 +3234,7 @@ mod cache_tests {
         let (new_generation, ..) = cache.definition("g").unwrap();
         assert_ne!(old_generation, new_generation);
 
-        cache.produce("g", old_generation, DIRECTED, edges, None, token, &source);
+        cache.produce("g", old_generation, &global(DIRECTED), edges, None, token, &source);
         assert_eq!(cached(&db), 0, "the stale generation must not publish");
 
         // Now let the new definition populate, and check the stale reader is
@@ -3208,13 +3243,13 @@ mod cache_tests {
         assert_eq!(cached(&db), 1);
         assert!(
             cache
-                .consume("g", new_generation, DIRECTED, edges, None, token)
+                .consume("g", new_generation, &global(DIRECTED), edges, None, token)
                 .is_some(),
             "the live generation reads it"
         );
         assert!(
             cache
-                .consume("g", old_generation, DIRECTED, edges, None, token)
+                .consume("g", old_generation, &global(DIRECTED), edges, None, token)
                 .is_none(),
             "the stale one does not"
         );
@@ -3294,7 +3329,7 @@ mod cache_tests {
 
         assert!(
             cache
-                .consume("g", generation, DIRECTED, edges, None, reader_watermark)
+                .consume("g", generation, &global(DIRECTED), edges, None, reader_watermark)
                 .is_some(),
             "the entry is servable before the writer starts"
         );
@@ -3321,7 +3356,7 @@ mod cache_tests {
         assert_eq!(cached(&db), 1);
         assert!(
             cache
-                .consume("g", generation, DIRECTED, edges, None, reader_watermark)
+                .consume("g", generation, &global(DIRECTED), edges, None, reader_watermark)
                 .is_none(),
             "`inflight` alone must deny the hit"
         );
@@ -3332,7 +3367,7 @@ mod cache_tests {
         cache.produce(
             "h",
             h_generation,
-            DIRECTED,
+            &global(DIRECTED),
             edges,
             None,
             reader_watermark,
@@ -3376,14 +3411,14 @@ mod cache_tests {
 
         // Cold and fresh: the winner's case.
         assert!(matches!(
-            slot_action(cache, "g", generation, DIRECTED, edges, None, &sources, watermark),
+            slot_action(cache, "g", generation, &global(DIRECTED), edges, None, &sources, watermark),
             SlotAction::BuildAndPublish
         ));
 
         // An entry landed while queued, still fresh for us: the payoff case.
         fetch(&db, "g", DIRECTED).unwrap();
         assert!(matches!(
-            slot_action(cache, "g", generation, DIRECTED, edges, None, &sources, watermark),
+            slot_action(cache, "g", generation, &global(DIRECTED), edges, None, &sources, watermark),
             SlotAction::Hit(_)
         ));
 
@@ -3392,7 +3427,7 @@ mod cache_tests {
         // everyone's way and build outside.
         cache.bump_token_leaving_entries(edges);
         assert!(matches!(
-            slot_action(cache, "g", generation, DIRECTED, edges, None, &sources, watermark),
+            slot_action(cache, "g", generation, &global(DIRECTED), edges, None, &sources, watermark),
             SlotAction::BuildOutsideTheSlot
         ));
     }
@@ -3592,7 +3627,7 @@ mod cache_tests {
         let edges = rel_id(&db, "knows");
         let token = cache.rel_state(edges).token;
         let source = fetch(&db, "g", DIRECTED).unwrap();
-        cache.produce("g", generation, DIRECTED, edges, None, token, &source);
+        cache.produce("g", generation, &global(DIRECTED), edges, None, token, &source);
 
         assert_eq!(cached(&db), 1);
         assert_eq!(

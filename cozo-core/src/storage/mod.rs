@@ -6,6 +6,11 @@
  * You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
+use std::any::Any;
+use std::cmp::Ordering;
+use std::fmt::Debug;
+use std::sync::Arc;
+
 use miette::{bail, Result};
 
 use crate::data::tuple::Tuple;
@@ -46,6 +51,77 @@ pub(crate) mod temp;
 #[cfg(feature = "storage-tikv")]
 pub(crate) mod tikv;
 // pub(crate) mod re;
+
+/// An engine's identity for one of the views it presents.
+///
+/// Implemented by the engine, never inspected outside it. The only thing anything else may do
+/// with one is compare it to another, and the only promise an engine makes is that two of its
+/// transactions get equal identities exactly when they see equal content.
+///
+/// An implementor orders only against its own type and answers `None` otherwise; [`StorageView`]
+/// settles those by concrete type instead. So no implementor has to invent an order against
+/// types it has never heard of, and the common case costs one downcast rather than a type
+/// comparison followed by one.
+pub trait ViewIdentity: Any + Debug + Send + Sync {
+    /// Order this identity against another, or `None` if `other` is not the same type.
+    fn view_cmp(&self, other: &dyn ViewIdentity) -> Option<Ordering>;
+}
+
+/// Which view of the store a transaction reads.
+///
+/// Engine-level caches key their entries on relation identity plus a content version, which is
+/// sound only while every transaction sees the same content for a relation at a given version.
+/// An engine whose transactions can disagree without any write between them breaks that, so it
+/// distinguishes its views here and the caches key on this as well.
+///
+/// The identity type belongs to the engine: what divides a store is the engine's business, and
+/// differs entirely between one that shards, one that reads a replica with lag, and one that
+/// composes layers. An engine that presents its store whole reports [`StorageView::undivided`],
+/// which is what the default implementation does.
+#[derive(Clone, Debug, Default)]
+pub struct StorageView(Option<Arc<dyn ViewIdentity>>);
+
+impl StorageView {
+    /// The store presented whole: one view, nothing to tell apart.
+    pub fn undivided() -> Self {
+        StorageView(None)
+    }
+
+    /// An engine's identity for one of several views it presents.
+    pub fn of(identity: Arc<dyn ViewIdentity>) -> Self {
+        StorageView(Some(identity))
+    }
+}
+
+impl Ord for StorageView {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (&self.0, &other.0) {
+            (None, None) => Ordering::Equal,
+            (None, Some(_)) => Ordering::Less,
+            (Some(_), None) => Ordering::Greater,
+            (Some(a), Some(b)) => a.view_cmp(b.as_ref()).unwrap_or_else(|| {
+                // Different engines' identities, which only meet if a process runs more than
+                // one engine. Ordering by concrete type keeps the total order total; nothing
+                // depends on which type sorts first.
+                Any::type_id(a.as_ref()).cmp(&Any::type_id(b.as_ref()))
+            }),
+        }
+    }
+}
+
+impl PartialOrd for StorageView {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for StorageView {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for StorageView {}
 
 /// Swappable storage trait for Cozo's storage engine
 pub trait Storage<'s>: Send + Sync + Clone {
@@ -144,6 +220,13 @@ pub trait StoreTx<'s>: Sync {
     /// Get multiple keys. If `for_update` is `true` (only possible in a write transaction),
     /// then the database needs to guarantee that `commit()` can only succeed if
     /// the keys have not been modified outside the transaction.
+    /// Which view of the store this transaction reads, for caches that would otherwise
+    /// conflate two transactions seeing different content. Defaults to
+    /// [`StorageView::undivided`]; only the layered backend composes more than one view.
+    fn storage_view(&self) -> StorageView {
+        StorageView::undivided()
+    }
+
     fn multi_get(&self, keys: &[Vec<u8>], for_update: bool) -> Result<Vec<Option<Vec<u8>>>> {
         keys.iter().map(|k| self.get(k, for_update)).collect()
     }
@@ -293,4 +376,90 @@ pub trait StoreTx<'s>: Sync {
     fn total_scan<'a>(&'a self) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>
     where
         's: 'a;
+}
+
+#[cfg(test)]
+mod view_tests {
+    use std::cmp::Ordering;
+    use std::sync::Arc;
+
+    use super::{StorageView, ViewIdentity};
+
+    /// Two engines, so the cross-type path is reachable. Neither knows the other exists, which
+    /// is the point: each answers only for its own type.
+    #[derive(Debug)]
+    struct Alpha(u64);
+    #[derive(Debug)]
+    struct Beta(u64);
+
+    impl ViewIdentity for Alpha {
+        fn view_cmp(&self, other: &dyn ViewIdentity) -> Option<Ordering> {
+            (other as &dyn std::any::Any)
+                .downcast_ref::<Alpha>()
+                .map(|other| self.0.cmp(&other.0))
+        }
+    }
+    impl ViewIdentity for Beta {
+        fn view_cmp(&self, other: &dyn ViewIdentity) -> Option<Ordering> {
+            (other as &dyn std::any::Any)
+                .downcast_ref::<Beta>()
+                .map(|other| self.0.cmp(&other.0))
+        }
+    }
+
+    fn alpha(n: u64) -> StorageView {
+        StorageView::of(Arc::new(Alpha(n)))
+    }
+    fn beta(n: u64) -> StorageView {
+        StorageView::of(Arc::new(Beta(n)))
+    }
+
+    #[test]
+    fn an_engine_orders_its_own_views() {
+        assert_eq!(alpha(1), alpha(1));
+        assert_ne!(alpha(1), alpha(2));
+        assert!(alpha(1) < alpha(2));
+    }
+
+    #[test]
+    fn the_undivided_store_is_its_own_view() {
+        assert_eq!(StorageView::undivided(), StorageView::undivided());
+        assert_ne!(StorageView::undivided(), alpha(0));
+        assert!(StorageView::undivided() < alpha(0));
+    }
+
+    /// Identities from different engines never compare equal, and the order between them is
+    /// antisymmetric. A `BTreeMap` keyed on these would corrupt silently otherwise.
+    #[test]
+    fn identities_from_different_engines_are_ordered_not_conflated() {
+        assert_ne!(alpha(7), beta(7), "same number, different engines");
+        assert_eq!(
+            alpha(7).cmp(&beta(7)).reverse(),
+            beta(7).cmp(&alpha(7)),
+            "the order between two engines is not antisymmetric"
+        );
+        // Whichever way the types sort, it must be consistent across values.
+        let first = alpha(0).cmp(&beta(0));
+        for (a, b) in [(0, 99), (99, 0), (5, 5)] {
+            assert_eq!(
+                alpha(a).cmp(&beta(b)),
+                first,
+                "type ordering must not depend on the values"
+            );
+        }
+    }
+
+    /// The ordering is total, which is what a map keyed on it requires.
+    #[test]
+    fn mixed_identities_sort_into_a_stable_total_order() {
+        use std::collections::BTreeSet;
+        let mut set = BTreeSet::new();
+        for v in [alpha(2), beta(1), StorageView::undivided(), alpha(1), beta(2)] {
+            assert!(set.insert(v), "a distinct view collided with one already present");
+        }
+        assert_eq!(set.len(), 5);
+        // Re-inserting an equal identity must be recognised as already present.
+        assert!(!set.insert(alpha(1)));
+        assert!(!set.insert(StorageView::undivided()));
+    }
 }

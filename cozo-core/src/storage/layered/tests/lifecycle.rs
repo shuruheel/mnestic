@@ -354,3 +354,44 @@ fn the_existing_entry_points_still_work() -> Result<()> {
     // in a single-layer stack; the multi-layer case is checked in the stackability suite.
     Ok(())
 }
+
+/// A value blob that will not decode is an error, not a panic.
+///
+/// The engine keeps every version of every record, so a single unreadable row must not make
+/// the rest of the history unreachable. The other backends decode fallibly for this reason;
+/// this pins the layered read path to the same contract.
+#[test]
+fn a_corrupt_value_is_an_error_not_a_panic() -> Result<()> {
+    use crate::runtime::relation::RelationId;
+    use crate::storage::{StoreTx, Storage};
+
+    let f = Fixture::new()?;
+    f.assert_rec(&base(), "k", "v")?;
+
+    // Find the raw key of a stored record, skipping the system relation that holds the catalog.
+    let lower = RelationId::SYSTEM.next().raw_encode().to_vec();
+    let upper = vec![0xffu8; 8];
+    let key = {
+        let tx = f.db.db.transact(false)?;
+        let mut it = tx.range_scan(&lower, &upper);
+        it.next().expect("the record just written should be there")?.0
+    };
+
+    // Overwrite its value with bytes that are not a value blob. `batch_put` is the restore
+    // path, so it writes raw pairs without going through the encoder.
+    f.db.db
+        .batch_put(Box::new(std::iter::once(Ok((key, vec![0xABu8; 5])))))?;
+
+    let err = f
+        .live(&base(), None)
+        .expect_err("a corrupt value should surface as an error");
+    // Specifically the corrupt-blob diagnostic, not merely "some error": the point is that the
+    // engine reports the unreadable row rather than dying on it.
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("value blob") || msg.contains("CorruptValueBlob") || msg.contains("corrupt"),
+        "expected a corrupt-value diagnostic, got: {msg}"
+    );
+    Ok(())
+}
+

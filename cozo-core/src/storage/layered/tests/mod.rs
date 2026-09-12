@@ -31,6 +31,7 @@ mod immutability;
 mod indexes;
 mod lifecycle;
 mod oracle;
+mod projections;
 mod reads;
 mod restack;
 mod retraction;
