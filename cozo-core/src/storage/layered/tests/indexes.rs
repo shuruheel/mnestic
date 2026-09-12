@@ -102,3 +102,121 @@ fn an_index_survives_a_branch_cycle_by_being_rebuilt() -> Result<()> {
     assert_eq!(neighbours(&f, &base())?, through_stack);
     Ok(())
 }
+
+/// Retract a record through `stack`.
+fn retract(f: &Fixture, stack: &Stack, id: &str, v: [f32; 2]) -> Result<()> {
+    f.db.run_on_stack(
+        &format!(
+            "?[id, at, v] <- [['{id}', 'RETRACT', [{}, {}]]] :put vrec {{id, at => v}}",
+            v[0], v[1]
+        ),
+        Default::default(),
+        stack,
+        None,
+        ScriptMutability::Mutable,
+    )?;
+    Ok(())
+}
+
+/// The `k` nearest *live* records, through a stack.
+fn live_neighbours(f: &Fixture, stack: &Stack) -> Result<BTreeSet<String>> {
+    let rows = f.db.run_on_stack(
+        "?[id] := ~vrec:idx{id | query: q, k: 10, ef: 50, validity: 'NOW'}, q = vec([1.0, 1.0])",
+        Default::default(),
+        stack,
+        None,
+        ScriptMutability::Immutable,
+    )?;
+    Ok(rows.rows.iter().map(|r| super::as_str(&r[0])).collect())
+}
+
+/// Every version of a record is its own node in the graph, and a retraction writes a version
+/// rather than removing one. So a branch that retracts a record still has the record's older
+/// versions in reach, and only a search that asks about liveness stops returning it.
+#[test]
+fn a_retraction_in_a_branch_hides_the_record_from_that_branch_only() -> Result<()> {
+    let f = Fixture::new()?;
+    f.db
+        .run_script(SCHEMA, Default::default(), ScriptMutability::Mutable)?;
+    f.db
+        .run_script(INDEX, Default::default(), ScriptMutability::Mutable)?;
+    for (id, v) in [("a", [1.0, 1.0]), ("b", [1.2, 1.2]), ("c", [1.4, 1.4])] {
+        put(&f, &base(), id, v)?;
+    }
+
+    f.db.create_layer("work")?;
+    let fork = f.seq();
+    let work: Stack = vec![LayerRef::new("work"), LayerRef::bounded("default", fork)];
+    retract(&f, &work, "b", [1.2, 1.2])?;
+
+    let all = ["a", "b", "c"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<BTreeSet<_>>();
+    // The retraction is only a newer version, so the graph still reaches `b` from either side.
+    assert_eq!(neighbours(&f, &work)?, all);
+    assert_eq!(neighbours(&f, &base())?, all);
+
+    assert_eq!(
+        live_neighbours(&f, &work)?,
+        ["a", "c"].iter().map(|s| s.to_string()).collect(),
+        "the branch still sees the record it retracted"
+    );
+    assert_eq!(
+        live_neighbours(&f, &base())?,
+        all,
+        "a branch retraction reached the base"
+    );
+    Ok(())
+}
+
+/// A bound cuts the records off at a sequence but not the index, whose keys carry no trailing
+/// validity for a window to select on. The graph therefore names records the stack cannot
+/// read. Those nodes drop out of the walk; the search is not an error and does not lose the
+/// records that are still there.
+#[test]
+fn a_bounded_stack_skips_the_nodes_it_cannot_resolve() -> Result<()> {
+    let f = Fixture::new()?;
+    f.db
+        .run_script(SCHEMA, Default::default(), ScriptMutability::Mutable)?;
+    f.db
+        .run_script(INDEX, Default::default(), ScriptMutability::Mutable)?;
+    for i in 0..12 {
+        put(&f, &base(), &format!("b{i:02}"), [i as f32, 0.0])?;
+    }
+
+    f.db.create_layer("work")?;
+    let fork = f.seq();
+    let work: Stack = vec![LayerRef::new("work"), LayerRef::bounded("default", fork)];
+    put(&f, &work, "w0", [0.5, 1.0])?;
+
+    // The base moves on. Its new rows join the graph, which the bound does not hide.
+    for i in 12..24 {
+        put(&f, &base(), &format!("b{i:02}"), [i as f32, 0.0])?;
+    }
+
+    let found = neighbours(&f, &work)?;
+    let visible: BTreeSet<String> = f
+        .db
+        .run_on_stack(
+            "?[id] := *vrec{id @ 'NOW'}",
+            Default::default(),
+            &work,
+            None,
+            ScriptMutability::Immutable,
+        )?
+        .rows
+        .iter()
+        .map(|r| super::as_str(&r[0]))
+        .collect();
+
+    assert!(
+        found.is_subset(&visible),
+        "returned a record the stack cannot read: {:?}",
+        &found - &visible
+    );
+    for id in ["b00", "b01", "w0"] {
+        assert!(found.contains(id), "lost {id}; got {found:?}");
+    }
+    Ok(())
+}

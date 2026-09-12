@@ -19,10 +19,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use miette::{bail, Result};
 
-use crate::data::tuple::{check_key_for_validity, Tuple};
-use crate::data::value::ValidityTs;
-use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
-use crate::storage::{Storage, StoreTx};
+use crate::data::tuple::Tuple;
+use crate::runtime::relation::try_decode_tuple_from_kv;
+use crate::storage::{Storage, StoreCursor, StoreTx};
 use crate::utils::swap_option_result;
 
 /// Create a database backed by memory.
@@ -198,28 +197,21 @@ impl<'s> StoreTx<'s> for MemTx<'s> {
         }
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        lower: &[u8],
-        upper: &[u8],
-        valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        match self {
-            MemTx::Reader(stored) => Box::new(SkipIterator {
-                inner: stored,
-                upper: upper.to_vec(),
-                valid_at,
-                next_bound: lower.to_vec(),
-                size_hint: None,
-            }),
-            MemTx::Writer(stored, delta) => Box::new(SkipDualIterator {
-                stored,
-                delta,
-                upper: upper.to_vec(),
-                valid_at,
-                next_bound: lower.to_vec(),
-            }),
-        }
+    fn cursor<'a>(&'a self, _lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        let (stored, delta) = match self {
+            MemTx::Reader(stored) => (&**stored, None),
+            MemTx::Writer(stored, delta) => (&**stored, Some(delta)),
+        };
+        Ok(Box::new(MemCursor {
+            stored,
+            delta,
+            upper: upper.to_vec(),
+            at: Vec::new(),
+            current: None,
+        }))
     }
 
     fn range_scan<'a>(
@@ -435,100 +427,85 @@ impl Iterator for CacheIter<'_> {
 }
 
 /// Keep an eye on https://github.com/rust-lang/rust/issues/49638
-pub(crate) struct SkipIterator<'a> {
-    pub(crate) inner: &'a BTreeMap<Vec<u8>, Vec<u8>>,
-    pub(crate) upper: Vec<u8>,
-    pub(crate) valid_at: ValidityTs,
-    pub(crate) next_bound: Vec<u8>,
-    pub(crate) size_hint: Option<usize>,
+
+/// A positioned scan over the stored map, with a write transaction's pending changes laid over
+/// it. A key the transaction has deleted is stepped over, exactly as a committed delete would
+/// be, so the two read alike.
+pub(crate) struct MemCursor<'a> {
+    stored: &'a BTreeMap<Vec<u8>, Vec<u8>>,
+    delta: Option<&'a BTreeMap<Vec<u8>, Option<Vec<u8>>>>,
+    upper: Vec<u8>,
+    /// The seek position, held here so stepping over a deleted key reuses one buffer.
+    at: Vec<u8>,
+    current: Option<(&'a [u8], &'a [u8])>,
 }
 
-impl<'a> Iterator for SkipIterator<'a> {
-    type Item = Result<Tuple>;
+impl<'a> MemCursor<'a> {
+    /// A cursor over a plain map, with no pending changes laid over it.
+    pub(crate) fn over(stored: &'a BTreeMap<Vec<u8>, Vec<u8>>, upper: &[u8]) -> MemCursor<'a> {
+        MemCursor {
+            stored,
+            delta: None,
+            upper: upper.to_vec(),
+            at: Vec::new(),
+            current: None,
+        }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
+    fn first_at_or_after<'k, V>(
+        map: &'a BTreeMap<Vec<u8>, V>,
+        from: &'k [u8],
+        upper: &'k [u8],
+    ) -> Option<(&'a [u8], &'a V)> {
+        map.range::<[u8], _>((Bound::Included(from), Bound::Excluded(upper)))
+            .next()
+            .map(|(k, v)| (k.as_slice(), v))
+    }
+}
+
+impl StoreCursor for MemCursor<'_> {
+    fn seek(&mut self, from: &[u8]) -> Result<bool> {
+        self.at.clear();
+        self.at.extend_from_slice(from);
         loop {
-            let nxt = self
-                .inner
-                .range::<Vec<u8>, (Bound<&Vec<u8>>, Bound<&Vec<u8>>)>((
-                    Bound::Included(&self.next_bound),
-                    Bound::Excluded(&self.upper),
-                ))
-                .next();
-            match nxt {
-                None => return None,
-                Some((candidate_key, candidate_val)) => {
-                    let (ret, nxt_bound) =
-                        check_key_for_validity(candidate_key, self.valid_at, self.size_hint);
-                    self.next_bound = nxt_bound;
-                    if let Some(mut nk) = ret {
-                        return Some(try_extend_tuple_from_v(&mut nk, candidate_val).map(|()| nk));
-                    }
+            let stored = Self::first_at_or_after(self.stored, &self.at, &self.upper)
+                .map(|(key, val)| (key, val.as_slice()));
+            let pending = match self.delta {
+                None => None,
+                Some(delta) => Self::first_at_or_after(delta, &self.at, &self.upper),
+            };
+            // Whichever key comes first wins, and a pending change wins a tie because it is
+            // the newer state of that key.
+            let (key, change) = match pending {
+                Some((key, change)) if stored.map_or(true, |(at, _)| key <= at) => (key, change),
+                _ => {
+                    self.current = stored;
+                    return Ok(stored.is_some());
+                }
+            };
+            match change {
+                Some(val) => {
+                    self.current = Some((key, val.as_slice()));
+                    return Ok(true);
+                }
+                // A key this transaction deleted: resume just past it.
+                None => {
+                    self.at.clear();
+                    self.at.extend_from_slice(key);
+                    self.at.push(0);
                 }
             }
         }
     }
-}
 
-struct SkipDualIterator<'a> {
-    stored: &'a BTreeMap<Vec<u8>, Vec<u8>>,
-    delta: &'a BTreeMap<Vec<u8>, Option<Vec<u8>>>,
-    upper: Vec<u8>,
-    valid_at: ValidityTs,
-    next_bound: Vec<u8>,
-}
+    fn key(&self) -> &[u8] {
+        self.current.expect("cursor key after a successful seek").0
+    }
 
-impl<'a> Iterator for SkipDualIterator<'a> {
-    type Item = Result<Tuple>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            let stored_nxt = self
-                .stored
-                .range::<Vec<u8>, (Bound<&Vec<u8>>, Bound<&Vec<u8>>)>((
-                    Bound::Included(&self.next_bound),
-                    Bound::Excluded(&self.upper),
-                ))
-                .next();
-            let delta_nxt = self
-                .delta
-                .range::<Vec<u8>, (Bound<&Vec<u8>>, Bound<&Vec<u8>>)>((
-                    Bound::Included(&self.next_bound),
-                    Bound::Excluded(&self.upper),
-                ))
-                .next();
-            let (candidate_key, candidate_val) = match (stored_nxt, delta_nxt) {
-                (None, None) => return None,
-                (None, Some((delta_key, maybe_delta_val))) => match maybe_delta_val {
-                    None => {
-                        let (_, nxt_seek) = check_key_for_validity(delta_key, self.valid_at, None);
-                        self.next_bound = nxt_seek;
-                        continue;
-                    }
-                    Some(delta_val) => (delta_key, delta_val),
-                },
-                (Some((stored_key, stored_val)), None) => (stored_key, stored_val),
-                (Some((stored_key, stored_val)), Some((delta_key, maybe_delta_val))) => {
-                    if stored_key < delta_key {
-                        (stored_key, stored_val)
-                    } else {
-                        match maybe_delta_val {
-                            None => {
-                                let (_, nxt_seek) =
-                                    check_key_for_validity(delta_key, self.valid_at, None);
-                                self.next_bound = nxt_seek;
-                                continue;
-                            }
-                            Some(delta_val) => (delta_key, delta_val),
-                        }
-                    }
-                }
-            };
-            let (ret, nxt_bound) = check_key_for_validity(candidate_key, self.valid_at, None);
-            self.next_bound = nxt_bound;
-            if let Some(mut nk) = ret {
-                return Some(try_extend_tuple_from_v(&mut nk, candidate_val).map(|()| nk));
-            }
-        }
+    fn value(&mut self) -> Result<&[u8]> {
+        Ok(self
+            .current
+            .expect("cursor value after a successful seek")
+            .1)
     }
 }

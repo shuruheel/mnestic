@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use miette::{miette, IntoDiagnostic, Result, WrapErr};
+use miette::{bail, miette, IntoDiagnostic, Result, WrapErr};
 
 use rocksdb::{
     OptimisticTransactionDB, OptimisticTransactionOptions, Options, WriteBatchWithTransaction,
@@ -13,7 +13,7 @@ use crate::data::tuple::{check_key_for_validity, Tuple};
 use crate::data::value::ValidityTs;
 use crate::runtime::db::{BadDbInit, DbManifest};
 use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
-use crate::storage::{Storage, StoreTx};
+use crate::storage::{Storage, StoreCursor, StoreTx};
 use crate::Db;
 
 const KEY_PREFIX_LEN: usize = 9;
@@ -296,25 +296,17 @@ impl<'s> StoreTx<'s> for NewRocksDbTx<'s> {
         }
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        lower: &[u8],
-        upper: &[u8],
-        valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+    fn cursor<'a>(&'a self, _lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
         match self.db_tx {
-            Some(ref db_tx) => Box::new(NewRocksDbSkipIterator {
-                inner: db_tx.iterator(rocksdb::IteratorMode::From(
-                    lower,
-                    rocksdb::Direction::Forward,
-                )),
+            Some(ref db_tx) => Ok(Box::new(NewRocksDbCursor {
+                inner: db_tx.iterator(rocksdb::IteratorMode::Start),
                 upper_bound: upper.to_vec(),
-                valid_at,
-                next_bound: lower.to_vec(),
-            }),
-            None => Box::new(std::iter::once(Err(miette!(
-                "Transaction already committed"
-            )))),
+                current: None,
+            })),
+            None => bail!("Transaction already committed"),
         }
     }
 
@@ -403,41 +395,43 @@ impl<'a> Iterator for NewRocksDbIterator<'a> {
     }
 }
 
-pub(crate) struct NewRocksDbSkipIterator<'a> {
+/// A positioned scan. Re-seeking is `set_mode`, and the iterator hands back both halves of an
+/// entry at once, so the value is already in hand by the time it is asked for.
+pub(crate) struct NewRocksDbCursor<'a> {
     inner: rocksdb::DBIteratorWithThreadMode<'a, rocksdb::Transaction<'a, OptimisticTransactionDB>>,
     upper_bound: Vec<u8>,
-    valid_at: ValidityTs,
-    next_bound: Vec<u8>,
+    current: Option<(Box<[u8]>, Box<[u8]>)>,
 }
 
-impl<'a> Iterator for NewRocksDbSkipIterator<'a> {
-    type Item = Result<Tuple>;
+impl StoreCursor for NewRocksDbCursor<'_> {
+    fn seek(&mut self, from: &[u8]) -> Result<bool> {
+        self.inner.set_mode(rocksdb::IteratorMode::From(
+            from,
+            rocksdb::Direction::Forward,
+        ));
+        self.current = match self.inner.next() {
+            None => None,
+            Some(Err(err)) => bail!("Iterator Error: {}", err),
+            Some(Ok((key, val))) if key.as_ref() < self.upper_bound.as_slice() => Some((key, val)),
+            Some(Ok(_)) => None,
+        };
+        Ok(self.current.is_some())
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            self.inner.set_mode(rocksdb::IteratorMode::From(
-                &self.next_bound,
-                rocksdb::Direction::Forward,
-            ));
-            match self.inner.next() {
-                None => return None,
-                Some(Ok((k_slice, v_slice))) => {
-                    if self.upper_bound.as_slice() <= k_slice.as_ref() {
-                        return None;
-                    }
+    fn key(&self) -> &[u8] {
+        &self
+            .current
+            .as_ref()
+            .expect("cursor key after a successful seek")
+            .0
+    }
 
-                    let (ret, nxt_bound) =
-                        check_key_for_validity(k_slice.as_ref(), self.valid_at, None);
-                    self.next_bound = nxt_bound;
-                    if let Some(mut tup) = ret {
-                        return Some(
-                            try_extend_tuple_from_v(&mut tup, v_slice.as_ref()).map(|()| tup),
-                        );
-                    }
-                }
-                Some(Err(e)) => return Some(Err(miette!("Iterator Error: {}", e))),
-            }
-        }
+    fn value(&mut self) -> Result<&[u8]> {
+        Ok(&self
+            .current
+            .as_ref()
+            .expect("cursor value after a successful seek")
+            .1)
     }
 }
 

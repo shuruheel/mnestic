@@ -12,10 +12,9 @@ use std::default::Default;
 use miette::Result;
 
 use crate::data::tuple::Tuple;
-use crate::data::value::ValidityTs;
 use crate::runtime::relation::try_decode_tuple_from_kv;
-use crate::storage::mem::SkipIterator;
-use crate::storage::{Storage, StoreTx};
+use crate::storage::mem::MemCursor;
+use crate::storage::{Storage, StoreCursor, StoreTx};
 
 #[derive(Default, Clone)]
 pub(crate) struct TempStorage;
@@ -95,19 +94,11 @@ impl<'s> StoreTx<'s> for TempTx {
         )
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        lower: &[u8],
-        upper: &[u8],
-        valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        Box::new(SkipIterator {
-            inner: &self.store,
-            upper: upper.to_vec(),
-            valid_at,
-            next_bound: lower.to_vec(),
-            size_hint: None,
-        })
+    fn cursor<'a>(&'a self, _lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        Ok(Box::new(MemCursor::over(&self.store, upper)))
     }
 
     fn range_scan<'a>(

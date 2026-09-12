@@ -8,10 +8,10 @@ use rocksdb::{DBRawIteratorWithThreadMode, MultiThreaded, OptimisticTransactionD
 use std::borrow::Cow;
 
 use crate::data::memcmp::tail_validity;
-use crate::data::tuple::{check_key_for_validity, key_ends_in_validity, Tuple};
-use crate::data::value::ValidityTs;
-use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
+use crate::data::tuple::{key_ends_in_validity, Tuple};
+use crate::runtime::relation::try_decode_tuple_from_kv;
 use crate::storage::layered::Seq;
+use crate::storage::StoreCursor;
 
 pub(crate) type LayeredDb = OptimisticTransactionDB<MultiThreaded>;
 pub(crate) type LayeredTxn<'a> = Transaction<'a, LayeredDb>;
@@ -160,7 +160,7 @@ impl<'a> LayerIter<'a> {
 /// validity, which sorts descending, so every version of a relation key arrives newest-first
 /// across the whole stack, irrespective of which layer holds it.
 ///
-/// Shadowing between layers is therefore not positional. [`StackSkipIter`] applies the
+/// Shadowing between layers is therefore not positional. [`StackCursor`] feeds the
 /// ordinary single-store validity rule to that newest-first stream, so the winner is the
 /// newest version, whichever layer holds it. Stack position decides only which copy of a
 /// byte-identical key is emitted.
@@ -211,7 +211,7 @@ impl<'a> StackMerge<'a> {
                 // Strictly less, so a tie leaves the slot with the earlier (higher) layer.
                 // A tie is byte-identical keys (same relation key *and* same stamp), so this
                 // chooses which copy of one row to emit. It does not decide which version of a
-                // key wins; the stamp does, in `StackSkipIter`.
+                // key wins; the stamp does, in the validity scan above.
                 Some(b) => {
                     if key < self.layers[b].key().unwrap() {
                         best = Some(idx)
@@ -342,40 +342,42 @@ impl<'a> Iterator for StackTupleIter<'a> {
 /// The merge below it already presents each key's versions newest-first across all layers, so
 /// cross-layer shadowing and cross-layer retraction both fall out of running the
 /// single-store validity rule over the merged stream.
-pub(crate) struct StackSkipIter<'a> {
+/// A positioned scan over a layer stack.
+///
+/// The merge is already a lending cursor, so a row the scan declines is never copied: only the
+/// index of the layer holding it is kept, and the key and value stay where the iterators put
+/// them.
+pub(crate) struct StackCursor<'a> {
     pub(crate) merge: StackMerge<'a>,
-    pub(crate) valid_at: ValidityTs,
-    pub(crate) next_bound: Vec<u8>,
+    front: Option<usize>,
 }
 
-impl<'a> Iterator for StackSkipIter<'a> {
-    type Item = Result<Tuple>;
+impl<'a> StackCursor<'a> {
+    pub(crate) fn new(merge: StackMerge<'a>) -> Self {
+        StackCursor { merge, front: None }
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        loop {
-            if let Err(err) = self.merge.seek(&self.next_bound) {
-                return Some(Err(err));
-            }
-            match self.merge.next_borrowed() {
-                None => return None,
-                Some(Err(err)) => return Some(Err(err)),
-                Some(Ok((_, k, v))) => {
-                    // Everything needing the borrows happens first; a skipped row, which is
-                    // the common case here, is never copied.
-                    let (ret, nxt_bound) = check_key_for_validity(k, self.valid_at, None);
-                    let tup = match ret {
-                        Some(mut tup) => match try_extend_tuple_from_v(&mut tup, v) {
-                            Ok(()) => Some(tup),
-                            Err(err) => return Some(Err(err)),
-                        },
-                        None => None,
-                    };
-                    self.next_bound = nxt_bound;
-                    if let Some(tup) = tup {
-                        return Some(Ok(tup));
-                    }
-                }
-            }
-        }
+    fn front(&self) -> &LayerIter<'a> {
+        &self.merge.layers[self.front.expect("cursor read after a successful seek")]
+    }
+}
+
+impl StoreCursor for StackCursor<'_> {
+    fn seek(&mut self, from: &[u8]) -> Result<bool> {
+        self.merge.seek(from)?;
+        self.front = match self.merge.next_borrowed() {
+            None => None,
+            Some(Err(err)) => return Err(err),
+            Some(Ok((front, _, _))) => Some(front),
+        };
+        Ok(self.front.is_some())
+    }
+
+    fn key(&self) -> &[u8] {
+        self.front().key().expect("a positioned layer has a key")
+    }
+
+    fn value(&mut self) -> Result<&[u8]> {
+        Ok(self.front().value().unwrap_or_default())
     }
 }

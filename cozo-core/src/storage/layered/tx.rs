@@ -15,12 +15,11 @@ use crate::data::memcmp::{
 };
 use crate::storage::layered::catalog::{catalog_relations, relation_of, Catalog};
 use crate::data::tuple::Tuple;
-use crate::data::value::ValidityTs;
 use crate::storage::layered::iter::{
-    LayeredTxn, StackMerge, StackRawIter, StackSkipIter, StackTupleIter, Window,
+    LayeredTxn, StackCursor, StackMerge, StackRawIter, StackTupleIter, Window,
 };
 use crate::storage::layered::{LayeredInner, StackSpec, Seq, PENDING_SEQ};
-use crate::storage::{StorageView, StoreTx};
+use crate::storage::{StorageView, StoreCursor, StoreTx};
 
 /// A resolved stack, together with the scratch space its per-key lookups reuse.
 ///
@@ -514,20 +513,14 @@ impl<'s> StoreTx<'s> for LayeredTx<'s> {
         }
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        lower: &[u8],
-        upper: &[u8],
-        valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        match self.gate(lower, false).and_then(|()| self.merge(lower, Some(upper.to_vec()))) {
-            Ok(merge) => Box::new(StackSkipIter {
-                merge,
-                valid_at,
-                next_bound: lower.to_vec(),
-            }),
-            Err(err) => Box::new(std::iter::once(Err(err))),
-        }
+    fn cursor<'a>(&'a self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        self.gate(lower, false)?;
+        Ok(Box::new(StackCursor::new(
+            self.merge(lower, Some(upper.to_vec()))?,
+        )))
     }
 
     fn range_scan<'a>(

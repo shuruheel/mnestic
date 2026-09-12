@@ -12,14 +12,14 @@ use std::sync::{Arc, Mutex};
 
 use itertools::Itertools;
 use lazy_static::lazy_static;
-use miette::{miette, IntoDiagnostic, Result};
+use miette::{bail, miette, IntoDiagnostic, Result};
 use tikv_client::{Transaction, TransactionClient};
 use tokio::runtime::Runtime;
 
 use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
 use crate::runtime::relation::try_decode_tuple_from_kv;
-use crate::storage::{Storage, StoreTx};
+use crate::storage::{Storage, StoreCursor, StoreTx};
 use crate::utils::{swap_option_result, TempCollector};
 use crate::Db;
 
@@ -188,15 +188,11 @@ impl<'s> StoreTx<'s> for TiKvTx {
         Box::new(BatchScanner::new(self.tx.clone(), lower, upper))
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        _lower: &[u8],
-        _upper: &[u8],
-        _valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        Box::new(iter::once(Err(miette!(
-            "TiKV backend does not support time travelling."
-        ))))
+    fn cursor<'a>(&'a self, _lower: &[u8], _upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        bail!("TiKV backend does not support time travelling.")
     }
 
     fn range_scan<'a>(

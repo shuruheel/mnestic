@@ -15,11 +15,10 @@ use either::{Either, Left, Right};
 use miette::{bail, miette, IntoDiagnostic, Result};
 use sqlite::{ConnectionThreadSafe, State, Statement};
 
-use crate::data::tuple::{check_key_for_validity, Tuple};
+use crate::data::tuple::Tuple;
 use crate::data::value::ValidityTs;
-use crate::runtime::relation::{try_decode_tuple_from_kv, try_extend_tuple_from_v};
-use crate::storage::{Storage, StoreTx};
-use crate::utils::swap_option_result;
+use crate::runtime::relation::try_decode_tuple_from_kv;
+use crate::storage::{Storage, StoreCursor, StoreTx};
 
 /// The Sqlite storage engine
 #[derive(Clone)]
@@ -34,11 +33,27 @@ pub struct SqliteStorage {
 ///
 /// You must provide a disk-based path: `:memory:` is not OK.
 /// If you want a pure memory storage, use [`new_cozo_mem`](crate::new_cozo_mem).
+/// How long a statement waits for a lock another connection holds before giving up.
+///
+/// Readers take no explicit transaction, so their locking is per-statement and a connection
+/// handed back to the pool can still be settling. Without a wait, a writer meeting that
+/// momentary overlap fails outright with "database is locked" instead of proceeding a
+/// millisecond later.
+const BUSY_TIMEOUT_MS: u32 = 3000;
+
+/// Open a connection to `path` and give it the shared busy timeout.
+fn open_connection(path: impl AsRef<Path>) -> Result<ConnectionThreadSafe> {
+    let conn = Connection::open_thread_safe(path).into_diagnostic()?;
+    conn.execute(format!("pragma busy_timeout = {BUSY_TIMEOUT_MS};"))
+        .into_diagnostic()?;
+    Ok(conn)
+}
+
 pub fn new_cozo_sqlite(path: impl AsRef<Path>) -> Result<crate::Db<SqliteStorage>> {
     if path.as_ref().to_str() == Some("") {
         bail!("empty path for sqlite storage")
     }
-    let conn = Connection::open_thread_safe(&path).into_diagnostic()?;
+    let conn = open_connection(&path)?;
     let query = r#"
         create table if not exists cozo
         (
@@ -65,7 +80,7 @@ impl<'s> Storage<'s> for SqliteStorage {
     fn transact(&'s self, write: bool) -> Result<Self::Tx> {
         let conn = {
             match self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-                None => Connection::open_thread_safe(&self.name).into_diagnostic()?,
+                None => open_connection(&self.name)?,
                 Some(conn) => conn,
             }
         };
@@ -148,6 +163,13 @@ const COUNT_RANGE_QUERY: usize = 6;
 
 impl Drop for SqliteTx<'_> {
     fn drop(&mut self) {
+        // The cached statements borrow the connection through a transmuted lifetime, and any
+        // that stopped on a row is still holding a read lock. Finalize them first: the
+        // rollback below needs the connection quiet, and once it is in the pool another
+        // thread may take it while these would still have been alive.
+        for slot in self.stmts.iter() {
+            drop(slot.lock().unwrap_or_else(|e| e.into_inner()).take());
+        }
         if let Right(ShardedLockWriteGuard { .. }) = self.lock {
             if !self.committed {
                 let query = r#"rollback;"#;
@@ -286,20 +308,22 @@ impl<'s> StoreTx<'s> for SqliteTx<'s> {
         Box::new(TupleIter(statement))
     }
 
-    fn range_skip_scan_tuple<'a>(
-        &'a self,
-        lower: &[u8],
-        upper: &[u8],
-        valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
-        let query = QUERIES[SKIP_RANGE_QUERY];
-        let statement = self.conn.as_ref().unwrap().prepare(query).unwrap();
-        Box::new(SkipIter {
-            stmt: statement,
-            valid_at,
-            next_bound: lower.to_vec(),
+    fn cursor<'a>(&'a self, _lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a,
+    {
+        let stmt = self
+            .conn
+            .as_ref()
+            .unwrap()
+            .prepare(QUERIES[SKIP_RANGE_QUERY])
+            .into_diagnostic()?;
+        Ok(Box::new(SqliteCursor {
+            stmt,
             upper_bound: upper.to_vec(),
-        })
+            key: Vec::new(),
+            value: None,
+        }))
     }
 
     fn range_bitemporal_scan_tuple<'a>(
@@ -447,41 +471,40 @@ impl<'l> crate::data::bitemporal::SeekCursor for SqliteSeekCursor<'l> {
     }
 }
 
-struct SkipIter<'l> {
+/// A positioned scan. Each seek rebinds the range query; the value column is read only when
+/// asked for, because reading it copies the blob out of the row.
+struct SqliteCursor<'l> {
     stmt: Statement<'l>,
-    valid_at: ValidityTs,
-    next_bound: Vec<u8>,
     upper_bound: Vec<u8>,
+    key: Vec<u8>,
+    value: Option<Vec<u8>>,
 }
 
-impl<'l> SkipIter<'l> {
-    fn next_inner(&mut self) -> Result<Option<Tuple>> {
-        loop {
-            self.stmt.reset().into_diagnostic()?;
-            self.stmt.bind((1, &self.next_bound as &[u8])).unwrap();
-            self.stmt.bind((2, &self.upper_bound as &[u8])).unwrap();
-
-            match self.stmt.next().into_diagnostic()? {
-                State::Done => return Ok(None),
-                State::Row => {
-                    let k = self.stmt.read::<Vec<u8>, _>(0).unwrap();
-                    let (ret, nxt_bound) = check_key_for_validity(&k, self.valid_at, None);
-                    self.next_bound = nxt_bound;
-                    if let Some(mut tup) = ret {
-                        let v = self.stmt.read::<Vec<u8>, _>(1).unwrap();
-                        try_extend_tuple_from_v(&mut tup, &v)?;
-                        return Ok(Some(tup));
-                    }
-                }
+impl StoreCursor for SqliteCursor<'_> {
+    fn seek(&mut self, from: &[u8]) -> Result<bool> {
+        self.stmt.reset().into_diagnostic()?;
+        self.stmt.bind((1, from)).into_diagnostic()?;
+        self.stmt
+            .bind((2, &self.upper_bound as &[u8]))
+            .into_diagnostic()?;
+        match self.stmt.next().into_diagnostic()? {
+            State::Done => Ok(false),
+            State::Row => {
+                self.key = self.stmt.read::<Vec<u8>, _>(0).into_diagnostic()?;
+                self.value = None;
+                Ok(true)
             }
         }
     }
-}
 
-impl<'l> Iterator for SkipIter<'l> {
-    type Item = Result<Tuple>;
+    fn key(&self) -> &[u8] {
+        &self.key
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        swap_option_result(self.next_inner())
+    fn value(&mut self) -> Result<&[u8]> {
+        if self.value.is_none() {
+            self.value = Some(self.stmt.read::<Vec<u8>, _>(1).into_diagnostic()?);
+        }
+        Ok(self.value.as_deref().unwrap())
     }
 }

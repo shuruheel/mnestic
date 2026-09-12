@@ -19,7 +19,7 @@ use thiserror::Error;
 
 use crate::data::aggr::Aggregation;
 use crate::data::expr::Expr;
-use crate::data::relation::StoredRelationMetadata;
+use crate::data::relation::{ColType, StoredRelationMetadata};
 use crate::data::symb::{Symbol, PROG_ENTRY};
 use crate::data::tuple::Tuple;
 use crate::data::value::{DataValue, ValidityTs};
@@ -1148,6 +1148,10 @@ pub(crate) struct HnswSearch {
     pub(crate) bind_distance: Option<Symbol>,
     pub(crate) bind_vector: Option<Symbol>,
     pub(crate) radius: Option<f64>,
+    /// Restrict results to the version of each record that is live at this point. Only
+    /// meaningful for a relation whose last key column is a validity, and required there for a
+    /// search to mean "nearest records" rather than "nearest versions of records".
+    pub(crate) validity: Option<ValidityTs>,
     pub(crate) filter: Option<Expr>,
     pub(crate) span: SourceSpan,
 }
@@ -1742,6 +1746,34 @@ impl SearchInput {
             None => None,
         };
 
+        let validity = match self.parameters.remove("validity") {
+            None => None,
+            Some(expr) => {
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("Relation `{0}` has no validity column, so `validity` does not apply")]
+                #[diagnostic(code(parser::hnsw_validity_not_applicable))]
+                struct HnswValidityNotApplicable(String, #[label] SourceSpan);
+
+                ensure!(
+                    matches!(
+                        base_handle.metadata.keys.last().map(|c| &c.typing.coltype),
+                        Some(ColType::Validity)
+                    ),
+                    HnswValidityNotApplicable(base_handle.name.to_string(), self.span)
+                );
+
+                #[derive(Debug, Error, Diagnostic)]
+                #[error("Expected a validity for `validity`")]
+                #[diagnostic(code(parser::expected_validity_for_hnsw))]
+                struct ExpectedValidityForHnsw(#[label] SourceSpan);
+
+                match expr.eval_to_const()? {
+                    DataValue::Validity(vld) => Some(vld.timestamp),
+                    _ => bail!(ExpectedValidityForHnsw(self.span)),
+                }
+            }
+        };
+
         let filter = self.parameters.remove("filter");
 
         let bind_field = match self.parameters.remove("bind_field") {
@@ -1829,6 +1861,7 @@ impl SearchInput {
             bind_distance,
             bind_vector,
             radius,
+            validity,
             filter,
             span: self.span,
         }));

@@ -17,7 +17,7 @@ use std::collections::BTreeMap;
 
 use miette::Result;
 
-use super::{base, frontier, Fixture};
+use super::{base, Fixture};
 use crate::storage::layered::flatten::{FlattenCursor, FlattenItem};
 use crate::storage::layered::{LayerRef, Stack};
 

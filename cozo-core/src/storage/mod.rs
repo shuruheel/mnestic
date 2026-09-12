@@ -13,7 +13,8 @@ use std::sync::Arc;
 
 use miette::{bail, Result};
 
-use crate::data::tuple::Tuple;
+use crate::data::tuple::{check_key_for_validity, Tuple};
+use crate::runtime::relation::try_extend_tuple_from_v;
 use crate::data::value::ValidityTs;
 use crate::try_decode_tuple_from_kv;
 
@@ -211,6 +212,134 @@ pub trait Storage<'s>: Send + Sync + Clone {
 
 /// Trait for the associated transaction type of a storage engine.
 /// A transaction needs to guarantee MVCC semantics for all operations.
+/// The validity skip scan: seek, test the key, read the value only if the test asks for it,
+/// and resume wherever the test says.
+struct SkipScan<'a> {
+    cursor: Box<dyn StoreCursor + 'a>,
+    matcher: Box<dyn SkipMatch + 'a>,
+    valid_at: ValidityTs,
+    next_bound: Vec<u8>,
+    done: bool,
+}
+
+impl SkipScan<'_> {
+    /// Resume just past `key`, the smallest bound that cannot land on it again.
+    fn after(key: &[u8]) -> Vec<u8> {
+        let mut bound = Vec::with_capacity(key.len() + 1);
+        bound.extend_from_slice(key);
+        bound.push(0);
+        bound
+    }
+
+    fn next_inner(&mut self) -> Result<Option<Tuple>> {
+        while self.cursor.seek(&self.next_bound)? {
+            // The validity rule reads the key alone, and the bound it returns clears every
+            // remaining row of this key prefix.
+            let (admitted, past_group) =
+                check_key_for_validity(self.cursor.key(), self.valid_at, None);
+            self.next_bound = past_group;
+            let Some(mut row) = admitted else { continue };
+            // A row the key test kept is offered its value, which only the matcher can
+            // decide to decode. The borrow ends with the call, leaving the key reachable below.
+            let step = match self.matcher.match_key(&row)? {
+                Step::Yield => self.matcher.match_value(&mut row, self.cursor.value()?)?,
+                declined => declined,
+            };
+            match step {
+                Step::Yield => return Ok(Some(row)),
+                Step::SkipGroup => continue,
+                Step::NextKey => {
+                    self.next_bound = Self::after(self.cursor.key());
+                    continue;
+                }
+            }
+        }
+        Ok(None)
+    }
+}
+
+impl Iterator for SkipScan<'_> {
+    type Item = Result<Tuple>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.next_inner() {
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Ok(Some(tuple)) => Some(Ok(tuple)),
+            Err(err) => {
+                self.done = true;
+                Some(Err(err))
+            }
+        }
+    }
+}
+
+/// A scan positioned on one row at a time, able to jump to an arbitrary key.
+///
+/// The value is fetched separately from the key because reading it is not free everywhere: the
+/// SQLite backend copies the blob out of the row, and a scan that decides from the key alone
+/// should not pay for it.
+pub trait StoreCursor {
+    /// Move to the first entry at or after `from`. `false` once nothing is left below the
+    /// upper bound the cursor was built with.
+    fn seek(&mut self, from: &[u8]) -> Result<bool>;
+
+    /// The key at the current position. Only valid after `seek` returned `true`.
+    fn key(&self) -> &[u8];
+
+    /// The value at the current position. Only valid after `seek` returned `true`.
+    fn value(&mut self) -> Result<&[u8]>;
+}
+
+/// Whether a scan returns a row, and where it resumes afterwards.
+pub enum Step {
+    /// Return the row.
+    Yield,
+    /// Discard it and resume past every row sharing its key prefix.
+    SkipGroup,
+    /// Discard it and resume at the key immediately after it.
+    NextKey,
+}
+
+/// Which rows a validity scan returns, and where it resumes after each one it declines.
+///
+/// The two halves run in order, and the second only when the first asks for it, so a scan that
+/// decides from key columns never pays to materialize a value it would discard. Each decision
+/// names where the scan resumes, so declining on a value is not silently assumed to resume
+/// wherever declining on a key would have.
+pub trait SkipMatch {
+    /// Decide from the key columns of a row the validity rule admitted. A row declined here
+    /// never has its value read.
+    fn match_key(&mut self, key: &Tuple) -> Result<Step>;
+
+    /// Decide again for a row `match_key` kept, given its value bytes.
+    ///
+    /// Decoding them into `row` is what costs, not receiving them, so this is where a scan
+    /// that only wants key columns declines to pay: override it to ignore `value`. The default
+    /// appends them, which is what a scan returning whole tuples wants.
+    fn match_value(&mut self, row: &mut Tuple, value: &[u8]) -> Result<Step> {
+        try_extend_tuple_from_v(row, value)?;
+        Ok(Step::Yield)
+    }
+}
+
+/// The rule every stored relation's time-travel scan follows: of the rows sharing a key prefix,
+/// the newest assertion no later than `valid_at`, and nothing else.
+///
+/// Left alone it reproduces `range_skip_scan_tuple`; wrap it to add conditions of your own.
+pub struct LiveAt;
+
+impl SkipMatch for LiveAt {
+    fn match_key(&mut self, _key: &Tuple) -> Result<Step> {
+        Ok(Step::Yield)
+    }
+}
+
 pub trait StoreTx<'s>: Sync {
     /// Get a key. If `for_update` is `true` (only possible in a write transaction),
     /// then the database needs to guarantee that `commit()` can only succeed if
@@ -302,6 +431,15 @@ pub trait StoreTx<'s>: Sync {
         }))
     }
 
+    /// A positioned scan over `[lower, upper)` that can jump.
+    ///
+    /// A skip rule rejects a key and then resumes from a position it computes, which a forward
+    /// iterator cannot express. This is the only part of such a scan that depends on the
+    /// backend; the rules themselves are shared.
+    fn cursor<'a>(&'a self, lower: &[u8], upper: &[u8]) -> Result<Box<dyn StoreCursor + 'a>>
+    where
+        's: 'a;
+
     /// Scan on a range with a certain validity.
     ///
     /// `lower` is inclusive whereas `upper` is exclusive.
@@ -323,7 +461,39 @@ pub trait StoreTx<'s>: Sync {
         lower: &[u8],
         upper: &[u8],
         valid_at: ValidityTs,
-    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>;
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>
+    where
+        's: 'a,
+    {
+        self.range_skip_scan_matched(lower, upper, valid_at, Box::new(LiveAt))
+    }
+
+    /// The same scan, with a say in which rows come back and where it resumes after the ones
+    /// that do not. See [`SkipMatch`].
+    ///
+    /// This is where the validity rule actually lives, written once over [`cursor`](Self::cursor)
+    /// rather than per backend.
+    fn range_skip_scan_matched<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        valid_at: ValidityTs,
+        matcher: Box<dyn SkipMatch + 'a>,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>
+    where
+        's: 'a,
+    {
+        match self.cursor(lower, upper) {
+            Ok(cursor) => Box::new(SkipScan {
+                cursor,
+                matcher,
+                valid_at,
+                next_bound: lower.to_vec(),
+                done: false,
+            }),
+            Err(err) => Box::new(std::iter::once(Err(err))),
+        }
+    }
 
     /// Two-level bitemporal scan (mnestic fork, bitemporality step 4b; see
     /// `data/bitemporal.rs`). The default implementation drives the generic
