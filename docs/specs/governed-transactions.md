@@ -1,6 +1,6 @@
 # Governed multi-transactions
 
-Status: implemented in the B-L0 engine branch; unreleased. The legacy
+Status: merged into main in PR #62; selected for 0.19, unreleased. The legacy
 `multi_transaction` and `run_multi_transaction` APIs remain compatible.
 
 ## Host API and ownership
@@ -113,3 +113,27 @@ job, including the commit-failure seam with `test-hooks`. Downstream MindGraph
 must use a released or explicit immutable compatibility pin after engine
 validation, migrate its existing mutable transaction callers as well as new read
 snapshots, and complete host admission tests before governance activation.
+
+## 0.19 release verification
+
+These checks validate the existing contract; they do not broaden the API. Link
+results to the final candidate SHA in the [release plan](../plans/0.19-planning.md).
+
+- [ ] Run the governed integration and warning-flush tests on memory, SQLite and
+      RocksDB, including `test-hooks` commit failures. Record commands/features.
+- [ ] Verify deadline capture includes scheduling delay, idle expiry closes the
+      worker, statement/Db limits only tighten budgets, and query errors roll back
+      earlier mutations while preserving their diagnostic codes.
+- [ ] Verify cancellation during uncooperative host code retains the admission
+      permit until the actual worker exits. Document that commit races have
+      uncertain outcomes; do not assert that every timed-out write rolled back.
+- [ ] Verify SQLite writer blocking and RocksDB snapshot concurrency separately.
+      Assert `::warnings` remains available during active read/write transactions.
+- [ ] Verify callback timeout after successful commit preserves committed data,
+      disconnects the stalled subscriber, and emits the reconciliation diagnostic.
+- [ ] Compile a native Rust host example against the packaged crate and run it
+      with host-owned worker/admission lifetimes; check legacy API compatibility.
+- [ ] Verify Python packages/adapters remain compatible with the engine changes.
+      The new governed API is native Rust; Python exposure is not a 0.19 promise.
+- [ ] Review release notes for cooperative cancellation, estimated per-statement
+      memory (not total RSS), and downstream activation prerequisites.
