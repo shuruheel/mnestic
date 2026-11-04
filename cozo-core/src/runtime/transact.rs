@@ -36,7 +36,11 @@ pub struct SessionTx<'a> {
     pub(crate) relation_store_id: Arc<AtomicU64>,
     pub(crate) temp_store_id: AtomicU32,
     pub(crate) tokenizers: Arc<TokenizerCache>,
-    /// Field order keeps the abort fence alive until store_tx is dropped.
+    /// Transaction-local FTS corpus totals and a shared handle to the Db's
+    /// committed doc-stats cache; see `Db::fts_doc_stats_cache`. The generation
+    /// is captured before opening store_tx so a stale snapshot cannot publish
+    /// totals over a newer committed corpus. Field order keeps the abort fence
+    /// alive until store_tx is dropped, including failed commit and unwind.
     pub(crate) fts_stats: TxFtsStats,
     /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
     /// shared handle to the `Db`'s high-water mark. See `runtime/tt_clock.rs`.
