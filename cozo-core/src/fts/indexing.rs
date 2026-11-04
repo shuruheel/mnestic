@@ -26,10 +26,35 @@ use std::collections::HashMap;
 use thiserror::Error;
 
 #[derive(Default)]
-pub(crate) struct FtsCache {}
+pub(crate) struct FtsCache {
+    // Deliberately stateless. Both BM25 corpus statistics — the document count `N` and the
+    // average document length `avgdl` — come from the transaction's doc-stats view (see
+    // `get_doc_stats_for_index`), so there is nothing left to memoize per query. It is
+    // kept as a type so the `fts_search` signature and the `query/ra.rs` plumbing stay stable.
+}
 
 impl FtsCache {
+    /// The BM25 corpus statistics for an index: `(total_tokens, n_docs)`.
+    ///
+    /// **O(1)** on the serialized warm path: reads transaction-local totals or
+    /// a compatible committed entry from the process-level cache on the `Db`.
+    /// Cold, invalidated or overlapping snapshots seed their own totals with a
+    /// deduplicated full scan. Writes maintain local totals incrementally (see
+    /// `SessionTx::finish_fts_change`) and publish them only after a safe commit.
+    /// Nothing here writes a shared storage key: a durable counter written from
+    /// every document transaction makes all concurrent writers conflict on one
+    /// RocksDB lock (the 0.8.3 design, reverted).
+    ///
+    /// `n_docs` is the number of documents **carrying at least one posting** — the
+    /// population that `df` and `avgdl` are also measured against, and therefore the
+    /// `N` Okapi BM25's IDF term is defined over. It is *not* the base relation's row
+    /// count: a row whose extracted text yields no tokens is in the relation but is not
+    /// a document in the collection being searched, and rows loaded by `import_relations`
+    /// (which maintains no FTS index) are not documents either. Sourcing `N` from the
+    /// relation instead was both wrong (it mixes a relation-derived `N` into an IDF whose
+    /// `df` is index-derived) and ruinously slow (a full relation scan on every query).
     /// Both counts come from the same posting snapshot as the ranked query.
+    /// See `docs/specs/fts-corpus-stats.md`.
     fn get_doc_stats_for_index(
         &mut self,
         idx: &RelationHandle,
@@ -78,6 +103,12 @@ impl<'a> SessionTx<'a> {
         idx.encode_partial_key_for_store(&[DataValue::Bot])
     }
 
+    /// Read corpus totals in this transaction's snapshot, seeding from the
+    /// existing postings when no compatible local or committed entry exists.
+    /// This read happens BEFORE a posting mutation so its delta is applied
+    /// exactly once to the pre-mutation population. Cache locks are released
+    /// before the scan; generation checks prevent stale scans from being
+    /// published into a newer committed cache.
     fn fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
         if let Some(stats) = self.fts_stats.get(idx.id) {
             return Ok(stats);
@@ -87,6 +118,14 @@ impl<'a> SessionTx<'a> {
         Ok(stats)
     }
 
+    /// Apply a document's delta to transaction-local totals AFTER every
+    /// posting write succeeds. Invalidating before the write loop leaves no
+    /// reusable local entry after partial failure; uncertain transactions use
+    /// an exact scan instead of another single-posting delta probe.
+    ///
+    /// Both `N` and `avgdl` affect ranking, so rolled-back deltas must not
+    /// escape into the process-level cache. The transaction lifecycle promotes
+    /// these exact totals only after a successful, compatible storage commit.
     fn finish_fts_change(
         &self,
         idx: &RelationHandle,
@@ -113,7 +152,7 @@ impl<'a> SessionTx<'a> {
     /// Deduplicated full scan of the FTS index → `(total_tokens, n_docs)` over
     /// the documents that have at least one posting. Each document's length is
     /// stored redundantly on every posting (`vals[3]`), so we count each document
-    /// key once. This is the legacy/seed path; the steady state reads the counter.
+    /// key once. This is the legacy/seed path; the steady state reads cached totals.
     pub(crate) fn scan_fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
         crate::fts::FTS_DOC_STATS_SCANS.with(|c| c.set(c.get() + 1));
         let start = idx.encode_partial_key_for_store(&[]);
@@ -139,13 +178,20 @@ impl<'a> SessionTx<'a> {
         Ok((total, seen.len() as u64))
     }
 
-    /// Recompute exact statistics in this transaction after an index rebuild.
+    /// Recompute the local doc-stats cache entry from a full scan. Called at
+    /// the end of an index (re)build to install authoritative corpus stats for
+    /// this transaction. Also deletes the legacy durable counter a 0.8.3 build
+    /// may have left behind. Shared publication waits for a successful commit.
     pub(crate) fn rebuild_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<()> {
         let stats = self.scan_fts_doc_stats(idx)?;
         self.seed_fts_doc_stats(idx, stats.0, stats.1)
     }
 
-    /// Seed only local statistics, after all fallible writes have succeeded.
+    /// Install corpus stats already known exactly (e.g. counted during a bulk
+    /// build), skipping the full index scan `rebuild_fts_doc_stats` pays. Also
+    /// deletes the legacy durable counter a 0.8.3 build may have left behind.
+    /// Totals become locally reusable only after that fallible cleanup succeeds;
+    /// shared publication is handled by the transaction's commit protocol.
     pub(crate) fn seed_fts_doc_stats(
         &mut self,
         idx: &RelationHandle,
@@ -670,10 +716,25 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         let (rows, count) =
             encode_fts_rows_for_tuple(tuple, extractor, stack, tokenizer, rel_handle, idx_handle)?;
+        // Maintain transaction-local doc stats so `avgdl` and BM25's `N` stay
+        // O(1) on the warm path. A seed-on-absent scan must see the pre-insert
+        // corpus; the local delta is installed only after all postings are written.
+        // No tokens means no postings and therefore no document in the indexed
+        // population, matching the full doc-stats scan.
         if rows.is_empty() {
             return Ok(());
         }
         let previous = self.fts_doc_stats(idx_handle)?;
+        // Count the document only if it is not *already* in the index. Most update paths
+        // are del-then-put, so the old document has been subtracted by the time we get
+        // here — but a **value-unchanged `:put` is not**: `query/stored.rs` skips the
+        // delete when `extracted == tup` (an identical tuple derives identical postings,
+        // so there is nothing to rewrite). Without this probe that path bumps `+1`
+        // with no matching `-1`, and the document count drifts up on every no-op write.
+        // That drift was invisible while `avgdl = total / n` was the counter's only
+        // consumer — both terms inflate together and the ratio barely moves — but BM25's
+        // `N` reads `n` directly, so it must be exact. `del_fts_index_item` makes the
+        // mirror-image probe for the same reason.
         let already_indexed = self.store_tx.exists(&rows[0].0, false)?;
         let scan_only = self.fts_stats.before_write(idx_handle.id);
         for (key_bytes, val_bytes) in rows {
@@ -721,6 +782,11 @@ impl<'a> SessionTx<'a> {
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
         }
+        // Maintain doc stats only if this document is actually indexed (probe
+        // one of its postings). That guards against a delete of an unindexed row
+        // and refresh paths where `del` runs over a not-yet-indexed row.
+        // Read the prior totals before removing postings so a seed scan still
+        // sees them; install the local delta only after the full delete succeeds.
         if collector.is_empty() {
             return Ok(());
         }

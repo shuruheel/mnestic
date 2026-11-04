@@ -180,7 +180,14 @@ pub struct Db<S> {
     /// (whose publication only becomes visible at the end) without re-blocking
     /// readers. Keyed by the index relation's full `base:idx` name.
     index_builds_in_progress: Arc<Mutex<BTreeSet<SmartString<LazyCompact>>>>,
-    /// Committed FTS statistics with snapshot-generation validation.
+    /// Cross-query cache of FTS corpus stats `(total_tokens, n_docs)` (mnestic
+    /// fork, DEVELOPMENT.md Bet 1b avgdl), shared by `Arc` with each SessionTx.
+    /// Entries describe committed postings and are keyed by index relation ID
+    /// so same-name recreation cannot reuse old totals. Transactions retain
+    /// local statistics and validate shared reuse against their snapshot's
+    /// generation and active-writer fences. Cold or incompatible snapshots
+    /// seed from their own posting scan; warm serialized work stays O(1).
+    /// See `fts/stats.rs` and `docs/specs/fts-transaction-stats.md`.
     fts_doc_stats_cache: Arc<FtsStatsCache>,
     /// Db-wide default per-query wall-clock budget in milliseconds (mnestic
     /// fork, query budget). `0` = unset. Set via
