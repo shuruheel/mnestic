@@ -1426,6 +1426,8 @@ impl<'a> SessionTx<'a> {
             non_idx_keys,
         )?;
 
+        self.fts_stats.before_write(idx_handle.id);
+
         // add index to relation
         let manifest = FtsIndexManifest {
             base_relation: config.base_relation.clone(),
@@ -2065,6 +2067,13 @@ impl<'a> SessionTx<'a> {
         let mut rel = self.get_relation(rel_name, true)?;
         let is_lsh = rel.lsh_indices.contains_key(&idx_name.name);
         let is_fts = rel.fts_indices.contains_key(&idx_name.name);
+        let fts_index_id = rel
+            .fts_indices
+            .get(&idx_name.name)
+            .map(|(index, _)| index.id);
+        if let Some(id) = fts_index_id {
+            self.fts_stats.before_write(id);
+        }
         if is_lsh || is_fts {
             self.tokenizers.named_cache.write().unwrap().clear();
             self.tokenizers.hashed_cache.write().unwrap().clear();
@@ -2097,6 +2106,9 @@ impl<'a> SessionTx<'a> {
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
+        if let Some(id) = fts_index_id {
+            self.fts_stats.removed(id);
+        }
         Ok(to_clean)
     }
 

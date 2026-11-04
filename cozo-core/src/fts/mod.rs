@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 pub(crate) mod ast;
 pub(crate) mod cangjie;
 pub(crate) mod indexing;
+pub(crate) mod stats;
 pub(crate) mod tokenizer;
 
 thread_local! {
@@ -36,6 +37,9 @@ thread_local! {
     /// Thread-local (query eval runs on the calling thread) so parallel tests
     /// cannot race each other's deltas.
     pub static FTS_LITERAL_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+
+    /// Full corpus-statistics scans, for cache regression checks.
+    pub static FTS_DOC_STATS_SCANS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 
     /// Per-thread count of base-relation row fetches performed after FTS
     /// ranking. Candidate-aware tests use it to prove rejected postings do not
