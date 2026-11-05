@@ -1,0 +1,4 @@
+   Compiling mnestic v0.18.0 (/private/tmp/mnestic-019-final-packaged/mnestic-0.18.0)
+   Compiling mnestic-019-host-smoke v0.0.0 (/private/tmp/mnestic-019-host)
+    Finished `dev` profile [unoptimized] target(s) in 19.29s
+     Running `/tmp/mnestic-019-target/debug/mnestic-019-host-smoke`

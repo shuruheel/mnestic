@@ -1,0 +1,17 @@
+Collecting mnestic==0.17.0
+  Downloading mnestic-0.17.0-cp37-abi3-macosx_11_0_arm64.whl.metadata (6.9 kB)
+Downloading mnestic-0.17.0-cp37-abi3-macosx_11_0_arm64.whl (12.6 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 12.6/12.6 MB 26.5 MB/s  0:00:00
+Saved /private/tmp/mnestic-019-old017-wheel/mnestic-0.17.0-cp37-abi3-macosx_11_0_arm64.whl
+Successfully downloaded mnestic
+
+[notice] A new release of pip is available: 25.2 -> 26.3
+[notice] To update, run: /private/tmp/mnestic-019-old017/bin/python3.13 -m pip install --upgrade pip
+Looking in links: /tmp/mnestic-019-old017-wheel
+Processing /tmp/mnestic-019-old017-wheel/mnestic-0.17.0-cp37-abi3-macosx_11_0_arm64.whl
+Installing collected packages: mnestic
+Successfully installed mnestic-0.17.0
+sqlite create PASS
+rocksdb create PASS
+sqlite verify PASS
+rocksdb verify PASS
