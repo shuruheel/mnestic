@@ -1,0 +1,28 @@
+{
+  "recorded": "2026-11-05",
+  "timing": "not measured",
+  "hnsw_rng": "uncontrolled; counts are observations, not regression estimates",
+  "files": {
+    "audit.py": "f2582fb2a24f8e9824a3ea34d55025651a012c528e7401dbb99de9f744ee366e",
+    "baseline.json.gz": "48076fe543b59aa73ec5b12485cc206e7f7d42cbb04374f45692e03a109bcff8",
+    "baseline.log": "3fc472f70355e83b18a1e20fec133466d07b2e596f43dbbb54c82d56b5a36bfc",
+    "candidate.json.gz": "34ad937352605839a81557c20f72cf27f6a7c2ae070f580235d7878a4a77e5b3",
+    "candidate.log": "6e8eb0ae88067ae974274a4268d1048fd006408f82a9a831d50aaf68b8de6f02",
+    "exact-baseline.json.gz": "0f04adc1dfcbedb5dbf8342772395ef0fbe2b0192cf36622e41c298c157cfaca",
+    "exact-candidate.json.gz": "7117e39dfe431a810933a3691448e212ffc6906b109956e6b2622be914e048b8",
+    "exact_eligible.py": "055e9b29e3da313073e8204c3eae299c46554b3100e315d1b2229b5f489244b1",
+    "investigate.py": "c7c757194d9d97b3459e7048fc1b4c24c7171963a305403d083a64bec1660a45"
+  },
+  "baseline": {
+    "source_sha": "1d13aedc7a309105ae147f2ed1d79cd18a078b00",
+    "package": "0.18.0",
+    "extension_sha256": "9225c1d969d1562010082c794b3841520ba8386875b6b132b51374b7884610f4",
+    "raw_sha256": "de9ed64d13a7c7580a4afd80972c4b21372466db5a519a9564aeabc0f0240629"
+  },
+  "candidate": {
+    "source_sha": "0148693b93f23956896999ba9a59f1fb4889fab6",
+    "package": "0.18.0",
+    "extension_sha256": "ce09af526a20638019ee035f3a65ba8b26072b14069ec423c361b9c906f886c9",
+    "raw_sha256": "8181535a97dae8a236c00e767c75b78edb481b8342d526ae1e60971a78afaebb"
+  }
+}
