@@ -644,8 +644,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         let script = match parsed {
             Ok(script) => script,
             Err(error) => {
-                // Literal decoding can emit a migration warning before a
-                // later AST error. Keep it with this Db, not the next caller.
+                // Keep diagnostics emitted before a parse/AST error with
+                // this Db, not the next caller on the same thread.
                 self.flush_warnings();
                 return Err(error);
             }

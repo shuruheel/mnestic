@@ -233,6 +233,24 @@ jobs:
               script = "cozo-lib-python/tests/test_upgrade_018.py"
               subprocess.run([sys.executable, script, "create", data], env=env, check=True)
               subprocess.run([sys.executable, script, "verify", data], check=True)
+      - name: Released 0.18 migration baseline and database upgrade
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys, tempfile
+          with tempfile.TemporaryDirectory() as work:
+              root = pathlib.Path(work)
+              old = str(root / "old-wheel")
+              subprocess.run([sys.executable, "-m", "pip", "install", "--target", old, "mnestic==0.18.0"], check=True)
+              env = os.environ.copy()
+              env["PYTHONPATH"] = old
+              migration = "cozo-lib-python/tests/test_string_migration_019.py"
+              baseline = str(root / "baseline.json")
+              subprocess.run([sys.executable, migration, "baseline", baseline], env=env, check=True)
+              subprocess.run([sys.executable, migration, "candidate", str(root / "candidate.json"), baseline], check=True)
+              upgrade = "cozo-lib-python/tests/test_upgrade_019.py"
+              data = str(root / "databases")
+              subprocess.run([sys.executable, upgrade, "create", data], env=env, check=True)
+              subprocess.run([sys.executable, upgrade, "verify", data], check=True)
       # `shell: python` runs the block under the setup-python interpreter on
       # every OS — no bash/pwsh quoting hazards.
       - name: Smoke test (rocksdb + mem engines)

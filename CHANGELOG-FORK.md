@@ -5,6 +5,13 @@ provenance and licensing.
 
 ## Unreleased
 
+### Changed
+
+- Retired `parser.string_decoding_changed`, the temporary 0.18 migration warning.
+  String decoding and errors are unchanged. Keep auditing legacy interpolated
+  scripts using the permanent [migration guidance](docs/specs/string-literals.md#migration-and-diagnostics);
+  parameter binding remains preferred.
+
 ### Added
 
 - Native Rust governed multi-transactions: a serialized client and host-owned

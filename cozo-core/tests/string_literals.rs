@@ -165,54 +165,19 @@ fn comments_parameters_and_descriptions() {
     }
 }
 
-fn warning_rows(d: &DbInstance) -> Vec<Value> {
-    run(d, "::warnings")
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter(|r| {
-            r.as_array()
-                .unwrap()
-                .iter()
-                .any(|v| v == "parser.string_decoding_changed")
-        })
-        .cloned()
-        .collect()
-}
-
 #[test]
-fn warning_is_bounded_conservative_and_drained_on_errors() {
+fn migration_warning_is_retired_without_changing_errors() {
     let d = db();
-    for _ in 0..2 {
-        run(&d, r#"?[x] <- [["a\nb"], ["c\td"]]"#);
-    }
-    assert_eq!(warning_rows(&d).len(), 2);
-    run(&d, "::warnings clear");
-    run(&d, r#"?[x] <- [["abc"], ['a\nb'], [_"a\nb"_]]"#);
-    assert!(warning_rows(&d).is_empty());
-    for lit in [r#"" a ""#, r#"__" a "__"#, r#""/*a*/""#] {
-        run(&d, &format!("?[x] <- [[{lit}]]"));
-    }
-    assert_eq!(warning_rows(&d).len(), 3);
-    run(&d, "::warnings clear");
-    let script = "?[x,y] <- [['é', \"a\\nb\"]]";
-    run(&d, script);
-    let warning = warning_rows(&d)[0].to_string();
-    assert!(warning.contains(&format!("byte offset {}", script.find('"').unwrap())));
-    assert!(warning.contains("may decode differently"));
-    assert!(!warning.contains("a\\nb"));
-    for script in [
-        r#"?[x] <- [["a\uD800"]]"#,
-        r#"?[x] := x = "a\nb", *missing{x}"#,
-    ] {
-        run(&d, "::warnings clear");
-        assert!(d
-            .run_script(script, BTreeMap::new(), ScriptMutability::Mutable)
-            .is_err());
-        // Read another Db first to detect thread-local leakage on parse errors.
-        assert!(warning_rows(&db()).is_empty());
-        assert_eq!(warning_rows(&d).len(), 1, "{script}");
-    }
+    run(&d, r#"?[x] <- [["a\nb"], [_"  raw  "_]]"#);
+    assert_eq!(run(&d, "::warnings"), json!([]));
+    assert!(d
+        .run_script(
+            r#"?[x] <- [["\uD800"]]"#,
+            BTreeMap::new(),
+            ScriptMutability::Mutable
+        )
+        .is_err());
+    assert_eq!(run(&d, "::warnings"), json!([]));
 }
 
 fn single_quote(s: &str) -> String {
