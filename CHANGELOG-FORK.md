@@ -26,6 +26,17 @@ provenance and licensing.
 
 ### Fixed
 
+- HNSW vector replacement/deletion now repairs directed paths through the removed
+  node. Incremental pruning preserves alternate paths, counts only live outgoing
+  edges and distinguishes vector fields/list elements within one row. Repair is
+  locally bounded: infeasible degree/work limits fail with `hnsw::repair_limit`;
+  incomplete graph mutations prevent commit even through the legacy transaction
+  API. Online-build reconciliation uses snapshot vectors for changed/deleted nodes.
+  **Rebuild pre-0.19 HNSW indexes with `::reindex <relation>`** to recover existing
+  disconnections and missing legacy reverse-edge records. Storage encoding is
+  unchanged. This does not change filtered-ANN eligibility or guarantee exact ANN
+  recall. See the [repair/recovery contract](docs/specs/hnsw-mutation-repair.md).
+
 - FTS document counts and average lengths now follow the querying transaction's
   posting snapshot and pending writes. Aborts and failed commits no longer leak
   speculative statistics into subsequent scores or top-k results; old RocksDB

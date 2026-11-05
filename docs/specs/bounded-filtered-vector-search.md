@@ -166,6 +166,11 @@ SHA and separately versioned experiment manifest. Preserve the baseline and
 candidate campaign at engine `0148693b`, harness `8050e72`, instead of relabeling
 new implementation results as the frozen candidate's evidence.
 
+The subsequently approved 0.19 mutation repair supersedes `0148693b` as a release
+candidate. Keep that old manifest as a pre-repair control and create a new pinned
+candidate/artifact manifest before release timings; the old resume command must
+not silently stand in for the repaired release campaign.
+
 ## Acceptance and staged implementation
 
 1. **Completed investigation:** retain graph witnesses, released/candidate parity,

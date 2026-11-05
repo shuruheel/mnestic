@@ -1803,27 +1803,26 @@ impl<'a> SessionTx<'a> {
             snap.insert(k, t);
         }
         let current: Vec<Tuple> = orig_table.scan_all(self).collect::<Result<Vec<_>>>()?;
-        let mut stack = vec![];
+        let mut remove = Vec::new();
+        let mut insert = Vec::new();
         for cur in &current {
             let k = orig_table.encode_key_for_store(&cur[0..nkeys], Default::default())?;
             match snap.remove(&k) {
-                None => {
-                    // new row inserted during the build
-                    self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
+                None => insert.push(cur),
+                Some(old) if old != cur => {
+                    remove.push(old);
+                    insert.push(cur);
                 }
-                Some(old) => {
-                    if old != cur {
-                        // row changed in place during the build
-                        self.hnsw_remove(orig_table, idx_table, old)?;
-                        self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
-                    }
-                }
+                Some(_) => {}
             }
         }
-        // rows present at snapshot but gone now: deleted during the build
-        let removed: Vec<&Tuple> = snap.into_values().collect();
-        for old in removed {
-            self.hnsw_remove(orig_table, idx_table, old)?;
+        remove.extend(snap.into_values());
+        // Remove all stale graph nodes using their snapshot vectors before
+        // inserting current rows. Current base rows may no longer contain them.
+        self.hnsw_remove_snapshot_rows(manifest, orig_table, idx_table, &remove)?;
+        let mut stack = vec![];
+        for cur in insert {
+            self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
         }
         Ok(())
     }

@@ -76,7 +76,8 @@ These are separately verified delivery states; no cloud deployment is implied.
 The [0.19 release plan](docs/plans/0.19-planning.md), updated November 5, selects
 already-merged governed native Rust multi-transactions, responsive `::warnings`,
 the promised migration-warning removal, a validated transactional FTS statistics
-fix, and the E1–E3 measurement/guidance deliverables. E2 includes the isolated
+fix, the explicitly approved HNSW mutation-connectivity repair, and the E1–E3
+measurement/guidance deliverables. E2 includes the isolated
 filtered-search case from closed PR #65; layered storage is not selected.
 **November 12, 2026 is the provisional release target; scope freezes November 5.**
 Confirm the target after the first measurement pass. Correctness and candidate-package
@@ -93,7 +94,7 @@ See the [measurement protocol](docs/plans/0.19-measurement-protocol.md) and
 | Remeasure the public hybrid-recall benchmark on 0.18 | Selected October 27 — measurement | Published numbers are from May on an older build; refresh `RESULTS.md` from the current build, add a filtered-query workload (type-restricted vector plus FTS) and a read-your-writes latency column |
 | Filtered vector search for selective predicates | Selected October 27 — investigation | Evidence: a consumer's type-restricted vector query over a rare type returned nothing because it post-filters a global ANN prefix. Verify and measure the inherited HNSW `filter:` path on the new workload first; add `candidates:` on HNSW (mirroring 0.17's candidate-aware FTS) only if the filter path cannot meet a bounded-widening contract with resource bounds |
 | Parse/plan cost of large vector literals and repeated query text | Selected October 27 — measurement | Consumers splice 1,000-plus-float vectors into script text per request; parameter-binding guidance first, a plan cache only on a measured high-frequency workload (existing gate) |
-| [HNSW integrity #56](https://github.com/shuruheel/mnestic/issues/56) | E4 investigation; verifier/repair not committed to 0.19 | Failure fixtures and verified invariants before a read-only verifier; reproduce a current failure before committing repair |
+| HNSW mutation disconnection | Owner selected repair for 0.19 after reproduction on 0.18 and candidate | [Transactional repair contract](docs/specs/hnsw-mutation-repair.md), deterministic mutation/pruning tests and recovery guidance; broader integrity #56 verifier remains separate |
 | [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Optional after core release gates | Agree warning behavior and preserve legitimate transaction-scoped relations |
 | [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Deferred behind the items above | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
 

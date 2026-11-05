@@ -42,6 +42,8 @@ pub struct SessionTx<'a> {
     /// totals over a newer committed corpus. Field order keeps the abort fence
     /// alive until store_tx is dropped, including failed commit and unwind.
     pub(crate) fts_stats: TxFtsStats,
+    /// An interrupted graph mutation must never be committed by a legacy client.
+    pub(crate) hnsw_mutations_incomplete: usize,
     /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
     /// shared handle to the `Db`'s high-water mark. See `runtime/tt_clock.rs`.
     pub(crate) tt_clock: Arc<TtClock>,
@@ -288,6 +290,9 @@ impl<'a> SessionTx<'a> {
     /// can escape the protocol. Taking the dirty set here also disarms
     /// [`Drop`], whose bump exists for transactions that never reach a commit.
     pub fn commit_tx(&mut self) -> Result<()> {
+        if self.hnsw_mutations_incomplete != 0 {
+            bail!("cannot commit after an incomplete HNSW mutation; abort the transaction");
+        }
         if !self.fts_stats.can_commit() {
             bail!("cannot commit after an incomplete FTS mutation; abort the transaction");
         }
