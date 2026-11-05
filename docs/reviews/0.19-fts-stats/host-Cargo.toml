@@ -1,0 +1,9 @@
+[package]
+name = "mnestic-019-host-smoke"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cozo = { package = "mnestic", path = "../mnestic-019-packaged/mnestic-0.18.0" }
+miette = "5.10.0"

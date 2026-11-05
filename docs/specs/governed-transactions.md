@@ -114,6 +114,11 @@ must use a released or explicit immutable compatibility pin after engine
 validation, migrate its existing mutable transaction callers as well as new read
 snapshots, and complete host admission tests before governance activation.
 
+The [native host example](../../cozo-core/examples/governed_transaction.rs)
+shows worker-owned admission and joining the worker on both success and query
+error. Its packaged-crate smoke result is recorded in the
+[November 5 validation](../reviews/2026-11-05-fts-transaction-stats.md).
+
 ## 0.19 release verification
 
 These checks validate the existing contract; they do not broaden the API. Link

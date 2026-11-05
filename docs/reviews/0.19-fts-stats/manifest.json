@@ -1,0 +1,74 @@
+{
+  "starting_sha": "d60da15d5798b2be9fa4b8de515f68426f15daaa",
+  "contribution_sha": "cf0dc189f4d7d75eec7d2d955933f690882c62a1",
+  "logs": {
+    "native-baseline.log": {
+      "captured_sha256": "37f9c535f0a0408d5dda0bb5aa2c875cc7a2373daf6475f5b220992a73ba229f",
+      "sha256": "37f9c535f0a0408d5dda0bb5aa2c875cc7a2373daf6475f5b220992a73ba229f"
+    },
+    "governed-baseline.log": {
+      "captured_sha256": "e4f6887c2385cd147002e51d559a54500d98f4e6ad594a3f01611ca40083fd2a",
+      "sha256": "e4f6887c2385cd147002e51d559a54500d98f4e6ad594a3f01611ca40083fd2a"
+    },
+    "python-baseline.log": {
+      "captured_sha256": "85eb0a393a90f1bfb5ea60690138584c3c3668ece66bb0ff59a5420da2e82d9e",
+      "sha256": "1349590524218c914b052a471dca517338529ec7b4226f6213171718ae38fba0"
+    },
+    "native-fixed.log": {
+      "captured_sha256": "599c6f3e7fd204b128c332b66c9e74cd54ac78e98f3f6992cbddda466721e256",
+      "sha256": "c2893afdc7a5461f9ccd71d025c43f3b7827536698a7e31fa87ad3e85c7270f6"
+    },
+    "rocks-fixed.log": {
+      "captured_sha256": "5461f5769d8824a33dde5673e07f1d9c3973805f969c28d176a2bb0f0db09471",
+      "sha256": "25c2d88b8b6cf3ff6aff650f43c3c4b32054f6c12ac89cce0fb3c0e7023f946f"
+    },
+    "lib.log": {
+      "captured_sha256": "a49faabf97a2702074aa8e30374cd2456a71e3a3a25662771864fcdc3d6cfbd1",
+      "sha256": "ae7b1538454434bfe9cd615679db461cf7ea881d029ece9133663fbb9a607e3e"
+    },
+    "clippy.log": {
+      "captured_sha256": "068ddc6d5de383e5f3d90e93fe61e90d97044f9755e88bcef196029a0accf7bf",
+      "sha256": "068ddc6d5de383e5f3d90e93fe61e90d97044f9755e88bcef196029a0accf7bf"
+    },
+    "python-fixed.log": {
+      "captured_sha256": "9dd24baa65f73b1e3681f29d7da574eac39a8c16695d12872a99f9b0a32a7d19",
+      "sha256": "9dd24baa65f73b1e3681f29d7da574eac39a8c16695d12872a99f9b0a32a7d19"
+    },
+    "python-contract.log": {
+      "captured_sha256": "3872f5a85da677f909ec5c55a5821758c34e2394460567a29f8043b480cc1105",
+      "sha256": "3872f5a85da677f909ec5c55a5821758c34e2394460567a29f8043b480cc1105"
+    },
+    "crate-package.log": {
+      "captured_sha256": "07bb13bf1b3955ae48b9772e768347ab6f7f90ae12e97d83f6f74f687e01c853",
+      "sha256": "07bb13bf1b3955ae48b9772e768347ab6f7f90ae12e97d83f6f74f687e01c853"
+    },
+    "host.log": {
+      "captured_sha256": "be3ac0f8411fb74fe1c3882be551e79de9b1ab920a6aa80885aff2ab682ca3ee",
+      "sha256": "be3ac0f8411fb74fe1c3882be551e79de9b1ab920a6aa80885aff2ab682ca3ee"
+    },
+    "host-Cargo.lock": {
+      "sha256": "80e7baa94021ceb243342f889d2f7c35cfc5ce515a1d4931a1f648a0a83bc19e"
+    },
+    "host-Cargo.toml": {
+      "sha256": "c082eee4a19a1fb7d4372585f00bcd77d3959dd1a7eaabcb09fad4695ebd77ed"
+    }
+  },
+  "validation_wheel": {
+    "filename": "mnestic-0.18.0-cp37-abi3-macosx_11_0_arm64.whl",
+    "sha256": "7b40cdbc496d639fb18abbbfb3b15a57bae34799f54b464edafafc44103930ba",
+    "profile": "dev, unoptimized, debug symbols disabled",
+    "features": [
+      "compact",
+      "storage-rocksdb",
+      "rdf-io",
+      "columnar-io"
+    ],
+    "status": "local FTS validation artifact, not final 0.19 release candidate"
+  },
+  "packaged_crate": {
+    "filename": "mnestic-0.18.0.crate",
+    "sha256": "27e7f3d383438abeaae58c63f6d33160e0595a075a5270259579770bc19d58f4",
+    "qualification": "local development artifact, not final 0.19 release candidate"
+  },
+  "log_normalization": "Trailing whitespace and extra final blank lines removed from text transcripts; captured_sha256 records the original tool output."
+}

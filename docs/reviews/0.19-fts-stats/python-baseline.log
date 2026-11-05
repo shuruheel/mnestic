@@ -1,0 +1,57 @@
+test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) ...
+  test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) (backend='mem') ... FAIL
+  test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) (backend='sqlite') ... FAIL
+  test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) (backend='rocksdb') ... FAIL
+
+======================================================================
+FAIL: test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) (backend='mem')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/mnestic-019-fts/cozo-lib-python/tests/test_fts_transaction_stats.py", line 41, in test_failed_script_preserves_rows_scores_and_top_result
+    self.assertEqual(run(QUERY), before)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [['a', 0.21772010539904393], ['b', 0.23382944055188795]] != [['a', 0.8145200573753216], ['b', 0.75382517568058]]
+
+First differing element 0:
+['a', 0.21772010539904393]
+['a', 0.8145200573753216]
+
+- [['a', 0.21772010539904393], ['b', 0.23382944055188795]]
++ [['a', 0.8145200573753216], ['b', 0.75382517568058]]
+
+======================================================================
+FAIL: test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) (backend='sqlite')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/mnestic-019-fts/cozo-lib-python/tests/test_fts_transaction_stats.py", line 41, in test_failed_script_preserves_rows_scores_and_top_result
+    self.assertEqual(run(QUERY), before)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [['a', 0.21772010539904393], ['b', 0.23382944055188795]] != [['a', 0.8145200573753216], ['b', 0.75382517568058]]
+
+First differing element 0:
+['a', 0.21772010539904393]
+['a', 0.8145200573753216]
+
+- [['a', 0.21772010539904393], ['b', 0.23382944055188795]]
++ [['a', 0.8145200573753216], ['b', 0.75382517568058]]
+
+======================================================================
+FAIL: test_failed_script_preserves_rows_scores_and_top_result (test_fts_transaction_stats.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) (backend='rocksdb')
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "/tmp/mnestic-019-fts/cozo-lib-python/tests/test_fts_transaction_stats.py", line 41, in test_failed_script_preserves_rows_scores_and_top_result
+    self.assertEqual(run(QUERY), before)
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
+AssertionError: Lists differ: [['a', 0.21772010539904393], ['b', 0.23382944055188795]] != [['a', 0.8145200573753216], ['b', 0.75382517568058]]
+
+First differing element 0:
+['a', 0.21772010539904393]
+['a', 0.8145200573753216]
+
+- [['a', 0.21772010539904393], ['b', 0.23382944055188795]]
++ [['a', 0.8145200573753216], ['b', 0.75382517568058]]
+
+----------------------------------------------------------------------
+Ran 1 test in 0.074s
+
+FAILED (failures=3)

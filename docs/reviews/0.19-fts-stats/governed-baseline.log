@@ -1,0 +1,33 @@
+   Compiling mnestic v0.18.0 (/private/tmp/mnestic-019-fts/cozo-core)
+    Finished `test` profile [unoptimized] target(s) in 4.25s
+     Running tests/fts_governed_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_governed_stats-c7335551699179f0)
+
+running 2 tests
+test mem_governed_fts_and_hybrid_follow_transaction_outcome ... FAILED
+test sqlite_governed_fts_and_hybrid_follow_transaction_outcome ... FAILED
+
+failures:
+
+---- mem_governed_fts_and_hybrid_follow_transaction_outcome stdout ----
+
+thread 'mem_governed_fts_and_hybrid_follow_transaction_outcome' (2115091) panicked at cozo-core/tests/fts_governed_stats.rs:103:9:
+assertion `left == right` failed: mem: Abort
+  left: [["a", 0.21772010539904393], ["b", 0.23382944055188795]]
+ right: [["a", 0.8145200573753216], ["b", 0.75382517568058]]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- sqlite_governed_fts_and_hybrid_follow_transaction_outcome stdout ----
+
+thread 'sqlite_governed_fts_and_hybrid_follow_transaction_outcome' (2115092) panicked at cozo-core/tests/fts_governed_stats.rs:103:9:
+assertion `left == right` failed: sqlite: Abort
+  left: [["a", 0.21772010539904393], ["b", 0.23382944055188795]]
+ right: [["a", 0.8145200573753216], ["b", 0.75382517568058]]
+
+
+failures:
+    mem_governed_fts_and_hybrid_follow_transaction_outcome
+    sqlite_governed_fts_and_hybrid_follow_transaction_outcome
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p mnestic --test fts_governed_stats`

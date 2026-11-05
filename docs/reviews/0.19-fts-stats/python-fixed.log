@@ -1,0 +1,6 @@
+test_failed_script_preserves_rows_scores_and_top_result (__main__.FtsTransactionStats.test_failed_script_preserves_rows_scores_and_top_result) ... ok
+
+----------------------------------------------------------------------
+Ran 1 test in 0.056s
+
+OK

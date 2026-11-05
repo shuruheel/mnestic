@@ -24,7 +24,7 @@ fn setup(db: &DbInstance) {
     );
     run(db, &format!(
         "?[id,body] <- [['a','alpha alpha {}'],['b','alpha pad pad'],['c','{}']] :put doc {{id=>body}}",
-        vec!["pad";8].join(" "), vec!["pad";100].join(" ")
+        ["pad"; 8].join(" "), ["pad"; 100].join(" ")
     ));
 }
 

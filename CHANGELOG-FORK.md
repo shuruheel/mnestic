@@ -19,6 +19,16 @@ provenance and licensing.
 
 ### Fixed
 
+- FTS document counts and average lengths now follow the querying transaction's
+  posting snapshot and pending writes. Aborts and failed commits no longer leak
+  speculative statistics into subsequent scores or top-k results; old RocksDB
+  readers cannot overwrite current statistics. Successful serialized writes retain
+  the warm cache path, while overlapping snapshots may rescan postings. An
+  incomplete FTS posting mutation prevents commit until a complete rebuild restores
+  consistency. Ranking formulas and storage format are unchanged. Contributed by
+  GrumpyChubbyCat in [PR #69](https://github.com/shuruheel/mnestic/pull/69); see the
+  [transactional statistics contract](docs/specs/fts-transaction-stats.md).
+
 - `::warnings` reads and clears the in-memory ring without opening a storage
   transaction. It no longer waits behind an active multi-transaction on memory
   or SQLite backends, which could otherwise stall inspection until idle expiry.
