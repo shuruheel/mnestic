@@ -4,6 +4,8 @@ Status: implemented locally, explicitly selected for 0.19 by the owner; release
 qualification and timing gates remain pending.
 This supersedes the earlier investigation-only scope for the demonstrated mutation
 defect. Filtered-search redesign and E1–E3 timings remain separate.
+The [validation record](../reviews/2026-11-05-hnsw-mutation-repair.md) pins source
+`e606c661`, tests, independent review and the packaged-crate smoke.
 
 ## Invariant and algorithm
 

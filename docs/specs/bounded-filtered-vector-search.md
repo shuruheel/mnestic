@@ -181,6 +181,9 @@ not silently stand in for the repaired release campaign.
    Validate degree/pruning, entry-point and vector-identity invariants, repeated
    mutations, rollback/failed commit and persistent reopen on SQLite/RocksDB.
    Full-neighbor reconnection is not selected without bounded update-cost analysis.
+   Follow-up: the owner-approved [mutation repair](hnsw-mutation-repair.md) is now
+   implemented at `e606c661`, with local correctness validation. Performance and
+   the broader bounded-search prototype remain separate pending work.
 3. **Bounded exact prototype:** instrument all ledgers and test exact ordering,
    empty/fewer-than-k, duplicate/missing/composite keys, predicate intersection,
    dtype/dimension/invalid values, snapshot overlap and read-your-writes.

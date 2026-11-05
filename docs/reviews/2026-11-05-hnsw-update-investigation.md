@@ -1,7 +1,11 @@
 # HNSW update omission: graph disconnection
 
-Status: cause established for the retained tiny fixtures; engine repair is not
-implemented. Exact eligible-key retrieval is verified on both packages. This is
+Historical investigation record. The subsequent owner-approved repair is
+implemented at `e606c661`; see its [validation](2026-11-05-hnsw-mutation-repair.md).
+The fixtures and observations below retain the pre-repair package identities.
+
+Status at investigation: cause established for the retained tiny fixtures;
+engine repair was not yet implemented. Exact eligible-key retrieval is verified on both packages. This is
 correctness investigation only. E1–E3 timings remain deferred to the owner's quiet
 window. The [bounded-search contract](../specs/bounded-filtered-vector-search.md)
 separates query filtering from graph maintenance.

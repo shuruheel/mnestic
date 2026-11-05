@@ -1,0 +1,61 @@
+{
+  "source_sha": "e606c661b3a863f6372789aee466ffb68c7d35ba",
+  "pre_repair_source": "65e77767",
+  "rustc": "1.98.0 (88d9e12ae 2026-08-18)",
+  "host": "aarch64-apple-darwin",
+  "native_features": [
+    "default/compact",
+    "storage-rocksdb",
+    "test-hooks"
+  ],
+  "native_profile": "debug; debug-info=0; incremental=0; jobs=2; compatible prebuilt debug RocksDB bridge",
+  "library_passed": 398,
+  "integration_passed": 85,
+  "ignored": {
+    "hnsw_nonblocking_build::measure_reader_unblock": "timing run deferred"
+  },
+  "mutation_matrix": {
+    "engines": [
+      "mem",
+      "sqlite",
+      "rocksdb"
+    ],
+    "mutations": 7,
+    "fresh_builds_per_case": 10,
+    "total_fixtures": 210,
+    "ef": [
+      50,
+      1600
+    ],
+    "k": 30,
+    "hnsw_rng": "uncontrolled; regression coverage only"
+  },
+  "performance": "E1-E3 deferred; no performance/recall-rate estimate accepted",
+  "crate": {
+    "path": "release/0.19-qualification/e606c661/crate/mnestic-0.18.0.crate",
+    "sha256": "dac07a2d2b5805b48f9f0252e8ae293811f2654243aeaf4a36e246a566d3094b",
+    "source_verified": true,
+    "independent_extracted_host": "SQLite bridge-deletion smoke passed; fresh Cargo.lock; no dependency overrides"
+  },
+  "source_files": {
+    "cozo-core/src/runtime/hnsw.rs": "03b61366db6d6084f8515bab1120c7d405f8c983d0b911f59503d8bbe428d454",
+    "cozo-core/src/runtime/hnsw/repair.rs": "6246c0af25314c869481664b63b93cdfb74fddac4e7f9d0563b709106c811b55",
+    "cozo-core/src/runtime/db.rs": "0b15e00ddab472619ece53a95e424263075a84fbdd3da10fc3b169a7f98a3220",
+    "cozo-core/src/runtime/transact.rs": "ab426cd12f4b37d789807b703b0ae693fdc52724ebeb05de88cd913244583872",
+    "cozo-core/src/runtime/relation.rs": "aab52aad0b3a58916e169fcdc3a7e5741c6e33bfc8cd2fdedf74dd05101bc800",
+    "cozo-core/src/query/stored.rs": "b7b0e951dc9a8929defee9d02ae2a52a98977adcca1713f36ff5bd1e7f24c56b",
+    "cozo-core/tests/hnsw_mutation_repair.rs": "4dba05445f304ff1b0c2f62ed65497e7f7749ddf8a723769a690d963517467f1"
+  },
+  "files": {
+    "before.log": "92d9fb471b4db9323ee56faaa31b9354843348d3c017a55326291990444e4113",
+    "clippy.log": "6d0ce35694990fc34379977c41af7da62c757e47cf005a5b9675709eccbe2cb0",
+    "host-Cargo.lock": "7952051fa5dbb88b0584cafdfe1d324c752866e807d4c9761843eaab1e2b725e",
+    "host-Cargo.toml": "1c7fb86c3c61855ab5fd174609942a3619ea0a700baa4e8b472616c17a6491a2",
+    "host-main.rs": "374e32bd73f8a05e4f0a54986ea49f3348e7db844d5c8ca5adfa6514707723aa",
+    "host.log": "3ef83fa4e5e332fca5c71aa088f2a543d2c26adb107516228ac25a859ec27e21",
+    "minimal.log": "7167bbfbe252bee53e57eb4480a551f88dfcf3b738ad4a243f0ae02c8e0b7033",
+    "native.log": "ed31f4e77654f7729c840d8498cc590bb8937cf290bdf08f6f1cd2a31a7620eb",
+    "package.log": "c087a5eb472bb1a3ec35e9e51239662fe9259a426a3f9e630a8bfc55a2952cd6"
+  },
+  "log_normalization": "Removed trailing blank line from native.log; all substantive output retained."
+}
