@@ -19,6 +19,12 @@ struct PruningWitnesses {
     steps_left: usize,
 }
 
+struct WitnessOverlay<'a> {
+    keys: &'a [CompoundKey],
+    positions: &'a FxHashMap<CompoundKey, usize>,
+    edges: &'a [Vec<bool>],
+}
+
 impl Default for PruningWitnesses {
     fn default() -> Self {
         Self {
@@ -72,6 +78,7 @@ fn reachable(edges: &[Vec<bool>], from: usize, to: usize, work: &mut usize) -> R
 // Only new edges may be removed. Every removal preserves all existing paths by
 // replacing that edge with a surviving path. Distance ordering is a heuristic;
 // the reachability test, not that heuristic, establishes the safety condition.
+#[cfg(test)]
 fn prune_bypasses(
     edges: &mut [Vec<bool>],
     added: &[(usize, usize, f64)],
@@ -183,13 +190,14 @@ impl SessionTx<'_> {
                     &keys[i],
                     sources,
                     &mut witnesses,
+                    None,
                 )? {
                     edges[n][i] = false;
                     degrees[n] -= 1;
                 }
             }
             if degrees[n] > cap {
-                return Err(limit("degree cap cannot preserve bypass paths"));
+                return Err(limit("insertion degree cap cannot preserve bypass paths"));
             }
         }
         let mut ret = PriorityQueue::new();
@@ -201,6 +209,7 @@ impl SessionTx<'_> {
         Ok(ret)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn hnsw_pruning_witness(
         &self,
         table: &RelationHandle,
@@ -209,6 +218,7 @@ impl SessionTx<'_> {
         destination: &CompoundKey,
         sources: Vec<CompoundKey>,
         witnesses: &mut PruningWitnesses,
+        overlay: Option<&WitnessOverlay<'_>>,
     ) -> Result<bool> {
         let mut seen: FxHashSet<_> = sources.iter().cloned().collect();
         let mut pending: std::collections::VecDeque<_> = sources.into();
@@ -228,7 +238,26 @@ impl SessionTx<'_> {
                     .collect();
                 witnesses.adjacency.insert(node.clone(), neighbours);
             }
-            for next in &witnesses.adjacency[&node] {
+            let stored = &witnesses.adjacency[&node];
+            let neighbours: Vec<_> = if let Some((plan, from)) =
+                overlay.and_then(|plan| plan.positions.get(&node).map(|&i| (plan, i)))
+            {
+                // Incident-to-incident edges come from the current plan: some
+                // bypasses are not stored yet, and earlier ones were pruned.
+                plan.edges[from]
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(j, live)| live.then_some(&plan.keys[j]))
+                    .chain(
+                        stored
+                            .iter()
+                            .filter(|key| !plan.positions.contains_key(*key)),
+                    )
+                    .collect()
+            } else {
+                stored.iter().collect()
+            };
+            for next in neighbours {
                 witnesses.steps_left = witnesses
                     .steps_left
                     .checked_sub(1)
@@ -322,7 +351,8 @@ impl SessionTx<'_> {
         layer: i64,
         node: &CompoundKey,
     ) -> Result<Vec<(CompoundKey, bool)>> {
-        self.repair_neighbours_with_budget(table, layer, node, &mut usize::MAX)
+        let mut rows_left = usize::MAX;
+        self.repair_neighbours_with_budget(table, layer, node, &mut rows_left)
     }
 
     fn repair_neighbours_with_budget(
@@ -449,7 +479,37 @@ impl SessionTx<'_> {
         } else {
             manifest.m_max
         };
-        prune_bypasses(&mut edges, &added, &mut degrees, cap)?;
+        prune_redundant_edges(&mut edges, &added, &mut degrees, cap)?;
+        if degrees.iter().any(|&degree| degree > cap) {
+            let mut witnesses = PruningWitnesses::default();
+            for &(from, to, _) in &added {
+                if degrees[from] <= cap || !edges[from][to] {
+                    continue;
+                }
+                edges[from][to] = false;
+                let plan = WitnessOverlay {
+                    keys: &keys,
+                    positions: &positions,
+                    edges: &edges,
+                };
+                if self.hnsw_pruning_witness(
+                    table,
+                    layer,
+                    node,
+                    &keys[to],
+                    vec![keys[from].clone()],
+                    &mut witnesses,
+                    Some(&plan),
+                )? {
+                    degrees[from] -= 1;
+                } else {
+                    edges[from][to] = true;
+                }
+            }
+            if degrees.iter().any(|&degree| degree > cap) {
+                return Err(limit("removal degree cap cannot preserve bypass paths"));
+            }
+        }
         for (from, to, distance) in added {
             if !edges[from][to] {
                 continue;
@@ -752,6 +812,163 @@ mod tests {
     }
 
     #[test]
+    fn removal_uses_external_witness_without_losing_survivor_paths() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "?[id,v]<-[[0,[0,0]],[1,[-1,0]],[2,[10,0]],[3,[0,1]],[4,[5,0]]] :put p{id=>v}",
+        );
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:8,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, mut manifest) = orig.hnsw_indices.get("g").unwrap().clone();
+        for row in table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap() {
+            let key = table
+                .encode_key_for_store(&row[..table.metadata.keys.len()], Default::default())
+                .unwrap();
+            tx.idx_del(&table, &key).unwrap();
+        }
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        let links = [(1, 0), (0, 2), (0, 3), (1, 4), (4, 2)];
+        for id in 0..5 {
+            let row = orig.get(&tx, &[DataValue::from(id)]).unwrap().unwrap();
+            let DataValue::Vec(v) = &row[1] else {
+                unreachable!()
+            };
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(id),
+                &node(id),
+                &[
+                    DataValue::from(links.iter().filter(|(from, _)| *from == id).count() as f64),
+                    DataValue::Bytes(v.get_hash().as_ref().to_vec()),
+                    DataValue::from(false),
+                ],
+            )
+            .unwrap();
+        }
+        for (from, to) in links {
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(from),
+                &node(to),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(false)],
+            )
+            .unwrap();
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(to),
+                &node(from),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+            )
+            .unwrap();
+        }
+        // Reuse stored-adjacency cache while changing the plan. Neither a
+        // previously planned bypass nor a stored incident edge may reappear.
+        let keys: Vec<_> = (1..5).map(node).collect();
+        let positions = keys
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, key)| (key, i))
+            .collect();
+        let mut edges = vec![vec![false; 4]; 4];
+        edges[0][3] = true; // stored 1 -> 4
+        edges[3][1] = true; // stored 4 -> 2
+        edges[0][2] = true; // planned 1 -> 3
+        let mut witnesses = PruningWitnesses::default();
+        for (destination, expected) in [(3, true), (3, false), (2, true), (2, false)] {
+            let plan = WitnessOverlay {
+                keys: &keys,
+                positions: &positions,
+                edges: &edges,
+            };
+            assert_eq!(
+                tx.hnsw_pruning_witness(
+                    &table,
+                    0,
+                    &node(0),
+                    &node(destination),
+                    vec![node(1)],
+                    &mut witnesses,
+                    Some(&plan),
+                )
+                .unwrap(),
+                expected,
+            );
+            if destination == 3 {
+                edges[0][2] = false;
+            } else {
+                edges[3][1] = false;
+            }
+        }
+        manifest.m_max0 = 2;
+        let mut cache = VectorCache {
+            cache: Default::default(),
+            distance: manifest.distance,
+        };
+        tx.hnsw_remove_vec(
+            &[DataValue::from(0)],
+            1,
+            -1,
+            &manifest,
+            &orig,
+            &table,
+            &mut cache,
+        )
+        .unwrap();
+        assert!(tx
+            .repair_edge_value(&table, 0, &node(1), &node(2))
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            tx.repair_edge_value(&table, 0, &node(1), &node(3))
+                .unwrap()
+                .unwrap()[2],
+            DataValue::from(false)
+        );
+        assert_eq!(
+            tx.repair_edge_value(&table, 0, &node(3), &node(1))
+                .unwrap()
+                .unwrap()[2],
+            DataValue::from(true)
+        );
+        for id in 1..5 {
+            let neighbours: Vec<_> = tx
+                .hnsw_get_neighbours(&node(id), 0, &table, false)
+                .unwrap()
+                .collect();
+            assert!(neighbours.len() <= 2);
+            let stored = tx
+                .repair_edge_value(&table, 0, &node(id), &node(id))
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored[0].get_float().unwrap() as usize, neighbours.len());
+            assert!(neighbours.iter().all(|(key, _)| key != &node(0)));
+        }
+        let seen = tx
+            .hnsw_get_neighbours(&node(1), 0, &table, false)
+            .unwrap()
+            .map(|(key, _)| key)
+            .collect::<FxHashSet<_>>();
+        assert!(seen.contains(&node(3)) && seen.contains(&node(4)));
+        assert!(tx
+            .hnsw_get_neighbours(&node(4), 0, &table, false)
+            .unwrap()
+            .any(|(key, _)| key == node(2)));
+    }
+
+    #[test]
     fn incremental_pruning_finds_external_witness_without_changing_edges() {
         let db = crate::DbInstance::new("mem", "", "").unwrap();
         script(&db, ":create p {id:Int=>v:<F32;2>}");
@@ -818,7 +1035,15 @@ mod tests {
             ..Default::default()
         };
         let error = tx
-            .hnsw_pruning_witness(table, 0, &node(0), &node(2), vec![node(1)], &mut budget)
+            .hnsw_pruning_witness(
+                table,
+                0,
+                &node(0),
+                &node(2),
+                vec![node(1)],
+                &mut budget,
+                None,
+            )
             .unwrap_err();
         assert!(error.to_string().contains("witness adjacency rows"));
         // An ignored edge is bookkeeping, never a valid witness.

@@ -17,7 +17,12 @@ At each layer, collect the incident vertices before removing x. Read both active
 edge directions: ignored reverse records are bookkeeping, not traversable edges.
 For every active incoming u->x and outgoing x->v, consider u->v as a bypass.
 Keep existing edges untouched. Prune an added bypass only if the affected local
-graph still supplies an alternate directed path from its source to its target.
+graph or a bounded external search supplies an alternate directed path from its
+source to its target. External searches exclude the removed vertex and use the
+current repair plan for edges between incident vertices, including uncommitted
+bypasses and excluding previously pruned bypasses. Stored edges outside that
+plan remain available as witnesses. Each removal therefore preserves paths in
+the graph that will actually be written, rather than in a stale adjacency cache.
 Check remaining outgoing degrees against the manifest's layer-specific cap.
 If the cap cannot be met, fail with `hnsw::repair_limit`; do not commit a degraded
 graph. All bypass distances use the existing metric and current vector identities.
@@ -51,7 +56,8 @@ They must never silently truncate the neighborhood or skip a required connection
 The external-path fallback additionally caps cached/visited vertices at 1,024,
 physical adjacency rows read at 16,384, and traversed adjacency entries at
 1,048,576. Row and traversal budgets are shared across all witness attempts in
-one pruning call; each individual scan retains the 4,096-row cap. These bounds
+one insertion-pruning or removal-repair call; each individual scan retains the
+4,096-row cap. These bounds
 are additional to the immediate-neighborhood proof, not whole-transaction limits.
 The component check is per layer, not a cache-wide ledger: vectors retained across
 layers and the reconciliation snapshot cache are outside that cap. This repair
@@ -102,7 +108,8 @@ a recovery strategy. No production database is rebuilt by the release itself.
 - Pruning checks demonstrate an alternate path survives; infeasible degree/work
   cases fail without committed base or graph changes.
 - An existing alternate path outside the immediate neighbourhood is recognized;
-  ignored edges are excluded and witness-budget exhaustion remains explicit.
+  insertion pruning and removal repair both cover this case. Ignored edges are
+  excluded and witness-budget exhaustion remains explicit.
 - Review insertion pruning interaction and partial legacy-transaction errors.
 - Run HNSW/reindex/hybrid and transaction regressions and strict Clippy. Retain
   immutable fix SHA and independent storage-contract review before delivery.
