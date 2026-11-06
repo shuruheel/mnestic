@@ -10,6 +10,24 @@ const MAX_ADJACENCY_ROWS: usize = 4096;
 const MAX_VECTOR_COMPONENTS: usize = 1_048_576;
 const MAX_DISTANCE_COMPONENTS: usize = 16_777_216;
 const MAX_REACH_STEPS: usize = 1_048_576;
+const MAX_WITNESS_VERTICES: usize = 1024;
+const MAX_WITNESS_ROWS: usize = 16_384;
+
+struct PruningWitnesses {
+    adjacency: FxHashMap<CompoundKey, Vec<CompoundKey>>,
+    rows_left: usize,
+    steps_left: usize,
+}
+
+impl Default for PruningWitnesses {
+    fn default() -> Self {
+        Self {
+            adjacency: FxHashMap::default(),
+            rows_left: MAX_WITNESS_ROWS,
+            steps_left: MAX_REACH_STEPS,
+        }
+    }
+}
 
 #[derive(Debug, Error, Diagnostic)]
 #[error("HNSW mutation repair limit: {0}; abort the mutation and rebuild the index or reduce the mutation scope")]
@@ -60,6 +78,19 @@ fn prune_bypasses(
     degrees: &mut [usize],
     cap: usize,
 ) -> Result<()> {
+    prune_redundant_edges(edges, added, degrees, cap)?;
+    if degrees.iter().any(|&degree| degree > cap) {
+        return Err(limit("degree cap cannot preserve bypass paths"));
+    }
+    Ok(())
+}
+
+fn prune_redundant_edges(
+    edges: &mut [Vec<bool>],
+    added: &[(usize, usize, f64)],
+    degrees: &mut [usize],
+    cap: usize,
+) -> Result<()> {
     let mut work = MAX_REACH_STEPS;
     for &(from, to, _) in added {
         if degrees[from] <= cap {
@@ -71,9 +102,6 @@ fn prune_bypasses(
         } else {
             edges[from][to] = true;
         }
-    }
-    if degrees.iter().any(|&degree| degree > cap) {
-        return Err(limit("degree cap cannot preserve bypass paths"));
     }
     Ok(())
 }
@@ -128,7 +156,42 @@ impl SessionTx<'_> {
         });
         let mut degrees = vec![0; n + 1];
         degrees[n] = n;
-        prune_bypasses(&mut edges, &removable, &mut degrees, cap)?;
+        prune_redundant_edges(&mut edges, &removable, &mut degrees, cap)?;
+        if degrees[n] > cap {
+            // An induced neighbourhood can hide an existing alternate path.
+            // Search beyond it only when the cheap local proof is insufficient.
+            // These witnesses never visit target, so removing its outgoing
+            // edges cannot invalidate a cached witness adjacency.
+            let mut witnesses = PruningWitnesses::default();
+            for &(_, i, _) in &removable {
+                if degrees[n] <= cap {
+                    break;
+                }
+                if !edges[n][i] {
+                    continue;
+                }
+                let sources = keys
+                    .iter()
+                    .enumerate()
+                    .filter(|(j, _)| *j != i && edges[n][*j])
+                    .map(|(_, key)| key.clone())
+                    .collect();
+                if self.hnsw_pruning_witness(
+                    table,
+                    layer,
+                    target,
+                    &keys[i],
+                    sources,
+                    &mut witnesses,
+                )? {
+                    edges[n][i] = false;
+                    degrees[n] -= 1;
+                }
+            }
+            if degrees[n] > cap {
+                return Err(limit("degree cap cannot preserve bypass paths"));
+            }
+        }
         let mut ret = PriorityQueue::new();
         for (_, i, d) in removable {
             if edges[n][i] {
@@ -136,6 +199,49 @@ impl SessionTx<'_> {
             }
         }
         Ok(ret)
+    }
+
+    fn hnsw_pruning_witness(
+        &self,
+        table: &RelationHandle,
+        layer: i64,
+        target: &CompoundKey,
+        destination: &CompoundKey,
+        sources: Vec<CompoundKey>,
+        witnesses: &mut PruningWitnesses,
+    ) -> Result<bool> {
+        let mut seen: FxHashSet<_> = sources.iter().cloned().collect();
+        let mut pending: std::collections::VecDeque<_> = sources.into();
+        while let Some(node) = pending.pop_front() {
+            if &node == destination {
+                return Ok(true);
+            }
+            if !witnesses.adjacency.contains_key(&node) {
+                if witnesses.adjacency.len() >= MAX_WITNESS_VERTICES {
+                    return Err(limit("pruning witness vertices"));
+                }
+                let neighbours = self
+                    .repair_neighbours_with_budget(table, layer, &node, &mut witnesses.rows_left)?
+                    .into_iter()
+                    .filter(|(key, live)| *live && key != target)
+                    .map(|(key, _)| key)
+                    .collect();
+                witnesses.adjacency.insert(node.clone(), neighbours);
+            }
+            for next in &witnesses.adjacency[&node] {
+                witnesses.steps_left = witnesses
+                    .steps_left
+                    .checked_sub(1)
+                    .ok_or_else(|| limit("pruning witness reachability work"))?;
+                if seen.insert(next.clone()) {
+                    if seen.len() > MAX_WITNESS_VERTICES {
+                        return Err(limit("pruning witness vertices"));
+                    }
+                    pending.push_back(next.clone());
+                }
+            }
+        }
+        Ok(false)
     }
 
     /// During build reconciliation the base relation is already newer than the
@@ -216,6 +322,16 @@ impl SessionTx<'_> {
         layer: i64,
         node: &CompoundKey,
     ) -> Result<Vec<(CompoundKey, bool)>> {
+        self.repair_neighbours_with_budget(table, layer, node, &mut usize::MAX)
+    }
+
+    fn repair_neighbours_with_budget(
+        &self,
+        table: &RelationHandle,
+        layer: i64,
+        node: &CompoundKey,
+        rows_left: &mut usize,
+    ) -> Result<Vec<(CompoundKey, bool)>> {
         let mut prefix = vec![DataValue::from(layer)];
         prefix.extend_from_slice(&node.0);
         prefix.push(DataValue::from(node.1 as i64));
@@ -226,6 +342,9 @@ impl SessionTx<'_> {
             if count >= MAX_ADJACENCY_ROWS {
                 return Err(limit("adjacency rows"));
             }
+            *rows_left = rows_left
+                .checked_sub(1)
+                .ok_or_else(|| limit("pruning witness adjacency rows"))?;
             let row = row?;
             if row.len() != 2 * n + 8 {
                 bail!("corrupt HNSW edge row during repair");
@@ -630,6 +749,91 @@ mod tests {
             }
             assert_eq!(visited.len(), 6, "reachability from {id}");
         }
+    }
+
+    #[test]
+    fn incremental_pruning_finds_external_witness_without_changing_edges() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "?[id,v]<-[[0,[0,0]],[1,[-1,0]],[2,[10,0]],[3,[0,1]],[4,[5,0]]] :put p{id=>v}",
+        );
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:8,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, _) = orig.hnsw_indices.get("g").unwrap();
+        for row in table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap() {
+            let key = table
+                .encode_key_for_store(&row[..table.metadata.keys.len()], Default::default())
+                .unwrap();
+            tx.idx_del(table, &key).unwrap();
+        }
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        // No path between 1,2,3 is visible in their induced subgraph. But
+        // 0->1->4->2 makes 0->2 redundant in the actual graph.
+        for (from, to) in [
+            (0, 1),
+            (1, 0),
+            (0, 2),
+            (2, 0),
+            (0, 3),
+            (3, 0),
+            (1, 4),
+            (4, 2),
+        ] {
+            tx.repair_put_edge(
+                table,
+                0,
+                &node(from),
+                &node(to),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(false)],
+            )
+            .unwrap();
+        }
+        let candidates = (1..4).map(|id| (node(id), OrderedFloat(1.))).collect();
+        let preferred = [1, 3]
+            .into_iter()
+            .map(|id| (node(id), Reverse(OrderedFloat(1.))))
+            .collect();
+        let before = table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap();
+        let kept = tx
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2)
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.get_priority(&node(1)).is_some());
+        assert!(kept.get_priority(&node(3)).is_some());
+        assert_eq!(
+            before,
+            table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap()
+        );
+        let mut budget = PruningWitnesses {
+            rows_left: 0,
+            ..Default::default()
+        };
+        let error = tx
+            .hnsw_pruning_witness(table, 0, &node(0), &node(2), vec![node(1)], &mut budget)
+            .unwrap_err();
+        assert!(error.to_string().contains("witness adjacency rows"));
+        // An ignored edge is bookkeeping, never a valid witness.
+        tx.repair_put_edge(
+            table,
+            0,
+            &node(4),
+            &node(2),
+            &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+        )
+        .unwrap();
+        let error = tx
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2)
+            .unwrap_err();
+        assert!(error.to_string().contains("degree cap"));
     }
 
     #[test]

@@ -28,10 +28,18 @@ the complete (row key, field, subindex), so list/vector-column siblings remain
 distinct. Vector replacement uses this same removal path before reinsertion.
 
 Incremental insertion/replacement pruning also preserves paths: it only removes
-an outgoing edge when the local neighborhood supplies an alternate route. It
+an outgoing edge when a checked alternate route survives. It
 uses the existing selection heuristic as a preference, retaining necessary edges.
+All selected bidirectional insertion links are installed before pruning, so the
+proof sees the complete new layer. Pruning first checks the immediate neighborhood.
+If that induced subgraph is insufficient, a bounded breadth-first search may prove
+an existing route through external vertices. It starts from currently retained
+outgoing neighbours and never visits the pruning target. Cached witness adjacency
+is therefore independent of earlier outgoing-edge removals within the same pass.
+The fallback only reads existing edges; it adds no connections and never traverses
+ignored reverse records. Missing proof or exhausted work still rejects the mutation.
 Shrinking selects from existing outgoing neighbors, matching the bulk builder's
-no-extension policy. An infeasible local degree constraint fails explicitly; this
+no-extension policy. An infeasible bounded degree constraint fails explicitly; this
 can also reject a fresh incremental insertion rather than disconnect a leaf.
 
 Repair is bounded by 256 incident/pruning vertices, 4,096 physical rows per
@@ -40,6 +48,11 @@ per layer repair and 1,048,576 adjacency checks per pruning pass. Exceeding
 a limit returns the same structured diagnostic with a reason. These are local
 repair work bounds, not a statement RSS limit or a hard wall-clock guarantee.
 They must never silently truncate the neighborhood or skip a required connection.
+The external-path fallback additionally caps cached/visited vertices at 1,024,
+physical adjacency rows read at 16,384, and traversed adjacency entries at
+1,048,576. Row and traversal budgets are shared across all witness attempts in
+one pruning call; each individual scan retains the 4,096-row cap. These bounds
+are additional to the immediate-neighborhood proof, not whole-transaction limits.
 The component check is per layer, not a cache-wide ledger: vectors retained across
 layers and the reconciliation snapshot cache are outside that cap. This repair
 does not complete the separate end-to-end search memory-accounting contract.
@@ -88,6 +101,8 @@ a recovery strategy. No production database is rebuilt by the release itself.
   and persistent reopen pass on SQLite and RocksDB.
 - Pruning checks demonstrate an alternate path survives; infeasible degree/work
   cases fail without committed base or graph changes.
+- An existing alternate path outside the immediate neighbourhood is recognized;
+  ignored edges are excluded and witness-budget exhaustion remains explicit.
 - Review insertion pruning interaction and partial legacy-transaction errors.
 - Run HNSW/reindex/hybrid and transaction regressions and strict Clippy. Retain
   immutable fix SHA and independent storage-contract review before delivery.
