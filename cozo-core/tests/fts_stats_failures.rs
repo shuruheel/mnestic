@@ -63,12 +63,14 @@ impl<'s> StoreTx<'s> for FaultTx<'s> {
         self.inner.put(key, value)
     }
     fn del(&mut self, key: &[u8]) -> Result<()> {
-        if self
+        // Rust 1.99 renamed this to try_update; keep the fixture compatible
+        // with the project's Rust 1.98 development toolchain as well.
+        #[allow(deprecated)]
+        let previous = self
             .faults
             .delete_countdown
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
-            == Ok(1)
-        {
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1));
+        if previous == Ok(1) {
             bail!("injected posting deletion failure");
         }
         self.inner.del(key)
