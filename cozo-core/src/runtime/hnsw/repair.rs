@@ -541,6 +541,98 @@ mod tests {
     }
 
     #[test]
+    fn insertion_prunes_after_installing_all_selected_links() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(&db, "?[id,v]<-[[0,[0,0]],[1,[1,0]],[2,[-1,0]],[3,[0,1]],[4,[0,-1]],[5,[0.1,0.1]]] :put p{id=>v}");
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:8,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, mut manifest) = orig.hnsw_indices.get("g").unwrap().clone();
+        for row in table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap() {
+            let key = table
+                .encode_key_for_store(&row[..table.metadata.keys.len()], Default::default())
+                .unwrap();
+            tx.idx_del(&table, &key).unwrap();
+        }
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        // A full star has no redundant edges until the new vertex's links to
+        // multiple leaves exist. The centre is the first selected neighbour.
+        for id in 0..5 {
+            let row = orig.get(&tx, &[DataValue::from(id)]).unwrap().unwrap();
+            let DataValue::Vec(v) = &row[1] else {
+                unreachable!()
+            };
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(id),
+                &node(id),
+                &[
+                    DataValue::from(if id == 0 { 4. } else { 1. }),
+                    DataValue::Bytes(v.get_hash().as_ref().to_vec()),
+                    DataValue::from(false),
+                ],
+            )
+            .unwrap();
+            if id != 0 {
+                for (from, to) in [(0, id), (id, 0)] {
+                    tx.repair_put_edge(
+                        &table,
+                        0,
+                        &node(from),
+                        &node(to),
+                        &[DataValue::from(1.), DataValue::Null, DataValue::from(false)],
+                    )
+                    .unwrap();
+                }
+            }
+        }
+        manifest.m_max0 = 4;
+        manifest.keep_pruned_connections = true;
+        let row = orig.get(&tx, &[DataValue::from(5)]).unwrap().unwrap();
+        let DataValue::Vec(v) = &row[1] else {
+            unreachable!()
+        };
+        let mut cache = VectorCache {
+            cache: Default::default(),
+            distance: manifest.distance,
+        };
+        tx.hnsw_put_vector(&row, v, 1, -1, &manifest, &orig, &table, &mut cache)
+            .unwrap();
+        for id in 0..6 {
+            let actual = tx
+                .hnsw_get_neighbours(&node(id), 0, &table, false)
+                .unwrap()
+                .count();
+            let stored = tx
+                .repair_edge_value(&table, 0, &node(id), &node(id))
+                .unwrap()
+                .unwrap();
+            assert!(actual <= 4);
+            assert_eq!(stored[0].get_float().unwrap() as usize, actual);
+            let mut visited = std::collections::BTreeSet::new();
+            let mut pending = vec![node(id)];
+            while let Some(current) = pending.pop() {
+                if visited.insert(current.clone()) {
+                    pending.extend(
+                        tx.hnsw_get_neighbours(&current, 0, &table, false)
+                            .unwrap()
+                            .map(|(key, _)| key),
+                    );
+                }
+            }
+            assert_eq!(visited.len(), 6, "reachability from {id}");
+        }
+    }
+
+    #[test]
     fn incremental_pruning_refuses_to_strand_a_leaf() {
         let db = crate::DbInstance::new("mem", "", "").unwrap();
         script(&db, ":create p {id:Int=>v:<F32;2>}");
