@@ -75,12 +75,13 @@ jobs:
           # aarch64 needs the 2_28 image: the manylinux2014 cross-GCC is too old
           # to assemble ring's ARM asm (#error "ARM assembler must define __ARM_ARCH").
           - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28", features: "compact,storage-rocksdb,rdf-io,columnar-io" }
+          # macos-14 retired on 2026-11-02; use the supported macos-15 image.
           # Intel-mac runners (macos-13) are retired — jobs queue forever.
           # Cross-compile x86_64 on the arm64 runner instead (rocksdb compiles
           # via the cc crate, no cmake, so clang cross-compiles it; validated
           # locally under Rosetta).
-          - { os: macos-14,       target: x86_64,  features: "compact,storage-rocksdb,rdf-io,columnar-io" }
-          - { os: macos-14,       target: aarch64, features: "compact,storage-rocksdb,rdf-io,columnar-io" }
+          - { os: macos-15,       target: x86_64,  features: "compact,storage-rocksdb,rdf-io,columnar-io" }
+          - { os: macos-15,       target: aarch64, features: "compact,storage-rocksdb,rdf-io,columnar-io" }
           - { os: windows-latest, target: x64,     features: "compact,storage-rocksdb,rdf-io,columnar-io" }
     steps:
       - uses: actions/checkout@v4
@@ -200,7 +201,7 @@ jobs:
         platform:
           - { os: ubuntu-latest,    artifact: mnestic-wheels-ubuntu-latest-x86_64 }
           - { os: ubuntu-24.04-arm, artifact: mnestic-wheels-ubuntu-latest-aarch64 }
-          - { os: macos-14,         artifact: mnestic-wheels-macos-14-aarch64 }
+          - { os: macos-15,         artifact: mnestic-wheels-macos-15-aarch64 }
           - { os: windows-latest,   artifact: mnestic-wheels-windows-latest-x64 }
     steps:
       - uses: actions/checkout@v4
