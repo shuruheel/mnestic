@@ -136,6 +136,16 @@ jobs:
         run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --verbose
       - name: Test (governed read and write transactions)
         run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --verbose
+      - name: Test (HNSW mutation repair, reconciliation and rebuild)
+        run: >
+          cargo test -p mnestic --features storage-rocksdb,test-hooks
+          --lib runtime::hnsw
+      - name: Test (persistent HNSW mutation and rebuild contracts)
+        run: >
+          cargo test -p mnestic --features storage-rocksdb,test-hooks
+          --test hnsw_mutation_repair --test hnsw_build --test hnsw_correctness
+          --test hnsw_nonblocking_build --test reindex --test hybrid_helper
+          --verbose
       - name: Test (columnar rollback and concurrency on RocksDB)
         run: >
           cargo test -p mnestic

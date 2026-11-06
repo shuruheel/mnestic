@@ -38,6 +38,10 @@ def main(mode, directory):
             restored.restore(str(root / (backend + "-backup.db")))
             assert snapshot(restored) == expected
             restored.close()
+            # Pre-0.19 indexes may lack reverse-edge bookkeeping or already be
+            # disconnected. Exercise the documented recovery before new writes.
+            run("::reindex docs")
+            assert snapshot() == expected, "rebuild changed the upgrade fixture"
             try:
                 run("{ ?[id] <- [[1]] :rm docs {id} } { ?[x] := *missing[x] }")
             except Exception:
@@ -48,6 +52,10 @@ def main(mode, directory):
             run("?[id,text,v] <- [[4,'alpha gamma',[0.5,0.5]]] :put docs {id => text,v}")
             assert [4] in run("?[id] := ~docs:fts{id | query:'gamma',k:10}")
             run("::reindex docs")
+            run("?[id,text,v] <- [[1,'alpha replacement',[0.25,0.75]]] :put docs {id => text,v}")
+            run("?[id] <- [[2]] :rm docs {id}")
+            exact = run("?[id] := *docs{id} :order id")
+            assert run("?[id] := ~docs:vec{id | query:vec([1,0]),k:10,ef:100} :order id") == exact
             after = snapshot()
             db.close()
             db = CozoDbPy(backend, str(root / (backend + ".db")), "{}")
