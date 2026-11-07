@@ -129,7 +129,9 @@ impl SessionTx<'_> {
         let mut stack = vec![];
 
         for (name, (idx_handle, _)) in rel_handle.fts_indices.iter() {
+            self.fts_stats.before_write(idx_handle.id);
             self.clear_index_relation(idx_handle)?;
+            self.fts_stats.complete_write(idx_handle.id, (0, 0), false);
             reports.push(ReindexReport {
                 index: name.clone(),
                 kind: "fts",

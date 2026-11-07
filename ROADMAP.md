@@ -40,6 +40,8 @@ release/issue descriptions retain their September 6 reconciliation date.
 ## Current state
 
 - `mnestic` 0.18.0 and `mnestic-rocks` 0.1.12 are the latest published releases.
+- `mnestic` 0.19.0 is in release preparation; its implementation is banked below.
+  Candidate qualification and the deferred E1–E3 measurements still gate publication.
 - Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
 - LangChain, LlamaIndex, LangGraph, and MCP integrations are published.
@@ -71,30 +73,47 @@ PR #80; core adoption of `v0.18.0` merged in
 [documentation update](https://github.com/shuruheel/mnestic-site/pull/3) is deployed.
 These are separately verified delivery states; no cloud deployment is implied.
 
-### 0.19 planning
+### 0.19 release preparation
 
-The [0.19 release plan](docs/plans/0.19-planning.md), updated October 30, selects
-already-merged governed native Rust multi-transactions, responsive `::warnings`,
-the promised migration-warning removal, and the E1–E3 measurement/guidance deliverables.
-**November 12, 2026 is the provisional release target; scope freezes November 5.**
-Confirm the target after the first measurement pass. Correctness and candidate-package
-validation gate publication; November 19 is the fallback checkpoint with scope frozen.
-A new filtered-vector mechanism remains conditional on evidence and review before freeze.
-See the [measurement protocol](docs/plans/0.19-measurement-protocol.md) and
-[filtered-vector investigation](docs/plans/0.19-filtered-vector-investigation.md).
+The [0.19 release plan](docs/plans/0.19-planning.md), updated November 5, selects
+native Rust governed multi-transactions, responsive `::warnings`, migration-warning
+retirement, transactional FTS statistics, HNSW mutation-connectivity repair and
+E1–E3 measurement/guidance. The code below is implemented and included in the
+0.19.0 candidate; it has not been published. The
+[0.19.0 changelog](CHANGELOG-FORK.md#0190--unreleased) owns upgrade instructions.
 
-| Work | State | Gate |
+| Banked implementation | Candidate behavior | Remaining release gate |
 |---|---|---|
-| Governed native Rust multi-transactions and responsive `::warnings` | Merged; selected for 0.19, unreleased | Validate candidate against the transaction contract, including cancellation/commit ambiguity and host worker ownership |
-| Remove temporary `parser.string_decoding_changed` warning | Scheduled for 0.19.0 | Keep the migration guidance after removing the diagnostic |
-| Remeasure the public hybrid-recall benchmark on 0.18 | Selected October 27 — measurement | Published numbers are from May on an older build; refresh `RESULTS.md` from the current build, add a filtered-query workload (type-restricted vector plus FTS) and a read-your-writes latency column |
-| Filtered vector search for selective predicates | Selected October 27 — investigation | Evidence: a consumer's type-restricted vector query over a rare type returned nothing because it post-filters a global ANN prefix. Verify and measure the inherited HNSW `filter:` path on the new workload first; add `candidates:` on HNSW (mirroring 0.17's candidate-aware FTS) only if the filter path cannot meet a bounded-widening contract with resource bounds |
-| Parse/plan cost of large vector literals and repeated query text | Selected October 27 — measurement | Consumers splice 1,000-plus-float vectors into script text per request; parameter-binding guidance first, a plan cache only on a measured high-frequency workload (existing gate) |
-| [HNSW integrity #56](https://github.com/shuruheel/mnestic/issues/56) | E4 investigation; verifier/repair not committed to 0.19 | Failure fixtures and verified invariants before a read-only verifier; reproduce a current failure before committing repair |
-| [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Deferred behind the items above | Agree warning behavior and preserve legitimate transaction-scoped relations |
-| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Deferred behind the items above | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
+| Governed native Rust multi-transactions | Host-owned worker, one deadline, bounded idle waiting, statement limits; every query error aborts | Final-candidate contract checks, including commit/cancellation ambiguity and worker admission |
+| Responsive `::warnings` | In-memory reads/clears avoid storage locks during active transactions | Final-candidate default/SQLite and RocksDB checks |
+| Transactional FTS statistics ([PR #69](https://github.com/shuruheel/mnestic/pull/69)) | Scores/top-k use the transaction's posting snapshot and pending writes | Final-candidate rollback, failed-commit, snapshot and package checks; review score-threshold changes |
+| Retirement of `parser.string_decoding_changed` | Diagnostic removed; decoding and permanent migration guidance retained | Released-0.18 result/error parity on final artifacts |
+| HNSW mutation connectivity | Preserve directed paths during removal/pruning or fail with `hnsw::repair_limit`; incomplete mutations cannot commit | Final-candidate package/upgrade qualification and workload cost/rejection measurements; rebuild old indexes explicitly |
 
-Broader HNSW, Arrow export and quantization work remains subject to the evidence gates below.
+The [HNSW validation record](docs/reviews/2026-11-05-hnsw-mutation-repair.md)
+records local correctness checks and independent review at `e606c661`. It does not
+qualify a later versioned package. Rebuild pre-0.19 HNSW indexes with
+`::reindex <relation>` after backup; validate against exact queries. The repair
+has local work caps, not total RSS/latency bounds or an exact ANN recall guarantee.
+
+**November 12, 2026 remains a provisional target**, with November 19 as the
+fallback checkpoint and scope frozen. The owner deferred timing runs to a quiet
+window. See the [measurement protocol](docs/plans/0.19-measurement-protocol.md)
+and [filtered-vector investigation](docs/plans/0.19-filtered-vector-investigation.md).
+
+| Remaining or deferred work | State | Gate |
+|---|---|---|
+| E1: refresh public hybrid-recall measurements | Awaiting quiet-window signal | Compare released 0.18 with optimized repaired-candidate artifacts; retain raw results, filtered workloads and read-your-writes latency |
+| E2: selective-vector behavior | Investigation and guidance remain required | Measure inherited HNSW `filter:` with the isolated PR #65 case and exact eligible-key oracle; retain recall/resource limitations. A new ANN mechanism is not banked scope |
+| E3: vector-literal parse/plan cost | Awaiting quiet-window signal | Compare literals with parameters at equal results; propose caching only if residual cost clears its evidence gate |
+| General HNSW integrity verifier ([#56](https://github.com/shuruheel/mnestic/issues/56)) | Deferred beyond the selected mutation repair | Separate bounded contract, failure corpus and accepted evidence |
+| [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Optional after core release gates | Agree warning behavior and preserve legitimate transaction-scoped relations |
+| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Deferred | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
+
+Layered storage is not selected. Broader HNSW, Arrow export and quantization work
+remain subject to the evidence gates below. Final hosted CI, package/adapter and
+upgrade checks, immutable downstream compatibility, documentation consistency and
+an independent readiness decision are required before publication.
 
 ### Measurement first — October 27, 2026
 

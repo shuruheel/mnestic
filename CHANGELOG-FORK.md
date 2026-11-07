@@ -5,23 +5,95 @@ provenance and licensing.
 
 ## Unreleased
 
+## 0.19.0 — Unreleased
+
+This candidate adds governed native Rust transactions and repairs transactional
+FTS statistics and HNSW mutation connectivity. Native hosts can call
+`db.governed_transaction(write, options)` to obtain a client and a worker whose
+lifetime owns admission; every query error rolls back that governed transaction.
+**Before using existing HNSW indexes, rebuild them with `::reindex <relation>`.**
+There is no storage-format migration, and `mnestic-rocks` remains at 0.1.12.
+Publication and final candidate qualification are pending.
+
 ### Added
 
-- Native Rust governed multi-transactions: a serialized client and host-owned
+- **Governed native Rust multi-transactions:** a serialized client and host-owned
   worker with an absolute deadline, bounded idle waiting, inherited statement
-  memory limits, cooperative cancellation and per-query warning flushes. Every
-  query error rolls back the whole transaction; the legacy API remains unchanged.
-  Hosts can retain admission until the actual worker exits. Stalled bounded
-  callbacks are disconnected with `callback.delivery_timeout` after a successful
-  commit, without undoing committed data. See
-  [the contract](docs/specs/governed-transactions.md), including SQLite/RocksDB
-  concurrency differences and uncertain outcomes when cancellation races commit.
+  memory limits, cooperative cancellation and per-query warning flushes. Hosts
+  retain admission until the worker actually exits. After a successful commit,
+  stalled bounded callbacks are disconnected with `callback.delivery_timeout`;
+  committed data stays committed. See the
+  [contract and host example](docs/specs/governed-transactions.md).
+
+### Changed
+
+- **BREAKING (results): Transactional FTS statistics.** Document counts and average
+  lengths now follow the querying transaction's posting snapshot and pending
+  writes. Aborts, failed commits and overlapping snapshots can therefore produce
+  different scores/top-k from 0.18, which could leak speculative or stale totals.
+  Ranking formulas are unchanged; there is no switch to retain the incorrect
+  statistics. Recheck score thresholds and ranking fixtures against committed
+  data. Serialized successful writes retain the warm cache path; cold,
+  invalidated or overlapping snapshots may scan postings. An incomplete posting
+  mutation prevents commit until a complete rebuild restores consistency;
+  normally abort the failed transaction. Contributed by GrumpyChubbyCat in
+  [PR #69](https://github.com/shuruheel/mnestic/pull/69); see the
+  [transactional statistics contract](docs/specs/fts-transaction-stats.md).
+
+### Removed
+
+- Retired `parser.string_decoding_changed`, the temporary 0.18 migration warning.
+  String decoding and errors are unchanged. Keep auditing legacy interpolated
+  scripts using the permanent [migration guidance](docs/specs/string-literals.md#migration-and-diagnostics);
+  parameter binding remains preferred.
 
 ### Fixed
 
-- `::warnings` reads and clears the in-memory ring without opening a storage
-  transaction. It no longer waits behind an active multi-transaction on memory
-  or SQLite backends, which could otherwise stall inspection until idle expiry.
+- **HNSW mutations preserve directed paths through a removed vertex.** Vector
+  replacement/deletion installs bypasses, incremental pruning retains required
+  paths, and degree accounting counts only active outgoing edges. Vector fields
+  and list elements within one row retain distinct identities. Online-build
+  reconciliation uses snapshot vectors for changed/deleted nodes.
+  External path proofs search from both ends under the existing work limits,
+  avoiding unnecessary exploration of wide components when a short proof exists
+  or a necessary leaf edge must be retained.
+- **`::warnings` remains responsive during active transactions.** Reads and clears
+  access the in-memory warning ring without opening a storage transaction, avoiding
+  the wait behind an active memory/SQLite multi-transaction.
+
+### API and compatibility
+
+- The governed API is additive, native Rust only; Python and other bindings do not
+  expose it. The legacy transaction API remains available. Host governance is not
+  activated by upgrading the engine alone.
+- **HNSW writes can now fail with `hnsw::repair_limit`**, including fresh incremental
+  insertions when preserving paths cannot meet the degree cap or local work limits.
+  Incomplete HNSW mutations prevent commit through every transaction API, including
+  legacy explicit transactions. **Abort and open a new transaction**; a later
+  successful statement cannot clear this guard. Investigate index configuration
+  or use exact eligible-key retrieval if the limit recurs.
+- **Rebuild pre-0.19 HNSW indexes with `::reindex <relation>`** after taking a backup
+  and scheduling an appropriate maintenance window. This repairs existing
+  disconnections and establishes missing reverse-edge records from legacy
+  `extend_candidates:true` incremental pruning. Local mutation repair cannot
+  discover those hidden incoming edges; raising `ef` cannot reconnect components.
+  Validate search against exact base-row/vector queries after rebuilding. See the
+  [repair and recovery contract](docs/specs/hnsw-mutation-repair.md).
+
+### Known limitations
+
+- Deadlines and cancellation are cooperative: they do not preempt blocking storage
+  or arbitrary host fixed-rule code. Cancellation racing a commit can leave its
+  outcome uncertain; retain worker admission and reconcile using host idempotency.
+  Per-statement memory estimates do not bound total process RSS or retained state.
+- HNSW repair caps are local: 256 incident/pruning vertices, 4,096 physical rows per
+  adjacency scan, 1,048,576 incident-vector components per layer, 16,777,216 distance
+  components per layer repair, and 1,048,576 adjacency checks per pruning pass.
+  They do not bound total RSS, retained vector caches or wall-clock latency.
+- Filtered-ANN eligibility is unchanged. Mutation repair does not guarantee exact
+  ANN recall or constitute a general index-integrity verifier. E1–E3 performance
+  and retrieval measurements remain pending; this candidate makes no new speed or
+  recall claim.
 
 ## 0.18.0
 

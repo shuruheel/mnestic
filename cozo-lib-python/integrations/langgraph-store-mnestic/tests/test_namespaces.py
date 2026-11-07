@@ -5,7 +5,7 @@ distinct — for any label content."""
 
 import random
 
-from langgraph.store.base import PutOp
+from langgraph.store.base import GetOp, PutOp
 
 from langgraph_store_mnestic._ns import decode_ns, encode_ns, encode_prefix
 
@@ -19,8 +19,13 @@ def test_dot_label_does_not_collide(store):
             PutOp(namespace=("a", "b"), key="k", value={"who": "nested"}),
         ]
     )
-    assert store.get(("a.b",), "k").value == {"who": "dotted"}
-    assert store.get(("a", "b"), "k").value == {"who": "nested"}
+    # Read through the same batch boundary: upstream get() also validates
+    # namespace labels and rejects periods in recent LangGraph releases.
+    dotted, nested = store.batch(
+        [GetOp(namespace=("a.b",), key="k"), GetOp(namespace=("a", "b"), key="k")]
+    )
+    assert dotted.value == {"who": "dotted"}
+    assert nested.value == {"who": "nested"}
 
     under_a = store.search(("a",))
     assert [i.value["who"] for i in under_a] == ["nested"]

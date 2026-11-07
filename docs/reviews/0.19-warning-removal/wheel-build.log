@@ -1,0 +1,404 @@
+🐍 Found CPython 3.13 at /private/tmp/mnestic-019-python/bin/python
+🔗 Found pyo3 bindings with abi3-py3.7 support
+💻 Using `MACOSX_DEPLOYMENT_TARGET=11.0` for aarch64-apple-darwin by default
+   Compiling gimli v0.32.3
+   Compiling codespan-reporting v0.13.1
+   Compiling libflate_lz77 v2.3.0
+   Compiling cxx v1.0.194
+   Compiling libflate v2.3.0
+   Compiling ring v0.17.14
+   Compiling addr2line v0.25.1
+   Compiling miniz_oxide v0.8.9
+   Compiling generic-array v0.14.7
+   Compiling syn v1.0.109
+   Compiling rayon-core v1.13.0
+   Compiling serde v1.0.228
+   Compiling arrow-data v59.2.0
+   Compiling zstd v0.13.3
+   Compiling ahash v0.7.8
+   Compiling scratch v1.0.9
+   Compiling flatbuffers v25.12.19
+   Compiling object v0.37.3
+   Compiling phf v0.11.3
+   Compiling num-bigint v0.4.7
+   Compiling parse-zoneinfo v0.3.1
+   Compiling sqlite3-src v0.6.1
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling proc-macro-error-attr2 v2.0.0
+   Compiling either v1.16.0
+   Compiling static_assertions v1.1.0
+   Compiling siphasher v1.0.3
+   Compiling adler32 v1.2.0
+   Compiling rustc-demangle v0.1.27
+   Compiling dary_heap v0.3.9
+   Compiling hashbrown v0.17.1
+   Compiling log v0.4.33
+   Compiling rustix v1.1.4
+   Compiling ucd-trie v0.1.7
+   Compiling byteorder v1.5.0
+   Compiling getrandom v0.4.3
+   Compiling fxhash v0.2.1
+   Compiling pest v2.8.6
+   Compiling arrow-array v59.2.0
+   Compiling backtrace v0.3.76
+   Compiling phf_shared v0.11.3
+   Compiling proc-macro-error2 v2.0.1
+   Compiling num-rational v0.4.2
+   Compiling chrono-tz-build v0.3.0
+   Compiling cxx-build v1.0.194
+   Compiling hashbrown v0.12.3
+   Compiling include-flate-compress v0.3.3
+   Compiling bincode v1.3.3
+   Compiling parking_lot v0.12.5
+   Compiling pyo3-ffi v0.21.2
+   Compiling num-iter v0.1.45
+   Compiling aho-corasick v1.1.4
+   Compiling indexmap v1.9.3
+   Compiling matrixmultiply v0.3.10
+   Compiling errno v0.3.14
+   Compiling unicode-linebreak v0.1.5
+   Compiling is_ci v1.2.0
+   Compiling snap v1.1.2
+   Compiling atomic v0.5.3
+   Compiling smawk v0.3.3
+   Compiling rustls v0.21.12
+   Compiling hashbrown v0.14.5
+   Compiling arrayvec v0.7.8
+   Compiling unicode-width v0.1.14
+   Compiling regex-syntax v0.8.11
+   Compiling graph_builder v0.4.1
+   Compiling twox-hash v2.1.3
+   Compiling lz4_flex v0.14.0
+   Compiling regex-automata v0.4.14
+   Compiling textwrap v0.15.2
+   Compiling num-format v0.4.4
+   Compiling dashmap v5.5.3
+   Compiling supports-color v2.1.0
+   Compiling num v0.4.3
+   Compiling delegate v0.8.0
+   Compiling rayon v1.10.0
+   Compiling fast2s v0.3.1
+   Compiling include-flate-codegen v0.3.3
+   Compiling mnestic-rocks v0.1.12 (/Users/shuruheel/Code/mindgraph/mnestic/cozorocks)
+   Compiling chrono-tz v0.9.0
+   Compiling backtrace-ext v0.2.1
+   Compiling arrow-select v59.2.0
+   Compiling pest_meta v2.8.6
+   Compiling twox-hash v1.6.3
+   Compiling block-buffer v0.10.4
+   Compiling crypto-common v0.1.7
+   Compiling sct v0.7.1
+   Compiling rustls-webpki v0.101.7
+   Compiling supports-unicode v2.1.0
+   Compiling supports-hyperlinks v2.1.0
+   Compiling link-cplusplus v1.0.12
+   Compiling cxxbridge-macro v1.0.194
+   Compiling atoi v2.0.0
+   Compiling smartstring v1.0.1
+   Compiling rmp v0.8.15
+   Compiling linereader v0.4.0
+   Compiling priority-queue v1.4.0
+   Compiling memoffset v0.9.1
+   Compiling miette-derive v5.10.0
+   Compiling terminal_size v0.1.17
+   Compiling page_size v0.4.2
+   Compiling num_cpus v1.17.0
+   Compiling memmap2 v0.5.10
+   Compiling oxiri v0.2.11
+   Compiling adler v1.0.2
+   Compiling byte-slice-cast v1.2.3
+   Compiling owo-colors v3.5.0
+   Compiling rawpointer v0.2.1
+   Compiling portable-atomic v1.13.1
+   Compiling fast-float2 v0.2.3
+   Compiling heck v0.4.1
+   Compiling oxilangtag v0.1.6
+   Compiling lazy_static v1.5.0
+   Compiling fastrand v2.4.1
+   Compiling tinyvec_macros v0.1.1
+   Compiling tinyvec v1.11.0
+   Compiling tempfile v3.27.0
+   Compiling oxrdf v0.3.3
+   Compiling pyo3-macros-backend v0.21.2
+   Compiling miette v5.10.0
+   Compiling miniz_oxide v0.7.4
+   Compiling digest v0.10.7
+   Compiling arrow-ipc v59.2.0
+   Compiling lz4_flex v0.10.0
+   Compiling pest_generator v2.8.6
+   Compiling include-flate v0.3.3
+   Compiling sqlite3-sys v0.17.0
+   Compiling regex v1.12.4
+   Compiling jieba-macros v0.7.1
+   Compiling pyo3 v0.21.2
+   Compiling cedarwood v0.4.6
+   Compiling crossbeam-channel v0.5.15
+   Compiling crossbeam-queue v0.3.12
+   Compiling csv-core v0.1.13
+   Compiling serde_derive v1.0.228
+   Compiling cpufeatures v0.2.17
+   Compiling seq-macro v0.3.6
+   Compiling atomic_float v0.1.0
+   Compiling ryu v1.0.23
+   Compiling nanorand v0.7.0
+   Compiling sha1_smol v1.0.1
+   Compiling webpki-roots v0.25.4
+   Compiling base64 v0.23.1
+   Compiling litrs v1.0.0
+   Compiling document-features v0.2.12
+   Compiling parquet v59.2.0
+   Compiling minreq v2.14.1
+   Compiling uuid v1.8.0
+   Compiling graph v0.3.1
+   Compiling csv v1.4.0
+   Compiling sha2 v0.10.9
+   Compiling rust-stemmers v1.2.0
+   Compiling crossbeam v0.8.4
+   Compiling jieba-rs v0.7.4
+   Compiling sqlite v0.36.2
+   Compiling pest_derive v2.8.6
+   Compiling swapvec v0.3.0
+   Compiling ndarray v0.15.6
+   Compiling pyo3-macros v0.21.2
+   Compiling oxttl v0.2.3
+   Compiling unicode-normalization v0.1.25
+   Compiling rmpv v1.3.1
+   Compiling rmp-serde v1.3.1
+   Compiling itertools v0.12.1
+   Compiling approx v0.5.1
+   Compiling ordered-float v4.6.0
+   Compiling serde_bytes v0.11.19
+   Compiling oxiri v0.3.1
+   Compiling casey v0.4.2
+   Compiling unindent v0.2.4
+   Compiling base64 v0.22.1
+   Compiling indoc v2.0.7
+   Compiling quadrature v0.1.2
+   Compiling rustc-hash v1.1.0
+warning: mnestic-rocks@0.1.12: rocksdb/port/mmap.cc:46:15: warning: first argument in call to 'memcpy' is a pointer to non-trivially copyable type 'rocksdb::MemMapping' [-Wnontrivial-memcall]
+warning: mnestic-rocks@0.1.12:    46 |   std::memcpy(this, &other, sizeof(*this));
+warning: mnestic-rocks@0.1.12:       |               ^
+warning: mnestic-rocks@0.1.12: rocksdb/port/mmap.cc:46:15: note: explicitly cast the pointer to silence this warning
+warning: mnestic-rocks@0.1.12:    46 |   std::memcpy(this, &other, sizeof(*this));
+warning: mnestic-rocks@0.1.12:       |               ^
+warning: mnestic-rocks@0.1.12:       |               (void*)
+warning: mnestic-rocks@0.1.12: 1 warning generated.
+   Compiling mnestic v0.18.0 (/Users/shuruheel/Code/mindgraph/mnestic/cozo-core)
+   Compiling mnestic-py v0.18.0 (/Users/shuruheel/Code/mindgraph/mnestic/cozo-lib-python)
+warning: use of deprecated associated function `pyo3::types::PyDict::new`: `PyDict::new` will be replaced by `PyDict::new_bound` in a future PyO3 version
+   --> src/lib.rs:341:23
+    |
+341 |     let ret = PyDict::new(py);
+    |                       ^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated associated function `pyo3::types::PyDict::new`: `PyDict::new` will be replaced by `PyDict::new_bound` in a future PyO3 version
+   --> src/lib.rs:369:29
+    |
+369 |             let d = PyDict::new(py);
+    |                             ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyBytes::new`: `PyBytes::new` will be replaced by `PyBytes::new_bound` in a future PyO3 version
+   --> src/lib.rs:387:41
+    |
+387 |         DataValue::Bytes(b) => PyBytes::new(py, &b).into(),
+    |                                         ^^^
+
+warning: use of deprecated method `pyo3::Python::<'py>::import`: `Python::import` will be replaced by `Python::import_bound` in a future PyO3 version
+   --> src/lib.rs:528:35
+    |
+528 |                 let json_mod = py.import("json")?;
+    |                                   ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:530:37
+    |
+530 |                 let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                     ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyString::new`: `PyString::new` will be replaced by `PyString::new_bound` in a future PyO3 version
+   --> src/lib.rs:530:56
+    |
+530 |                 let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                                        ^^^
+
+warning: use of deprecated method `pyo3::Python::<'py>::import`: `Python::import` will be replaced by `Python::import_bound` in a future PyO3 version
+   --> src/lib.rs:604:35
+    |
+604 |                 let json_mod = py.import("json")?;
+    |                                   ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:606:37
+    |
+606 |                 let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                     ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyString::new`: `PyString::new` will be replaced by `PyString::new_bound` in a future PyO3 version
+   --> src/lib.rs:606:56
+    |
+606 |                 let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                                        ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyString::new`: `PyString::new` will be replaced by `PyString::new_bound` in a future PyO3 version
+   --> src/lib.rs:647:40
+    |
+647 |                     let op = PyString::new(py, op.as_str()).into();
+    |                                        ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:650:41
+    |
+650 |                     let args = PyTuple::new(py, [op, new_py, old_py]);
+    |                                         ^^^
+
+warning: use of deprecated method `pyo3::Py::<T>::as_ref`: use `obj.bind(py)` instead of `obj.as_ref(py)`
+   --> src/lib.rs:651:39
+    |
+651 |                     let callable = cb.as_ref(py);
+    |                                       ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyList::new`: `PyList::new` will be replaced by `PyList::new_bound` in a future PyO3 version
+   --> src/lib.rs:670:41
+    |
+670 |                 let py_inputs = PyList::new(
+    |                                         ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:675:37
+    |
+675 |                 let args = PyTuple::new(py, vec![PyObject::from(py_inputs), py_opts]);
+    |                                     ^^^
+
+warning: use of deprecated method `pyo3::Py::<T>::as_ref`: use `obj.bind(py)` instead of `obj.as_ref(py)`
+   --> src/lib.rs:676:30
+    |
+676 |                 let res = cb.as_ref(py).call1(args).into_diagnostic()?;
+    |                              ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyDict::new`: `PyDict::new` will be replaced by `PyDict::new_bound` in a future PyO3 version
+   --> src/lib.rs:724:27
+    |
+724 |         let ret = PyDict::new(py);
+    |                           ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:495:17
+    |
+495 |         params: &PyDict,
+    |                 ^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:597:56
+    |
+597 |     pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
+    |                                                        ^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:640:58
+    |
+640 |     pub fn register_callback(&self, rel: &str, callback: &PyAny) -> PyResult<u32> {
+    |                                                          ^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:664:19
+    |
+664 |         callback: &PyAny,
+    |                   ^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:730:58
+    |
+730 |     pub fn import_relations(&self, py: Python<'_>, data: &PyDict) -> PyResult<()> {
+    |                                                          ^
+
+warning: use of deprecated method `pyo3::Python::<'py>::import`: `Python::import` will be replaced by `Python::import_bound` in a future PyO3 version
+   --> src/lib.rs:875:35
+    |
+875 |                 let json_mod = py.import("json")?;
+    |                                   ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:877:37
+    |
+877 |                 let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                     ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyString::new`: `PyString::new` will be replaced by `PyString::new_bound` in a future PyO3 version
+   --> src/lib.rs:877:56
+    |
+877 |                 let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                                        ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:869:67
+    |
+869 |     pub fn run_script(&self, py: Python<'_>, query: &str, params: &PyDict) -> PyResult<PyObject> {
+    |                                                                   ^
+
+warning: use of deprecated method `pyo3::Python::<'py>::import`: `Python::import` will be replaced by `Python::import_bound` in a future PyO3 version
+   --> src/lib.rs:898:31
+    |
+898 |             let json_mod = py.import("json")?;
+    |                               ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:900:33
+    |
+900 |             let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                 ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyString::new`: `PyString::new` will be replaced by `PyString::new_bound` in a future PyO3 version
+   --> src/lib.rs:900:52
+    |
+900 |             let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                                    ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:889:13
+    |
+889 |     params: &PyDict,
+    |             ^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:890:15
+    |
+890 |     bindings: &PyDict,
+    |               ^
+
+warning: use of deprecated method `pyo3::Python::<'py>::import`: `Python::import` will be replaced by `Python::import_bound` in a future PyO3 version
+   --> src/lib.rs:914:31
+    |
+914 |             let json_mod = py.import("json")?;
+    |                               ^^^^^^
+
+warning: use of deprecated associated function `pyo3::types::PyTuple::new`: `PyTuple::new` will be replaced by `PyTuple::new_bound` in a future PyO3 version
+   --> src/lib.rs:916:33
+    |
+916 |             let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                 ^^^
+
+warning: use of deprecated associated function `pyo3::types::PyString::new`: `PyString::new` will be replaced by `PyString::new_bound` in a future PyO3 version
+   --> src/lib.rs:916:52
+    |
+916 |             let args = PyTuple::new(py, [PyString::new(py, &reports)]);
+    |                                                    ^^^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:908:51
+    |
+908 | fn variables(py: Python<'_>, query: &str, params: &PyDict) -> PyResult<BTreeSet<String>> {
+    |                                                   ^
+
+warning: use of deprecated method `pyo3::deprecations::GilRefs::<T>::function_arg`: use `&Bound<'_, T>` instead for this function argument
+   --> src/lib.rs:924:29
+    |
+924 | fn mnestic(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
+    |                             ^
+
+warning: `mnestic-py` (lib) generated 35 warnings
+    Finished `release` profile [optimized] target(s) in 8m 23s
+warning: the following packages contain code that will be rejected by a future version of Rust: proc-macro-error2 v2.0.1
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+📦 Built wheel for abi3 Python ≥ 3.7 to /tmp/mnestic-019-release-wheels/mnestic-0.18.0-cp37-abi3-macosx_11_0_arm64.whl

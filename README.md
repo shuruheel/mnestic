@@ -90,35 +90,45 @@ capabilities on top of it:
   drop a database that fails an integrity check.
 - **Interruptibility that works** — `::kill` and `:timeout` abort running
   queries, including long graph-adjacency builds.
+- **Governed multi-transactions (0.19 candidate)** — a native Rust host-owned
+  worker retains admission through cancellation and cleanup, with one deadline,
+  bounded idle waiting, inherited statement memory limits and warning flushes.
+  Any query error aborts the transaction; the legacy API remains available.
+  ([contract](docs/specs/governed-transactions.md))
 
 Everything else — CozoScript, the storage engines, the data model — is upstream
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.18.0
+## New in 0.19.0 (release candidate)
 
-This release corrects string decoding,
-nested JSON conversion and single-term FTS prefixes. Review these result changes
-before upgrading:
+This candidate adds governed native Rust transactions and repairs transactional
+FTS statistics and HNSW mutation connectivity. Publication and final qualification
+are pending.
 
-- **BREAKING (results):** double-quoted `"a\nb"` now contains a newline. Use
-  `_"a\nb"_` for a literal backslash or bind parameters. Literal edge whitespace
-  and comments are preserved; trim explicitly when intended. Raw fences require
-  adjacent matching underscores. Audit stored-query bodies as well as scripts.
-- **BREAKING (results):** nested UUIDs become strings, bytes become base64 strings,
-  and scalar infinities become `"INFINITY"` / `"NEGATIVE_INFINITY"`, including new
-  `Json`-column writes and `to_string`. Stored JSON stays unchanged; migrate only
-  known typed fields or adapt consumers. Old infinity-derived nulls are irreversible.
-- FTS prefixes apply configured lowercase and ASCII-folding filters: `Di*` matches
-  `Diwank` on a lowercase index without rebuilding it. Prefixes match indexed terms,
-  including stems; exact terms retain the full analyzer pipeline. Use an index
-  without those filters when case/accent distinctions must be preserved.
-- Integer FTS boosts such as `Di*^3` no longer panic.
+- **Governed transactions (native Rust):** `db.governed_transaction(write, options)`
+  returns a serialized client and host-owned worker. One deadline, bounded idle
+  waiting, inherited statement memory limits and warning flushes apply across the
+  transaction; every query error rolls it back. Hosts retain admission until the
+  worker exits. Cancellation is cooperative and can race a commit, so hosts must
+  reconcile uncertain outcomes. Python and other bindings do not expose this API.
+- **BREAKING (results):** FTS scores/top-k now use statistics from the querying
+  transaction's posting snapshot and pending writes. Aborts and failed commits no
+  longer leak speculative totals. Recheck score thresholds and ranking fixtures;
+  there is no legacy-statistics switch. Overlapping snapshots may rescan postings.
+- **Rebuild pre-0.19 HNSW indexes with `::reindex <relation>`** after a backup, then
+  validate search against exact base-row/vector queries. New mutations preserve
+  directed paths; existing disconnections and missing legacy reverse records need
+  that explicit rebuild. Writes, including fresh insertions, can fail with
+  `hnsw::repair_limit` when local degree/work caps cannot preserve paths. Abort and
+  open a new transaction after failure; later statements cannot make it committable.
+- `::warnings` stays responsive during active memory/SQLite transactions.
+  `parser.string_decoding_changed` is retired as promised; decoding is unchanged.
+  The permanent 0.18 migration guidance still applies to legacy scripts.
 
-There is no storage-format migration or bridge release. Python native conversions
-remain unchanged; `\uXXXX` escapes remain BMP-only (bind parameters or use literal
-non-BMP text). The temporary string migration warning is scheduled for removal
-in 0.19.0.
+Storage encoding and `mnestic-rocks` 0.1.12 are unchanged. The local repair caps
+are not total memory or latency guarantees; filtered-ANN eligibility and its
+approximate-recall limitations remain. No new performance claim is made.
 
 Full upgrade guidance is in the [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 

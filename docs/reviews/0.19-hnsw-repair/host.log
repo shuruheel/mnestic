@@ -1,0 +1,6 @@
+     Locking 250 packages to latest compatible versions
+   Compiling mnestic v0.18.0 (/tmp/mnestic-019-repair-packaged/mnestic-0.18.0)
+   Compiling mnestic-019-repair-host v0.0.0 (/tmp/mnestic-019-repair-host)
+    Finished `dev` profile [unoptimized] target(s) in 20.25s
+     Running `/tmp/mnestic-019-target/debug/mnestic-019-repair-host /tmp/mnestic-019-repair-host/smoke.sqlite`
+PASS: extracted crate preserves the bridge survivor on SQLite

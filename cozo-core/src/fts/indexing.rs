@@ -28,22 +28,22 @@ use thiserror::Error;
 #[derive(Default)]
 pub(crate) struct FtsCache {
     // Deliberately stateless. Both BM25 corpus statistics — the document count `N` and the
-    // average document length `avgdl` — now come from the process-level doc-stats cache on the
-    // `Db` (see `get_doc_stats_for_index`), so there is nothing left to memoize per query. It is
+    // average document length `avgdl` — come from the transaction's doc-stats view (see
+    // `get_doc_stats_for_index`), so there is nothing left to memoize per query. It is
     // kept as a type so the `fts_search` signature and the `query/ra.rs` plumbing stay stable.
 }
 
 impl FtsCache {
     /// The BM25 corpus statistics for an index: `(total_tokens, n_docs)`.
     ///
-    /// **O(1)** per query: reads the process-level doc-stats cache on the `Db`,
-    /// seeding it with one deduplicated full scan of the index the first time it
-    /// is touched in this process. Writes maintain the cache incrementally (see
-    /// `SessionTx::bump_fts_doc_stats`), so the scan is paid once per process per
-    /// index, never per query — and, deliberately, nothing here writes a shared
-    /// storage key (a durable counter written from every document transaction
-    /// makes all concurrent writers conflict on one RocksDB lock; that was the
-    /// 0.8.3 design, reverted).
+    /// **O(1)** on the serialized warm path: reads transaction-local totals or
+    /// a compatible committed entry from the process-level cache on the `Db`.
+    /// Cold, invalidated or overlapping snapshots seed their own totals with a
+    /// deduplicated full scan. Writes maintain local totals incrementally (see
+    /// `SessionTx::finish_fts_change`) and publish them only after a safe commit.
+    /// Nothing here writes a shared storage key: a durable counter written from
+    /// every document transaction makes all concurrent writers conflict on one
+    /// RocksDB lock (the 0.8.3 design, reverted).
     ///
     /// `n_docs` is the number of documents **carrying at least one posting** — the
     /// population that `df` and `avgdl` are also measured against, and therefore the
@@ -53,19 +53,14 @@ impl FtsCache {
     /// (which maintains no FTS index) are not documents either. Sourcing `N` from the
     /// relation instead was both wrong (it mixes a relation-derived `N` into an IDF whose
     /// `df` is index-derived) and ruinously slow (a full relation scan on every query).
+    /// Both counts come from the same posting snapshot as the ranked query.
     /// See `docs/specs/fts-corpus-stats.md`.
     fn get_doc_stats_for_index(
         &mut self,
         idx: &RelationHandle,
         tx: &SessionTx<'_>,
     ) -> Result<(u64, u64)> {
-        let mut cache = tx.fts_doc_stats_cache.lock().unwrap();
-        if let Some(stats) = cache.get(&idx.name).copied() {
-            return Ok(stats);
-        }
-        let stats = tx.scan_fts_doc_stats(idx)?;
-        cache.insert(idx.name.clone(), stats);
-        Ok(stats)
+        tx.fts_doc_stats(idx)
     }
 }
 
@@ -108,39 +103,58 @@ impl<'a> SessionTx<'a> {
         idx.encode_partial_key_for_store(&[DataValue::Bot])
     }
 
-    /// Apply a delta to the process-level doc-stats cache for `idx`, seeding it
-    /// with a one-time scan of the existing postings if absent.
+    /// Read corpus totals in this transaction's snapshot, seeding from the
+    /// existing postings when no compatible local or committed entry exists.
+    /// This read happens BEFORE a posting mutation so its delta is applied
+    /// exactly once to the pre-mutation population. Cache locks are released
+    /// before the scan; generation checks prevent stale scans from being
+    /// published into a newer committed cache.
+    fn fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        if let Some(stats) = self.fts_stats.get(idx.id) {
+            return Ok(stats);
+        }
+        let stats = self.scan_fts_doc_stats(idx)?;
+        self.fts_stats.remember(idx.id, stats);
+        Ok(stats)
+    }
+
+    /// Apply a document's delta to transaction-local totals AFTER every
+    /// posting write succeeds. Invalidating before the write loop leaves no
+    /// reusable local entry after partial failure; uncertain transactions use
+    /// an exact scan instead of another single-posting delta probe.
     ///
-    /// Call BEFORE mutating the document's postings: the seed scan must observe
-    /// the pre-mutation corpus so the delta is applied exactly once. The cache
-    /// mutex is a leaf lock; holding it across the (one-time) seed scan keeps
-    /// concurrent seeders from losing each other's deltas. Deltas from
-    /// transactions that later roll back are not undone — `avgdl` is a smoothing
-    /// denominator, the drift is negligible and clears on process restart or
-    /// index rebuild.
-    fn bump_fts_doc_stats(
+    /// Both `N` and `avgdl` affect ranking, so rolled-back deltas must not
+    /// escape into the process-level cache. The transaction lifecycle promotes
+    /// these exact totals only after a successful, compatible storage commit.
+    fn finish_fts_change(
         &self,
         idx: &RelationHandle,
+        previous: (u64, u64),
         token_delta: i64,
         doc_delta: i64,
+        scan_only: bool,
     ) -> Result<()> {
-        let cache = self.fts_doc_stats_cache.clone();
-        let mut guard = cache.lock().unwrap();
-        let (total, n) = match guard.get(&idx.name).copied() {
-            Some(stats) => stats,
-            None => self.scan_fts_doc_stats(idx)?,
+        let stats = if scan_only {
+            self.scan_fts_doc_stats(idx)?
+        } else {
+            match (
+                previous.0.checked_add_signed(token_delta),
+                previous.1.checked_add_signed(doc_delta),
+            ) {
+                (Some(tokens), Some(docs)) => (tokens, docs),
+                _ => self.scan_fts_doc_stats(idx)?,
+            }
         };
-        let total = (total as i64).saturating_add(token_delta).max(0) as u64;
-        let n = (n as i64).saturating_add(doc_delta).max(0) as u64;
-        guard.insert(idx.name.clone(), (total, n));
+        self.fts_stats.complete_write(idx.id, stats, scan_only);
         Ok(())
     }
 
     /// Deduplicated full scan of the FTS index → `(total_tokens, n_docs)` over
     /// the documents that have at least one posting. Each document's length is
     /// stored redundantly on every posting (`vals[3]`), so we count each document
-    /// key once. This is the legacy/seed path; the steady state reads the counter.
+    /// key once. This is the legacy/seed path; the steady state reads cached totals.
     pub(crate) fn scan_fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        crate::fts::FTS_DOC_STATS_SCANS.with(|c| c.set(c.get() + 1));
         let start = idx.encode_partial_key_for_store(&[]);
         let end = idx.encode_partial_key_for_store(&[DataValue::Bot]);
         let mut seen: FxHashSet<Tuple> = FxHashSet::default();
@@ -154,38 +168,43 @@ impl<'a> SessionTx<'a> {
                     .get(3)
                     .and_then(DataValue::get_int)
                     .ok_or_else(|| miette!("corrupt FTS posting value: missing document length"))?;
-                total += doc_len.max(0) as u64;
+                let doc_len = u64::try_from(doc_len)
+                    .map_err(|_| miette!("corrupt FTS posting: negative document length"))?;
+                total = total
+                    .checked_add(doc_len)
+                    .ok_or_else(|| miette!("FTS corpus token count overflow"))?;
             }
         }
         Ok((total, seen.len() as u64))
     }
 
-    /// Recompute the doc-stats cache entry from a full scan. Called at the end
-    /// of an index (re)build to publish authoritative corpus stats (and to clear
-    /// drift from any rolled-back deltas). Also deletes the legacy durable
-    /// counter a 0.8.3 build may have left behind.
+    /// Recompute the local doc-stats cache entry from a full scan. Called at
+    /// the end of an index (re)build to install authoritative corpus stats for
+    /// this transaction. Also deletes the legacy durable counter a 0.8.3 build
+    /// may have left behind. Shared publication waits for a successful commit.
     pub(crate) fn rebuild_fts_doc_stats(&mut self, idx: &RelationHandle) -> Result<()> {
         let stats = self.scan_fts_doc_stats(idx)?;
         self.seed_fts_doc_stats(idx, stats.0, stats.1)
     }
 
-    /// Publish corpus stats already known exactly (e.g. counted during a bulk
+    /// Install corpus stats already known exactly (e.g. counted during a bulk
     /// build), skipping the full index scan `rebuild_fts_doc_stats` pays. Also
     /// deletes the legacy durable counter a 0.8.3 build may have left behind.
+    /// Totals become locally reusable only after that fallible cleanup succeeds;
+    /// shared publication is handled by the transaction's commit protocol.
     pub(crate) fn seed_fts_doc_stats(
         &mut self,
         idx: &RelationHandle,
         total_tokens: u64,
         n_docs: u64,
     ) -> Result<()> {
-        self.fts_doc_stats_cache
-            .lock()
-            .unwrap()
-            .insert(idx.name.clone(), (total_tokens, n_docs));
+        self.fts_stats.before_write(idx.id);
         let legacy_key = Self::fts_stats_key(idx);
         if self.store_tx.exists(&legacy_key, false)? {
             self.store_tx.del(&legacy_key)?;
         }
+        self.fts_stats
+            .complete_write(idx.id, (total_tokens, n_docs), false);
         Ok(())
     }
 
@@ -697,12 +716,15 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         let (rows, count) =
             encode_fts_rows_for_tuple(tuple, extractor, stack, tokenizer, rel_handle, idx_handle)?;
-        // Maintain the process-level doc-stats cache (mnestic fork, Bet 1b) so
-        // `avgdl` and BM25's `N` are O(1) reads. Done *before* writing this document's
-        // postings so a seed-on-absent scan sees the pre-insert corpus. `count == 0`
-        // (no tokens ⇒ no postings) is skipped, matching the scan, which only counts
-        // documents that have postings.
-        //
+        // Maintain transaction-local doc stats so `avgdl` and BM25's `N` stay
+        // O(1) on the warm path. A seed-on-absent scan must see the pre-insert
+        // corpus; the local delta is installed only after all postings are written.
+        // No tokens means no postings and therefore no document in the indexed
+        // population, matching the full doc-stats scan.
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let previous = self.fts_doc_stats(idx_handle)?;
         // Count the document only if it is not *already* in the index. Most update paths
         // are del-then-put, so the old document has been subtracted by the time we get
         // here — but a **value-unchanged `:put` is not**: `query/stored.rs` skips the
@@ -713,19 +735,18 @@ impl<'a> SessionTx<'a> {
         // consumer — both terms inflate together and the ratio barely moves — but BM25's
         // `N` reads `n` directly, so it must be exact. `del_fts_index_item` makes the
         // mirror-image probe for the same reason.
-        if count > 0 {
-            let already_indexed = match rows.first() {
-                Some((key_bytes, _)) => self.store_tx.exists(key_bytes, false)?,
-                None => false,
-            };
-            if !already_indexed {
-                self.bump_fts_doc_stats(idx_handle, count, 1)?;
-            }
-        }
+        let already_indexed = self.store_tx.exists(&rows[0].0, false)?;
+        let scan_only = self.fts_stats.before_write(idx_handle.id);
         for (key_bytes, val_bytes) in rows {
             self.store_tx.put(&key_bytes, &val_bytes)?;
         }
-        Ok(())
+        self.finish_fts_change(
+            idx_handle,
+            previous,
+            if already_indexed { 0 } else { count },
+            if already_indexed { 0 } else { 1 },
+            scan_only,
+        )
     }
     pub(crate) fn del_fts_index_item(
         &mut self,
@@ -761,28 +782,33 @@ impl<'a> SessionTx<'a> {
         for k in &tuple[..rel_handle.metadata.keys.len()] {
             key.push(k.clone());
         }
-        // Maintain the process-level doc-stats cache (mnestic fork, Bet 1b) — but
-        // only if this document is actually indexed (probe one of its postings).
-        // That guards against a delete of an unindexed row and the del-then-put
-        // refresh in `create_fts_index`, where `del` runs over a not-yet-indexed
-        // row. Done before the postings are removed so a seed-on-absent scan
-        // still sees them.
-        if count > 0 {
-            if let Some(term) = collector.iter().next() {
-                let mut probe = key.clone();
-                probe[0] = DataValue::Str(term.clone());
-                let probe_bytes = idx_handle.encode_key_for_store(&probe, Default::default())?;
-                if self.store_tx.exists(&probe_bytes, false)? {
-                    self.bump_fts_doc_stats(idx_handle, -count, -1)?;
-                }
-            }
+        // Maintain doc stats only if this document is actually indexed (probe
+        // one of its postings). That guards against a delete of an unindexed row
+        // and refresh paths where `del` runs over a not-yet-indexed row.
+        // Read the prior totals before removing postings so a seed scan still
+        // sees them; install the local delta only after the full delete succeeds.
+        if collector.is_empty() {
+            return Ok(());
         }
+        let previous = self.fts_doc_stats(idx_handle)?;
+        let term = collector.iter().next().expect("nonempty token set");
+        let mut probe = key.clone();
+        probe[0] = DataValue::Str(term.clone());
+        let probe_bytes = idx_handle.encode_key_for_store(&probe, Default::default())?;
+        let indexed = self.store_tx.exists(&probe_bytes, false)?;
+        let scan_only = self.fts_stats.before_write(idx_handle.id);
         for text in collector {
             key[0] = DataValue::Str(text);
             let key_bytes = idx_handle.encode_key_for_store(&key, Default::default())?;
             self.store_tx.del(&key_bytes)?;
         }
-        Ok(())
+        self.finish_fts_change(
+            idx_handle,
+            previous,
+            if indexed { -count } else { 0 },
+            if indexed { -1 } else { 0 },
+            scan_only,
+        )
     }
 }
 

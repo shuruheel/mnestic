@@ -13,12 +13,12 @@ use std::time::Instant;
 
 use crate::data::program::ReturnMutation;
 use miette::{bail, Diagnostic, Result};
-use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
 use crate::data::tuple::TupleT;
 use crate::data::value::DataValue;
 use crate::data::value::{Validity, ValidityTs, LARGEST_UTF_CHAR};
+use crate::fts::stats::TxFtsStats;
 use crate::fts::TokenizerCache;
 use crate::parse::SourceSpan;
 use crate::runtime::callback::CallbackCollector;
@@ -36,9 +36,14 @@ pub struct SessionTx<'a> {
     pub(crate) relation_store_id: Arc<AtomicU64>,
     pub(crate) temp_store_id: AtomicU32,
     pub(crate) tokenizers: Arc<TokenizerCache>,
-    /// Cross-query cache of FTS corpus stats for legacy indexes (mnestic fork);
-    /// see `Db::fts_doc_stats_cache`. Shared `Arc` cloned per transaction.
-    pub(crate) fts_doc_stats_cache: Arc<Mutex<BTreeMap<SmartString<LazyCompact>, (u64, u64)>>>,
+    /// Transaction-local FTS corpus totals and a shared handle to the Db's
+    /// committed doc-stats cache; see `Db::fts_doc_stats_cache`. The generation
+    /// is captured before opening store_tx so a stale snapshot cannot publish
+    /// totals over a newer committed corpus. Field order keeps the abort fence
+    /// alive until store_tx is dropped, including failed commit and unwind.
+    pub(crate) fts_stats: TxFtsStats,
+    /// An interrupted graph mutation must never be committed by a legacy client.
+    pub(crate) hnsw_mutations_incomplete: usize,
     /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
     /// shared handle to the `Db`'s high-water mark. See `runtime/tt_clock.rs`.
     pub(crate) tt_clock: Arc<TtClock>,
@@ -285,9 +290,19 @@ impl<'a> SessionTx<'a> {
     /// can escape the protocol. Taking the dirty set here also disarms
     /// [`Drop`], whose bump exists for transactions that never reach a commit.
     pub fn commit_tx(&mut self) -> Result<()> {
+        if self.hnsw_mutations_incomplete != 0 {
+            bail!("cannot commit after an incomplete HNSW mutation; abort the transaction");
+        }
+        if !self.fts_stats.can_commit() {
+            bail!("cannot commit after an incomplete FTS mutation; abort the transaction");
+        }
         if self.dirty_relations.is_empty() {
             // Read-only transaction: nothing to invalidate, no lock to take.
-            return self.commit_tx_inner();
+            let result = self.commit_tx_inner();
+            if result.is_ok() {
+                self.fts_stats.committed();
+            }
+            return result;
         }
         self.projections.begin_commit(&self.dirty_relations);
         self.commit_inflight = true;
@@ -297,6 +312,9 @@ impl<'a> SessionTx<'a> {
         self.commit_inflight = false;
         self.projections.finish_commit(&self.dirty_relations);
         self.dirty_relations.clear();
+        if res.is_ok() {
+            self.fts_stats.committed();
+        }
         res
     }
 

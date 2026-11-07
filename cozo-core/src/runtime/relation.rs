@@ -1426,6 +1426,8 @@ impl<'a> SessionTx<'a> {
             non_idx_keys,
         )?;
 
+        self.fts_stats.before_write(idx_handle.id);
+
         // add index to relation
         let manifest = FtsIndexManifest {
             base_relation: config.base_relation.clone(),
@@ -1801,27 +1803,26 @@ impl<'a> SessionTx<'a> {
             snap.insert(k, t);
         }
         let current: Vec<Tuple> = orig_table.scan_all(self).collect::<Result<Vec<_>>>()?;
-        let mut stack = vec![];
+        let mut remove = Vec::new();
+        let mut insert = Vec::new();
         for cur in &current {
             let k = orig_table.encode_key_for_store(&cur[0..nkeys], Default::default())?;
             match snap.remove(&k) {
-                None => {
-                    // new row inserted during the build
-                    self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
+                None => insert.push(cur),
+                Some(old) if old != cur => {
+                    remove.push(old);
+                    insert.push(cur);
                 }
-                Some(old) => {
-                    if old != cur {
-                        // row changed in place during the build
-                        self.hnsw_remove(orig_table, idx_table, old)?;
-                        self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
-                    }
-                }
+                Some(_) => {}
             }
         }
-        // rows present at snapshot but gone now: deleted during the build
-        let removed: Vec<&Tuple> = snap.into_values().collect();
-        for old in removed {
-            self.hnsw_remove(orig_table, idx_table, old)?;
+        remove.extend(snap.into_values());
+        // Remove all stale graph nodes using their snapshot vectors before
+        // inserting current rows. Current base rows may no longer contain them.
+        self.hnsw_remove_snapshot_rows(manifest, orig_table, idx_table, &remove)?;
+        let mut stack = vec![];
+        for cur in insert {
+            self.hnsw_put(manifest, orig_table, idx_table, filter, &mut stack, cur)?;
         }
         Ok(())
     }
@@ -2065,6 +2066,13 @@ impl<'a> SessionTx<'a> {
         let mut rel = self.get_relation(rel_name, true)?;
         let is_lsh = rel.lsh_indices.contains_key(&idx_name.name);
         let is_fts = rel.fts_indices.contains_key(&idx_name.name);
+        let fts_index_id = rel
+            .fts_indices
+            .get(&idx_name.name)
+            .map(|(index, _)| index.id);
+        if let Some(id) = fts_index_id {
+            self.fts_stats.before_write(id);
+        }
         if is_lsh || is_fts {
             self.tokenizers.named_cache.write().unwrap().clear();
             self.tokenizers.hashed_cache.write().unwrap().clear();
@@ -2097,6 +2105,9 @@ impl<'a> SessionTx<'a> {
             .unwrap();
         self.store_tx.put(&new_encoded, &meta_val)?;
 
+        if let Some(id) = fts_index_id {
+            self.fts_stats.removed(id);
+        }
         Ok(to_clean)
     }
 

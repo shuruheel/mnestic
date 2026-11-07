@@ -1,0 +1,58 @@
+   Compiling mnestic v0.18.0 (/private/tmp/mnestic-019-fts/cozo-core)
+    Finished `test` profile [unoptimized] target(s) in 29.92s
+     Running tests/fts_governed_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_governed_stats-c7335551699179f0)
+
+running 2 tests
+test mem_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+test sqlite_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/fts_stats_failures.rs (/tmp/mnestic-019-target/debug/deps/fts_stats_failures-1c85ffca8f59fa4b)
+
+running 3 tests
+test storage_commit_failure_keeps_statistics_private_until_rollback_finishes ... ok
+test ignored_partial_posting_error_still_rejects_outer_script_commit ... ok
+test partial_posting_failure_cannot_be_committed_even_after_a_retry ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/fts_transaction_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_transaction_stats-9a46894159a8bc82)
+
+running 6 tests
+test prefixes_keep_lowercase_normalization ... ok
+test failed_multistatement_script_does_not_change_committed_statistics ... ok
+test rejected_commit_does_not_publish_speculative_statistics ... ok
+test warm_serialized_reads_and_successful_writes_do_not_scan_the_corpus ... ok
+test committed_updates_rebuilds_and_recreated_index_match_fresh_postings ... ok
+test abort_and_handle_drop_preserve_complete_scores_and_top_one ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/governed_transaction.rs (/tmp/mnestic-019-target/debug/deps/governed_transaction-1995b1b4feb3f5bd)
+
+running 22 tests
+test mem::disconnect ... ok
+test mem::failed_commit ... ok
+test explicit_kill_aborts_prior_writes_even_when_custom_rule_returns_late ... ok
+test scheduling_delay_counts_and_zero_idle_is_rejected ... ok
+test mem::commit_and_abort ... ok
+test mem::read_only_and_failure ... ok
+test mem::warnings_while_open ... ok
+test sqlite::disconnect ... ok
+test sqlite::failed_commit ... ok
+test sqlite::commit_and_abort ... ok
+test sqlite::read_only_and_failure ... ok
+test sqlite::warnings_while_open ... ok
+test mem::memory ... ok
+test sqlite::memory ... ok
+test mem::idle ... ok
+test sqlite::idle ... ok
+test sqlite_snapshot ... ok
+test mem::deadlines ... ok
+test sqlite::deadlines ... ok
+test cancellation_keeps_permit_on_actual_worker_until_uncooperative_code_exits ... ok
+test stalled_callback_does_not_hold_committed_worker_forever ... ok
+test whole_deadline_expires_during_idle_before_longer_idle_limit ... ok
+
+test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.08s

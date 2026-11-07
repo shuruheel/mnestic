@@ -1,0 +1,16 @@
+Processing /tmp/mnestic-019-release-wheels/mnestic-0.18.0-cp37-abi3-macosx_11_0_arm64.whl
+Installing collected packages: mnestic
+  Attempting uninstall: mnestic
+    Found existing installation: mnestic 0.18.0
+    Uninstalling mnestic-0.18.0:
+      Successfully uninstalled mnestic-0.18.0
+Successfully installed mnestic-0.18.0
+Collecting pyarrow==24.0.0
+  Downloading pyarrow-24.0.0-cp313-cp313-macosx_12_0_arm64.whl.metadata (3.0 kB)
+Downloading pyarrow-24.0.0-cp313-cp313-macosx_12_0_arm64.whl (35.0 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 35.0/35.0 MB 65.0 MB/s  0:00:00
+Installing collected packages: pyarrow
+Successfully installed pyarrow-24.0.0
+parquet PASS (values and atomic rollback)
+arrow_ipc_file PASS (values and atomic rollback)
+arrow_ipc_stream PASS (values and atomic rollback)

@@ -1,0 +1,7 @@
+sqlite observations []
+rocksdb observations [('rocksdb', [22, 23, 24], [[22, 968.0], [23, 968.0]]), ('rocksdb', [22, 23, 24], [[22, 968.0], [23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]])]
+Traceback (most recent call last):
+  File "/Users/shuruheel/Code/mindgraph/mnestic/cozo-lib-python/tests/test_filtered_retrieval_019.py", line 39, in <module>
+    assert not failures, failures
+           ^^^^^^^^^^^^
+AssertionError: [('rocksdb', [22, 23, 24], [[22, 968.0], [23, 968.0]]), ('rocksdb', [22, 23, 24], [[22, 968.0], [23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]]), ('rocksdb', [23, 24], [[23, 968.0]])]
