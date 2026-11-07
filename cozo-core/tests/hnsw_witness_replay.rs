@@ -13,7 +13,11 @@ fn replay_full_scale_witness_mutations() {
     let db = DbInstance::new("sqlite", path.to_str().unwrap(), "{}").unwrap();
     let inputs: Vec<BTreeMap<String, serde_json::Value>> =
         serde_json::from_slice(&std::fs::read(source.join("mutations.json")).unwrap()).unwrap();
-    assert_eq!(inputs.len(), 200, "the frozen small workload has 200 writes");
+    assert_eq!(
+        inputs.len(),
+        200,
+        "the frozen small workload has 200 writes"
+    );
     for (i, input) in inputs.into_iter().enumerate() {
         let params = input
             .into_iter()
