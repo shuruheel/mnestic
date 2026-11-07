@@ -37,10 +37,23 @@ an outgoing edge when a checked alternate route survives. It
 uses the existing selection heuristic as a preference, retaining necessary edges.
 All selected bidirectional insertion links are installed before pruning, so the
 proof sees the complete new layer. Pruning first checks the immediate neighborhood.
-If that induced subgraph is insufficient, a bounded breadth-first search may prove
-an existing route through external vertices. It starts from currently retained
-outgoing neighbours and never visits the pruning target. Cached witness adjacency
-is therefore independent of earlier outgoing-edge removals within the same pass.
+If that induced subgraph is insufficient, a bounded bidirectional breadth-first
+search may prove an existing route through external vertices. Forward search
+starts from currently retained outgoing neighbours; backward search starts from
+the candidate destination. Expand the smaller frontier and accept a proof when
+the visited sets meet, before scheduling further unrelated expansion. Both sides
+exclude the pruning target. Cached stored adjacency is therefore independent of
+earlier outgoing-edge removals within the same pass.
+
+Backward search uses physical reverse bookkeeping to enumerate possible
+predecessors, then reads the opposite edge's active flag. An ignored row is never
+itself evidence of a traversable edge. Missing reverse rows fail as index
+corruption; legacy indexes still require the documented rebuild. During removal,
+both forward rows and backward columns between incident vertices come from the
+current repair plan, not cached stored edges. This preserves uncommitted bypasses
+and excludes previously pruned bypasses in both search directions. Reaching an
+empty frontier disproves that particular alternate route without exploring an
+unrelated large component; other removable edges can still be considered.
 The fallback only reads existing edges; it adds no connections and never traverses
 ignored reverse records. Missing proof or exhausted work still rejects the mutation.
 Shrinking selects from existing outgoing neighbors, matching the bulk builder's
@@ -53,8 +66,9 @@ per layer repair and 1,048,576 adjacency checks per pruning pass. Exceeding
 a limit returns the same structured diagnostic with a reason. These are local
 repair work bounds, not a statement RSS limit or a hard wall-clock guarantee.
 They must never silently truncate the neighborhood or skip a required connection.
-The external-path fallback additionally caps cached/visited vertices at 1,024,
-physical adjacency rows read at 16,384, and traversed adjacency entries at
+The external-path fallback additionally caps cached vertices and the combined
+distinct vertices visited by both search directions at 1,024,
+physical adjacency rows read (including reverse-edge point reads) at 16,384, and traversed adjacency entries at
 1,048,576. Row and traversal budgets are shared across all witness attempts in
 one insertion-pruning or removal-repair call; each individual scan retains the
 4,096-row cap. These bounds
@@ -110,6 +124,10 @@ a recovery strategy. No production database is rebuilt by the release itself.
 - An existing alternate path outside the immediate neighbourhood is recognized;
   insertion pruning and removal repair both cover this case. Ignored edges are
   excluded and witness-budget exhaustion remains explicit.
+- Wide-component fixtures recognize short proofs without exhausting the frontier,
+  retain necessary leaf edges, and find a different removable edge. Vertex, row
+  (including reverse probes) and step limits still fail explicitly. Reusing a
+  stored-adjacency cache respects changing repair plans in both directions.
 - Review insertion pruning interaction and partial legacy-transaction errors.
 - Run HNSW/reindex/hybrid and transaction regressions and strict Clippy. Retain
   immutable fix SHA and independent storage-contract review before delivery.

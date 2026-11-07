@@ -14,9 +14,14 @@ const MAX_WITNESS_VERTICES: usize = 1024;
 const MAX_WITNESS_ROWS: usize = 16_384;
 
 struct PruningWitnesses {
-    adjacency: FxHashMap<CompoundKey, Vec<CompoundKey>>,
+    adjacency: FxHashMap<CompoundKey, WitnessNeighbours>,
     rows_left: usize,
     steps_left: usize,
+}
+
+struct WitnessNeighbours {
+    outgoing: Vec<CompoundKey>,
+    incoming: Vec<CompoundKey>,
 }
 
 struct WitnessOverlay<'a> {
@@ -220,55 +225,115 @@ impl SessionTx<'_> {
         witnesses: &mut PruningWitnesses,
         overlay: Option<&WitnessOverlay<'_>>,
     ) -> Result<bool> {
-        let mut seen: FxHashSet<_> = sources.iter().cloned().collect();
-        let mut pending: std::collections::VecDeque<_> = sources.into();
-        while let Some(node) = pending.pop_front() {
-            if &node == destination {
-                return Ok(true);
-            }
-            if !witnesses.adjacency.contains_key(&node) {
-                if witnesses.adjacency.len() >= MAX_WITNESS_VERTICES {
-                    return Err(limit("pruning witness vertices"));
-                }
-                let neighbours = self
-                    .repair_neighbours_with_budget(table, layer, &node, &mut witnesses.rows_left)?
-                    .into_iter()
-                    .filter(|(key, live)| *live && key != target)
-                    .map(|(key, _)| key)
-                    .collect();
-                witnesses.adjacency.insert(node.clone(), neighbours);
-            }
-            let stored = &witnesses.adjacency[&node];
-            let neighbours: Vec<_> = if let Some((plan, from)) =
-                overlay.and_then(|plan| plan.positions.get(&node).map(|&i| (plan, i)))
-            {
-                // Incident-to-incident edges come from the current plan: some
-                // bypasses are not stored yet, and earlier ones were pruned.
-                plan.edges[from]
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(j, live)| live.then_some(&plan.keys[j]))
-                    .chain(
-                        stored
-                            .iter()
-                            .filter(|key| !plan.positions.contains_key(*key)),
-                    )
-                    .collect()
+        let mut forward_seen: FxHashSet<_> = sources.iter().cloned().collect();
+        if forward_seen.contains(destination) {
+            return Ok(true);
+        }
+        let mut backward_seen = FxHashSet::from_iter([destination.clone()]);
+        if forward_seen.len() + backward_seen.len() > MAX_WITNESS_VERTICES {
+            return Err(limit("pruning witness vertices"));
+        }
+        let mut forward = sources;
+        let mut backward = vec![destination.clone()];
+        // Expand the smaller frontier. A necessary edge into a leaf can be
+        // disproved from its destination without exploring the whole component.
+        // A meeting vertex proves an actual directed source -> destination path.
+        while !forward.is_empty() && !backward.is_empty() {
+            let reverse = backward.len() < forward.len();
+            let (frontier, seen, opposite) = if reverse {
+                (&mut backward, &mut backward_seen, &forward_seen)
             } else {
-                stored.iter().collect()
+                (&mut forward, &mut forward_seen, &backward_seen)
             };
-            for next in neighbours {
-                witnesses.steps_left = witnesses
-                    .steps_left
-                    .checked_sub(1)
-                    .ok_or_else(|| limit("pruning witness reachability work"))?;
-                if seen.insert(next.clone()) {
-                    if seen.len() > MAX_WITNESS_VERTICES {
+            let mut next_frontier = Vec::new();
+            for node in frontier.drain(..) {
+                if !witnesses.adjacency.contains_key(&node) {
+                    if witnesses.adjacency.len() >= MAX_WITNESS_VERTICES {
                         return Err(limit("pruning witness vertices"));
                     }
-                    pending.push_back(next.clone());
+                    let mut outgoing = Vec::new();
+                    let mut incoming = Vec::new();
+                    for (key, live) in self.repair_neighbours_with_budget(
+                        table,
+                        layer,
+                        &node,
+                        &mut witnesses.rows_left,
+                    )? {
+                        if &key == target {
+                            continue;
+                        }
+                        if live {
+                            outgoing.push(key.clone());
+                        }
+                        // Physical reverse rows identify possible predecessors,
+                        // but only the opposite row's active flag proves one.
+                        // Charge point reads to the same physical-row budget.
+                        witnesses.rows_left = witnesses
+                            .rows_left
+                            .checked_sub(1)
+                            .ok_or_else(|| limit("pruning witness adjacency rows"))?;
+                        let value = self.repair_edge_value(table, layer, &key, &node)?
+                            .ok_or_else(|| miette!("corrupt HNSW index: missing reverse edge during witness search"))?;
+                        let ignored = value
+                            .get(2)
+                            .and_then(DataValue::get_bool)
+                            .ok_or_else(|| miette!("corrupt HNSW reverse flag"))?;
+                        if !ignored {
+                            incoming.push(key);
+                        }
+                    }
+                    witnesses
+                        .adjacency
+                        .insert(node.clone(), WitnessNeighbours { outgoing, incoming });
+                }
+                let stored = &witnesses.adjacency[&node];
+                let stored = if reverse {
+                    &stored.incoming
+                } else {
+                    &stored.outgoing
+                };
+                let neighbours: Vec<_> = if let Some((plan, from)) =
+                    overlay.and_then(|plan| plan.positions.get(&node).map(|&i| (plan, i)))
+                {
+                    // Read the current plan in either direction; never cache
+                    // proposed or previously pruned incident-to-incident edges.
+                    (0..plan.keys.len())
+                        .filter(|&j| {
+                            if reverse {
+                                plan.edges[j][from]
+                            } else {
+                                plan.edges[from][j]
+                            }
+                        })
+                        .map(|j| &plan.keys[j])
+                        .chain(
+                            stored
+                                .iter()
+                                .filter(|key| !plan.positions.contains_key(*key)),
+                        )
+                        .collect()
+                } else {
+                    stored.iter().collect()
+                };
+                for next in neighbours {
+                    witnesses.steps_left = witnesses
+                        .steps_left
+                        .checked_sub(1)
+                        .ok_or_else(|| limit("pruning witness reachability work"))?;
+                    // Check the proof before scheduling unrelated expansion.
+                    if opposite.contains(next) {
+                        return Ok(true);
+                    }
+                    if !seen.contains(next) {
+                        if seen.len() + opposite.len() >= MAX_WITNESS_VERTICES {
+                            return Err(limit("pruning witness vertices"));
+                        }
+                        seen.insert(next.clone());
+                        next_frontier.push(next.clone());
+                    }
                 }
             }
+            *frontier = next_frontier;
         }
         Ok(false)
     }
@@ -886,30 +951,35 @@ mod tests {
         edges[0][3] = true; // stored 1 -> 4
         edges[3][1] = true; // stored 4 -> 2
         edges[0][2] = true; // planned 1 -> 3
-        let mut witnesses = PruningWitnesses::default();
-        for (destination, expected) in [(3, true), (3, false), (2, true), (2, false)] {
-            let plan = WitnessOverlay {
-                keys: &keys,
-                positions: &positions,
-                edges: &edges,
-            };
-            assert_eq!(
-                tx.hnsw_pruning_witness(
-                    &table,
-                    0,
-                    &node(0),
-                    &node(destination),
-                    vec![node(1)],
-                    &mut witnesses,
-                    Some(&plan),
-                )
-                .unwrap(),
-                expected,
-            );
-            if destination == 3 {
-                edges[0][2] = false;
-            } else {
-                edges[3][1] = false;
+                            // One source selects forward expansion; two select backward expansion.
+        for sources in [vec![node(1)], vec![node(1), node(4)]] {
+            edges[0][2] = true;
+            edges[3][1] = true;
+            let mut witnesses = PruningWitnesses::default();
+            for (destination, expected) in [(3, true), (3, false), (2, true), (2, false)] {
+                let plan = WitnessOverlay {
+                    keys: &keys,
+                    positions: &positions,
+                    edges: &edges,
+                };
+                assert_eq!(
+                    tx.hnsw_pruning_witness(
+                        &table,
+                        0,
+                        &node(0),
+                        &node(destination),
+                        sources.clone(),
+                        &mut witnesses,
+                        Some(&plan),
+                    )
+                    .unwrap(),
+                    expected,
+                );
+                if destination == 3 {
+                    edges[0][2] = false;
+                } else {
+                    edges[3][1] = false;
+                }
             }
         }
         manifest.m_max0 = 2;
@@ -969,6 +1039,144 @@ mod tests {
     }
 
     #[test]
+    fn bidirectional_witness_keeps_vertex_row_and_step_limits() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:16,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, _) = orig.hnsw_indices.get("g").unwrap();
+        let node = |id: usize| (vec![DataValue::from(id as i64)], 1, -1);
+        let last = MAX_WITNESS_VERTICES + 2;
+        for from in 1..last {
+            for (a, b, ignored) in [(from, from + 1, false), (from + 1, from, true)] {
+                tx.repair_put_edge(
+                    table,
+                    0,
+                    &node(a),
+                    &node(b),
+                    &[
+                        DataValue::from(1.),
+                        DataValue::Null,
+                        DataValue::from(ignored),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        for (mut budget, reason) in [
+            (PruningWitnesses::default(), "witness vertices"),
+            // One physical prefix row fits, but its reverse point read does not.
+            (
+                PruningWitnesses {
+                    rows_left: 1,
+                    ..Default::default()
+                },
+                "witness adjacency rows",
+            ),
+            (
+                PruningWitnesses {
+                    steps_left: 0,
+                    ..Default::default()
+                },
+                "witness reachability work",
+            ),
+        ] {
+            let error = tx
+                .hnsw_pruning_witness(
+                    table,
+                    0,
+                    &node(0),
+                    &node(last),
+                    vec![node(1)],
+                    &mut budget,
+                    None,
+                )
+                .unwrap_err();
+            assert!(error.to_string().contains(reason), "{error:?}");
+            assert!(budget.adjacency.len() <= MAX_WITNESS_VERTICES);
+        }
+    }
+
+    #[test]
+    fn pruning_witness_does_not_explore_a_wide_component_before_a_short_proof() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:16,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, _) = orig.hnsw_indices.get("g").unwrap();
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        let mut links = vec![(0, 1), (0, 3), (0, 9999), (1, 4), (4, 3)];
+        // Every stored vertex except the deliberately over-cap pruning target
+        // stays within 32 outgoing edges. The unrelated component is wide
+        // enough to exhaust a forward-only 1024-vertex search.
+        for branch in 100..131 {
+            links.push((1, branch));
+            for leaf in 0..32 {
+                links.push((branch, 1000 + (branch - 100) * 32 + leaf));
+            }
+        }
+        for &(from, to) in &links {
+            for (a, b, ignored) in [(from, to, false), (to, from, true)] {
+                tx.repair_put_edge(
+                    table,
+                    0,
+                    &node(a),
+                    &node(b),
+                    &[
+                        DataValue::from(1.),
+                        DataValue::Null,
+                        DataValue::from(ignored),
+                    ],
+                )
+                .unwrap();
+            }
+        }
+        let before = table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap();
+        let mut witnesses = PruningWitnesses::default();
+        assert!(tx
+            .hnsw_pruning_witness(
+                table,
+                0,
+                &node(0),
+                &node(3),
+                vec![node(1)],
+                &mut witnesses,
+                None,
+            )
+            .unwrap());
+        // 9999 is reachable only through excluded target 0. Retain that edge,
+        // then prove the redundant 0 -> 3 through 0 -> 1 -> 4 -> 3.
+        let candidates = [(1, 1.), (3, 90.), (9999, 100.)]
+            .into_iter()
+            .map(|(id, d)| (node(id), OrderedFloat(d)))
+            .collect();
+        let kept = tx
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &PriorityQueue::new(), 2)
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.get_priority(&node(1)).is_some());
+        assert!(kept.get_priority(&node(9999)).is_some());
+        assert_eq!(
+            before,
+            table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap()
+        );
+    }
+
+    #[test]
     fn incremental_pruning_finds_external_witness_without_changing_edges() {
         let db = crate::DbInstance::new("mem", "", "").unwrap();
         script(&db, ":create p {id:Int=>v:<F32;2>}");
@@ -1015,6 +1223,18 @@ mod tests {
             .unwrap();
         }
         let candidates = (1..4).map(|id| (node(id), OrderedFloat(1.))).collect();
+        // The production index stores bookkeeping rows for both directions,
+        // even when only one direction is traversable.
+        for (from, to) in [(4, 1), (2, 4)] {
+            tx.repair_put_edge(
+                table,
+                0,
+                &node(from),
+                &node(to),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+            )
+            .unwrap();
+        }
         let preferred = [1, 3]
             .into_iter()
             .map(|id| (node(id), Reverse(OrderedFloat(1.))))

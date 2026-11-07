@@ -54,6 +54,9 @@ Publication and final candidate qualification are pending.
   paths, and degree accounting counts only active outgoing edges. Vector fields
   and list elements within one row retain distinct identities. Online-build
   reconciliation uses snapshot vectors for changed/deleted nodes.
+  External path proofs search from both ends under the existing work limits,
+  avoiding unnecessary exploration of wide components when a short proof exists
+  or a necessary leaf edge must be retained.
 - **`::warnings` remains responsive during active transactions.** Reads and clears
   access the in-memory warning ring without opening a storage transaction, avoiding
   the wait behind an active memory/SQLite multi-transaction.
