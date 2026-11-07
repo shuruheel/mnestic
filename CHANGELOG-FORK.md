@@ -57,6 +57,10 @@ Publication and final candidate qualification are pending.
   External path proofs search from both ends under the existing work limits,
   avoiding unnecessary exploration of wide components when a short proof exists
   or a necessary leaf edge must be retained.
+  Incremental pruning tries local and external proofs for older edges before
+  dropping a newly installed link, avoiding ordering-dependent rejections when
+  that link supplies a route needed by a later neighbor. Degree and work limits
+  remain enforced, including explicit failure for infeasible repairs.
 - **`::warnings` remains responsive during active transactions.** Reads and clears
   access the in-memory warning ring without opening a storage transaction, avoiding
   the wait behind an active memory/SQLite multi-transaction.

@@ -130,6 +130,7 @@ impl SessionTx<'_> {
         candidates: &PriorityQueue<CompoundKey, OrderedFloat<f64>>,
         preferred: &PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>,
         cap: usize,
+        inserted: Option<&CompoundKey>,
     ) -> Result<PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>> {
         if candidates.len() > MAX_NEIGHBOURS {
             return Err(limit("pruning vertices"));
@@ -166,17 +167,35 @@ impl SessionTx<'_> {
                 .then_with(|| OrderedFloat(b.2).cmp(&OrderedFloat(a.2)))
                 .then_with(|| a.1.cmp(&b.1))
         });
-        let mut degrees = vec![0; n + 1];
-        degrees[n] = n;
-        prune_redundant_edges(&mut edges, &removable, &mut degrees, cap)?;
-        if degrees[n] > cap {
+        let mut degree = n;
+        let mut local_work = MAX_REACH_STEPS;
+        let mut witnesses = PruningWitnesses::default();
+        // Earlier neighbours must not casually discard the new vertex's links:
+        // that can leave a later neighbour with too many indispensable branches.
+        // Try both local and external proofs for old edges before considering the
+        // newly inserted edge. This is a preference, never an unremovable edge.
+        // Budgets are shared across both phases, not renewed for the fallback.
+        for new_edge in [false, true] {
+            let phase: Vec<_> = removable
+                .iter()
+                .filter(|(_, i, _)| (inserted == Some(&keys[*i])) == new_edge)
+                .collect();
+            for &&(_, i, _) in &phase {
+                if degree <= cap {
+                    break;
+                }
+                edges[n][i] = false;
+                if reachable(&edges, n, i, &mut local_work)? {
+                    degree -= 1;
+                } else {
+                    edges[n][i] = true;
+                }
+            }
             // An induced neighbourhood can hide an existing alternate path.
-            // Search beyond it only when the cheap local proof is insufficient.
-            // These witnesses never visit target, so removing its outgoing
-            // edges cannot invalidate a cached witness adjacency.
-            let mut witnesses = PruningWitnesses::default();
-            for &(_, i, _) in &removable {
-                if degrees[n] <= cap {
+            // Witnesses exclude target, so its outgoing-edge removals cannot
+            // invalidate the stored-adjacency cache shared by these phases.
+            for &&(_, i, _) in &phase {
+                if degree <= cap {
                     break;
                 }
                 if !edges[n][i] {
@@ -198,12 +217,12 @@ impl SessionTx<'_> {
                     None,
                 )? {
                     edges[n][i] = false;
-                    degrees[n] -= 1;
+                    degree -= 1;
                 }
             }
-            if degrees[n] > cap {
-                return Err(limit("insertion degree cap cannot preserve bypass paths"));
-            }
+        }
+        if degree > cap {
+            return Err(limit("insertion degree cap cannot preserve bypass paths"));
         }
         let mut ret = PriorityQueue::new();
         for (_, i, d) in removable {
@@ -1105,6 +1124,226 @@ mod tests {
     }
 
     #[test]
+    fn insertion_pruning_preserves_new_links_until_old_proofs_are_exhausted() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:2,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, _) = orig.hnsw_indices.get("g").unwrap();
+        // N=0, A=1, B=2, C=3, D=4, E=5. Existing graph is strongly
+        // connected and capped at two. N selects A and B reciprocally.
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        let links = [
+            (1, 2),
+            (1, 5),
+            (2, 3),
+            (2, 4),
+            (3, 1),
+            (4, 2),
+            (5, 1),
+            (0, 1),
+            (0, 2),
+            (1, 0),
+            (2, 0),
+        ];
+        for &(a, b) in &links {
+            for (from, to) in [(a, b), (b, a)] {
+                tx.repair_put_edge(
+                    table,
+                    0,
+                    &node(from),
+                    &node(to),
+                    &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+                )
+                .unwrap();
+            }
+        }
+        for &(a, b) in &links {
+            tx.repair_put_edge(
+                table,
+                0,
+                &node(a),
+                &node(b),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(false)],
+            )
+            .unwrap();
+        }
+        let a = [0, 2, 5]
+            .into_iter()
+            .map(|id| (node(id), OrderedFloat(1.)))
+            .collect();
+        let b = [0, 3, 4]
+            .into_iter()
+            .map(|id| (node(id), OrderedFloat(1.)))
+            .collect();
+        let greedy = tx
+            .hnsw_preserve_pruned_paths(&node(1), 0, table, &a, &PriorityQueue::new(), 2, None)
+            .unwrap();
+        assert!(greedy.get_priority(&node(0)).is_none());
+        // A->N was validly removed via A->B->N. That decision leaves B
+        // with three indispensable branches, although a joint solution exists.
+        tx.repair_put_edge(
+            table,
+            0,
+            &node(1),
+            &node(0),
+            &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+        )
+        .unwrap();
+        let error = tx
+            .hnsw_preserve_pruned_paths(&node(2), 0, table, &b, &PriorityQueue::new(), 2, None)
+            .unwrap_err();
+        assert!(format!("{error}").contains("insertion degree cap cannot preserve bypass paths"));
+        // Undo A's choice. Keeping its new link instead allows A->B to
+        // disappear through A->N->B, then B->N through B->C->A->N.
+        tx.repair_put_edge(
+            table,
+            0,
+            &node(1),
+            &node(0),
+            &[DataValue::from(1.), DataValue::Null, DataValue::from(false)],
+        )
+        .unwrap();
+        let alternative = tx
+            .hnsw_preserve_pruned_paths(
+                &node(1),
+                0,
+                table,
+                &a,
+                &PriorityQueue::new(),
+                2,
+                Some(&node(0)),
+            )
+            .unwrap();
+        assert!(alternative.get_priority(&node(2)).is_none());
+        tx.repair_put_edge(
+            table,
+            0,
+            &node(1),
+            &node(2),
+            &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+        )
+        .unwrap();
+        let last = tx
+            .hnsw_preserve_pruned_paths(
+                &node(2),
+                0,
+                table,
+                &b,
+                &PriorityQueue::new(),
+                2,
+                Some(&node(0)),
+            )
+            .unwrap();
+        assert_eq!(last.len(), 2);
+        assert!(last.get_priority(&node(0)).is_none());
+        tx.repair_put_edge(
+            table,
+            0,
+            &node(2),
+            &node(0),
+            &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+        )
+        .unwrap();
+        let mut edges = vec![vec![false; 6]; 6];
+        for (i, row) in edges.iter_mut().enumerate() {
+            for (dest, live) in tx.repair_neighbours(table, 0, &node(i as i64)).unwrap() {
+                if live {
+                    row[dest.0[0].get_int().unwrap() as usize] = true;
+                }
+            }
+            assert!(row.iter().filter(|&&live| live).count() <= 2);
+        }
+        let mut work = MAX_REACH_STEPS;
+        for i in 0..6 {
+            for j in 0..6 {
+                assert!(reachable(&edges, i, j, &mut work).unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn insertion_tries_external_old_edge_proofs_before_new_edge_local_proof() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create p {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "::hnsw create p:g {fields:[v],dim:2,m:2,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("p", false).unwrap();
+        let (table, _) = orig.hnsw_indices.get("g").unwrap();
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        let links = [
+            (1, 0),
+            (1, 2),
+            (1, 3),
+            (2, 0),
+            (0, 1),
+            (0, 4),
+            (4, 2),
+            (3, 1),
+        ];
+        for &(a, b) in &links {
+            for (from, to) in [(a, b), (b, a)] {
+                tx.repair_put_edge(
+                    table,
+                    0,
+                    &node(from),
+                    &node(to),
+                    &[DataValue::from(1.), DataValue::Null, DataValue::from(true)],
+                )
+                .unwrap();
+            }
+        }
+        for &(a, b) in &links {
+            tx.repair_put_edge(
+                table,
+                0,
+                &node(a),
+                &node(b),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(false)],
+            )
+            .unwrap();
+        }
+        let before = table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap();
+        let candidates = [0, 2, 3]
+            .into_iter()
+            .map(|id| (node(id), OrderedFloat(1.)))
+            .collect();
+        // 1->0 has a local alternate 1->2->0. Keep it until the external
+        // alternate 1->0->4->2 for old edge 1->2 has been considered.
+        let kept = tx
+            .hnsw_preserve_pruned_paths(
+                &node(1),
+                0,
+                table,
+                &candidates,
+                &PriorityQueue::new(),
+                2,
+                Some(&node(0)),
+            )
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.get_priority(&node(0)).is_some());
+        assert!(kept.get_priority(&node(3)).is_some());
+        assert_eq!(
+            before,
+            table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap()
+        );
+    }
+
+    #[test]
     fn pruning_witness_does_not_explore_a_wide_component_before_a_short_proof() {
         let db = crate::DbInstance::new("mem", "", "").unwrap();
         script(&db, ":create p {id:Int=>v:<F32;2>}");
@@ -1165,7 +1404,15 @@ mod tests {
             .map(|(id, d)| (node(id), OrderedFloat(d)))
             .collect();
         let kept = tx
-            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &PriorityQueue::new(), 2)
+            .hnsw_preserve_pruned_paths(
+                &node(0),
+                0,
+                table,
+                &candidates,
+                &PriorityQueue::new(),
+                2,
+                None,
+            )
             .unwrap();
         assert_eq!(kept.len(), 2);
         assert!(kept.get_priority(&node(1)).is_some());
@@ -1241,7 +1488,7 @@ mod tests {
             .collect();
         let before = table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap();
         let kept = tx
-            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2)
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2, None)
             .unwrap();
         assert_eq!(kept.len(), 2);
         assert!(kept.get_priority(&node(1)).is_some());
@@ -1276,7 +1523,7 @@ mod tests {
         )
         .unwrap();
         let error = tx
-            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2)
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2, None)
             .unwrap_err();
         assert!(error.to_string().contains("degree cap"));
     }
@@ -1334,7 +1581,7 @@ mod tests {
         .into_iter()
         .collect();
         let error = tx
-            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2)
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2, None)
             .unwrap_err();
         assert!(error.to_string().contains("degree cap"));
         // A surviving path through 1 now permits removal of the direct 0->2.
@@ -1351,7 +1598,7 @@ mod tests {
         )
         .unwrap();
         let kept = tx
-            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2)
+            .hnsw_preserve_pruned_paths(&node(0), 0, table, &candidates, &preferred, 2, None)
             .unwrap();
         assert!(kept.get_priority(&node(1)).is_some() && kept.get_priority(&node(3)).is_some());
     }

@@ -36,7 +36,16 @@ Incremental insertion/replacement pruning also preserves paths: it only removes
 an outgoing edge when a checked alternate route survives. It
 uses the existing selection heuristic as a preference, retaining necessary edges.
 All selected bidirectional insertion links are installed before pruning, so the
-proof sees the complete new layer. Pruning first checks the immediate neighborhood.
+proof sees the complete new layer. While shrinking an existing neighbor, first
+try removing older outgoing edges using local and then bounded external proofs.
+Only if those cannot meet the cap, consider removing its newly installed link to
+the inserted vertex, again requiring a path proof. This preserves a new route
+that later neighbors may need: an individually valid early removal can otherwise
+leave a later neighbor with too many indispensable branches despite a feasible
+alternative pruning order. The new link is a preference, not a protected edge;
+some fixed edge sets remain genuinely infeasible and must still fail explicitly.
+Both phases share the same local-work and external witness budgets and cache.
+Pruning first checks the immediate neighborhood.
 If that induced subgraph is insufficient, a bounded bidirectional breadth-first
 search may prove an existing route through external vertices. Forward search
 starts from currently retained outgoing neighbours; backward search starts from
@@ -128,6 +137,10 @@ a recovery strategy. No production database is rebuilt by the release itself.
   retain necessary leaf edges, and find a different removable edge. Vertex, row
   (including reverse probes) and step limits still fail explicitly. Reusing a
   stored-adjacency cache respects changing repair plans in both directions.
+- A deterministic sequential-pruning fixture retains the new link until older
+  local/external proofs are tried, permits its later removal when necessary, and
+  checks final degree caps and all-pairs reachability. Duplicate-vector fixtures
+  exercise the consumer's 100/100/1 insertion batches and verify full retrieval.
 - Review insertion pruning interaction and partial legacy-transaction errors.
 - Run HNSW/reindex/hybrid and transaction regressions and strict Clippy. Retain
   immutable fix SHA and independent storage-contract review before delivery.

@@ -280,7 +280,8 @@ impl<'a> SessionTx<'a> {
         vec_cache: &mut VectorCache,
     ) -> Result<()> {
         let tuple_key = &tuple[..orig_table.metadata.keys.len()];
-        vec_cache.insert((tuple_key.to_vec(), idx, subidx), q.clone());
+        let inserted_key = (tuple_key.to_vec(), idx, subidx);
+        vec_cache.insert(inserted_key.clone(), q.clone());
         let hash = q.get_hash();
         let mut canary_tuple = vec![DataValue::from(0)];
         for _ in 0..2 {
@@ -467,6 +468,7 @@ impl<'a> SessionTx<'a> {
                         // shrink links
                         target_degree = self.hnsw_shrink_neighbour(
                             neighbour,
+                            &inserted_key,
                             m_max,
                             current_level,
                             manifest,
@@ -505,6 +507,7 @@ impl<'a> SessionTx<'a> {
     fn hnsw_shrink_neighbour(
         &mut self,
         target_key: &CompoundKey,
+        inserted: &CompoundKey,
         m: usize,
         level: i64,
         manifest: &HnswIndexManifest,
@@ -537,6 +540,7 @@ impl<'a> SessionTx<'a> {
             &candidates,
             &new_candidates,
             m,
+            Some(inserted),
         )?;
         let mut old_candidate_set = FxHashSet::default();
         for (old, _) in &candidates {
