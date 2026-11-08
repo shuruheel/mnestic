@@ -59,25 +59,46 @@ fn edge_key(layer: i64, from: &CompoundKey, to: &CompoundKey) -> Tuple {
     key
 }
 
-fn reachable(edges: &[Vec<bool>], from: usize, to: usize, work: &mut usize) -> Result<bool> {
-    let mut seen = vec![false; edges.len()];
-    let mut stack = vec![from];
-    seen[from] = true;
-    while let Some(node) = stack.pop() {
-        if node == to {
-            return Ok(true);
-        }
-        for (next, connected) in edges[node].iter().enumerate() {
-            *work = work
-                .checked_sub(1)
-                .ok_or_else(|| limit("reachability work"))?;
-            if *connected && !seen[next] {
-                seen[next] = true;
-                stack.push(next);
+#[derive(Default)]
+struct ReachabilityScratch {
+    seen: Vec<bool>,
+    stack: Vec<usize>,
+}
+
+impl ReachabilityScratch {
+    fn reachable(
+        &mut self,
+        edges: &[Vec<bool>],
+        from: usize,
+        to: usize,
+        work: &mut usize,
+    ) -> Result<bool> {
+        self.seen.resize(edges.len(), false);
+        self.seen.fill(false);
+        self.stack.clear();
+        self.stack.push(from);
+        self.seen[from] = true;
+        while let Some(node) = self.stack.pop() {
+            if node == to {
+                return Ok(true);
+            }
+            for (next, connected) in edges[node].iter().enumerate() {
+                *work = work
+                    .checked_sub(1)
+                    .ok_or_else(|| limit("reachability work"))?;
+                if *connected && !self.seen[next] {
+                    self.seen[next] = true;
+                    self.stack.push(next);
+                }
             }
         }
+        Ok(false)
     }
-    Ok(false)
+}
+
+#[cfg(test)]
+fn reachable(edges: &[Vec<bool>], from: usize, to: usize, work: &mut usize) -> Result<bool> {
+    ReachabilityScratch::default().reachable(edges, from, to, work)
 }
 
 // Only new edges may be removed. Every removal preserves all existing paths by
@@ -104,12 +125,13 @@ fn prune_redundant_edges(
     cap: usize,
 ) -> Result<()> {
     let mut work = MAX_REACH_STEPS;
+    let mut scratch = ReachabilityScratch::default();
     for &(from, to, _) in added {
         if degrees[from] <= cap {
             continue;
         }
         edges[from][to] = false;
-        if reachable(edges, from, to, &mut work)? {
+        if scratch.reachable(edges, from, to, &mut work)? {
             degrees[from] -= 1;
         } else {
             edges[from][to] = true;
@@ -169,6 +191,7 @@ impl SessionTx<'_> {
         });
         let mut degree = n;
         let mut local_work = MAX_REACH_STEPS;
+        let mut scratch = ReachabilityScratch::default();
         let mut witnesses = PruningWitnesses::default();
         // Earlier neighbours must not casually discard the new vertex's links:
         // that can leave a later neighbour with too many indispensable branches.
@@ -185,7 +208,7 @@ impl SessionTx<'_> {
                     break;
                 }
                 edges[n][i] = false;
-                if reachable(&edges, n, i, &mut local_work)? {
+                if scratch.reachable(&edges, n, i, &mut local_work)? {
                     degree -= 1;
                 } else {
                     edges[n][i] = true;
@@ -642,6 +665,23 @@ impl SessionTx<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reachability_scratch_resets_after_success_failure_and_exhaustion() {
+        let mut edges = vec![vec![false; 3]; 3];
+        edges[0][1] = true;
+        edges[0][2] = true;
+        let mut scratch = ReachabilityScratch::default();
+        let mut work = 3;
+        assert!(scratch.reachable(&edges, 0, 2, &mut work).unwrap());
+        assert_eq!(work, 0);
+        // Reusing buffers must not replenish the caller's shared budget.
+        assert!(scratch.reachable(&edges, 0, 1, &mut work).is_err());
+        edges[0][1] = false;
+        assert!(!scratch.reachable(&edges, 0, 1, &mut 100).unwrap());
+        edges[0][1] = true;
+        assert!(scratch.reachable(&edges, 0, 1, &mut 100).unwrap());
+    }
 
     fn script(db: &crate::DbInstance, text: &str) -> crate::NamedRows {
         db.run_script(text, Default::default(), crate::ScriptMutability::Mutable)

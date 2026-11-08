@@ -27,6 +27,11 @@ Publication and final candidate qualification are pending.
 
 ### Changed
 
+- Reuse local HNSW reachability scratch buffers without changing traversal or
+  repair work limits. Skip FTS writer-completion bookkeeping for transactions
+  that never begin posting mutations, while retaining snapshot-generation capture.
+  These reduce avoidable work; no new performance percentage is claimed.
+
 - **BREAKING (results): Transactional FTS statistics.** Document counts and average
   lengths now follow the querying transaction's posting snapshot and pending
   writes. Aborts, failed commits and overlapping snapshots can therefore produce

@@ -8,6 +8,7 @@
 //! snapshots use local scans without publishing their results.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use crate::runtime::relation::RelationId;
@@ -55,6 +56,7 @@ impl FtsStatsCache {
             shared: self.clone(),
             generation,
             local: Mutex::new(Local::default()),
+            mutation_started: AtomicBool::new(false),
         }
     }
 
@@ -80,6 +82,9 @@ pub(crate) struct TxFtsStats {
     shared: Arc<FtsStatsCache>,
     generation: u64,
     local: Mutex<Local>,
+    // Set before any fallible mutation bookkeeping. Read-only transactions still
+    // capture the generation before their snapshot, but need no writer cleanup.
+    mutation_started: AtomicBool,
 }
 
 impl TxFtsStats {
@@ -133,6 +138,7 @@ impl TxFtsStats {
     }
 
     fn start_write(&self, id: Option<RelationId>) -> bool {
+        self.mutation_started.store(true, Ordering::Release);
         let mut local = self.local();
         let mut shared = self.shared.lock();
         if !local.active {
@@ -175,7 +181,7 @@ impl TxFtsStats {
     }
 
     pub(crate) fn can_commit(&self) -> bool {
-        self.local().uncertain.is_empty()
+        !self.mutation_started.load(Ordering::Acquire) || self.local().uncertain.is_empty()
     }
 
     pub(crate) fn removed(&self, id: RelationId) {
@@ -185,6 +191,9 @@ impl TxFtsStats {
     }
 
     fn finish(&self, committed: bool) {
+        if !self.mutation_started.load(Ordering::Acquire) {
+            return;
+        }
         let mut local = self.local();
         if local.finished {
             return;
@@ -238,6 +247,24 @@ mod tests {
     use super::FtsStatsCache;
     use crate::runtime::relation::RelationId;
     use std::sync::Arc;
+
+    #[test]
+    fn unused_reader_still_captures_generation_before_snapshot() {
+        let (cache, id) = warmed();
+        let reader = cache.transaction();
+        let writer = cache.transaction();
+        writer.before_write(id);
+        writer.complete_write(id, (200, 4), false);
+        writer.committed();
+        // A fast no-op lifecycle must not delay generation capture until get.
+        assert_eq!(reader.get(id), None);
+        assert!(reader.can_commit());
+        reader.committed();
+        assert_eq!(cache.transaction().get(id), Some((200, 4)));
+        let failed = cache.transaction();
+        failed.before_write(id);
+        assert!(!failed.can_commit());
+    }
 
     fn warmed() -> (Arc<FtsStatsCache>, RelationId) {
         let cache = Arc::new(FtsStatsCache::default());
