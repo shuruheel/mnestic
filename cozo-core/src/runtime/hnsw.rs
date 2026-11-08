@@ -53,6 +53,8 @@ impl HnswIndexManifest {
     }
 }
 
+mod repair;
+
 type CompoundKey = (Tuple, usize, i32);
 
 #[inline]
@@ -201,11 +203,15 @@ impl VectorCache {
     }
 
     fn insert_from_tuple(&mut self, key: &CompoundKey, tuple: &[DataValue]) -> Result<()> {
-        let mut field = &tuple[key.1];
+        let mut field = tuple
+            .get(key.1)
+            .ok_or_else(|| miette!("corrupt HNSW vector field"))?;
         if key.2 >= 0 {
             match field {
                 DataValue::List(l) => {
-                    field = &l[key.2 as usize];
+                    field = l
+                        .get(key.2 as usize)
+                        .ok_or_else(|| miette!("corrupt HNSW vector subindex"))?;
                 }
                 _ => bail!("Cannot interpret {} as list", field),
             }
@@ -274,7 +280,8 @@ impl<'a> SessionTx<'a> {
         vec_cache: &mut VectorCache,
     ) -> Result<()> {
         let tuple_key = &tuple[..orig_table.metadata.keys.len()];
-        vec_cache.insert((tuple_key.to_vec(), idx, subidx), q.clone());
+        let inserted_key = (tuple_key.to_vec(), idx, subidx);
+        vec_cache.insert(inserted_key.clone(), q.clone());
         let hash = q.get_hash();
         let mut canary_tuple = vec![DataValue::from(0)];
         for _ in 0..2 {
@@ -288,7 +295,9 @@ impl<'a> SessionTx<'a> {
                     return Ok(());
                 }
             }
-            self.hnsw_remove_vec(tuple_key, idx, subidx, orig_table, idx_table)?;
+            self.hnsw_remove_vec(
+                tuple_key, idx, subidx, manifest, orig_table, idx_table, vec_cache,
+            )?;
         }
 
         let ep_res = idx_table
@@ -425,7 +434,12 @@ impl<'a> SessionTx<'a> {
                     let in_val_bytes =
                         idx_table.encode_val_only_for_store(&in_val, Default::default())?;
                     self.idx_put(idx_table, &in_key_bytes, &in_val_bytes)?;
+                }
 
+                // Pruning must see every selected link in this layer. Otherwise
+                // paths through the new vertex's not-yet-written neighbours are
+                // invisible and a feasible insertion can be rejected.
+                for (neighbour, _) in neighbours.iter() {
                     // shrink links if necessary
                     let mut target_self_key =
                         Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
@@ -454,6 +468,7 @@ impl<'a> SessionTx<'a> {
                         // shrink links
                         target_degree = self.hnsw_shrink_neighbour(
                             neighbour,
+                            &inserted_key,
                             m_max,
                             current_level,
                             manifest,
@@ -492,6 +507,7 @@ impl<'a> SessionTx<'a> {
     fn hnsw_shrink_neighbour(
         &mut self,
         target_key: &CompoundKey,
+        inserted: &CompoundKey,
         m: usize,
         level: i64,
         manifest: &HnswIndexManifest,
@@ -516,6 +532,15 @@ impl<'a> SessionTx<'a> {
             idx_table,
             orig_table,
             vec_cache,
+        )?;
+        let new_candidates = self.hnsw_preserve_pruned_paths(
+            target_key,
+            level,
+            idx_table,
+            &candidates,
+            &new_candidates,
+            m,
+            Some(inserted),
         )?;
         let mut old_candidate_set = FxHashSet::default();
         for (old, _) in &candidates {
@@ -740,7 +765,7 @@ impl<'a> SessionTx<'a> {
                     miette!("corrupt HNSW edge row: vector sub-index is not an integer")
                 })? as i32;
                 let key_tup = tuple[key_len + 3..2 * key_len + 3].to_vec();
-                if key_tup == cand_key.0 {
+                if key_tup == cand_key.0 && key_idx == cand_key.1 && key_subidx == cand_key.2 {
                     return Ok(None);
                 }
                 let distance = tuple[2 * key_len + 5]
@@ -823,7 +848,8 @@ impl<'a> SessionTx<'a> {
             cache: FxHashMap::default(),
             distance: manifest.distance,
         };
-        self.hnsw_put_inner(
+        self.hnsw_mutations_incomplete += 1;
+        let result = self.hnsw_put_inner(
             manifest,
             orig_table,
             idx_table,
@@ -831,7 +857,11 @@ impl<'a> SessionTx<'a> {
             stack,
             tuple,
             &mut vec_cache,
-        )
+        );
+        if result.is_ok() {
+            self.hnsw_mutations_incomplete -= 1;
+        }
+        result
     }
 
     /// Bulk-build an HNSW index over `tuples` (mnestic fork). The graph is
@@ -995,7 +1025,7 @@ impl<'a> SessionTx<'a> {
     ) -> Result<bool> {
         if let Some(code) = filter {
             if !eval_bytecode_pred(code, tuple, stack, Default::default())? {
-                self.hnsw_remove(orig_table, idx_table, tuple)?;
+                self.hnsw_remove(manifest, orig_table, idx_table, tuple)?;
                 return Ok(false);
             }
         }
@@ -1016,7 +1046,7 @@ impl<'a> SessionTx<'a> {
             .iter()
             .map(|(_, idx, sub)| (*idx, *sub))
             .collect();
-        self.hnsw_remove_except(orig_table, idx_table, tuple, &keep)?;
+        self.hnsw_remove_except(manifest, orig_table, idx_table, tuple, &keep, vec_cache)?;
         if extracted_vectors.is_empty() {
             return Ok(false);
         }
@@ -1029,19 +1059,38 @@ impl<'a> SessionTx<'a> {
     }
     pub(crate) fn hnsw_remove(
         &mut self,
+        manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
         tuple: &[DataValue],
     ) -> Result<()> {
-        self.hnsw_remove_except(orig_table, idx_table, tuple, &FxHashSet::default())
+        let mut cache = VectorCache {
+            cache: FxHashMap::default(),
+            distance: manifest.distance,
+        };
+        self.hnsw_mutations_incomplete += 1;
+        let result = self.hnsw_remove_except(
+            manifest,
+            orig_table,
+            idx_table,
+            tuple,
+            &FxHashSet::default(),
+            &mut cache,
+        );
+        if result.is_ok() {
+            self.hnsw_mutations_incomplete -= 1;
+        }
+        result
     }
 
     fn hnsw_remove_except(
         &mut self,
+        manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
         tuple: &[DataValue],
         keep: &FxHashSet<(usize, i32)>,
+        vec_cache: &mut VectorCache,
     ) -> Result<()> {
         let mut prefix = vec![DataValue::from(0)];
         prefix.extend_from_slice(&tuple[0..orig_table.metadata.keys.len()]);
@@ -1068,18 +1117,23 @@ impl<'a> SessionTx<'a> {
             .collect::<Result<_>>()?;
         for (tuple_key, idx, subidx) in candidates {
             if !keep.contains(&(idx, subidx)) {
-                self.hnsw_remove_vec(&tuple_key, idx, subidx, orig_table, idx_table)?;
+                self.hnsw_remove_vec(
+                    &tuple_key, idx, subidx, manifest, orig_table, idx_table, vec_cache,
+                )?;
             }
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     fn hnsw_remove_vec(
         &mut self,
         tuple_key: &[DataValue],
         idx: usize,
         subidx: i32,
+        manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
+        vec_cache: &mut VectorCache,
     ) -> Result<()> {
         let compound_key = (tuple_key.to_vec(), idx, subidx);
         // Go down the layers and remove all the links
@@ -1094,6 +1148,14 @@ impl<'a> SessionTx<'a> {
             }
             let self_key_bytes = idx_table.encode_key_for_store(&self_key, Default::default())?;
             if self.idx_exists(idx_table, &self_key_bytes)? {
+                self.hnsw_repair_before_remove(
+                    &compound_key,
+                    layer,
+                    manifest,
+                    orig_table,
+                    idx_table,
+                    vec_cache,
+                )?;
                 self.idx_del(idx_table, &self_key_bytes)?;
             } else {
                 break;
@@ -1104,8 +1166,6 @@ impl<'a> SessionTx<'a> {
                 .collect_vec();
             encountered_singletons |= neigbours.is_empty();
             for (neighbour_key, _) in neigbours {
-                // REMARK: this still has some probability of disconnecting the graph.
-                // Should we accept that as a consequence of the probabilistic nature of the algorithm?
                 let mut out_key = vec![DataValue::from(layer)];
                 out_key.extend_from_slice(tuple_key);
                 out_key.push(DataValue::from(idx as i64));
@@ -1123,6 +1183,13 @@ impl<'a> SessionTx<'a> {
                 in_key.push(DataValue::from(idx as i64));
                 in_key.push(DataValue::from(subidx as i64));
                 let in_key_bytes = idx_table.encode_key_for_store(&in_key, Default::default())?;
+                let incoming = self
+                    .idx_get(idx_table, &in_key_bytes)?
+                    .ok_or_else(|| miette!("corrupt HNSW index: missing reverse edge"))?;
+                let incoming = try_decode_val_only(&in_key_bytes, &incoming)?;
+                let incoming_active = !incoming[2]
+                    .get_bool()
+                    .ok_or_else(|| miette!("corrupt HNSW edge flag"))?;
                 self.idx_del(idx_table, &in_key_bytes)?;
                 let mut neighbour_self_key = vec![DataValue::from(layer)];
                 for _ in 0..2 {
@@ -1141,7 +1208,7 @@ impl<'a> SessionTx<'a> {
                     .first()
                     .and_then(DataValue::get_float)
                     .ok_or_else(|| miette!("corrupt HNSW self-row: missing numeric degree"))?;
-                neighbour_val[0] = DataValue::from(degree - 1.);
+                neighbour_val[0] = DataValue::from(degree - if incoming_active { 1. } else { 0. });
                 let neighbour_val_bytes_new =
                     idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?;
                 self.idx_put(

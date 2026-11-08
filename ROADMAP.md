@@ -39,7 +39,10 @@ release/issue descriptions retain their September 6 reconciliation date.
 
 ## Current state
 
-- `mnestic` 0.18.0 and `mnestic-rocks` 0.1.12 are the latest published releases.
+- `mnestic` 0.19.0 release scope was approved November 8, 2026, with the latency
+  caveats below; `mnestic-rocks` stays at 0.1.12. Registry/tag confirmation belongs
+  to the release delivery record, not this roadmap.
+- The preceding engine release is 0.18.0.
 - Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
 - LangChain, LlamaIndex, LangGraph, and MCP integrations are published.
@@ -71,32 +74,50 @@ PR #80; core adoption of `v0.18.0` merged in
 [documentation update](https://github.com/shuruheel/mnestic-site/pull/3) is deployed.
 These are separately verified delivery states; no cloud deployment is implied.
 
-### 0.19 planning
+### 0.19 release scope and decision
 
-The [0.19 release plan](docs/plans/0.19-planning.md), updated October 30, selects
-already-merged governed native Rust multi-transactions, responsive `::warnings`,
-the promised migration-warning removal, and the E1–E3 measurement/guidance deliverables.
-**November 12, 2026 is the provisional release target; scope freezes November 5.**
-Confirm the target after the first measurement pass. Correctness and candidate-package
-validation gate publication; November 19 is the fallback checkpoint with scope frozen.
-A new filtered-vector mechanism remains conditional on evidence and review before freeze.
-See the [measurement protocol](docs/plans/0.19-measurement-protocol.md) and
-[filtered-vector investigation](docs/plans/0.19-filtered-vector-investigation.md).
+The owner authorized release on November 8 following independent review of the
+focused runtime measurements. The [release decision](docs/plans/0.19-planning.md#november-8-release-decision-and-measurement-scope)
+records the accepted caveats and supersedes the provisional November 12/19 dates
+and earlier quiet-window hold. The
+[0.19.0 changelog](CHANGELOG-FORK.md#0190--2026-11-08) owns upgrade instructions.
 
-| Work | State | Gate |
-|---|---|---|
-| Governed native Rust multi-transactions and responsive `::warnings` | Merged; selected for 0.19, unreleased | Validate candidate against the transaction contract, including cancellation/commit ambiguity and host worker ownership |
-| Remove temporary `parser.string_decoding_changed` warning | Scheduled for 0.19.0 | Keep the migration guidance after removing the diagnostic |
-| Remeasure the public hybrid-recall benchmark on 0.18 | Selected October 27 — measurement | Published numbers are from May on an older build; refresh `RESULTS.md` from the current build, add a filtered-query workload (type-restricted vector plus FTS) and a read-your-writes latency column |
-| Filtered vector search for selective predicates | Selected October 27 — investigation | Evidence: a consumer's type-restricted vector query over a rare type returned nothing because it post-filters a global ANN prefix. Verify and measure the inherited HNSW `filter:` path on the new workload first; add `candidates:` on HNSW (mirroring 0.17's candidate-aware FTS) only if the filter path cannot meet a bounded-widening contract with resource bounds |
-| Parse/plan cost of large vector literals and repeated query text | Selected October 27 — measurement | Consumers splice 1,000-plus-float vectors into script text per request; parameter-binding guidance first, a plan cache only on a measured high-frequency workload (existing gate) |
-| [HNSW integrity #56](https://github.com/shuruheel/mnestic/issues/56) | E4 investigation; verifier/repair not committed to 0.19 | Failure fixtures and verified invariants before a read-only verifier; reproduce a current failure before committing repair |
-| [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Deferred behind the items above | Agree warning behavior and preserve legitimate transaction-scoped relations |
-| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Deferred behind the items above | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
+| Included capability | Behavior and upgrade boundary |
+|---|---|
+| Governed native Rust multi-transactions | Host-owned worker, one deadline, bounded idle waiting and statement limits; every query error aborts. Host admission must follow worker lifetime |
+| Responsive `::warnings` | In-memory reads/clears avoid storage locks during active transactions |
+| Transactional FTS statistics ([PR #69](https://github.com/shuruheel/mnestic/pull/69)) | Scores/top-k use the transaction's posting snapshot and pending writes; recheck score thresholds and ranking fixtures |
+| Retirement of `parser.string_decoding_changed` | Diagnostic removed; decoding and permanent migration guidance retained |
+| HNSW mutation connectivity | Preserve directed paths during removal/pruning or fail with `hnsw::repair_limit`; incomplete mutations cannot commit. Rebuild pre-0.19 indexes explicitly |
 
-Broader HNSW, Arrow export and quantization work remains subject to the evidence gates below.
+Rebuild pre-0.19 HNSW indexes with `::reindex <relation>` after backup and validate
+against exact queries. Budget maintenance time and evaluate write costs on the
+actual workload. Repair has local work caps, not total RSS/latency bounds or an
+exact ANN recall guarantee.
 
-### Measurement first — October 27, 2026
+The focused measurements compare two 0.19 builds, `3a8815a2` → `d6b9b5bf`, not
+0.18 → 0.19. Write p95 rose 3.1% on RocksDB and 11.8% on SQLite, with strong
+seed-specific SQLite tails. A separate one-seed RocksDB/1536-dimension window
+flagged five read cases, including exact scans around 249 → 288 ms and filtered
+ANN at 38.55 → 44.80 ms. Those observations remain caveats; they do not justify a
+general speedup or a uniformly small upgrade penalty. The original R2 campaign
+remains incomplete and the follow-up pair remains separate in the evidence.
+
+| Deferred work | Gate |
+|---|---|
+| Consumer automatic exact routing | Deferred after material full-API overhead; any renewed implementation needs its own consumer acceptance |
+| New filtered-ANN mechanism | Inherited selective-retrieval limitations remain; require a bounded contract and measured benefit |
+| Plan caching | Parameter-binding guidance first; require residual planning cost on a real high-frequency workload |
+| General HNSW integrity verifier ([#56](https://github.com/shuruheel/mnestic/issues/56)) | Separate bounded contract, failure corpus and accepted evidence |
+| [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Agree warning behavior and preserve legitimate transaction-scoped relations |
+| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
+
+Layered storage is not selected. Broader HNSW, Arrow export and quantization work
+retain the gates below. A refreshed public 0.18-to-0.19 performance comparison is
+not claimed by the focused release evidence. Final publication-SHA checks and
+registry confirmation remain part of the release workflow.
+
+### Historical measurement-first selection — October 27, 2026
 
 The next engine work is small and measurement-led. Consumers building retrieval on mnestic
 report end-to-end latencies an order of magnitude above the engine's measured fused

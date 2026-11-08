@@ -1,0 +1,24 @@
+   Compiling mnestic v0.18.0 (/Users/shuruheel/Code/mindgraph/mnestic/cozo-core)
+    Finished `test` profile [unoptimized] target(s) in 1m 08s
+     Running tests/hnsw_mutation_repair.rs (/tmp/mnestic-019-target/debug/deps/hnsw_mutation_repair-b2618bd071cd9c59)
+
+running 1 test
+test bridge_delete_and_vector_replacement_preserve_survivors ... FAILED
+
+failures:
+
+---- bridge_delete_and_vector_replacement_preserve_survivors stdout ----
+
+thread 'bridge_delete_and_vector_replacement_preserve_survivors' (2649175) panicked at cozo-core/tests/hnsw_mutation_repair.rs:35:5:
+assertion `left == right` failed
+  left: [0]
+ right: [0, 2]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    bridge_delete_and_vector_replacement_preserve_survivors
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p mnestic --test hnsw_mutation_repair`

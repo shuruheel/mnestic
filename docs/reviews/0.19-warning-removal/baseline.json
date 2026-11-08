@@ -1,0 +1,128 @@
+{
+  "mode": "baseline",
+  "version": "0.18.0",
+  "fixture_sha256": "690cf54437e44064906d08bfe5b994b996591d427112d935ff5405855db93c01",
+  "records": [
+    {
+      "case": "corrected_builder",
+      "value": "quote\" and apostrophe'",
+      "rows": [
+        [
+          0,
+          "quote\" and apostrophe'"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "corrected_builder",
+      "value": "C:\\Users\\name",
+      "rows": [
+        [
+          1,
+          "C:\\Users\\name"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "corrected_builder",
+      "value": "path/to/name",
+      "rows": [
+        [
+          2,
+          "path/to/name"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "corrected_builder",
+      "value": "  edge\t\n",
+      "rows": [
+        [
+          3,
+          "  edge\t\n"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "corrected_builder",
+      "value": "\u00e9\ud83d\ude00",
+      "rows": [
+        [
+          4,
+          "\u00e9\ud83d\ude00"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "corrected_builder",
+      "value": "/* comment */",
+      "rows": [
+        [
+          5,
+          "/* comment */"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "corrected_builder",
+      "value": "\\uD800",
+      "rows": [
+        [
+          6,
+          "\\uD800"
+        ]
+      ],
+      "warnings": []
+    },
+    {
+      "case": "legacy_warning",
+      "literal": "\"a\\nb\"",
+      "rows": [
+        [
+          "a\nb"
+        ]
+      ],
+      "warnings": [
+        "parser.string_decoding_changed"
+      ]
+    },
+    {
+      "case": "legacy_warning",
+      "literal": "_\"  raw  \"_",
+      "rows": [
+        [
+          "  raw  "
+        ]
+      ],
+      "warnings": [
+        "parser.string_decoding_changed"
+      ]
+    },
+    {
+      "case": "error",
+      "literal": "\"\\uD800\"",
+      "error_code": "parser::invalid_utf8_code",
+      "warnings": [
+        "parser.string_decoding_changed"
+      ]
+    },
+    {
+      "case": "error",
+      "literal": "\"\\q\"",
+      "error_code": "parser::pest",
+      "warnings": []
+    },
+    {
+      "case": "error",
+      "literal": "__ \"gap\" __",
+      "error_code": "parser::pest",
+      "warnings": []
+    }
+  ]
+}

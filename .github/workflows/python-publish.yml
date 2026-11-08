@@ -75,12 +75,13 @@ jobs:
           # aarch64 needs the 2_28 image: the manylinux2014 cross-GCC is too old
           # to assemble ring's ARM asm (#error "ARM assembler must define __ARM_ARCH").
           - { os: ubuntu-latest,  target: aarch64, manylinux: "2_28", features: "compact,storage-rocksdb,rdf-io,columnar-io" }
+          # macos-14 retired on 2026-11-02; use the supported macos-15 image.
           # Intel-mac runners (macos-13) are retired — jobs queue forever.
           # Cross-compile x86_64 on the arm64 runner instead (rocksdb compiles
           # via the cc crate, no cmake, so clang cross-compiles it; validated
           # locally under Rosetta).
-          - { os: macos-14,       target: x86_64,  features: "compact,storage-rocksdb,rdf-io,columnar-io" }
-          - { os: macos-14,       target: aarch64, features: "compact,storage-rocksdb,rdf-io,columnar-io" }
+          - { os: macos-15,       target: x86_64,  features: "compact,storage-rocksdb,rdf-io,columnar-io" }
+          - { os: macos-15,       target: aarch64, features: "compact,storage-rocksdb,rdf-io,columnar-io" }
           - { os: windows-latest, target: x64,     features: "compact,storage-rocksdb,rdf-io,columnar-io" }
     steps:
       - uses: actions/checkout@v4
@@ -200,7 +201,7 @@ jobs:
         platform:
           - { os: ubuntu-latest,    artifact: mnestic-wheels-ubuntu-latest-x86_64 }
           - { os: ubuntu-24.04-arm, artifact: mnestic-wheels-ubuntu-latest-aarch64 }
-          - { os: macos-14,         artifact: mnestic-wheels-macos-14-aarch64 }
+          - { os: macos-15,         artifact: mnestic-wheels-macos-15-aarch64 }
           - { os: windows-latest,   artifact: mnestic-wheels-windows-latest-x64 }
     steps:
       - uses: actions/checkout@v4
@@ -214,6 +215,8 @@ jobs:
         run: python -m pip install --no-index --find-links dist mnestic
       - name: String, JSON and FTS compatibility contract
         run: python cozo-lib-python/tests/test_string_json_contract.py
+      - name: FTS transaction ranking contract
+        run: python cozo-lib-python/tests/test_fts_transaction_stats.py
       - name: Install columnar test producer
         run: python -m pip install pyarrow
       - name: Columnar distribution contract
@@ -231,6 +234,24 @@ jobs:
               script = "cozo-lib-python/tests/test_upgrade_018.py"
               subprocess.run([sys.executable, script, "create", data], env=env, check=True)
               subprocess.run([sys.executable, script, "verify", data], check=True)
+      - name: Released 0.18 migration baseline and database upgrade
+        shell: python
+        run: |
+          import os, pathlib, subprocess, sys, tempfile
+          with tempfile.TemporaryDirectory() as work:
+              root = pathlib.Path(work)
+              old = str(root / "old-wheel")
+              subprocess.run([sys.executable, "-m", "pip", "install", "--target", old, "mnestic==0.18.0"], check=True)
+              env = os.environ.copy()
+              env["PYTHONPATH"] = old
+              migration = "cozo-lib-python/tests/test_string_migration_019.py"
+              baseline = str(root / "baseline.json")
+              subprocess.run([sys.executable, migration, "baseline", baseline], env=env, check=True)
+              subprocess.run([sys.executable, migration, "candidate", str(root / "candidate.json"), baseline], check=True)
+              upgrade = "cozo-lib-python/tests/test_upgrade_019.py"
+              data = str(root / "databases")
+              subprocess.run([sys.executable, upgrade, "create", data], env=env, check=True)
+              subprocess.run([sys.executable, upgrade, "verify", data], check=True)
       # `shell: python` runs the block under the setup-python interpreter on
       # every OS — no bash/pwsh quoting hazards.
       - name: Smoke test (rocksdb + mem engines)
@@ -276,6 +297,10 @@ jobs:
         run: python -m pip install candidate-sdist/*.tar.gz
       - run: python -m pip install pyarrow
       - run: python cozo-lib-python/tests/test_string_json_contract.py
+      - name: FTS transaction ranking contract (sdist backends)
+        env:
+          MNESTIC_TEST_BACKENDS: mem,sqlite
+        run: python cozo-lib-python/tests/test_fts_transaction_stats.py
       - run: python cozo-lib-python/tests/test_columnar_distribution.py
 
   # --- publish (OIDC trusted publishing); one job per PyPI project ---

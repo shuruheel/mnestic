@@ -144,7 +144,7 @@ pub(crate) mod fts;
 /// counter, for scan-count regression tests (the NEAR double-scan class is
 /// invisible in results). Hidden from docs; no stability guarantee.
 #[doc(hidden)]
-pub use fts::{FTS_BASE_ROW_FETCHES, FTS_LITERAL_SCANS};
+pub use fts::{FTS_BASE_ROW_FETCHES, FTS_DOC_STATS_SCANS, FTS_LITERAL_SCANS};
 pub mod parse;
 pub(crate) mod query;
 pub(crate) mod runtime;

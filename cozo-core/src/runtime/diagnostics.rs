@@ -58,14 +58,42 @@ pub(crate) fn emit(code: &'static str, message: String, hint: impl Into<String>)
     });
 }
 
-/// Emit at most once for this code between script warning drains.
-pub(crate) fn emit_once(code: &'static str, message: String, hint: impl Into<String>) {
-    if !SINK.with(|sink| sink.borrow().iter().any(|warning| warning.code == code)) {
-        emit(code, message, hint);
-    }
-}
-
 /// Take everything the current thread has emitted since the last drain.
 pub(crate) fn drain() -> Vec<QueryWarning> {
     SINK.with(|s| std::mem::take(&mut *s.borrow_mut()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DbInstance, ScriptMutability};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn script_diagnostics_flush_to_the_owning_database_on_every_exit() {
+        // Model an extension's diagnostic without coupling routing coverage to
+        // any temporary migration warning. Include grammar and AST failures.
+        for script in [
+            "?[x] <- [[1]]",
+            "invalid query [",
+            r#"?[x] <- [["\uD800"]]"#,
+            "?[x] := *missing[x]",
+        ] {
+            let db = DbInstance::default();
+            let other = DbInstance::default();
+            for _ in 0..2 {
+                emit("test.extension_warning", "fixture".into(), "fixture");
+                let result = db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable);
+                assert_eq!(result.is_ok(), script == "?[x] <- [[1]]");
+                assert!(other.run_default("::warnings").unwrap().rows.is_empty());
+            }
+            let rows = db.run_default("::warnings").unwrap().rows;
+            assert_eq!(rows.len(), 2);
+            assert!(rows
+                .iter()
+                .all(|row| row[1].get_str() == Some("test.extension_warning")));
+            db.run_default("::warnings clear").unwrap();
+            assert!(db.run_default("::warnings").unwrap().rows.is_empty());
+        }
+    }
 }

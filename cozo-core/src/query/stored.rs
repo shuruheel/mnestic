@@ -2057,8 +2057,8 @@ impl<'a> SessionTx<'a> {
                         }
                     }
                     if has_hnsw_indices {
-                        for (idx_handle, _) in relation_store.hnsw_indices.values() {
-                            self.hnsw_remove(relation_store, idx_handle, &extracted)?;
+                        for (idx_handle, manifest) in relation_store.hnsw_indices.values() {
+                            self.hnsw_remove(manifest, relation_store, idx_handle, &tup)?;
                         }
                     }
                     if need_to_collect {

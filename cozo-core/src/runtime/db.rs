@@ -40,6 +40,7 @@ use crate::data::relation::ColumnDef;
 use crate::data::tuple::{Tuple, TupleT};
 use crate::data::value::{DataValue, ValidityTs, LARGEST_UTF_CHAR};
 use crate::fixed_rule::DEFAULT_FIXED_RULES;
+use crate::fts::stats::FtsStatsCache;
 use crate::fts::TokenizerCache;
 use crate::parse::sys::{HnswIndexConfig, SysOp};
 use crate::parse::{parse_expressions, parse_script, CozoScript, SourceSpan};
@@ -179,14 +180,15 @@ pub struct Db<S> {
     /// (whose publication only becomes visible at the end) without re-blocking
     /// readers. Keyed by the index relation's full `base:idx` name.
     index_builds_in_progress: Arc<Mutex<BTreeSet<SmartString<LazyCompact>>>>,
-    /// Cross-query cache of FTS corpus stats `(total_tokens, n_docs)` keyed by
-    /// index relation name (mnestic fork, DEVELOPMENT.md Bet 1b avgdl). Only
-    /// consulted for *legacy* FTS indexes that predate the durable doc-stats
-    /// counter (no aggregate stored) and have not been written since — for those
-    /// the corpus is immutable, so a single deduplicated scan per process is
-    /// correct and needs no invalidation. Indexes built/migrated under the
-    /// counter read it directly (O(1)) and never touch this cache.
-    fts_doc_stats_cache: Arc<Mutex<BTreeMap<SmartString<LazyCompact>, (u64, u64)>>>,
+    /// Cross-query cache of FTS corpus stats `(total_tokens, n_docs)` (mnestic
+    /// fork, DEVELOPMENT.md Bet 1b avgdl), shared by `Arc` with each SessionTx.
+    /// Entries describe committed postings and are keyed by index relation ID
+    /// so same-name recreation cannot reuse old totals. Transactions retain
+    /// local statistics and validate shared reuse against their snapshot's
+    /// generation and active-writer fences. Cold or incompatible snapshots
+    /// seed from their own posting scan; warm serialized work stays O(1).
+    /// See `fts/stats.rs` and `docs/specs/fts-transaction-stats.md`.
+    fts_doc_stats_cache: Arc<FtsStatsCache>,
     /// Db-wide default per-query wall-clock budget in milliseconds (mnestic
     /// fork, query budget). `0` = unset. Set via
     /// [`Db::set_default_query_timeout`]; folded (via `min`) into every
@@ -642,8 +644,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         let script = match parsed {
             Ok(script) => script,
             Err(error) => {
-                // Literal decoding can emit a migration warning before a
-                // later AST error. Keep it with this Db, not the next caller.
+                // Keep diagnostics emitted before a parse/AST error with
+                // this Db, not the next caller on the same thread.
                 self.flush_warnings();
                 return Err(error);
             }
@@ -1521,6 +1523,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         // outside any `SessionTx`, so no dirty set could ever see it — and the
         // check runs after this point, on an error path a caller may ignore.
         self.graph_projections.invalidate_all();
+        let _fts_restore = self.fts_doc_stats_cache.raw_write();
         #[cfg(feature = "storage-sqlite")]
         {
             let sqlite_db = crate::new_cozo_sqlite(in_file)?;
@@ -1980,13 +1983,15 @@ impl<'s, S: Storage<'s>> Db<S> {
         // struct-literal field would be evaluated in source order, which is
         // too easy to reorder by accident — hence the separate binding.
         let watermark = self.graph_projections.watermark();
+        let fts_stats = self.fts_doc_stats_cache.transaction();
         let ret = SessionTx {
             store_tx: Box::new(self.db.transact(false)?),
             temp_store_tx: self.temp_db.transact(true)?,
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
-            fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
+            fts_stats,
+            hnsw_mutations_incomplete: 0,
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
@@ -2005,13 +2010,15 @@ impl<'s, S: Storage<'s>> Db<S> {
     pub(crate) fn transact_write(&'s self) -> Result<SessionTx<'s>> {
         // See `transact`: the watermark capture must precede the pin.
         let watermark = self.graph_projections.watermark();
+        let fts_stats = self.fts_doc_stats_cache.transaction();
         let ret = SessionTx {
             store_tx: Box::new(self.db.transact(true)?),
             temp_store_tx: self.temp_db.transact(true)?,
             relation_store_id: self.relation_store_id.clone(),
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
-            fts_doc_stats_cache: self.fts_doc_stats_cache.clone(),
+            fts_stats,
+            hnsw_mutations_incomplete: 0,
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),

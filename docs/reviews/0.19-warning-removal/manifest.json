@@ -1,0 +1,103 @@
+{
+  "engine_sha": "0148693b93f23956896999ba9a59f1fb4889fab6",
+  "wheel": "/tmp/mnestic-019-release-wheels/mnestic-0.18.0-cp37-abi3-macosx_11_0_arm64.whl",
+  "wheel_sha256": "460762e64c44856beacb506127534527aa4bf7640983e34213963922221cad26",
+  "profile": "release; native RocksDB compiled -O3; no external archive",
+  "rustc": "rustc 1.98.0 (88d9e12ae 2026-08-18)\nbinary: rustc\ncommit-hash: 88d9e12ae178fab0fb5cc050a94da85685d449ea\ncommit-date: 2026-08-18\nhost: aarch64-apple-darwin\nrelease: 1.98.0\nLLVM version: 22.1.8\n",
+  "features": [
+    "compact",
+    "storage-rocksdb",
+    "rdf-io",
+    "columnar-io"
+  ],
+  "files": {
+    "docs/reviews/0.19-warning-removal/baseline.json": "7e59539d5a0a8b2cbf7140aac77e12885cd5a833e0a11896ed3769bbb2a3e134",
+    "docs/reviews/0.19-warning-removal/candidate.json": "b67a8bffe45e9221603b53185de3cfe0f2fe2dd2526787e3f29778adc9dc3760",
+    "docs/reviews/0.19-filtered-retrieval/reproduce_updates.py": "3d10525d0948e4d30dd533ced26a33af4497567925d5f670c87211e7b4188e95",
+    "docs/reviews/0.19-filtered-retrieval/baseline.log": "27494e1220661cb00225ea02b8189ff8ab937a157c69e6db3ed3c04f47d2c151",
+    "docs/reviews/0.19-filtered-retrieval/candidate.log": "9d00f3e49ba2f52cdd80e024fdd24abdd0769b53d80393e0f3234f01baebd8ae"
+  },
+  "source_artifacts": {
+    "/tmp/mnestic-019-target/package/mnestic-0.18.0.crate": "c0d6806f7b4dda1b481ae2aed2516f6b1e1532aba3baafcb3c97b14226a36fac",
+    "/tmp/mnestic-019-sdist/mnestic-0.18.0.tar.gz": "a9c6bd31b8e055397e194a5ab11a51caa45ad8d0fa465084caabd528f8356785"
+  },
+  "retained_artifacts": {
+    "candidate": {
+      "path": "release/0.19-qualification/0148693b/candidate/mnestic-0.18.0-cp37-abi3-macosx_11_0_arm64.whl",
+      "sha256": "460762e64c44856beacb506127534527aa4bf7640983e34213963922221cad26"
+    },
+    "baseline": {
+      "path": "release/0.19-qualification/0148693b/baseline/mnestic-0.18.0-cp37-abi3-macosx_11_0_arm64.whl",
+      "sha256": "1c042b400ad3ad464e1c6a0923e4f933b36f59d367dddbb3bc2866d57cbe7abc"
+    },
+    "crate": {
+      "path": "release/0.19-qualification/0148693b/crate/mnestic-0.18.0.crate",
+      "sha256": "c0d6806f7b4dda1b481ae2aed2516f6b1e1532aba3baafcb3c97b14226a36fac"
+    },
+    "sdist": {
+      "path": "release/0.19-qualification/0148693b/sdist/mnestic-0.18.0.tar.gz",
+      "sha256": "a9c6bd31b8e055397e194a5ab11a51caa45ad8d0fa465084caabd528f8356785"
+    }
+  },
+  "validation_logs": {
+    "native-library.log": {
+      "source_sha256": "1e1092e46c0c630a592801da346b5e55f427df627d5967d4fed459004bc3a77b",
+      "stored_sha256": "65a0fdc4b269e004276ad016f96ede4205b8e0e1f321c48b93f92000f8ae0b27"
+    },
+    "native-integration.log": {
+      "source_sha256": "101e2d18212d4e182fcc543b3da5d7d6702937d78d2880c07081e7c466522dd4",
+      "stored_sha256": "cc2b7eb1d801e296a250261818b70242fabd0691e0b056b94db3002be7b6d5e0"
+    },
+    "clippy.log": {
+      "source_sha256": "2e23818a55c2749c44f865170fd93623d3d0202d3512a873353a29d568bf973b",
+      "stored_sha256": "2e23818a55c2749c44f865170fd93623d3d0202d3512a873353a29d568bf973b"
+    },
+    "packaged-host.log": {
+      "source_sha256": "2523121ebe4042a517f5c45985dae24c5ecd1892d0ee49378b33f10ab470a6bb",
+      "stored_sha256": "2523121ebe4042a517f5c45985dae24c5ecd1892d0ee49378b33f10ab470a6bb"
+    },
+    "sdist-install.log": {
+      "source_sha256": "2690d9dd7f02742f27c4d5f62004a2959eeb607cc43fd5c1dd44b2d77452c7d2",
+      "stored_sha256": "2690d9dd7f02742f27c4d5f62004a2959eeb607cc43fd5c1dd44b2d77452c7d2"
+    },
+    "sdist-contract.log": {
+      "source_sha256": "9f169aa04896ef0203477ff61d8d57406ec0dab00b71ec15cf38cdae22509147",
+      "stored_sha256": "9f169aa04896ef0203477ff61d8d57406ec0dab00b71ec15cf38cdae22509147"
+    },
+    "sdist-fts.log": {
+      "source_sha256": "8fc491c33af10c373d8f98a2362fd7e66cdc6c96497aa5aa59d429264ca5ac92",
+      "stored_sha256": "8fc491c33af10c373d8f98a2362fd7e66cdc6c96497aa5aa59d429264ca5ac92"
+    },
+    "wheel-columnar.log": {
+      "source_sha256": "40785aeb78a3d4affb663b6378465ce5570ac79e314b405daa35f2e75493129b",
+      "stored_sha256": "40785aeb78a3d4affb663b6378465ce5570ac79e314b405daa35f2e75493129b"
+    },
+    "upgrade017.log": {
+      "source_sha256": "b8012d035e97954c66d02fccc887d1da80aeeb659ae299261a3c8f7d63be6c12",
+      "stored_sha256": "b8012d035e97954c66d02fccc887d1da80aeeb659ae299261a3c8f7d63be6c12"
+    },
+    "qualification-commands.py": {
+      "source_sha256": "9be7dffe3783ff53cebf93a21a8611b565b812e8cb6ff7b96d602afb88468e17",
+      "stored_sha256": "9be7dffe3783ff53cebf93a21a8611b565b812e8cb6ff7b96d602afb88468e17"
+    },
+    "wheel-build.log": {
+      "source_sha256": "352329956c05ba47cf63961d540de398e18badeb401aa3a60cfd1a061e3149d2",
+      "stored_sha256": "352329956c05ba47cf63961d540de398e18badeb401aa3a60cfd1a061e3149d2"
+    }
+  },
+  "native_results": {
+    "library": 392,
+    "integration": 56,
+    "clippy": "passed",
+    "extracted_crate_host": "passed; no private overrides"
+  },
+  "python_results": {
+    "migration_fixtures": 12,
+    "wheel_contract": "5 passed",
+    "wheel_fts": "passed mem/sqlite/rocksdb",
+    "columnar": "parquet, Arrow file and stream; values and atomic rollback passed",
+    "upgrade_018": "sqlite/rocksdb reopen, restore, stored queries, FTS/HNSW, rollback, reindex passed",
+    "upgrade_017": "retained fixture passed sqlite/rocksdb",
+    "sdist": "clean isolated install; 5 contract tests and FTS mem/sqlite passed"
+  }
+}

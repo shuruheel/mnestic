@@ -1,0 +1,281 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling glob v0.3.3
+   Compiling clang-sys v1.8.1
+   Compiling minimal-lexical v0.2.1
+   Compiling nom v7.1.3
+   Compiling quote v1.0.47
+   Compiling syn v2.0.119
+   Compiling syn v3.0.2
+   Compiling serde_derive v1.0.229
+   Compiling zerocopy-derive v0.8.55
+   Compiling libloading v0.8.9
+   Compiling serde v1.0.229
+   Compiling either v1.16.0
+   Compiling bindgen v0.72.1
+   Compiling itertools v0.13.0
+   Compiling zerocopy v0.8.55
+   Compiling cexpr v0.6.0
+   Compiling rustc-hash v2.1.3
+   Compiling shlex v1.3.0
+   Compiling bitflags v2.13.1
+   Compiling foldhash v0.2.0
+   Compiling smallvec v1.15.2
+   Compiling num-integer v0.1.46
+   Compiling ring v0.17.14
+   Compiling hashbrown v0.17.1
+   Compiling indexmap v2.14.0
+   Compiling zstd-sys v2.0.16+zstd.1.5.7
+   Compiling link-cplusplus v1.0.12
+   Compiling parking_lot_core v0.9.12
+   Compiling scratch v1.0.9
+   Compiling hashbrown v0.16.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling thiserror-impl v1.0.69
+   Compiling cxxbridge-flags v1.0.198
+   Compiling untrusted v0.9.0
+   Compiling scopeguard v1.2.0
+   Compiling unicode-width v0.2.2
+   Compiling termcolor v1.4.1
+   Compiling syn v1.0.109
+   Compiling codespan-reporting v0.13.1
+   Compiling lock_api v0.4.14
+   Compiling cxx v1.0.198
+   Compiling rand_chacha v0.3.1
+   Compiling thiserror v1.0.69
+   Compiling libflate_lz77 v2.3.0
+   Compiling num-bigint v0.4.8
+   Compiling proc-macro-error-attr3 v3.0.2
+   Compiling num-complex v0.4.6
+   Compiling lz4-sys v1.11.1+lz4-1.10.0
+   Compiling getrandom v0.3.4
+   Compiling proc-macro-error3 v3.0.2
+   Compiling num-rational v0.4.2
+   Compiling zstd-safe v7.2.4
+   Compiling zstd v0.13.3
+   Compiling cxx-build v1.0.198
+   Compiling libflate v2.3.0
+   Compiling rand v0.8.7
+   Compiling num-iter v0.1.46
+   Compiling ahash v0.8.12
+   Compiling arrayvec v0.7.8
+   Compiling graph_builder v0.4.1
+   Compiling hashbrown v0.14.5
+   Compiling rustls v0.21.12
+   Compiling dashmap v5.5.3
+   Compiling delegate v0.8.0
+   Compiling num-format v0.4.4
+   Compiling num v0.4.3
+   Compiling mnestic-rocks v0.1.12 (/private/tmp/mnestic-019-fts/cozorocks)
+   Compiling twox-hash v1.6.3
+   Compiling include-flate-compress v0.3.4
+   Compiling include-flate-codegen v0.3.4
+   Compiling parking_lot v0.12.5
+   Compiling sct v0.7.1
+   Compiling rustls-webpki v0.101.7
+   Compiling cxxbridge-macro v1.0.198
+   Compiling half v2.7.1
+   Compiling bincode v1.3.3
+   Compiling miette-derive v5.10.0
+   Compiling atoi v2.0.0
+   Compiling linereader v0.4.0
+   Compiling memmap2 v0.5.10
+   Compiling page_size v0.4.2
+   Compiling num_cpus v1.17.0
+   Compiling atomic v0.5.3
+   Compiling byte-slice-cast v1.2.3
+   Compiling fast-float2 v0.2.3
+   Compiling miette v5.10.0
+   Compiling ciborium-ll v0.2.2
+   Compiling pest_generator v2.8.7
+   Compiling include-flate v0.3.4
+   Compiling lz4_flex v0.10.0
+   Compiling cedarwood v0.4.6
+   Compiling webpki-roots v0.25.4
+   Compiling atomic_float v0.1.0
+   Compiling nanorand v0.7.0
+   Compiling graph v0.3.1
+   Compiling minreq v2.14.1
+   Compiling jieba-rs v0.7.4
+   Compiling swapvec v0.3.0
+   Compiling fast2s v0.3.1
+   Compiling pest_derive v2.8.7
+   Compiling smartstring v1.0.1
+   Compiling ciborium v0.2.2
+   Compiling ndarray v0.15.6
+   Compiling rmp-serde v1.3.1
+   Compiling tinytemplate v1.2.1
+   Compiling rust-stemmers v1.2.0
+   Compiling casey v0.4.2
+   Compiling criterion v0.5.1
+   Compiling mnestic v0.18.0 (/private/tmp/mnestic-019-fts/cozo-core)
+    Finished `test` profile [unoptimized] target(s) in 3m 19s
+     Running tests/fts_avgdl.rs (/tmp/mnestic-019-target/debug/deps/fts_avgdl-73bc3db2d478fcd5)
+
+running 4 tests
+test avgdl_counter_survives_reopen ... ok
+test avgdl_value_feeds_bm25_denominator ... ok
+test delete_maintains_avgdl_like_fresh_build ... ok
+test bulk_build_doc_stats_match_incremental_on_multi_column_pk ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/fts_candidates.rs (/tmp/mnestic-019-target/debug/deps/fts_candidates-7c8d375116ea037e)
+
+running 5 tests
+test candidate_errors_empty_scope_and_multi_parent_are_explicit ... ok
+test candidate_scope_handles_boolean_and_proximity_queries ... ok
+test candidate_scope_preserves_scores_and_composes_with_filter ... ok
+test candidate_scope_is_applied_before_top_k ... ok
+test candidate_keys_are_arity_checked_and_type_coerced ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/fts_corpus_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_corpus_stats-0aabd006533fb374)
+
+running 4 tests
+test repeated_identical_puts_do_not_drift_n ... ok
+test indexed_writes_do_move_n ... ok
+test whitespace_only_rows_do_not_change_bm25_scores ... ok
+test unindexed_rows_do_not_change_bm25_scores ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.13s
+
+     Running tests/fts_governed_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_governed_stats-df931639bc41f562)
+
+running 3 tests
+test mem_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+test sqlite_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+test rocks_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+
+     Running tests/fts_phrase.rs (/tmp/mnestic-019-target/debug/deps/fts_phrase-0dfcd9263c4c4ff3)
+
+running 18 tests
+test bind_spans_multibyte ... ok
+test phrase_is_ordered ... ok
+test phrase_in_near_is_named_error ... ok
+test all_stopword_phrase_is_empty ... ok
+test bind_spans_term_and_phrase ... ok
+test phrase_prefix_is_named_error ... ok
+test ngram_phrase_is_named_error_terms_still_work ... ok
+test near_scans_each_literal_once ... ok
+test snippet_pure_edges ... ok
+test stemmed_phrase_matches_stems ... ok
+test quoted_single_token_equivalent ... ok
+test single_token_quoted_in_near_still_legal ... ok
+test phrase_requires_adjacency ... ok
+test phrase_tf_is_anchor_count ... ok
+test snippet_end_to_end ... ok
+test stopword_hole_is_one_token_wildcard ... ok
+test unquoted_stays_and ... ok
+test phrase_subset_of_and ... ok
+
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+
+     Running tests/fts_prefix.rs (/tmp/mnestic-019-target/debug/deps/fts_prefix-ca450e1bc7d2c386)
+
+running 6 tests
+test raw_and_ngram_indexes_receive_one_prefix ... ok
+test unsupported_or_empty_prefixes_never_broaden_search ... ok
+test lowercase_prefixes_share_exact_normalization_and_composition ... ok
+test prefix_candidates_updates_deletes_and_reopen ... ok
+test incomplete_terms_skip_full_word_filters ... ok
+test folding_respects_configured_order_and_no_filter_is_case_sensitive ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/fts_stats_failures.rs (/tmp/mnestic-019-target/debug/deps/fts_stats_failures-d83174d3e12035dd)
+
+running 3 tests
+test ignored_partial_posting_error_still_rejects_outer_script_commit ... ok
+test storage_commit_failure_keeps_statistics_private_until_rollback_finishes ... ok
+test partial_posting_failure_cannot_be_committed_even_after_a_retry ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
+     Running tests/fts_transaction_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_transaction_stats-21a550d9ffb01075)
+
+running 9 tests
+test an_open_writer_does_not_change_another_readers_scores ... ok
+test an_old_rocks_snapshot_cannot_reuse_or_publish_newer_statistics ... ok
+test failed_multistatement_script_does_not_change_committed_statistics ... ok
+test rejected_commit_does_not_publish_speculative_statistics ... ok
+test prefixes_keep_lowercase_normalization ... ok
+test overlapping_commits_match_a_rebuilt_combined_corpus ... ok
+test committed_updates_rebuilds_and_recreated_index_match_fresh_postings ... ok
+test abort_and_handle_drop_preserve_complete_scores_and_top_one ... ok
+test warm_serialized_reads_and_successful_writes_do_not_scan_the_corpus ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.21s
+
+     Running tests/governed_transaction.rs (/tmp/mnestic-019-target/debug/deps/governed_transaction-692824ed505ec7fc)
+
+running 31 tests
+test explicit_kill_aborts_prior_writes_even_when_custom_rule_returns_late ... ok
+test mem::disconnect ... ok
+test mem::failed_commit ... ok
+test mem::commit_and_abort ... ok
+test mem::warnings_while_open ... ok
+test mem::read_only_and_failure ... ok
+test mem::memory ... ok
+test rocks::disconnect ... ok
+test rocks::failed_commit ... ok
+test rocks::commit_and_abort ... ok
+test mem::idle ... ok
+test rocks::warnings_while_open ... ok
+test scheduling_delay_counts_and_zero_idle_is_rejected ... ok
+test rocks::read_only_and_failure ... ok
+test sqlite::commit_and_abort ... ok
+test sqlite::disconnect ... ok
+test rocks_snapshot ... ok
+test sqlite::failed_commit ... ok
+test rocks::idle ... ok
+test sqlite::read_only_and_failure ... ok
+test sqlite::warnings_while_open ... ok
+test rocks::memory ... ok
+test sqlite::memory ... ok
+test sqlite::idle ... ok
+test mem::deadlines ... ok
+test sqlite_snapshot ... ok
+test rocks::deadlines ... ok
+test sqlite::deadlines ... ok
+test cancellation_keeps_permit_on_actual_worker_until_uncooperative_code_exits ... ok
+test stalled_callback_does_not_hold_committed_worker_forever ... ok
+test whole_deadline_expires_during_idle_before_longer_idle_limit ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.24s
+
+     Running tests/hybrid_helper.rs (/tmp/mnestic-019-target/debug/deps/hybrid_helper-9f7676e621516f47)
+
+running 13 tests
+test detailed_script_widens_limit_by_leg_count ... ok
+test helper_vector_only_runs ... ok
+test helper_detailed_returns_per_leg_contributions ... ok
+test helper_fuses_hnsw_and_fts ... ok
+test helper_handles_empty_fts_leg ... ok
+test helper_fts_only_runs ... ok
+test script_builder_is_inspectable ... ok
+test helper_detailed_with_mmr_joins_detail_onto_selection ... ok
+test helper_matches_handwritten_pattern ... ok
+test helper_extra_traversal_list_is_fused ... ok
+test helper_with_mmr_rerank ... ok
+test helper_zero_legs_is_a_loud_error ... ok
+test rejects_identifier_injection ... ok
+
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.57s
+
+     Running tests/reindex.rs (/tmp/mnestic-019-target/debug/deps/reindex-221fae56c242b104)
+
+running 9 tests
+test reindex_of_a_missing_relation_errors ... ok
+test reindex_in_a_mutating_imperative_program_does_not_relock ... ok
+test reindex_without_search_indexes_is_a_loud_noop ... ok
+test reindex_makes_bulk_imported_rows_searchable ... ok
+test reindex_rebuilds_hnsw ... ok
+test reindex_is_idempotent ... ok
+test reindex_rebuilds_lsh_and_preserves_its_geometry ... ok
+test reindex_evicts_ghost_postings ... ok
+test rebuilt_index_is_equivalent_to_a_fresh_one ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s

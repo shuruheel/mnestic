@@ -1,0 +1,93 @@
+   Compiling mnestic v0.18.0 (/Users/shuruheel/Code/mindgraph/mnestic/cozo-core)
+    Finished `test` profile [unoptimized] target(s) in 29.75s
+     Running tests/fts_governed_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_governed_stats-df931639bc41f562)
+
+running 3 tests
+test mem_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+test sqlite_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+test rocks_governed_fts_and_hybrid_follow_transaction_outcome ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.07s
+
+     Running tests/fts_stats_failures.rs (/tmp/mnestic-019-target/debug/deps/fts_stats_failures-d83174d3e12035dd)
+
+running 3 tests
+test storage_commit_failure_keeps_statistics_private_until_rollback_finishes ... ok
+test ignored_partial_posting_error_still_rejects_outer_script_commit ... ok
+test partial_posting_failure_cannot_be_committed_even_after_a_retry ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/fts_transaction_stats.rs (/tmp/mnestic-019-target/debug/deps/fts_transaction_stats-21a550d9ffb01075)
+
+running 9 tests
+test an_open_writer_does_not_change_another_readers_scores ... ok
+test failed_multistatement_script_does_not_change_committed_statistics ... ok
+test an_old_rocks_snapshot_cannot_reuse_or_publish_newer_statistics ... ok
+test prefixes_keep_lowercase_normalization ... ok
+test rejected_commit_does_not_publish_speculative_statistics ... ok
+test overlapping_commits_match_a_rebuilt_combined_corpus ... ok
+test committed_updates_rebuilds_and_recreated_index_match_fresh_postings ... ok
+test abort_and_handle_drop_preserve_complete_scores_and_top_one ... ok
+test warm_serialized_reads_and_successful_writes_do_not_scan_the_corpus ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+     Running tests/governed_transaction.rs (/tmp/mnestic-019-target/debug/deps/governed_transaction-692824ed505ec7fc)
+
+running 31 tests
+test mem::failed_commit ... ok
+test mem::disconnect ... ok
+test explicit_kill_aborts_prior_writes_even_when_custom_rule_returns_late ... ok
+test mem::commit_and_abort ... ok
+test mem::read_only_and_failure ... ok
+test mem::warnings_while_open ... ok
+test rocks::failed_commit ... ok
+test rocks::disconnect ... ok
+test rocks::commit_and_abort ... ok
+test rocks::read_only_and_failure ... ok
+test rocks::warnings_while_open ... ok
+test mem::memory ... ok
+test scheduling_delay_counts_and_zero_idle_is_rejected ... ok
+test rocks_snapshot ... ok
+test sqlite::commit_and_abort ... ok
+test sqlite::disconnect ... ok
+test sqlite::failed_commit ... ok
+test rocks::memory ... ok
+test mem::idle ... ok
+test sqlite::read_only_and_failure ... ok
+test sqlite::warnings_while_open ... ok
+test rocks::idle ... ok
+test sqlite::memory ... ok
+test sqlite::idle ... ok
+test sqlite_snapshot ... ok
+test mem::deadlines ... ok
+test rocks::deadlines ... ok
+test sqlite::deadlines ... ok
+test cancellation_keeps_permit_on_actual_worker_until_uncooperative_code_exits ... ok
+test stalled_callback_does_not_hold_committed_worker_forever ... ok
+test whole_deadline_expires_during_idle_before_longer_idle_limit ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.16s
+
+     Running tests/query_warnings.rs (/tmp/mnestic-019-target/debug/deps/query_warnings-a8ef8494b3c237cc)
+
+running 5 tests
+test import_stranded_indexes_warning ... ok
+test pagerank_unconverged_warning ... ok
+test rust_accessor_matches_sysop ... ok
+test cartesian_step_warning_is_structured ... ok
+test seq_is_monotone_across_queries ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+     Running tests/string_literals.rs (/tmp/mnestic-019-target/debug/deps/string_literals-bc462095b5eb67f7)
+
+running 5 tests
+test migration_warning_is_retired_without_changing_errors ... ok
+test comments_parameters_and_descriptions ... ok
+test malformed_literals_are_loud ... ok
+test literals_preserve_content_and_decode_each_escape ... ok
+test bounded_literal_round_trips ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.56s

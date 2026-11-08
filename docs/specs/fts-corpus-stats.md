@@ -1,5 +1,14 @@
 # Spec — FTS Corpus Statistics: the per-query relation count that "O(1) avgdl" left behind
 
+## Current transaction contract
+
+The historical cache design below is superseded by
+[transactional corpus statistics](fts-transaction-stats.md). `N` and `avgdl`
+keep their posting-derived definitions. The shared cache now contains committed
+statistics only; snapshot generations, transaction-local totals and writer
+fences preserve rollback and snapshot consistency without a corpus scan on
+every warm query.
+
 _Created 2026-07-13. Status: **SHIPPED in 0.13.0** (decision 18 originally banked it rather than cutting a 0.12.3). Grounding: every `file:line` verified against HEAD (0.12.2) on 2026-07-13; the measurement is a first-ever `medium`-scale run of `hybrid-recall-bench` (mnestic 0.12.1, RocksDB, real embeddings, 40k vs 400k chunks, same box) — which required fixing the benchmark's workload generator first (`mnestic-benchmarks@dedd0f0`: `medium` and `large` could never be generated). Sibling: `fts_avgdl.rs` / the 0.8.4 avgdl redesign, **whose job this finishes**._
 
 > **Anti-overbuild guardrails.** No new cache: `N` is sourced from the doc-stats cache that already exists on `Db` and is already maintained on every write. No persisted-catalog change (the cache is an in-memory `BTreeMap` behind an `Arc<Mutex<…>>` on `Db`, `runtime/db.rs:172` → cloned into `SessionTx`, `runtime/transact.rs:40-41`), so the rmp_serde append-only rule is not in play. No planner change, no grammar change, no new sysop. Two functions and one probe.

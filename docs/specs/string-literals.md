@@ -28,18 +28,27 @@ This changes existing scripts, so it ships in a minor release with a migration n
 - Re-executed `::describe` and stored-query bodies use the new parsing. Existing stored strings/descriptions are not rewritten.
 - Parameters and single-quoted value semantics are unchanged.
 
-Retain `parser.string_decoding_changed` for 0.18, with removal queued for 0.19. Emit at most once per warning drain (normally one script run), using the existing diagnostics sink. Qualifying double-quoted literals contain a backslash or edge trivia; qualifying raw literals contain edge trivia. Include only the literal's byte offset within the parsed input, never its contents. For FTS this is the FTS query text, not an offset translated into the enclosing script.
+The temporary `parser.string_decoding_changed` diagnostic shipped in 0.18 and is
+removed in the 0.19 candidate. Decoding, error codes and stored values are unchanged.
+The migration guidance above remains permanent. Absence of this retired diagnostic
+is not proof that a legacy query has been migrated.
 
-The message says **may decode differently**: valid FTS escapes and some hash-containing literals already decoded correctly. This is a conservative migration aid, not a complete compatibility detector. Standalone expression parsing follows the existing thread-local sink lifetime until a subsequent database flush.
+The diagnostic was conservative: valid FTS escapes and some hash-containing literals
+already decoded correctly. The released-0.18 fixtures in
+`cozo-lib-python/tests/test_string_migration_019.py` distinguish corrected parameter
+builders from intentionally warning-producing literals and compare result/error
+behavior with the candidate. The wheel workflow retains that isolated baseline.
 
-Route `DbInstance::run_script` through the existing options dispatcher so both public entry paths use the same parser/error flush. Flush emitted diagnostics on AST-construction errors as well as execution errors. A grammar failure before literal decoding emits no warning. Test this explicitly across two databases on the same thread; warnings from a failed script must not leak into the second database.
+Both public script entry paths still flush diagnostics on parsing/AST and execution
+errors. Routing tests use a synthetic extension diagnostic and the permanent
+`query.cartesian_step` diagnostic; failures must not leak warnings to another Db.
 
 ## Acceptance
 
 - Feature-ungated `tests/string_literals.rs`: both issue cases; each escape in each quoted form; BMP/non-BMP/surrogate boundaries; invalid escapes and byte offsets; empty strings; quote/fence substrings; mismatched and spaced fences; identifier adjacency; CRLF, hashes and block-comment markers; whitespace preservation; comments between tokens; hidden-quote compatibility case; parameters; `::describe`.
 - Round-trip all 30,941 strings of length <= 4 over the 13-character grammar alphabet, plus 2,000 deterministic length-5–40 strings including Unicode and CR. Encode in all three forms, batch at most 1,000 rows, include row IDs so relational ordering/deduplication cannot hide a mismatch. No new dependency.
 - FTS module tests pin escaped phrases, invalid-escape rejection and fenced-text interpretation.
-- Warning tests pin deduplication, repeated runs, no warnings for unaffected forms, byte offsets after multibyte text, and failures during AST construction and execution.
+- Warning tests pin retirement of the migration signal; independent routing tests cover repeated runs, clear, grammar/AST/evaluation failures and database ownership.
 - Run engine tests, strict default-feature Clippy, and MindGraph all-feature consumer tests. Audit in-tree CozoScript for changed literals and triage every hit; elapsed time alone is not a soak.
 - Validate changed site examples through a freshly built `doc_check`; grammar edits must invalidate its build. Publish docs only with the corresponding release.
 
@@ -47,7 +56,7 @@ Route `DbInstance::run_script` through the existing options dispatcher so both p
 
 Replace the three MindGraph interpolated type lists with one parameter-building helper and test quoted/backslash-containing types. This is a separate consumer change; its current in-tree caller uses constants, so it does not create a downstream deployment gate for the engine.
 
-The implementation and migration documentation shipped in 0.18.0 alongside the independently reviewed FTS prefix changes (#55). No bridge change was required. Keep the temporary migration warning removal scheduled for 0.19.0.
+The implementation and migration documentation shipped in 0.18.0 alongside the independently reviewed FTS prefix changes (#55). No bridge change was required. The 0.19 candidate removes only the temporary migration warning.
 
 ## Review decisions, 2026-09-05
 

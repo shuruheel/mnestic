@@ -34,13 +34,17 @@ class StringJsonContract(unittest.TestCase):
         self.rows("?[id,j] := id=2, j=decode_base64('AQID') :put cells {id => j}")
         self.assertEqual(self.rows("?[id,j] := *cells{id,j} :order id"), [[1, old], [2, "AQID"]])
 
-    def test_failed_parse_keeps_warning_with_its_database(self):
+    def test_failed_parse_preserves_existing_warnings_with_its_database(self):
+        for name in ("a", "b", "c"):
+            self.rows(":create " + name + " {x: Int}")
+            self.rows("?[x] <- [[1]] :put " + name + " {x}")
+        self.rows("?[x,y,z] := *a[x], *b[y], *c[z]")
         with self.assertRaises(Exception):
             self.rows(r'''?[x] <- [["a\uD800"]]''')
         other = CozoDbPy("mem", "", "{}")
         self.assertEqual(other.run_script("::warnings", {}, False)["rows"], [])
         warnings = self.rows("::warnings")
-        self.assertEqual(sum(row[1] == "parser.string_decoding_changed" for row in warnings), 1)
+        self.assertEqual(sum(row[1] == "query.cartesian_step" for row in warnings), 1)
 
     def test_prefix_normalization_and_integer_boost(self):
         self.rows(":create docs {id: Int => text: String}")
