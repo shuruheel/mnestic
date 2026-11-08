@@ -90,7 +90,7 @@ capabilities on top of it:
   drop a database that fails an integrity check.
 - **Interruptibility that works** — `::kill` and `:timeout` abort running
   queries, including long graph-adjacency builds.
-- **Governed multi-transactions (0.19 candidate)** — a native Rust host-owned
+- **Governed multi-transactions** — a native Rust host-owned
   worker retains admission through cancellation and cleanup, with one deadline,
   bounded idle waiting, inherited statement memory limits and warning flushes.
   Any query error aborts the transaction; the legacy API remains available.
@@ -100,11 +100,10 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.19.0 (release candidate)
+## New in 0.19.0
 
-This candidate adds governed native Rust transactions and repairs transactional
-FTS statistics and HNSW mutation connectivity. Publication and final qualification
-are pending.
+This release adds governed native Rust transactions and repairs transactional
+FTS statistics and HNSW mutation connectivity.
 
 - **Governed transactions (native Rust):** `db.governed_transaction(write, options)`
   returns a serialized client and host-owned worker. One deadline, bounded idle
@@ -128,7 +127,12 @@ are pending.
 
 Storage encoding and `mnestic-rocks` 0.1.12 are unchanged. The local repair caps
 are not total memory or latency guarantees; filtered-ANN eligibility and its
-approximate-recall limitations remain. No new performance claim is made.
+approximate-recall limitations remain. Schedule maintenance time for index rebuilds
+and evaluate write costs on your workload. A focused comparison between two 0.19
+builds measured write p95 increases of 3.1% on RocksDB and 11.8% on SQLite, with
+seed-sensitive tails; a separate one-seed window also showed roughly 16% increases
+in selected exact scans. These are not 0.18-to-0.19 measurements or a bound on
+upgrade cost. No general speedup or exact ANN recall is promised.
 
 Full upgrade guidance is in the [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 

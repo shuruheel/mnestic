@@ -5,15 +5,14 @@ provenance and licensing.
 
 ## Unreleased
 
-## 0.19.0 — Unreleased
+## 0.19.0 — 2026-11-08
 
-This candidate adds governed native Rust transactions and repairs transactional
+This release adds governed native Rust transactions and repairs transactional
 FTS statistics and HNSW mutation connectivity. Native hosts can call
 `db.governed_transaction(write, options)` to obtain a client and a worker whose
 lifetime owns admission; every query error rolls back that governed transaction.
 **Before using existing HNSW indexes, rebuild them with `::reindex <relation>`.**
 There is no storage-format migration, and `mnestic-rocks` remains at 0.1.12.
-Publication and final candidate qualification are pending.
 
 ### Added
 
@@ -26,11 +25,6 @@ Publication and final candidate qualification are pending.
   [contract and host example](docs/specs/governed-transactions.md).
 
 ### Changed
-
-- Reuse local HNSW reachability scratch buffers without changing traversal or
-  repair work limits. Skip FTS writer-completion bookkeeping for transactions
-  that never begin posting mutations, while retaining snapshot-generation capture.
-  These reduce avoidable work; no new performance percentage is claimed.
 
 - **BREAKING (results): Transactional FTS statistics.** Document counts and average
   lengths now follow the querying transaction's posting snapshot and pending
@@ -59,13 +53,8 @@ Publication and final candidate qualification are pending.
   paths, and degree accounting counts only active outgoing edges. Vector fields
   and list elements within one row retain distinct identities. Online-build
   reconciliation uses snapshot vectors for changed/deleted nodes.
-  External path proofs search from both ends under the existing work limits,
-  avoiding unnecessary exploration of wide components when a short proof exists
-  or a necessary leaf edge must be retained.
-  Incremental pruning tries local and external proofs for older edges before
-  dropping a newly installed link, avoiding ordering-dependent rejections when
-  that link supplies a route needed by a later neighbor. Degree and work limits
-  remain enforced, including explicit failure for infeasible repairs.
+  Pruning uses bounded local and external path proofs, preserving new links
+  while checking older edges. Infeasible degree/work constraints fail explicitly.
 - **`::warnings` remains responsive during active transactions.** Reads and clears
   access the in-memory warning ring without opening a storage transaction, avoiding
   the wait behind an active memory/SQLite multi-transaction.
@@ -100,9 +89,18 @@ Publication and final candidate qualification are pending.
   components per layer repair, and 1,048,576 adjacency checks per pruning pass.
   They do not bound total RSS, retained vector caches or wall-clock latency.
 - Filtered-ANN eligibility is unchanged. Mutation repair does not guarantee exact
-  ANN recall or constitute a general index-integrity verifier. E1–E3 performance
-  and retrieval measurements remain pending; this candidate makes no new speed or
-  recall claim.
+  ANN recall or constitute a general index-integrity verifier. Optional consumer
+  automatic exact-routing changes are deferred.
+- **Allow for workload-dependent upgrade costs.** Rebuilding old HNSW indexes
+  takes maintenance time; path-preserving writes perform additional work and can
+  reach repair limits. A focused comparison of two 0.19 builds (`3a8815a2` →
+  `d6b9b5bf`) measured write p95 of 38.015 → 39.200 ms on RocksDB (+3.1%) and
+  46.123 → 51.545 ms on SQLite (+11.8%). SQLite tails were strongly seed-specific.
+  A separate one-seed RocksDB/1536-dimension window flagged five read cases,
+  including exact scans around 249 → 288 ms (about +16%) and filtered ANN at
+  38.55 → 44.80 ms. These synthetic, window-sensitive observations neither compare
+  0.18 with 0.19 nor establish a small upgrade penalty or general speedup. See the
+  [measurement scope and release decision](docs/plans/0.19-planning.md#november-8-release-decision-and-measurement-scope).
 
 ## 0.18.0
 
