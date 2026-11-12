@@ -523,7 +523,7 @@ impl<'a> SessionTx<'a> {
         {
             candidates.push(neighbour_key, OrderedFloat(neighbour_dist));
         }
-        let new_candidates = self.hnsw_select_neighbours_heuristic(
+        let heuristic = self.hnsw_select_neighbours_heuristic(
             &vec,
             &candidates,
             m,
@@ -533,15 +533,42 @@ impl<'a> SessionTx<'a> {
             orig_table,
             vec_cache,
         )?;
-        let new_candidates = self.hnsw_preserve_pruned_paths(
+        let new_candidates = match self.hnsw_preserve_pruned_paths(
             target_key,
             level,
             idx_table,
             &candidates,
-            &new_candidates,
+            &heuristic,
             m,
             Some(inserted),
-        )?;
+        ) {
+            Ok(preserved) => preserved,
+            // Path-preserving pruning is read-only and fails before any write,
+            // so falling back to the heuristic selection (the pre-0.19 shrink)
+            // starts from an untouched graph. Never fail the write for it.
+            Err(err) => match repair::repair_limit_reason(&err) {
+                Some(reason) => {
+                    repair::emit_repair_fallback(&orig_table.name, "insertion", level, reason);
+                    let inserted_present = candidates.get(inserted).is_some();
+                    if inserted_present && candidates.len() - 1 <= m {
+                        // Keep every existing edge of the neighbour and decline only
+                        // its new link to the inserted vertex: no existing row loses
+                        // a path. The inserted vertex keeps its own outgoing links
+                        // and any incoming links its other neighbours accepted.
+                        let mut keep = PriorityQueue::new();
+                        for (key, dist) in candidates.iter() {
+                            if key != inserted {
+                                keep.push(key.clone(), Reverse(*dist));
+                            }
+                        }
+                        keep
+                    } else {
+                        heuristic
+                    }
+                }
+                None => return Err(err),
+            },
+        };
         let mut old_candidate_set = FxHashSet::default();
         for (old, _) in &candidates {
             old_candidate_set.insert(old.clone());
@@ -1148,14 +1175,38 @@ impl<'a> SessionTx<'a> {
             }
             let self_key_bytes = idx_table.encode_key_for_store(&self_key, Default::default())?;
             if self.idx_exists(idx_table, &self_key_bytes)? {
-                self.hnsw_repair_before_remove(
+                // Every repair limit is checked before the repair writes, so on
+                // a limit this layer is untouched and the unlink below proceeds
+                // exactly as before 0.19. Never fail the write for it.
+                if let Err(err) = self.hnsw_repair_before_remove(
                     &compound_key,
                     layer,
                     manifest,
                     orig_table,
                     idx_table,
                     vec_cache,
-                )?;
+                ) {
+                    match repair::repair_limit_reason(&err) {
+                        Some(reason) => {
+                            repair::emit_repair_fallback(
+                                &orig_table.name,
+                                "removal",
+                                layer,
+                                reason,
+                            );
+                            // Degree-preserving one-edge reconnection before the
+                            // unlink, so in-neighbours are not cut off (0.19.1).
+                            self.hnsw_reconnect_before_unlink(
+                                &compound_key,
+                                layer,
+                                orig_table,
+                                idx_table,
+                                vec_cache,
+                            )?;
+                        }
+                        None => return Err(err),
+                    }
+                }
                 self.idx_del(idx_table, &self_key_bytes)?;
             } else {
                 break;

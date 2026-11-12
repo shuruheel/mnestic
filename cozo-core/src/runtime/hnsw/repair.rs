@@ -49,6 +49,31 @@ fn limit(reason: &'static str) -> miette::Report {
     RepairLimit(reason).into()
 }
 
+/// The bounded-work reason, if `err` is a repair limit rather than corruption or
+/// an I/O failure. Callers fall back to unrepaired maintenance only for limits:
+/// every limit is raised before the repair writes anything, so the fallback
+/// starts from an untouched graph (0.19.1).
+pub(super) fn repair_limit_reason(err: &miette::Report) -> Option<&'static str> {
+    err.downcast_ref::<RepairLimit>().map(|limit| limit.0)
+}
+
+/// Record a bounded-repair fallback as a structured warning (`::warnings`,
+/// `Db::recent_warnings`) instead of failing the write.
+pub(super) fn emit_repair_fallback(relation: &str, op: &str, layer: i64, reason: &str) {
+    crate::runtime::diagnostics::emit(
+        "hnsw.repair_fallback",
+        format!(
+            "HNSW {op} on relation '{relation}' (layer {layer}) exceeded its repair work bound \
+             ({reason}); applied the bounded fallback instead of the path-preserving repair"
+        ),
+        format!(
+            "Search stays correct for rows it reaches, but repeated fallbacks can leave rows \
+             unreachable by ANN. Run `::reindex {relation}` during maintenance to restore full \
+             connectivity; count `hnsw.repair_fallback` warnings to decide when."
+        ),
+    );
+}
+
 fn edge_key(layer: i64, from: &CompoundKey, to: &CompoundKey) -> Tuple {
     let mut key = vec![DataValue::from(layer)];
     for node in [from, to] {
@@ -505,6 +530,125 @@ impl SessionTx<'_> {
         Ok(ret)
     }
 
+    /// Bounded-fallback removal (0.19.1), used when the path-preserving repair
+    /// exceeds its work bounds. Each in-neighbour `u` of the removed vertex `x`
+    /// replaces its edge `u -> x` with an edge to the out-neighbour of `x` nearest
+    /// to `u` that `u` does not already link to. The unlink that follows removes
+    /// `u -> x` and decrements `u`'s degree, so every in-neighbour ends at its
+    /// prior degree: the degree cap that defeated the full repair cannot be
+    /// exceeded. This is the one-edge localized reconnection of the
+    /// topology-aware update strategy (arXiv 2503.00402), not a reachability
+    /// proof; it keeps each in-neighbour attached to `x`'s neighbourhood instead
+    /// of dropping the path as the pre-0.19 unlink did. Work is O(in x out)
+    /// distance evaluations over vertices already adjacent to `x`; an
+    /// in-neighbour whose own adjacency exceeds the scan bound is skipped (it
+    /// keeps its other links), never failing the write.
+    pub(super) fn hnsw_reconnect_before_unlink(
+        &mut self,
+        node: &CompoundKey,
+        layer: i64,
+        orig: &RelationHandle,
+        table: &RelationHandle,
+        cache: &mut VectorCache,
+    ) -> Result<usize> {
+        let mut rows_left = usize::MAX;
+        let incident = match self.repair_neighbours_with_budget(table, layer, node, &mut rows_left)
+        {
+            Ok(incident) => incident,
+            Err(err) if repair_limit_reason(&err).is_some() => return Ok(0),
+            Err(err) => return Err(err),
+        };
+        let outs: Vec<CompoundKey> = incident
+            .iter()
+            .filter(|(_, live)| *live)
+            .map(|(key, _)| key.clone())
+            .collect();
+        if outs.is_empty() {
+            return Ok(0);
+        }
+        let mut reconnected = 0;
+        for (u, _) in &incident {
+            let reverse = self
+                .repair_edge_value(table, layer, u, node)?
+                .ok_or_else(|| miette!("corrupt HNSW index: missing reverse edge during repair"))?;
+            let incoming_active = !reverse[2]
+                .get_bool()
+                .ok_or_else(|| miette!("corrupt HNSW reverse flag"))?;
+            if !incoming_active {
+                continue;
+            }
+            let mut u_rows = usize::MAX;
+            let u_out: FxHashSet<CompoundKey> =
+                match self.repair_neighbours_with_budget(table, layer, u, &mut u_rows) {
+                    Ok(list) => list
+                        .into_iter()
+                        .filter(|(_, live)| *live)
+                        .map(|(k, _)| k)
+                        .collect(),
+                    Err(err) if repair_limit_reason(&err).is_some() => continue,
+                    Err(err) => return Err(err),
+                };
+            cache.ensure_key(u, orig, self)?;
+            let mut best: Option<(f64, &CompoundKey)> = None;
+            for v in &outs {
+                if v == u || u_out.contains(v) {
+                    continue;
+                }
+                cache.ensure_key(v, orig, self)?;
+                let d = cache.k_dist(u, v);
+                if best.is_none_or(|(bd, bv)| {
+                    OrderedFloat(d)
+                        .cmp(&OrderedFloat(bd))
+                        .then_with(|| v.cmp(bv))
+                        .is_lt()
+                }) {
+                    best = Some((d, v));
+                }
+            }
+            let Some((distance, v)) = best else {
+                // u already links to every out-neighbour of x: it stays attached.
+                continue;
+            };
+            let v = v.clone();
+            self.repair_put_edge(
+                table,
+                layer,
+                u,
+                &v,
+                &[
+                    DataValue::from(distance),
+                    DataValue::Null,
+                    DataValue::from(false),
+                ],
+            )?;
+            if self.repair_edge_value(table, layer, &v, u)?.is_none() {
+                self.repair_put_edge(
+                    table,
+                    layer,
+                    &v,
+                    u,
+                    &[
+                        DataValue::from(distance),
+                        DataValue::Null,
+                        DataValue::from(true),
+                    ],
+                )?;
+            }
+            let mut value = self
+                .repair_edge_value(table, layer, u, u)?
+                .ok_or_else(|| miette!("corrupt HNSW index: missing neighbour self row"))?;
+            let degree = value
+                .first()
+                .and_then(DataValue::get_float)
+                .ok_or_else(|| miette!("corrupt HNSW self-row: missing numeric degree"))?;
+            // +1 here, -1 when the unlink removes the active u -> x edge.
+            value[0] = DataValue::from(degree + 1.0);
+            self.repair_put_edge(table, layer, u, u, &value)?;
+            reconnected += 1;
+        }
+        Ok(reconnected)
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(super) fn hnsw_repair_before_remove(
         &mut self,
@@ -689,7 +833,7 @@ mod tests {
     }
 
     #[test]
-    fn upper_layer_failure_cannot_commit_lower_layer_repairs() {
+    fn upper_layer_repair_limit_falls_back_without_failing_the_write() {
         let db = crate::DbInstance::new("mem", "", "").unwrap();
         script(&db, ":create p {id:Int=>v:<F32;2>}");
         script(
@@ -779,26 +923,33 @@ mod tests {
         drop(tx);
         let query = "?[l,a,f,s,b,g,t,d,h,i] := *p:g[l,a,f,s,b,g,t,d,h,i] :order l,a,f,s,b,g,t";
         let before = script(&db, query).rows;
-        let tx = db.multi_transaction(true);
-        let error = tx
-            .run_script("?[id]<-[[1]] :rm p{id}", Default::default())
-            .unwrap_err();
-        assert!(format!("{error:?}").contains("hnsw::repair_limit"));
-        // The lower layer really changed before the upper-layer degree failure.
-        assert_ne!(
-            tx.run_script(query, Default::default()).unwrap().rows,
-            before
+        db.run_default("::warnings clear").unwrap();
+        // 0.19.1: the upper layer's degree cap cannot be met, so that layer falls
+        // back to unrepaired removal. The write succeeds instead of failing.
+        script(&db, "?[id]<-[[1]] :rm p{id}");
+        let warnings = db.run_default("::warnings").unwrap().rows;
+        assert!(
+            warnings
+                .iter()
+                .any(|row| row[1].get_str() == Some("hnsw.repair_fallback")),
+            "{warnings:?}"
         );
-        tx.run_script("?[id,v]<-[[4,[4,4]]] :put p{id=>v}", Default::default())
-            .unwrap();
-        assert!(tx
-            .commit()
-            .unwrap_err()
-            .to_string()
-            .contains("incomplete HNSW mutation"));
-        drop(tx);
-        assert_eq!(script(&db, query).rows, before);
-        assert_eq!(script(&db, "?[id] := *p{id}").rows.len(), 5);
+        assert_ne!(script(&db, query).rows, before);
+        let ids: Vec<_> = script(&db, "?[id] := *p{id} :order id")
+            .rows
+            .into_iter()
+            .map(|row| row[0].get_int().unwrap())
+            .collect();
+        assert_eq!(ids, vec![0, 2, 3, 4]);
+        // The lower layer was still repaired, so every survivor stays reachable.
+        for id in [0, 2, 3, 4] {
+            let found = script(
+                &db,
+                &format!("?[id] := ~p:g{{id | query: vec([{id},{id}]), k: 1, ef: 16}}"),
+            )
+            .rows;
+            assert_eq!(found, vec![vec![DataValue::from(id)]], "survivor {id}");
+        }
     }
 
     #[test]

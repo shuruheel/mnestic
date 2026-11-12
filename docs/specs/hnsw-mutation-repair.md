@@ -24,8 +24,10 @@ bypasses and excluding previously pruned bypasses. Stored edges outside that
 plan remain available as witnesses. Each removal therefore preserves paths in
 the graph that will actually be written, rather than in a stale adjacency cache.
 Check remaining outgoing degrees against the manifest's layer-specific cap.
-If the cap cannot be met, fail with `hnsw::repair_limit`; do not commit a degraded
-graph. All bypass distances use the existing metric and current vector identities.
+If the cap cannot be met within the work bounds, fall back (0.19.1, below): reconnect
+each in-neighbour by one edge, unlink the vertex on that layer, and record a
+`hnsw.repair_fallback` warning. All bypass distances use the existing metric and
+current vector identities.
 
 Write new active edges with reverse bookkeeping rows, then remove x's edges and
 self row. Count only active outgoing edges in degrees. Identify self edges by
@@ -64,15 +66,17 @@ and excludes previously pruned bypasses in both search directions. Reaching an
 empty frontier disproves that particular alternate route without exploring an
 unrelated large component; other removable edges can still be considered.
 The fallback only reads existing edges; it adds no connections and never traverses
-ignored reverse records. Missing proof or exhausted work still rejects the mutation.
+ignored reverse records. Missing proof or exhausted work triggers the bounded fallback below.
 Shrinking selects from existing outgoing neighbors, matching the bulk builder's
-no-extension policy. An infeasible bounded degree constraint fails explicitly; this
-can also reject a fresh incremental insertion rather than disconnect a leaf.
+no-extension policy. An infeasible bounded degree constraint falls back for that
+neighbour (decline the new link, else the heuristic selection; below), with the same
+warning.
 
 Repair is bounded by 256 incident/pruning vertices, 4,096 physical rows per
 adjacency scan, 1,048,576 incident-vector components per layer, 16,777,216 distance components
 per layer repair and 1,048,576 adjacency checks per pruning pass. Exceeding
-a limit returns the same structured diagnostic with a reason. These are local
+a limit raises `hnsw::repair_limit` with a reason inside the repair; the write path
+then applies the bounded fallback below. It never fails the user's write. These are local
 repair work bounds, not a statement RSS limit or a hard wall-clock guarantee.
 They must never silently truncate the neighborhood or skip a required connection.
 The external-path fallback additionally caps cached vertices and the combined
@@ -117,9 +121,61 @@ Example, using the relation from the investigation:
 This rebuilds the relation's search indexes using their existing manifests.
 Verify expected keys against exact base-row/vector queries afterward. A rebuild
 does not guarantee that a future mutation fits a restrictive degree/work cap.
-If a repair-limit error recurs, abort and investigate the index configuration or
-use exact eligible-key retrieval; repeated retries with the same inputs are not
-a recovery strategy. No production database is rebuilt by the release itself.
+Recurring `hnsw.repair_fallback` warnings mean parts of the graph were maintained
+without path preservation; schedule `::reindex` from the warning count. No
+production database is rebuilt by the release itself.
+
+## Bounded fallback (0.19.1)
+
+0.19.0 rejected the user's write whenever a repair exceeded its work bounds. Under
+sustained churn on clustered data that rejected a growing share of ordinary
+updates, deletes and inserts (about 4% rising to 20% per round at 2,000 rows, m=16),
+while 0.18, which never repaired, accepted every write but left rows unreachable
+(11% after ten rounds). Neither is acceptable for a long-lived memory store.
+
+From 0.19.1 a repair limit never fails the write. Every limit is checked before
+the repair writes anything, so the fallback starts from an untouched graph:
+
+- removal: skip the bypass repair for that layer. Before the unlink, give each
+  in-neighbour u of the removed vertex x (an active u→x edge) one replacement
+  edge u→v to the nearest live out-neighbour v of x that u does not already link
+  to, then unlink x. u loses u→x and gains u→v, so its degree is unchanged and no
+  cap is exceeded (a one-edge localized reconnection, after arXiv 2503.00402).
+  An in-neighbour whose own adjacency scan exceeds a bound is skipped; the step
+  never fails the write;
+- insertion pruning: if the neighbour's existing edges still fit the degree cap
+  without the new link, keep all of them and decline only the link to the inserted
+  vertex, so no existing row loses a path; otherwise keep the heuristic neighbour
+  selection, exactly as before 0.19.
+
+Measured (clustered vectors, 2,000 rows, dim 64, m=16; ten rounds each
+re-embedding 10%, deleting 5% and inserting 5%; rows not found by searching their
+own vector at k=1, ef=64):
+
+| build | writes rejected | unreachable after 10 rounds | recall@10 |
+|---|---|---|---|
+| 0.18.0 | 0 | 227 | 0.85 |
+| 0.19.0 | 14–87 per round | 0 | 1.000 |
+| 0.19.1, plain unlink | 0 | 9 | 1.000 |
+| 0.19.1, reconnect | 0 | 1 | 1.000 |
+
+At 10,000 rows (same churn, ten rounds): 0.18.0 789 unreachable, recall 0.912;
+0.19.0 3,293 writes rejected, 5 unreachable, recall 0.997; plain unlink 55
+unreachable, recall 0.998; reconnect 0 rejected, 32 unreachable, recall 0.997.
+
+A diagnostic at 4,000 rows classified the reconnect build's 6 misses: 4 still had
+live in-edges and were found at `ef: 400` (ordinary approximate-search misses,
+which 0.19.0 also shows), and 2 had no active in-edge (orphans, unreachable by
+any ANN search). Exact scans found all 6 and `::reindex` restored them. Orphans
+are the fallback's residual cost; a guard that keeps at least one in-edge for a
+re-inserted vertex is the candidate follow-up. Until then, count
+`hnsw.repair_fallback` warnings and `::reindex` during maintenance.
+
+Each fallback emits a structured `hnsw.repair_fallback` warning (`::warnings`,
+`Db::recent_warnings`) naming the relation, operation, layer and limit. Writes
+that repair within bounds keep the full path-preservation guarantee. Errors other
+than repair limits (corruption, missing vectors, I/O) still fail the write and
+still block commit through the incomplete-mutation guard.
 
 ## Acceptance
 
@@ -129,7 +185,9 @@ a recovery strategy. No production database is rebuilt by the release itself.
 - Repeated mutations, read-your-writes, script abort, explicit abort, failed commit
   and persistent reopen pass on SQLite and RocksDB.
 - Pruning checks demonstrate an alternate path survives; infeasible degree/work
-  cases fail without committed base or graph changes.
+  cases fall back with a `hnsw.repair_fallback` warning and never fail the write
+  (0.19.1). Sustained clustered churn commits every write and keeps survivors
+  reachable (`sustained_clustered_churn_never_fails_a_write`).
 - An existing alternate path outside the immediate neighbourhood is recognized;
   insertion pruning and removal repair both cover this case. Ignored edges are
   excluded and witness-budget exhaustion remains explicit.

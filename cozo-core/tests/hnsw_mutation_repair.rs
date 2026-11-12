@@ -354,3 +354,130 @@ fn failed_commit_does_not_publish_repair() {
         assert_search(&db, &[0, 1, 2]);
     }
 }
+
+/// Deterministic xorshift for the churn fixture (no rand dev-dependency).
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+    fn unit(&mut self) -> f32 {
+        (self.next() >> 40) as f32 / (1u64 << 24) as f32 * 2.0 - 1.0
+    }
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+fn clustered(rng: &mut Rng, centers: &[Vec<f32>]) -> Vec<f32> {
+    let c = &centers[rng.below(centers.len())];
+    c.iter().map(|x| x + 0.3 * rng.unit()).collect()
+}
+
+fn vec_literal(v: &[f32]) -> String {
+    let parts: Vec<_> = v.iter().map(|x| format!("{x:.5}")).collect();
+    format!("[{}]", parts.join(","))
+}
+
+/// 0.19.1 regression: sustained churn on clustered vectors with a default-shaped
+/// index. 0.19.0 rejected a growing share of these writes with
+/// `hnsw::repair_limit` (about 4% rising to 20% per round at 2,000 rows), and
+/// 0.18 accepted them but left rows unreachable by ANN. Every write must now
+/// succeed; repair-limit cases fall back with a `hnsw.repair_fallback` warning;
+/// and surviving rows must stay findable by their own vector.
+#[test]
+fn sustained_clustered_churn_never_fails_a_write() {
+    let (n, dim, rounds) = (600usize, 16usize, 6usize);
+    let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+    let centers: Vec<Vec<f32>> = (0..8)
+        .map(|_| (0..dim).map(|_| rng.unit() * 3.0).collect())
+        .collect();
+    let db = DbInstance::new("mem", "", "").unwrap();
+    run(&db, &format!(":create t {{id:Int=>v:<F32;{dim}>}}"));
+    run(
+        &db,
+        &format!(
+            "::hnsw create t:vec {{dim:{dim},m:16,dtype:F32,fields:[v],distance:Cosine,ef_construction:64}}"
+        ),
+    );
+    let mut live: std::collections::BTreeMap<i64, Vec<f32>> = Default::default();
+    for id in 0..n as i64 {
+        let v = clustered(&mut rng, &centers);
+        run(
+            &db,
+            &format!("?[id,v]<-[[{id},{}]] :put t{{id=>v}}", vec_literal(&v)),
+        );
+        live.insert(id, v);
+    }
+    let mut next_id = n as i64;
+    for _round in 0..rounds {
+        let ids: Vec<i64> = live.keys().copied().collect();
+        let mut order = ids.clone();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.below(i + 1));
+        }
+        let (n_upd, n_del) = (order.len() / 10, order.len() / 20);
+        for &id in &order[..n_upd] {
+            let v = clustered(&mut rng, &centers);
+            run(
+                &db,
+                &format!("?[id,v]<-[[{id},{}]] :put t{{id=>v}}", vec_literal(&v)),
+            );
+            live.insert(id, v);
+        }
+        for &id in &order[n_upd..n_upd + n_del] {
+            run(&db, &format!("?[id]<-[[{id}]] :rm t{{id}}"));
+            live.remove(&id);
+        }
+        for _ in 0..n_del {
+            let v = clustered(&mut rng, &centers);
+            run(
+                &db,
+                &format!("?[id,v]<-[[{next_id},{}]] :put t{{id=>v}}", vec_literal(&v)),
+            );
+            live.insert(next_id, v);
+            next_id += 1;
+        }
+    }
+    let unreachable: Vec<i64> = live
+        .iter()
+        .filter(|(id, v)| {
+            let found = run(
+                &db,
+                &format!(
+                    "?[id] := ~t:vec{{id | query: vec({}), k: 1, ef: 64}}",
+                    vec_literal(v)
+                ),
+            );
+            found.rows.first().and_then(|r| r[0].get_int()) != Some(**id)
+        })
+        .map(|(id, _)| *id)
+        .collect();
+    let fallbacks = run(&db, "::warnings")
+        .rows
+        .iter()
+        .filter(|row| row[1].get_str() == Some("hnsw.repair_fallback"))
+        .count();
+    eprintln!(
+        "churn: {} live rows, {} unreachable by own vector, {fallbacks} repair fallbacks (ring-capped)",
+        live.len(),
+        unreachable.len()
+    );
+    // The fallback path must actually run here, or this test cannot tell 0.19.1
+    // from 0.19.0 (which rejects exactly these writes).
+    assert!(fallbacks > 0, "churn never exceeded a repair bound");
+    // Measured on the 2,000-row, ten-round version of this churn (dim 64): 0.18.0
+    // left 11% of rows unreachable, a plain unlink fallback 0.45%, the reconnect
+    // fallback 0.05%. The 0.5% bound catches 0.18-style degradation; it is too
+    // coarse to separate the two fallbacks (this 600-row run measures 0).
+    assert!(
+        unreachable.len() * 200 <= live.len(),
+        "{} of {} rows unreachable: {unreachable:?}",
+        unreachable.len(),
+        live.len()
+    );
+}

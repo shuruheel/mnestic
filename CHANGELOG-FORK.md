@@ -5,6 +5,31 @@ provenance and licensing.
 
 ## Unreleased
 
+### Fixed — HNSW repair limits no longer fail writes (engine, for 0.19.1)
+
+- 0.19.0's path-preserving HNSW repair rejected the user's write with
+  `hnsw::repair_limit` whenever a repair exceeded its work bounds. Under sustained
+  churn on clustered vectors (2,000 rows, m=16; each round re-embedding 10%,
+  deleting 5% and inserting 5%) that rejected about 4% of writes in the first
+  round, rising to about 20% by the seventh. 0.18.0 accepted every write but left
+  11% of rows unreachable by ANN after ten rounds. A repair limit now falls back
+  to a bounded step for that layer or neighbour instead of failing the write —
+  every limit is checked before the repair writes, so the fallback starts from an
+  untouched graph — and records a structured `hnsw.repair_fallback` warning
+  (`::warnings`). On removal, each in-neighbour of the deleted vertex is first
+  reconnected to its nearest live out-neighbour of the deleted vertex
+  (degree-preserving, after arXiv 2503.00402), then the vertex is unlinked. On
+  insertion pruning, the neighbour keeps its existing edges and declines the new
+  link when they fit the degree cap, otherwise it uses the heuristic selection.
+  Same churn, ten rounds: 0 writes rejected, recall@10 1.000, 1 of 2,000 rows
+  unreachable (9 with a plain unlink, 227 on 0.18.0); at 10,000 rows, 32
+  unreachable and recall@10 0.997 (0.18.0: 789 and 0.912; 0.19.0: 3,293 writes
+  rejected). Residual unreachable rows are restored by `::reindex` and stay
+  reachable by exact scans, keyed queries and other indexes. Writes that repair within
+  bounds keep the full guarantee; corruption and other errors still fail the
+  write and block commit. Spec: `docs/specs/hnsw-mutation-repair.md` § Bounded
+  fallback.
+
 ### Added — `mnestic-mcp` 0.3.0: two-axis recall with evidence
 
 - New relation `memory_belief {id, vt: Validity, tt: TxTime => text, meta, source}`,
