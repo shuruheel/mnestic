@@ -42,6 +42,14 @@ release/issue descriptions retain their September 6 reconciliation date.
 - `mnestic` 0.19.0 release scope was approved November 8, 2026, with the latency
   caveats below; `mnestic-rocks` stays at 0.1.12. Registry/tag confirmation belongs
   to the release delivery record, not this roadmap.
+- `mnestic` 0.19.1 (approved by the owner November 12, 2026) is a patch: HNSW repair
+  limits fall back with an `hnsw.repair_fallback` warning instead of failing the
+  write. Measured churn evidence is in the
+  [0.19.1 changelog](CHANGELOG-FORK.md#0191--2026-11-12) and the
+  [repair spec](docs/specs/hnsw-mutation-repair.md#bounded-fallback-0191). The
+  "measured degradation after churn" evidence gate for HNSW long-run prevention is
+  now met by those measurements; a guard against orphaned re-inserted vertices is
+  the candidate follow-up.
 - The preceding engine release is 0.18.0.
 - Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
@@ -143,7 +151,7 @@ demand-gated export work. Its import half shipped in 0.17.0 and is retained as c
 | Area | Activation evidence |
 |---|---|
 | Arrow export | A released-import user names an Arrow-native or zero-copy workflow |
-| HNSW long-run prevention | Measured degradation after churn |
+| HNSW long-run prevention | Measured degradation after churn — **met November 12, 2026** (0.18.0: 7.9% of 10,000 rows unreachable after ten churn rounds; 0.19.1: 0.32%). Remaining work: the orphan guard, then a decision on automatic consolidation |
 | Plan cache | Repeated planning cost on a real high-frequency workload |
 | Filtered-vector redesign | A measured low-selectivity failure beyond bounded widening |
 | FTS scale work | User-visible latency or documented corpus-scale pressure |

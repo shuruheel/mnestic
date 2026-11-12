@@ -100,10 +100,25 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.19.0
+## New in 0.19.1
 
-This release adds governed native Rust transactions and repairs transactional
-FTS statistics and HNSW mutation connectivity.
+**HNSW repair limits no longer fail writes.** 0.19.0 rejected an update, delete or
+insert with `hnsw::repair_limit` when path-preserving repair exceeded its local
+work bounds; under sustained churn on clustered vectors that refused a growing
+share of ordinary writes (3,293 over ten rounds at 10,000 rows). The write now
+continues from an untouched graph with a bounded step — a removal first reconnects
+each in-neighbour of the removed vertex by one edge, an insertion keeps the
+neighbour's existing edges — and records a structured `hnsw.repair_fallback`
+warning. Ten churn rounds at 10,000 rows: no writes rejected, recall@10 0.997, 32
+rows unreachable by ANN (0.18.0: 789, recall 0.912). Those rows stay reachable by
+exact scans, keyed queries and other indexes, and `::reindex <relation>` restores
+them; count `hnsw.repair_fallback` warnings to schedule it. Other errors still fail
+the write. No storage or API change.
+
+### From 0.19.0
+
+0.19.0 added governed native Rust transactions and repaired transactional FTS
+statistics and HNSW mutation connectivity.
 
 - **Governed transactions (native Rust):** `db.governed_transaction(write, options)`
   returns a serialized client and host-owned worker. One deadline, bounded idle
@@ -118,9 +133,9 @@ FTS statistics and HNSW mutation connectivity.
 - **Rebuild pre-0.19 HNSW indexes with `::reindex <relation>`** after a backup, then
   validate search against exact base-row/vector queries. New mutations preserve
   directed paths; existing disconnections and missing legacy reverse records need
-  that explicit rebuild. Writes, including fresh insertions, can fail with
-  `hnsw::repair_limit` when local degree/work caps cannot preserve paths. Abort and
-  open a new transaction after failure; later statements cannot make it committable.
+  that explicit rebuild. From 0.19.1 a repair that
+  exceeds local degree/work caps falls back instead of failing the write and
+  records an `hnsw.repair_fallback` warning.
 - `::warnings` stays responsive during active memory/SQLite transactions.
   `parser.string_decoding_changed` is retired as promised; decoding is unchanged.
   The permanent 0.18 migration guidance still applies to legacy scripts.
