@@ -226,6 +226,14 @@ about performance [here](https://docs.cozodb.org/en/latest/releases/v0.3.html).
 
 ## Getting started
 
+For mnestic itself, start with the
+[Python quickstart](docs/guides/quickstart.md): `pip install mnestic`, then one
+script that opens a persistent store, builds vector and full-text indexes,
+retrieves with per-leg attribution, updates, backs up, reopens and restores.
+Coming from Neo4j, see [Cypher to CozoScript](docs/guides/cypher-to-cozoscript.md).
+The upstream CozoDB material below still teaches the query language, but its
+WASM demo runs upstream CozoDB, not mnestic.
+
 Usually, to learn a database, you need to install it first.
 This is unnecessary for CozoDB as a testimony to its extreme embeddability, since you can run
 a complete CozoDB instance in your browser, at near-native speed for most operations!

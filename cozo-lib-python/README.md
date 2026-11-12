@@ -15,6 +15,11 @@ required).
 pip install mnestic
 ```
 
+New here? The [quickstart](https://github.com/shuruheel/mnestic/blob/main/docs/guides/quickstart.md)
+walks a persistent memory store through indexing, hybrid retrieval, updates,
+backup, reopen and restore in one runnable script. Coming from Cypher, see
+[Cypher to CozoScript](https://github.com/shuruheel/mnestic/blob/main/docs/guides/cypher-to-cozoscript.md).
+
 ```python
 from mnestic import CozoDbPy
 
