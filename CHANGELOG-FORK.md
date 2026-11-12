@@ -5,7 +5,20 @@ provenance and licensing.
 
 ## Unreleased
 
-### Fixed — `mnestic-mcp` 0.2.1: byte budgets count wire bytes
+### Added — `mnestic-mcp` 0.3.0: two-axis recall with evidence
+
+- New relation `memory_belief {id, vt: Validity, tt: TxTime => text, meta, source}`,
+  written in the same transaction as every store, update and delete. Writes take
+  optional `source` (the evidence) and `valid_from` / `valid_until` (backdated
+  corrections and retractions).
+- `recall_believed(valid_at, known_at, query)` answers what was true at one time
+  according to what had been recorded by another; each result carries
+  `valid_from`, `recorded_at` (the engine's commit stamp, which callers cannot
+  supply) and `source`. `memory_timeline(id)` lists every assertion and
+  retraction with its evidence. Existing stores gain the relation on open;
+  their earlier history remains available through `recall_as_of`.
+
+### Fixed — `mnestic-mcp` 0.3.0: byte budgets count wire bytes
 
 - `max_bytes` was measured as compact-JSON *characters* of a per-item estimate,
   while FastMCP sends indented UTF-8 JSON. Non-ASCII results passed the check

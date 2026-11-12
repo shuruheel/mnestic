@@ -1,4 +1,4 @@
-"""FastMCP wiring: 10 thin tools delegating to `MemoryStore`. Tool names speak
+"""FastMCP wiring: 13 thin tools delegating to `MemoryStore`. Tool names speak
 mechanism (store/search/link/recall), never a cognitive ontology."""
 
 from __future__ import annotations
@@ -16,14 +16,22 @@ def build_server(store: MemoryStore) -> FastMCP:
     mcp = FastMCP(name="mnestic-memory", instructions=INSTRUCTIONS)
 
     @mcp.tool()
-    def store_memory(text: str, meta: Optional[dict] = None, id: Optional[str] = None) -> dict:
+    def store_memory(
+        text: str,
+        meta: Optional[dict] = None,
+        id: Optional[str] = None,
+        source: Optional[str] = None,
+        valid_from: Optional[str] = None,
+    ) -> dict:
         """Store one memory (a durable fact, preference, decision, or outcome).
-        Returns its id."""
-        return store.store(text, meta=meta, id=id)
+        `source` names the evidence (a message, document, URL). `valid_from`
+        (ISO-8601) says when the fact became true, if not now. Returns its id."""
+        return store.store(text, meta=meta, id=id, source=source, valid_from=valid_from)
 
     @mcp.tool()
     def store_batch(items: List[dict]) -> dict:
-        """Store many memories atomically. Each item: {text, meta?, id?}."""
+        """Store many memories atomically. Each item:
+        {text, meta?, id?, source?, valid_from?}."""
         return store.store_batch(items)
 
     @mcp.tool()
@@ -70,15 +78,23 @@ def build_server(store: MemoryStore) -> FastMCP:
         return budget.continue_result(token, max_bytes)
 
     @mcp.tool()
-    def update(id: str, text: Optional[str] = None, meta: Optional[dict] = None) -> dict:
-        """Correct or extend a memory (meta is merged). History is preserved
-        for recall_as_of."""
-        return store.update(id, text=text, meta=meta)
+    def update(
+        id: str,
+        text: Optional[str] = None,
+        meta: Optional[dict] = None,
+        source: Optional[str] = None,
+        valid_from: Optional[str] = None,
+    ) -> dict:
+        """Correct or extend a memory (meta is merged). Pass `valid_from` when the
+        change took effect earlier than now (a backdated correction) and `source`
+        for the evidence. Earlier beliefs stay queryable."""
+        return store.update(id, text=text, meta=meta, source=source, valid_from=valid_from)
 
     @mcp.tool()
-    def delete(id: str) -> dict:
-        """Delete a memory (its history stays recallable via recall_as_of)."""
-        return store.delete(id)
+    def delete(id: str, source: Optional[str] = None, valid_until: Optional[str] = None) -> dict:
+        """Delete a memory: it stops being true from `valid_until` (default now).
+        Its history stays queryable via recall_believed and memory_timeline."""
+        return store.delete(id, source=source, valid_until=valid_until)
 
     @mcp.tool()
     def link(src: str, dst: str, rel: str = "relates_to", weight: float = 1.0) -> dict:
@@ -93,10 +109,34 @@ def build_server(store: MemoryStore) -> FastMCP:
         k: int = 20,
         max_bytes: int = budget.DEFAULT_MAX_BYTES,
     ) -> dict:
-        """What the memory store contained at ISO-8601 instant t (time travel;
-        updates/deletes are never destructive). Byte-budgeted output (see
+        """What the memory store contained at ISO-8601 instant t, by write time
+        (updates/deletes are never destructive). For "what was true then" versus
+        "what was known then", use recall_believed. Byte-budgeted output (see
         search)."""
         return budget.budget_slice(store.recall_as_of(t, query=query, k=k), "memories", max_bytes)
+
+    @mcp.tool()
+    def recall_believed(
+        valid_at: Optional[str] = None,
+        known_at: Optional[str] = None,
+        query: Optional[str] = None,
+        k: int = 20,
+        max_bytes: int = budget.DEFAULT_MAX_BYTES,
+    ) -> dict:
+        """Two-axis recall: what was true at `valid_at`, according to what had been
+        recorded by `known_at` (both ISO-8601, default now). Each result carries
+        valid_from, recorded_at (stamped by the database, not the caller) and
+        source. Byte-budgeted output (see search)."""
+        out = store.recall_believed(valid_at=valid_at, known_at=known_at, query=query, k=k)
+        return budget.budget_slice(out, "memories", max_bytes)
+
+    @mcp.tool()
+    def memory_timeline(
+        id: str, limit: int = 100, max_bytes: int = budget.DEFAULT_MAX_BYTES
+    ) -> dict:
+        """Every recorded belief about one memory: each assertion and retraction
+        with when it was valid, when it was recorded, and its source."""
+        return budget.budget_slice(store.memory_timeline(id, limit=limit), "events", max_bytes)
 
     @mcp.tool()
     def stats() -> dict:

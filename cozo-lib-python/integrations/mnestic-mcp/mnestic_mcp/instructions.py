@@ -31,10 +31,18 @@ Use `link(src, dst, rel)` when two memories belong together (rel names a
 mechanism: "relates_to", "follows", "contradicts"). Use `update` for
 corrections — never store a duplicate. Don't narrate tool usage.
 
-## The two tools no other memory server has
+Pass `source` (where the fact came from) when you know it. When a change took
+effect earlier than now ("they moved last month"), pass `valid_from`.
+
+## Attribution and time
 - search(explain=true): per-leg attribution — exactly how much the keyword,
   vector, and graph legs each contributed to every result. Use when the user
   asks "why did you recall that?" or when retrieval needs debugging.
-- recall_as_of(t): the memory store as it existed at time t — updates and
-  deletes are never destructive. Use for "what did you know before X?".
+- recall_believed(valid_at, known_at): two separate questions — what was TRUE
+  at valid_at, according to what had been RECORDED by known_at. Use for "what
+  did you think on March 5 about where I lived in February?" and for audits.
+  recorded_at is stamped by the database at commit; it cannot be backdated.
+- memory_timeline(id): every assertion and retraction for one memory, with
+  sources — "how did this belief change, and on what evidence?".
+- recall_as_of(t): the store's contents as of write time t.
 """

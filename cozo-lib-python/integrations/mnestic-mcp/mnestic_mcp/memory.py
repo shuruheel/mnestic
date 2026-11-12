@@ -10,6 +10,13 @@ Storage layout (targets the published mnestic 0.12.2 wheel):
   Updates assert a new interval; deletes assert a retraction — `recall_as_of`
   reads `@ t`. Timestamps are validated `>= 0` in Python: the 0.12.2 engine
   panics on pre-epoch validity stamps.
+- `memory_belief {id, vt: Validity, tt: TxTime => text, meta, source}` — the
+  two-axis record. `vt` is when the memory is true in the world (defaults to the
+  write time; `valid_from` backdates a correction); `tt` is stamped by the engine
+  at commit and cannot be supplied, so "what did the store believe at T" is an
+  audit answer, not an application claim. `source` names the evidence. Written in
+  the same transaction as every store/update/delete. Stores created before this
+  relation existed gain it on open; their earlier history stays in memories_hist.
 - `links {src, dst, rel => weight, created_at}` — typed weighted edges,
   mechanism-named rels. Feeds the hybrid graph leg and `find_related`.
 - `db_meta {k => v}` — schema version + embedding-model pinning (a db built
@@ -62,6 +69,21 @@ def parse_when(t: str) -> str:
     return dt.isoformat().replace("+00:00", "Z")
 
 
+_BELIEF_PUT = (
+    "{?[id, vt, text, meta, source] <- $brows "
+    ":put memory_belief {id, vt => text, meta, source}}"
+)
+
+
+def _to_us(iso: str) -> int:
+    return int(datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp() * 1_000_000)
+
+
+def _vt_us(when: Optional[str], default_us: int) -> int:
+    """Valid-from instant in µs: the caller's ISO-8601 time, else the write time."""
+    return _to_us(parse_when(when)) if when else default_us
+
+
 class MemoryStore:
     def __init__(
         self,
@@ -110,6 +132,13 @@ class MemoryStore:
             self.db.run_script(
                 ":create memories_hist {id: String, at: Validity => text: String, "
                 "meta: Json, created_at: Int}",
+                {},
+                False,
+            )
+        if "memory_belief" not in rels:
+            self.db.run_script(
+                ":create memory_belief {id: String, vt: Validity, tt: TxTime => "
+                "text: String, meta: Json, source: String}",
                 {},
                 False,
             )
@@ -168,8 +197,18 @@ class MemoryStore:
 
     # --- writes ---
 
-    def store(self, text: str, meta: Optional[dict] = None, id: Optional[str] = None) -> dict:
-        out = self.store_batch([{"text": text, "meta": meta or {}, "id": id}])
+    def store(
+        self,
+        text: str,
+        meta: Optional[dict] = None,
+        id: Optional[str] = None,
+        source: Optional[str] = None,
+        valid_from: Optional[str] = None,
+    ) -> dict:
+        out = self.store_batch(
+            [{"text": text, "meta": meta or {}, "id": id, "source": source,
+              "valid_from": valid_from}]
+        )
         return {"id": out["ids"][0], "created_at": out["created_at"]}
 
     def store_batch(self, items: List[dict]) -> dict:
@@ -182,18 +221,28 @@ class MemoryStore:
         t = self._now_us()
         rows = [[i, tx, m, t, t, e] for i, tx, m, e in zip(ids, texts, metas, embs)]
         hrows = [[i, [t, True], tx, m, t] for i, tx, m in zip(ids, texts, metas)]
+        brows = [
+            [i, [_vt_us(it.get("valid_from"), t), True], tx, m, str(it.get("source") or "")]
+            for i, tx, m, it in zip(ids, texts, metas, items)
+        ]
         self.db.run_script(
             "{?[id, text, meta, created_at, updated_at, emb] <- $rows "
             ":put memories {id => text, meta, created_at, updated_at, emb}} "
             "{?[id, at, text, meta, created_at] <- $hrows "
-            ":put memories_hist {id, at => text, meta, created_at}}",
-            {"rows": rows, "hrows": hrows},
+            ":put memories_hist {id, at => text, meta, created_at}} "
+            + _BELIEF_PUT,
+            {"rows": rows, "hrows": hrows, "brows": brows},
             False,
         )
         return {"ids": ids, "count": len(ids), "created_at": _iso(t)}
 
     def update(
-        self, id: str, text: Optional[str] = None, meta: Optional[dict] = None
+        self,
+        id: str,
+        text: Optional[str] = None,
+        meta: Optional[dict] = None,
+        source: Optional[str] = None,
+        valid_from: Optional[str] = None,
     ) -> dict:
         cur = self._fetch([id])
         if id not in cur:
@@ -208,10 +257,12 @@ class MemoryStore:
         t = self._now_us()
         blocks = [
             "{?[id, at, text, meta, created_at] <- $hrows "
-            ":put memories_hist {id, at => text, meta, created_at}}"
+            ":put memories_hist {id, at => text, meta, created_at}}",
+            _BELIEF_PUT,
         ]
         params: Dict[str, Any] = {
             "hrows": [[id, [t, True], new_text, new_meta, created_at]],
+            "brows": [[id, [_vt_us(valid_from, t), True], new_text, new_meta, str(source or "")]],
         }
         if emb is not None:
             blocks.insert(
@@ -234,7 +285,9 @@ class MemoryStore:
         self.db.run_script(" ".join(blocks), params, False)
         return {"id": id, "updated_at": _iso(t)}
 
-    def delete(self, id: str) -> dict:
+    def delete(
+        self, id: str, source: Optional[str] = None, valid_until: Optional[str] = None
+    ) -> dict:
         existed = id in self._fetch([id])
         if not existed:
             return {"deleted": False}
@@ -243,9 +296,15 @@ class MemoryStore:
             "{?[id] <- [[$id]] :rm memories {id}} "
             "{?[id, at, text, meta, created_at] <- [[$id, [$t, false], '', {}, $t]] "
             ":put memories_hist {id, at => text, meta, created_at}} "
-            "{?[src, dst, rel] := *links{src, dst, rel}, (src == $id or dst == $id) "
+            + _BELIEF_PUT
+            + " {?[src, dst, rel] := *links{src, dst, rel}, (src == $id or dst == $id) "
             ":rm links {src, dst, rel}}",
-            {"id": id, "t": t},
+            {
+                "id": id,
+                "t": t,
+                # a retraction: from valid_until (default now) the memory no longer holds
+                "brows": [[id, [_vt_us(valid_until, t), False], "", {}, str(source or "")]],
+            },
             False,
         )
         return {"deleted": True}
@@ -474,6 +533,59 @@ class MemoryStore:
             "memories": [self._row_out(r[0], r[1], r[2], r[3]) for r in rows],
         }
 
+    def recall_believed(
+        self,
+        valid_at: Optional[str] = None,
+        known_at: Optional[str] = None,
+        query: Optional[str] = None,
+        k: int = 20,
+    ) -> dict:
+        """Two-axis recall: memories true at `valid_at` (default now) according to
+        what the store had recorded by `known_at` (default now). Each result says
+        when it became valid, when it was recorded, and its source."""
+        k = max(1, min(int(k), 200))
+        params: Dict[str, Any] = {"v": parse_when(valid_at) if valid_at else "NOW"}
+        axes = "vt: $v"
+        if known_at:
+            params["t"] = parse_when(known_at)
+            axes += ", tt: $t"
+        filt = ""
+        if query:
+            filt = ", str_includes(lowercase(text), lowercase($q))"
+            params["q"] = str(query)
+        rows = self.db.run_script(
+            f"?[id, text, meta, source, vt, tt] := "
+            f"*memory_belief{{id, text, meta, source, vt, tt @ ({axes})}}{filt}\n"
+            f":order -vt\n:limit {k}",
+            params,
+            True,
+        )["rows"]
+        return {
+            "valid_at": params["v"] if valid_at else "now",
+            "known_at": params.get("t", "now"),
+            "memories": [
+                {"id": r[0], "text": r[1], "meta": r[2], "source": r[3] or None,
+                 "valid_from": _iso(r[4][0]), "recorded_at": _iso(r[5][0])}
+                for r in rows
+            ],
+        }
+
+    def memory_timeline(self, id: str, limit: int = 100) -> dict:
+        """Every belief ever recorded for one memory, newest valid time first:
+        assertions and retractions on both axes, with their sources."""
+        limit = max(1, min(int(limit), 1000))
+        rows = self.db.run_script(
+            f"::history memory_belief $key {limit}", {"key": [str(id)]}, True
+        )["rows"]
+        return {
+            "id": id,
+            "events": [
+                {"valid_from": _iso(r[1]), "op": r[2], "recorded_at": _iso(r[3]),
+                 "text": r[4], "meta": r[5], "source": r[6] or None}
+                for r in rows
+            ],
+        }
+
     def stats(self) -> dict:
         def _count(script: str) -> int:
             rows = self.db.run_script(script, {}, True)["rows"]
@@ -486,6 +598,7 @@ class MemoryStore:
             "memories": _count("?[count(id)] := *memories{id}"),
             "links": _count("?[count(rel)] := *links{src, dst, rel}"),
             "history_rows": _count("?[count(at)] := *memories_hist{id, at}"),
+            "belief_rows": _count("?[count(id)] := *memory_belief{id, vt, tt}"),
             "indices": indices,
             "model": getattr(self.embedder, "model_name", "unknown"),
             "dim": int(self.embedder.dim),
