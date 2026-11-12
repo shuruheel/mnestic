@@ -5,35 +5,11 @@ provenance and licensing.
 
 ## Unreleased
 
-### Added — `mnestic-mcp` 0.3.0: two-axis recall with evidence
-
-- New relation `memory_belief {id, vt: Validity, tt: TxTime => text, meta, source}`,
-  written in the same transaction as every store, update and delete. Writes take
-  optional `source` (the evidence) and `valid_from` / `valid_until` (backdated
-  corrections and retractions).
-- `recall_believed(valid_at, known_at, query)` answers what was true at one time
-  according to what had been recorded by another; each result carries
-  `valid_from`, `recorded_at` (the engine's commit stamp, which callers cannot
-  supply) and `source`. `memory_timeline(id)` lists every assertion and
-  retraction with its evidence. Existing stores gain the relation on open;
-  their earlier history remains available through `recall_as_of`.
-
-### Fixed — `mnestic-mcp` 0.3.0: byte budgets count wire bytes
-
-- `max_bytes` was measured as compact-JSON *characters* of a per-item estimate,
-  while FastMCP sends indented UTF-8 JSON. Non-ASCII results passed the check
-  far over budget (300 CJK characters reported fitting 512 bytes while taking
-  925), and at the 20 000 default a 40-item CJK result went out uncut at
-  27 172 bytes. The slicer now measures the complete response (token and note
-  included) as FastMCP serializes it and keeps the longest fitting prefix. Every
-  response is within `max_bytes` except a single item larger than the budget,
-  which is served alone with `oversized_item: true` and its `response_bytes`.
-  A protocol test pins the measurement to a real client session.
-
 ## 0.19.1 — 2026-11-12
 
 Patch release. No storage-format or API change; `mnestic-rocks` stays 0.1.12.
-Upgrading from 0.18 still needs the 0.19.0 `::reindex` step below.
+Upgrading from 0.18 still needs the 0.19.0 `::reindex` step below. The
+`py-v0.19.1` release also published `mnestic-mcp` 0.3.0 (entries below).
 
 ### Fixed — HNSW repair limits no longer fail writes
 
@@ -59,6 +35,31 @@ Upgrading from 0.18 still needs the 0.19.0 `::reindex` step below.
   bounds keep the full guarantee; corruption and other errors still fail the
   write and block commit. Spec: `docs/specs/hnsw-mutation-repair.md` § Bounded
   fallback.
+
+### Added — `mnestic-mcp` 0.3.0: two-axis recall with evidence
+
+- New relation `memory_belief {id, vt: Validity, tt: TxTime => text, meta, source}`,
+  written in the same transaction as every store, update and delete. Writes take
+  optional `source` (the evidence) and `valid_from` / `valid_until` (backdated
+  corrections and retractions).
+- `recall_believed(valid_at, known_at, query)` answers what was true at one time
+  according to what had been recorded by another; each result carries
+  `valid_from`, `recorded_at` (the engine's commit stamp, which callers cannot
+  supply) and `source`. `memory_timeline(id)` lists every assertion and
+  retraction with its evidence. Existing stores gain the relation on open;
+  their earlier history remains available through `recall_as_of`.
+
+### Fixed — `mnestic-mcp` 0.3.0: byte budgets count wire bytes
+
+- `max_bytes` was measured as compact-JSON *characters* of a per-item estimate,
+  while FastMCP sends indented UTF-8 JSON. Non-ASCII results passed the check
+  far over budget (300 CJK characters reported fitting 512 bytes while taking
+  925), and at the 20 000 default a 40-item CJK result went out uncut at
+  27 172 bytes. The slicer now measures the complete response (token and note
+  included) as FastMCP serializes it and keeps the longest fitting prefix. Every
+  response is within `max_bytes` except a single item larger than the budget,
+  which is served alone with `oversized_item: true` and its `response_bytes`.
+  A protocol test pins the measurement to a real client session.
 
 ## 0.19.0 — 2026-11-08
 
