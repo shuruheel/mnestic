@@ -2,7 +2,7 @@
 Unit tests on the slicer plus an end-to-end pass through a real MemoryStore
 search payload."""
 
-import json
+import pytest
 
 from mnestic_mcp import budget
 
@@ -36,8 +36,8 @@ def test_over_budget_is_cut_at_item_boundaries():
     assert out["truncated"] is True
     assert 0 < len(out["results"]) < 50
     assert out["remaining"] == 50 - len(out["results"])
-    # every slice fits the budget
-    assert len(json.dumps(out, ensure_ascii=False)) <= 2_000 + 200  # note text slack
+    # the complete response fits the budget, measured as wire bytes
+    assert budget.wire_bytes(out) <= 2_000
     # items are byte-identical prefixes, never trimmed
     assert out["results"] == p["results"][: len(out["results"])]
     assert out["mode_used"] == "keyword"
@@ -71,6 +71,7 @@ def test_single_oversized_item_is_served_not_looped():
     out = budget.budget_slice(p, "results", 1_000)
     assert out["results"][0]["id"] == "big"
     assert out.get("oversized_item") is True
+    assert out["response_bytes"] == budget.wire_bytes(out)
     assert "continuation" not in out
 
 
@@ -103,3 +104,40 @@ def test_end_to_end_through_memory_store(mem):
     assert len(slices) > 1
     reassembled = [it for s in slices for it in s["results"]]
     assert [r["id"] for r in reassembled] == [r["id"] for r in full["results"]]
+
+
+# --- 0.2.1: byte accounting is UTF-8 wire bytes of the final response ---
+
+
+@pytest.mark.parametrize("ch", ["x", "é", "记", "🧠"])
+@pytest.mark.parametrize("max_bytes", [512, 2_000, 20_000])
+def test_every_non_oversized_slice_is_within_budget(ch, max_bytes):
+    p = {
+        "results": [{"id": f"m{i}", "text": ch * (37 + i % 90)} for i in range(400)],
+        "mode_used": "keyword",
+    }
+    slices = _walk(p, "results", max_bytes)
+    for s in slices:
+        if not s.get("oversized_item"):
+            assert budget.wire_bytes(s) <= max_bytes
+    assert [it for s in slices for it in s["results"]] == p["results"]
+
+
+def test_cjk_payload_over_budget_is_not_passed_through():
+    # The reproduced 0.2.0 defect: 300 CJK chars counted as ~327 "bytes" and
+    # passed max_bytes=512 while occupying ~925 bytes, with no flag.
+    p = {"results": [{"text": "记" * 300}]}
+    out = budget.budget_slice(p, "results", 512)
+    assert out is not p
+    assert out["oversized_item"] is True
+    assert out["response_bytes"] > 512
+
+
+def test_slices_are_maximal():
+    # The cut is the longest fitting prefix, not a conservative estimate.
+    p = {"results": [{"id": i, "text": "记" * 40} for i in range(100)]}
+    out = budget.budget_slice(p, "results", 3_000)
+    n = len(out["results"])
+    bigger = dict(out, results=p["results"][: n + 1], remaining=99 - n)
+    bigger["note"] = out["note"].replace(f"after {n} of", f"after {n + 1} of")
+    assert budget.wire_bytes(bigger) > 3_000

@@ -5,6 +5,18 @@ provenance and licensing.
 
 ## Unreleased
 
+### Fixed — `mnestic-mcp` 0.2.1: byte budgets count wire bytes
+
+- `max_bytes` was measured as compact-JSON *characters* of a per-item estimate,
+  while FastMCP sends indented UTF-8 JSON. Non-ASCII results passed the check
+  far over budget (300 CJK characters reported fitting 512 bytes while taking
+  925), and at the 20 000 default a 40-item CJK result went out uncut at
+  27 172 bytes. The slicer now measures the complete response (token and note
+  included) as FastMCP serializes it and keeps the longest fitting prefix. Every
+  response is within `max_bytes` except a single item larger than the budget,
+  which is served alone with `oversized_item: true` and its `response_bytes`.
+  A protocol test pins the measurement to a real client session.
+
 ## 0.19.0 — 2026-11-08
 
 This release adds governed native Rust transactions and repairs transactional

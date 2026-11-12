@@ -49,6 +49,14 @@ slice under the same budget. A wide result can no longer blow your agent's
 context with no way back. (Tokens don't survive a server restart; the error
 says so and tells you to re-run the query.)
 
+`max_bytes` counts UTF-8 bytes of the complete response exactly as it goes on
+the wire (FastMCP's indented JSON text block), truncation fields included.
+Every response fits, with one exception: a single item larger than the budget
+is served alone with `oversized_item: true` and its real `response_bytes`,
+since trimming would break prefix semantics and an empty page would loop.
+(0.2.0 counted compact-JSON characters, so non-ASCII results could exceed the
+budget several times over; fixed in 0.2.1.)
+
 ## Configuration
 
 | Flag / env | Default | Meaning |
