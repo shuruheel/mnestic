@@ -63,8 +63,8 @@ release/issue descriptions retain their September 6 reconciliation date.
 
 | Order | Work | Current state and scope |
 |---:|---|---|
-| 1 | Search indexes on transaction-time relations | `::fts`, `::hnsw`, `::lsh` and `::index create` are rejected on `TxTime` relations ([bitemporality spec](docs/specs/bitemporality.md), deferred in v1), so history and search cannot be combined. Scope: legalize them, stamp index entries with the base row's commit time, and let `:as_of` searches return what was live at that time. Needs a spec (index versioning, history GC/evict of index entries, cost of as-of search) before code |
-| 2 | Governed transactions from Python | `db.governed_transaction(write, options)` (deadline, idle wait, statement limits, abort on error) is Rust-only since 0.19.0; Python's `multi_transact` uses the ungoverned path. Scope: expose the governed client and its options in `cozo-lib-python`, with `MnesticError` kinds for deadline and limit aborts |
+| 1 | Search indexes on transaction-time relations | `::fts`, `::hnsw`, `::lsh` and `::index create` are rejected on `TxTime` relations ([bitemporality spec](docs/specs/bitemporality.md), deferred in v1), so history and search cannot be combined. Scope: legalize them, stamp index entries with the base row's commit time, and let `:as_of` searches return what was live at that time. Draft spec, not yet reviewed: [search and secondary indexes on transaction-time relations](docs/specs/txtime-search-indexes.md) |
+| 2 | Governed transactions from Python | `db.governed_transaction(write, options)` (deadline, idle wait, statement limits, abort on error) is Rust-only since 0.19.0; Python's `multi_transact` uses the ungoverned path. Scope: expose the governed client and its options in `cozo-lib-python`, with `MnesticError` kinds for deadline and limit aborts. Draft spec, not yet reviewed: [governed transactions from Python](docs/specs/python-governed-transactions.md) |
 
 Considered and not selected on November 13, 2026:
 
