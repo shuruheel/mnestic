@@ -11,14 +11,17 @@ use crate::data::program::HnswSearch;
 use crate::data::relation::VecElementType;
 use crate::data::tuple::Tuple;
 use crate::data::value::Vector;
+use crate::parse::expr::build_expr;
 use crate::parse::sys::HnswDistance;
+use crate::parse::{CozoScriptParser, Rule};
 use crate::runtime::relation::{try_decode_val_only, RelationHandle};
 use crate::runtime::transact::SessionTx;
 use crate::storage::StoreTx;
 use crate::{DataValue, SourceSpan};
 use itertools::Itertools;
-use miette::{bail, miette, Result};
+use miette::{bail, miette, IntoDiagnostic, Result};
 use ordered_float::OrderedFloat;
+use pest::Parser;
 use priority_queue::PriorityQueue;
 use rand::Rng;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -439,6 +442,7 @@ impl<'a> SessionTx<'a> {
                 // Pruning must see every selected link in this layer. Otherwise
                 // paths through the new vertex's not-yet-written neighbours are
                 // invisible and a feasible insertion can be rejected.
+                let mut kept_links = 0usize;
                 for (neighbour, _) in neighbours.iter() {
                     // shrink links if necessary
                     let mut target_self_key =
@@ -466,7 +470,7 @@ impl<'a> SessionTx<'a> {
                         + 1;
                     if target_degree > m_max {
                         // shrink links
-                        target_degree = self.hnsw_shrink_neighbour(
+                        let (degree, kept) = self.hnsw_shrink_neighbour(
                             neighbour,
                             &inserted_key,
                             m_max,
@@ -476,6 +480,10 @@ impl<'a> SessionTx<'a> {
                             orig_table,
                             vec_cache,
                         )?;
+                        target_degree = degree;
+                        kept_links += usize::from(kept);
+                    } else {
+                        kept_links += 1;
                     }
                     // update degree
                     target_self_val[0] = DataValue::from(target_degree as f64);
@@ -485,6 +493,28 @@ impl<'a> SessionTx<'a> {
                         idx_table,
                         &target_self_key_bytes,
                         &target_self_val_bytes_new,
+                    )?;
+                }
+                // Orphan guard (0.19.2): if every neighbour declined or pruned its
+                // link back, nothing points at the new vertex on this layer and
+                // no search can reach it. Give the nearest neighbour that can take
+                // it the link back, keeping that neighbour's degree within m.
+                if kept_links == 0 && !neighbours.is_empty() {
+                    let mut by_distance: Vec<_> = neighbours
+                        .iter()
+                        .map(|(k, Reverse(OrderedFloat(d)))| (k.clone(), *d))
+                        .collect();
+                    by_distance.sort_by(|a, b| {
+                        OrderedFloat(a.1)
+                            .cmp(&OrderedFloat(b.1))
+                            .then_with(|| a.0.cmp(&b.0))
+                    });
+                    self.hnsw_restore_in_link(
+                        &inserted_key,
+                        &by_distance,
+                        current_level,
+                        m_max,
+                        idx_table,
                     )?;
                 }
             }
@@ -514,7 +544,7 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         orig_table: &RelationHandle,
         vec_cache: &mut VectorCache,
-    ) -> Result<usize> {
+    ) -> Result<(usize, bool)> {
         vec_cache.ensure_key(target_key, orig_table, self)?;
         let vec = vec_cache.get_key(target_key).clone();
         let mut candidates = PriorityQueue::new();
@@ -563,7 +593,13 @@ impl<'a> SessionTx<'a> {
                         }
                         keep
                     } else {
-                        heuristic
+                        self.hnsw_protect_sole_in_edges(
+                            target_key,
+                            level,
+                            idx_table,
+                            &candidates,
+                            heuristic,
+                        )?
                     }
                 }
                 None => return Err(err),
@@ -578,6 +614,7 @@ impl<'a> SessionTx<'a> {
             new_candidate_set.insert(new.clone());
         }
         let new_degree = new_candidates.len();
+        let kept_inserted = new_candidate_set.contains(inserted);
         for (new, Reverse(OrderedFloat(new_dist))) in new_candidates {
             if !old_candidate_set.contains(&new) {
                 let mut new_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
@@ -636,7 +673,7 @@ impl<'a> SessionTx<'a> {
             }
         }
 
-        Ok(new_degree)
+        Ok((new_degree, kept_inserted))
     }
     fn hnsw_select_neighbours_heuristic(
         &self,
@@ -1400,11 +1437,159 @@ impl<'a> SessionTx<'a> {
                     }
                 }
 
-                let mut cand_tuple = config
+                let base_row = config
                     .base_handle
                     .get(self, &cand_key.0)?
                     .ok_or_else(|| miette!("corrupted index"))?;
+                let cand_tuple = Self::hnsw_result_tuple(config, base_row, &cand_key, distance)?;
 
+                if let Some((code, span)) = filter_bytecode {
+                    if !eval_bytecode_pred(code, &cand_tuple, stack, *span)? {
+                        continue;
+                    }
+                }
+
+                ret.push(cand_tuple);
+            }
+            ret.reverse();
+            ret.truncate(config.k);
+
+            // Filtered completeness (0.19.2). The graph search visits about `ef`
+            // vertices nearest the query regardless of the filter. If at least k
+            // of them pass, any eligible row nearer than the k-th would have been
+            // among them too, so the result is as good as unfiltered ANN. Fewer
+            // than k passing means the window held too few eligible rows, so
+            // score every eligible row exactly instead (bounded; see
+            // `hnsw_filtered_exact`).
+            if filter_bytecode.is_some() && ret.len() < config.k {
+                if let Some(exact) =
+                    self.hnsw_filtered_exact(&q, config, filter_bytecode, stack, &vec_cache)?
+                {
+                    return Ok(exact);
+                }
+            }
+
+            Ok(ret)
+        } else {
+            Ok(vec![])
+        }
+    }
+
+    /// Exact top-k over every row that the index covers and the query filter
+    /// accepts, in `(distance, key, field, subindex)` order. Returns `None`
+    /// (keep the ANN result, warn `hnsw.filtered_incomplete`) past
+    /// `FILTERED_EXACT_MAX_ROWS` base rows.
+    fn hnsw_filtered_exact(
+        &self,
+        q: &Vector,
+        config: &HnswSearch,
+        filter_bytecode: &Option<(Vec<Bytecode>, SourceSpan)>,
+        stack: &mut Vec<DataValue>,
+        vec_cache: &VectorCache,
+    ) -> Result<Option<Vec<Tuple>>> {
+        let index_filter = match &config.manifest.index_filter {
+            Some(f_code) => {
+                let parsed = CozoScriptParser::parse(Rule::expr, f_code)
+                    .into_diagnostic()?
+                    .next()
+                    .unwrap();
+                let mut code_expr = build_expr(parsed, &Default::default())?;
+                code_expr.fill_binding_indices(&config.base_handle.raw_binding_map())?;
+                Some(code_expr.compile()?)
+            }
+            None => None,
+        };
+        type Ranked = (OrderedFloat<f64>, Tuple, usize, i32);
+        let mut best: std::collections::BinaryHeap<(Ranked, Tuple)> = Default::default();
+        let n_keys = config.base_handle.metadata.keys.len();
+        for (scanned, row) in config.base_handle.scan_all(self).enumerate() {
+            if scanned >= FILTERED_EXACT_MAX_ROWS {
+                crate::runtime::diagnostics::emit(
+                    "hnsw.filtered_incomplete",
+                    format!(
+                        "filtered vector search on '{}' found fewer than {} matches among its \
+                         candidates, and the relation exceeds the {} rows an exact rescan may \
+                         read; results may be incomplete",
+                        config.base_handle.name, config.k, FILTERED_EXACT_MAX_ROWS
+                    ),
+                    "Create a partial index for the selective filter (`::hnsw create ... \
+                     filter: <expr>`), or raise `ef`."
+                        .to_string(),
+                );
+                return Ok(None);
+            }
+            let row = row?;
+            if let Some(code) = &index_filter {
+                if !eval_bytecode_pred(code, &row, stack, Default::default())? {
+                    continue;
+                }
+            }
+            let mut vectors = vec![];
+            for &field in &config.manifest.vec_fields {
+                match row.get(field) {
+                    Some(DataValue::Vec(v)) => vectors.push((v.clone(), field, -1i32)),
+                    Some(DataValue::List(l)) => {
+                        for (sub, v) in l.iter().enumerate() {
+                            if let DataValue::Vec(v) = v {
+                                vectors.push((v.clone(), field, sub as i32));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for (v, field, sub) in vectors {
+                // The index only ever holds vectors of its own dtype and dimension.
+                if v.len() != config.manifest.vec_dim
+                    || std::mem::discriminant(&v) != std::mem::discriminant(q)
+                {
+                    continue;
+                }
+                let distance = vec_cache.dist(q, &v);
+                if let Some(r) = config.radius {
+                    if distance > r {
+                        continue;
+                    }
+                }
+                let rank: Ranked = (OrderedFloat(distance), row[..n_keys].to_vec(), field, sub);
+                if best.len() >= config.k {
+                    if let Some((worst, _)) = best.peek() {
+                        if rank >= *worst {
+                            continue;
+                        }
+                    }
+                }
+                let cand_key = (row[..n_keys].to_vec(), field, sub);
+                let cand_tuple = Self::hnsw_result_tuple(config, row.clone(), &cand_key, distance)?;
+                if let Some((code, span)) = filter_bytecode {
+                    if !eval_bytecode_pred(code, &cand_tuple, stack, *span)? {
+                        continue;
+                    }
+                }
+                best.push((rank, cand_tuple));
+                if best.len() > config.k {
+                    best.pop();
+                }
+            }
+        }
+        Ok(Some(
+            best.into_sorted_vec()
+                .into_iter()
+                .map(|(_, tuple)| tuple)
+                .collect(),
+        ))
+    }
+
+    /// A base row extended with the search's bound columns, in the order of
+    /// `HnswSearch::all_bindings()`.
+    fn hnsw_result_tuple(
+        config: &HnswSearch,
+        mut cand_tuple: Tuple,
+        cand_key: &CompoundKey,
+        distance: f64,
+    ) -> Result<Tuple> {
+        {
+            {
                 // make sure the order is the same as in all_bindings()!!!
                 if config.bind_field.is_some() {
                     let field = if cand_key.1 < config.base_handle.metadata.keys.len() {
@@ -1438,24 +1623,14 @@ impl<'a> SessionTx<'a> {
                     };
                     cand_tuple.push(vec);
                 }
-
-                if let Some((code, span)) = filter_bytecode {
-                    if !eval_bytecode_pred(code, &cand_tuple, stack, *span)? {
-                        continue;
-                    }
-                }
-
-                ret.push(cand_tuple);
             }
-            ret.reverse();
-            ret.truncate(config.k);
-
-            Ok(ret)
-        } else {
-            Ok(vec![])
         }
+        Ok(cand_tuple)
     }
 }
+
+/// Base rows an exact filtered rescan may read before giving up (0.19.2).
+const FILTERED_EXACT_MAX_ROWS: usize = 200_000;
 
 #[cfg(test)]
 mod tests {

@@ -32,6 +32,81 @@ fn report2py(r: Report) -> PyErr {
     PyException::new_err(r.to_string())
 }
 
+pyo3::create_exception!(
+    mnestic,
+    MnesticError,
+    PyException,
+    "Raised for query, transaction and storage errors (mnestic 0.19.2).\n\n\
+     A subclass of Exception, so existing handlers still catch it. `args[0]` is the \
+     diagnostic dict earlier releases raised. Stable attributes: `code` (diagnostic \
+     code or None), `kind` (\"parse\", \"query\", \"timeout\", \"conflict\", \"limit\" \
+     or \"other\"), `retryable` (True only when rerunning the same call can succeed: \
+     a lock or transaction conflict) and `message`."
+);
+
+/// Map a diagnostic to the stable `kind`/`retryable` pair on `MnesticError`.
+fn classify_error(code: &str, message: &str) -> (&'static str, bool) {
+    let m = message.to_ascii_lowercase();
+    if code == "eval::killed" || code.contains("timeout") {
+        ("timeout", false)
+    } else if m.contains("database is locked")
+        || m.contains("resource busy")
+        || m.contains("busy")
+        || m.contains("try again")
+        || m.contains("deadlock")
+        || m.contains("conflict")
+        || (m.contains("timed out") && m.contains("lock"))
+    {
+        ("conflict", true)
+    } else if code.starts_with("parser") || code.starts_with("parse") {
+        ("parse", false)
+    } else if code.contains("limit") || code.contains("budget") {
+        ("limit", false)
+    } else if code.starts_with("eval")
+        || code.starts_with("query")
+        || code.starts_with("compile")
+        || code.starts_with("fixed_rule")
+    {
+        ("query", false)
+    } else {
+        ("other", false)
+    }
+}
+
+/// Convert an engine error into `MnesticError`, carrying the diagnostic dict.
+fn script_error(py: Python<'_>, err: Report, source: Option<&str>) -> PyErr {
+    let report = format_error_as_json(err, source);
+    let code = report
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let message = report
+        .get("message")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let (kind, retryable) = classify_error(&code, &message);
+    let build = || -> PyResult<PyErr> {
+        let payload = py
+            .import_bound("json")?
+            .getattr("loads")?
+            .call1((report.to_string(),))?;
+        let err = MnesticError::new_err(payload.unbind());
+        let value = err.value_bound(py);
+        if code.is_empty() {
+            value.setattr("code", py.None())?;
+        } else {
+            value.setattr("code", code.as_str())?;
+        }
+        value.setattr("kind", kind)?;
+        value.setattr("retryable", retryable)?;
+        value.setattr("message", message.as_str())?;
+        Ok(err)
+    };
+    build().unwrap_or_else(|e| e)
+}
+
 fn py_to_named_rows(ob: &PyAny) -> PyResult<NamedRows> {
     let d = ob.downcast::<PyDict>()?;
     let rows = d
@@ -524,12 +599,7 @@ impl CozoDbPy {
         match result {
             Ok(rows) => Ok(named_rows_to_py(rows, py)),
             Err(err) => {
-                let reports = format_error_as_json(err, Some(query)).to_string();
-                let json_mod = py.import("json")?;
-                let loads_fn = json_mod.getattr("loads")?;
-                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                let msg = loads_fn.call1(args)?;
-                Err(PyException::new_err(PyObject::from(msg)))
+                Err(script_error(py, err, Some(query)))
             }
         }
     }
@@ -600,12 +670,7 @@ impl CozoDbPy {
         match py.allow_threads(|| db.hybrid_search(&q)) {
             Ok(rows) => Ok(named_rows_to_py(rows, py)),
             Err(err) => {
-                let reports = format_error_as_json(err, None).to_string();
-                let json_mod = py.import("json")?;
-                let loads_fn = json_mod.getattr("loads")?;
-                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                let msg = loads_fn.call1(args)?;
-                Err(PyException::new_err(PyObject::from(msg)))
+                Err(script_error(py, err, None))
             }
         }
     }
@@ -628,12 +693,7 @@ impl CozoDbPy {
         match py.allow_threads(|| db.run_cypher(query, &sch, params)) {
             Ok(rows) => Ok(named_rows_to_py(rows, py)),
             Err(err) => {
-                let reports = format_error_as_json(err, Some(query)).to_string();
-                let json_mod = py.import("json")?;
-                let loads_fn = json_mod.getattr("loads")?;
-                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                let msg = loads_fn.call1(args)?;
-                Err(PyException::new_err(PyObject::from(msg)))
+                Err(script_error(py, err, Some(query)))
             }
         }
     }
@@ -871,12 +931,7 @@ impl CozoDbMulTx {
         match py.allow_threads(|| self.tx.run_script(query, params)) {
             Ok(rows) => Ok(named_rows_to_py(rows, py)),
             Err(err) => {
-                let reports = format_error_as_json(err, Some(query)).to_string();
-                let json_mod = py.import("json")?;
-                let loads_fn = json_mod.getattr("loads")?;
-                let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-                let msg = loads_fn.call1(args)?;
-                Err(PyException::new_err(PyObject::from(msg)))
+                Err(script_error(py, err, Some(query)))
             }
         }
     }
@@ -894,12 +949,7 @@ fn eval_expressions(
     match evaluate_expressions(query, &params, &bindings) {
         Ok(v) => Ok(value_to_py(v, py)),
         Err(err) => {
-            let reports = format_error_as_json(err, Some(query)).to_string();
-            let json_mod = py.import("json")?;
-            let loads_fn = json_mod.getattr("loads")?;
-            let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-            let msg = loads_fn.call1(args)?;
-            Err(PyException::new_err(PyObject::from(msg)))
+            Err(script_error(py, err, Some(query)))
         }
     }
 }
@@ -910,12 +960,7 @@ fn variables(py: Python<'_>, query: &str, params: &PyDict) -> PyResult<BTreeSet<
     match get_variables(query, &params) {
         Ok(rows) => Ok(rows),
         Err(err) => {
-            let reports = format_error_as_json(err, Some(query)).to_string();
-            let json_mod = py.import("json")?;
-            let loads_fn = json_mod.getattr("loads")?;
-            let args = PyTuple::new(py, [PyString::new(py, &reports)]);
-            let msg = loads_fn.call1(args)?;
-            Err(PyException::new_err(PyObject::from(msg)))
+            Err(script_error(py, err, Some(query)))
         }
     }
 }
@@ -924,6 +969,7 @@ fn variables(py: Python<'_>, query: &str, params: &PyDict) -> PyResult<BTreeSet<
 fn mnestic(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<CozoDbPy>()?;
     m.add_class::<CozoDbMulTx>()?;
+    m.add("MnesticError", _py.get_type_bound::<MnesticError>())?;
     m.add_function(wrap_pyfunction!(eval_expressions, m)?)?;
     m.add_function(wrap_pyfunction!(variables, m)?)?;
     Ok(())

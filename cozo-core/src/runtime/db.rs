@@ -1501,7 +1501,11 @@ impl<'s, S: Storage<'s>> Db<S> {
     pub fn backup_db(&'s self, out_file: impl AsRef<Path>) -> Result<()> {
         #[cfg(feature = "storage-sqlite")]
         {
-            let sqlite_db = crate::new_cozo_sqlite(out_file)?;
+            // A backup is one portable file: rollback journal, no WAL sidecar.
+            let sqlite_db = crate::new_cozo_sqlite_with_options(
+                out_file,
+                crate::SqliteOptions::single_file(),
+            )?;
             if sqlite_db.relation_store_id.load(Ordering::SeqCst) != 0 {
                 bail!("Cannot create backup: data exists in the target database.");
             }
@@ -1526,7 +1530,10 @@ impl<'s, S: Storage<'s>> Db<S> {
         let _fts_restore = self.fts_doc_stats_cache.raw_write();
         #[cfg(feature = "storage-sqlite")]
         {
-            let sqlite_db = crate::new_cozo_sqlite(in_file)?;
+            let sqlite_db = crate::new_cozo_sqlite_with_options(
+                in_file,
+                crate::SqliteOptions::keep_file_mode(),
+            )?;
             let mut s_tx = sqlite_db.transact()?;
             {
                 let mut tx = self.transact()?;
@@ -1573,7 +1580,10 @@ impl<'s, S: Storage<'s>> Db<S> {
             let locks = self.obtain_relation_locks(rel_names.iter());
             let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
 
-            let source_db = crate::new_cozo_sqlite(in_file)?;
+            let source_db = crate::new_cozo_sqlite_with_options(
+                in_file,
+                crate::SqliteOptions::keep_file_mode(),
+            )?;
             let mut src_tx = source_db.transact()?;
             let mut dst_tx = self.transact_write()?;
 
