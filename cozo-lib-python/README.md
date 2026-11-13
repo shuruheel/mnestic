@@ -73,6 +73,59 @@ seconds; on expiry the query raises an `eval::timeout` error.
 `db.default_query_timeout()` reads it back; the effective budget for a query is
 the minimum of that default and any per-call `timeout`.
 
+## Governed transactions
+
+`db.governed_transact(write, timeout=…)` opens a transaction with one deadline
+for the whole transaction, counted from the call. Any error rolls it back.
+
+```python
+with db.governed_transact(True, timeout=30.0) as tx:
+    tx.run_script("?[k, v] <- [[1, 'a']] :put kv {k => v}", {})
+    rows = tx.run_script("?[k, v] := *kv{k, v}", {})
+# a clean exit commits; an exception aborts and propagates unchanged
+```
+
+- `timeout` (required) is in seconds. `idle_timeout` (default 5 s) bounds the
+  wait between statements. `mem_limit` is an estimated per-statement memory
+  limit in bytes.
+- Expiry raises `eval::timeout`. A memory abort raises
+  `eval::mem_budget_exceeded`. Every error rolls the transaction back, and later
+  calls raise `transaction::closed`. `commit()` re-raises the error that ended
+  the transaction. `abort()` on an ended transaction does nothing.
+- `tx.cancel()` can be called from any thread. A blocked statement then raises
+  `eval::killed` at the engine's next cancellation check.
+- `db.close()` cancels the handle's open governed transactions.
+- When `commit()` fails with `maybe_committed` set, the commit may have
+  happened: reconcile before retrying. `retryable` is True only when the
+  transaction certainly did not commit.
+- `db.run_governed(fn, write=True, timeout=30.0, max_attempts=3)` runs
+  `fn(tx)`, commits, and retries `retryable` errors with jittered backoff.
+  Every attempt shares one `timeout`. It never retries a `maybe_committed`
+  error. `fn` may run more than once, so effects outside the transaction
+  repeat.
+
+Things to know:
+
+- **On SQLite, a governed write transaction excludes every other query.** While
+  it is open, other calls on the same handle raise
+  `transaction::governed_write_open` immediately. This includes `run_script`,
+  `multi_transact`, another `governed_transact`, import, export and backup.
+  Calls through another handle or process wait on SQLite's lock. A governed read
+  transaction makes writers wait. RocksDB has none of these restrictions.
+- **The idle limit is 5 s by default.** A block that pauses longer between
+  statements, for example to call a model, is rolled back, and the next call
+  raises `eval::timeout`. Do slow work before opening the transaction, or pass
+  a larger `idle_timeout`.
+- **Do not rely on garbage collection to end a transaction.** A transaction
+  dropped without `commit()` or `abort()` rolls back and emits a
+  `ResourceWarning`, but when that happens depends on the interpreter
+  (reference cycles, PyPy, shutdown). Use `with` or end it explicitly.
+- Each open transaction holds one thread and a snapshot until it ends. The
+  binding does not limit how many you open.
+
+The older `db.multi_transact(write)` is unchanged. It has no deadline or idle
+limit, and `db.close()` does not cancel it.
+
 ## RDF at the boundary — and what it means for the wheel's trust posture
 
 The wheel ships the `rdf-io` engine feature: `RdfReader` reads Turtle,

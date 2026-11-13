@@ -46,6 +46,9 @@ rdf-io = ["cozo/rdf-io"]
 ## Host-controlled Parquet/Arrow IPC import. Unlike `rdf-io`, this adds no
 ## CozoScript reader and does not widen script authority.
 columnar-io = ["cozo/columnar-io"]
+## Internal: exposes `_fail_next_commit_for_tests` for the binding's own
+## tests. Never enable in a published wheel.
+test-hooks = ["cozo/test-hooks"]
 ## Uses jemalloc as the global allocator, can make a difference in performance
 jemalloc = ["cozo/jemalloc"]
 ## Enables io-uring option for the RocksDB storage

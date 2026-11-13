@@ -5,6 +5,33 @@ provenance and licensing.
 
 ## Unreleased
 
+### Added — governed transactions from Python
+
+Spec: `docs/specs/python-governed-transactions.md`. Binding only; no engine
+change.
+
+- **`db.governed_transact(write, timeout=…, idle_timeout=5.0, mem_limit=None)`**
+  exposes the engine's governed multi-transactions. Each transaction gets one
+  deadline, a bounded wait between statements, an optional per-statement memory
+  limit, and rollback on any error.
+  - It returns a `GovernedTx` with `run_script`, `commit`, `abort` and
+    `cancel`. It works as a context manager: a clean exit commits, an exception
+    aborts.
+  - Each transaction runs on its own named worker thread, which never takes the
+    GIL. Invalid arguments raise `ValueError`, not a panic.
+- **`db.run_governed(fn, write=True, timeout=30.0, max_attempts=3)`** retries
+  `retryable` errors with jittered exponential backoff within one overall
+  timeout. It never retries an ambiguous commit.
+- **`MnesticError.maybe_committed`** is True when `commit()` failed and the
+  commit may have completed (a timeout, cancellation or storage error during
+  the commit). It is False on every other error, and is never True together
+  with `retryable`.
+- **`db.close()` cancels the handle's open governed transactions.** Legacy
+  `multi_transact` transactions are unaffected.
+- **SQLite:** while a governed write from a handle is open, other calls on that
+  handle raise `transaction::governed_write_open` (`kind` "conflict",
+  `retryable` False) instead of waiting on the store lock.
+
 ## 0.19.2 — 2026-11-12
 
 Patch release focused on the gaps a head-to-head comparison with Neo4j Labs'
