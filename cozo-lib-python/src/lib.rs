@@ -7,7 +7,7 @@
  */
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 #[cfg(feature = "columnar-io")]
 use std::time::Duration;
 
@@ -18,6 +18,9 @@ use pyo3::types::{PyBool, PyByteArray, PyBytes, PyDict, PyList, PyString, PyTupl
 use serde_json::json;
 
 use cozo::*;
+
+mod governed;
+use governed::GovernedTx;
 
 fn py_to_rows(ob: &PyAny) -> PyResult<Vec<Vec<DataValue>>> {
     let rows = ob.extract::<Vec<Vec<&PyAny>>>()?;
@@ -36,13 +39,61 @@ pyo3::create_exception!(
     mnestic,
     MnesticError,
     PyException,
-    "Raised for query, transaction and storage errors (mnestic 0.19.2).\n\n\
+    "Raised for query, transaction and storage errors (mnestic 0.19.2+).\n\n\
      A subclass of Exception, so existing handlers still catch it. `args[0]` is the \
      diagnostic dict earlier releases raised. Stable attributes: `code` (diagnostic \
      code or None), `kind` (\"parse\", \"query\", \"timeout\", \"conflict\", \"limit\" \
      or \"other\"), `retryable` (True only when rerunning the same call can succeed: \
-     a lock or transaction conflict) and `message`."
+     a lock or transaction conflict), `maybe_committed` and `message`.\n\n\
+     For a governed transaction (`CozoDbPy.governed_transact`, 0.19.3), `retryable` \
+     refers to rerunning the whole transaction, and is True only when the \
+     transaction certainly did not commit. `maybe_committed` is True when \
+     `commit()` failed in a way that leaves the outcome unknown (a timeout, a \
+     cancellation or a storage error during the commit): reconcile before \
+     retrying. It is False on every other error, including every non-governed \
+     one. `retryable` and `maybe_committed` are never both True."
 );
+
+/// Build a binding-made `MnesticError` with the same attributes and `args[0]`
+/// shape as one converted from an engine diagnostic.
+fn binding_error(
+    py: Python<'_>,
+    code: &str,
+    message: &str,
+    kind: &str,
+    retryable: bool,
+) -> PyErr {
+    let build = || -> PyResult<PyErr> {
+        let payload = PyDict::new_bound(py);
+        payload.set_item("ok", false)?;
+        payload.set_item("code", code)?;
+        payload.set_item("message", message)?;
+        payload.set_item("severity", "error")?;
+        payload.set_item("display", format!("{code}\n\n  × {message}\n"))?;
+        let err = MnesticError::new_err(payload.unbind());
+        let value = err.value_bound(py);
+        value.setattr("code", code)?;
+        value.setattr("kind", kind)?;
+        value.setattr("retryable", retryable)?;
+        value.setattr("maybe_committed", false)?;
+        value.setattr("message", message)?;
+        Ok(err)
+    };
+    build().unwrap_or_else(|e| e)
+}
+
+const TX_CLOSED_CODE: &str = "transaction::closed";
+const GOVERNED_WRITE_OPEN_CODE: &str = "transaction::governed_write_open";
+
+fn tx_closed_error(py: Python<'_>) -> PyErr {
+    binding_error(
+        py,
+        TX_CLOSED_CODE,
+        "Governed transaction is closed",
+        "other",
+        false,
+    )
+}
 
 /// Map a diagnostic to the stable `kind`/`retryable` pair on `MnesticError`.
 fn classify_error(code: &str, message: &str) -> (&'static str, bool) {
@@ -101,6 +152,7 @@ fn script_error(py: Python<'_>, err: Report, source: Option<&str>) -> PyErr {
         }
         value.setattr("kind", kind)?;
         value.setattr("retryable", retryable)?;
+        value.setattr("maybe_committed", false)?;
         value.setattr("message", message.as_str())?;
         Ok(err)
     };
@@ -522,6 +574,10 @@ fn named_rows_to_py(named_rows: NamedRows, py: Python<'_>) -> PyObject {
 #[pyclass]
 struct CozoDbPy {
     db: RwLock<Option<DbInstance>>,
+    /// Open governed transactions of this handle (python-governed-transactions D2).
+    governed: Arc<governed::Registry>,
+    /// SQLite handles refuse other calls while a governed write is open (D9).
+    sqlite: bool,
 }
 
 #[pyclass]
@@ -543,6 +599,54 @@ impl CozoDbPy {
             .clone()
             .ok_or_else(|| PyException::new_err(DB_CLOSED_MSG))
     }
+
+    /// D9: on SQLite a governed write holds the store lock for its whole
+    /// life, so any other storage call on this handle would wait until the
+    /// transaction's idle limit rolls it back. Refuse at once instead.
+    fn refuse_if_governed_write(&self, py: Python<'_>) -> PyResult<()> {
+        if self.sqlite && self.governed.has_write() {
+            return Err(binding_error(
+                py,
+                GOVERNED_WRITE_OPEN_CODE,
+                "A governed write transaction opened from this handle is still open; on SQLite it excludes every other query on the handle. Commit or abort it first.",
+                "conflict",
+                false,
+            ));
+        }
+        Ok(())
+    }
+
+    /// Like [`Self::db_ref`], plus the D9 refusal.
+    fn db_for_storage(&self, py: Python<'_>) -> PyResult<DbInstance> {
+        let db = self.db_ref()?;
+        self.refuse_if_governed_write(py)?;
+        Ok(db)
+    }
+
+    fn open_governed(
+        &self,
+        py: Python<'_>,
+        write: bool,
+        deadline: std::time::Instant,
+        idle_timeout: std::time::Duration,
+        mem_limit: Option<usize>,
+    ) -> PyResult<GovernedTx> {
+        let db = self.db_for_storage(py)?;
+        let tx = governed::open(
+            py,
+            db,
+            &self.governed,
+            write,
+            deadline,
+            idle_timeout,
+            mem_limit,
+        )?;
+        // A close() that raced this open must still end the transaction.
+        if self.db.read().unwrap().is_none() {
+            self.governed.cancel_all();
+        }
+        Ok(tx)
+    }
 }
 
 #[pymethods]
@@ -550,9 +654,17 @@ impl CozoDbPy {
     #[new]
     fn new(engine: &str, path: &str, options: &str) -> PyResult<Self> {
         match DbInstance::new(engine, path, options) {
-            Ok(db) => Ok(Self {
-                db: RwLock::new(Some(db)),
-            }),
+            Ok(db) => {
+                #[cfg(feature = "storage-sqlite")]
+                let sqlite = matches!(db, DbInstance::Sqlite(_));
+                #[cfg(not(feature = "storage-sqlite"))]
+                let sqlite = false;
+                Ok(Self {
+                    db: RwLock::new(Some(db)),
+                    governed: Default::default(),
+                    sqlite,
+                })
+            }
             Err(err) => Err(PyException::new_err(format!("{err:?}"))),
         }
     }
@@ -574,7 +686,7 @@ impl CozoDbPy {
         // Clone the handle out of a momentary read guard and drop the guard
         // BEFORE `py.allow_threads` — holding the lock across the blocking call
         // would serialize queries and re-block `close`.
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         let params = convert_params(params)?;
         let result = py.allow_threads(|| {
             let mutability = if immutable {
@@ -665,7 +777,7 @@ impl CozoDbPy {
     /// trailing columns `parent`, `depth` carry the cheapest-path witness
     /// (null on non-graph rows): 7 columns without MMR, 8 with it.
     pub fn hybrid_search(&self, py: Python<'_>, query: &PyDict) -> PyResult<PyObject> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         let q = py_to_hybrid_search(query)?;
         match py.allow_threads(|| db.hybrid_search(&q)) {
             Ok(rows) => Ok(named_rows_to_py(rows, py)),
@@ -687,7 +799,7 @@ impl CozoDbPy {
         schema: &PyDict,
         params: &PyDict,
     ) -> PyResult<PyObject> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         let sch = py_to_cypher_schema(schema)?;
         let params = convert_params(params)?;
         match py.allow_threads(|| db.run_cypher(query, &sch, params)) {
@@ -776,7 +888,7 @@ impl CozoDbPy {
         Ok(())
     }
     pub fn export_relations(&self, py: Python<'_>, relations: Vec<String>) -> PyResult<PyObject> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         let res = match py.allow_threads(|| db.export_relations(relations.iter())) {
             Ok(res) => res,
             Err(err) => return Err(PyException::new_err(err.to_string())),
@@ -788,7 +900,7 @@ impl CozoDbPy {
         Ok(ret.into())
     }
     pub fn import_relations(&self, py: Python<'_>, data: &PyDict) -> PyResult<()> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         let mut arg = BTreeMap::new();
         for (k, v) in data.iter() {
             let k = k.extract::<String>()?;
@@ -866,7 +978,7 @@ impl CozoDbPy {
             .with_max_decoded_batch_bytes(max_decoded_batch_bytes)
             .with_max_value_bytes(max_value_bytes)
             .with_max_nesting_depth(max_nesting_depth);
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         let report = py
             .allow_threads(|| db.import_columnar_file(relation, path, &options))
             .map_err(report2py)?;
@@ -880,11 +992,11 @@ impl CozoDbPy {
         Ok(result.into_py(py))
     }
     pub fn backup(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         py.allow_threads(|| db.backup_db(path)).map_err(report2py)
     }
     pub fn restore(&self, py: Python<'_>, path: &str) -> PyResult<()> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         py.allow_threads(|| db.restore_backup(path))
             .map_err(report2py)
     }
@@ -894,7 +1006,7 @@ impl CozoDbPy {
         in_file: &str,
         relations: Vec<String>,
     ) -> PyResult<()> {
-        let db = self.db_ref()?;
+        let db = self.db_for_storage(py)?;
         py.allow_threads(|| db.import_from_backup(in_file, &relations))
             .map_err(report2py)
     }
@@ -903,14 +1015,96 @@ impl CozoDbPy {
     /// PyCell borrow — the "Already borrowed" bug. Returns immediately even while
     /// queries run; the underlying storage drops when the last in-flight
     /// `DbInstance` clone is dropped.
+    ///
+    /// Open governed transactions are cancelled (0.19.3): their next call
+    /// raises and nothing they wrote commits. A RocksDB path is released once
+    /// their worker threads exit. Legacy `multi_transact` transactions are
+    /// not affected.
     pub fn close(&self) -> bool {
-        self.db.write().unwrap().take().is_some()
+        let had = self.db.write().unwrap().take().is_some();
+        self.governed.cancel_all();
+        had
     }
-    pub fn multi_transact(&self, write: bool) -> PyResult<CozoDbMulTx> {
-        let db = self.db_ref()?;
+    pub fn multi_transact(&self, py: Python<'_>, write: bool) -> PyResult<CozoDbMulTx> {
+        let db = self.db_for_storage(py)?;
         Ok(CozoDbMulTx {
             tx: db.multi_transaction(write),
         })
+    }
+    /// Open a governed transaction (0.19.3): one deadline for the whole
+    /// transaction (`timeout` seconds from this call, required), at most
+    /// `idle_timeout` seconds between statements, an optional per-statement
+    /// estimated memory limit in bytes, and rollback on any error. Use as a
+    /// context manager: a clean exit commits, an exception aborts.
+    ///
+    /// On SQLite a governed write excludes every other query on the same
+    /// handle; such calls raise `transaction::governed_write_open` until it
+    /// ends.
+    #[pyo3(signature = (write, *, timeout, idle_timeout=None, mem_limit=None))]
+    pub fn governed_transact(
+        &self,
+        py: Python<'_>,
+        write: bool,
+        timeout: &Bound<'_, PyAny>,
+        idle_timeout: Option<&Bound<'_, PyAny>>,
+        mem_limit: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<GovernedTx> {
+        let total = governed::parse_seconds("timeout", timeout)?;
+        let idle = match idle_timeout {
+            Some(v) if !v.is_none() => governed::parse_seconds("idle_timeout", v)?,
+            _ => std::time::Duration::from_secs(5),
+        };
+        let mem_limit = governed::parse_mem_limit(mem_limit)?;
+        let deadline = governed::deadline_after("timeout", total)?;
+        self.open_governed(py, write, deadline, idle, mem_limit)
+    }
+    /// Run `func(tx)` in a fresh governed transaction and commit it,
+    /// retrying errors marked `retryable` with jittered exponential backoff
+    /// (50 ms, doubling) until `max_attempts` or the overall `timeout`, which
+    /// spans every attempt. Never retries an error with `maybe_committed`.
+    /// The last error is raised unchanged. `func` must be safe to run more
+    /// than once: effects outside the transaction repeat.
+    #[pyo3(signature = (func, *, write=true, timeout=None, max_attempts=3, idle_timeout=None, mem_limit=None))]
+    #[allow(clippy::too_many_arguments)]
+    pub fn run_governed(
+        &self,
+        py: Python<'_>,
+        func: &Bound<'_, PyAny>,
+        write: bool,
+        timeout: Option<&Bound<'_, PyAny>>,
+        max_attempts: i64,
+        idle_timeout: Option<&Bound<'_, PyAny>>,
+        mem_limit: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyObject> {
+        let total = match timeout {
+            Some(v) if !v.is_none() => governed::parse_seconds("timeout", v)?,
+            _ => std::time::Duration::from_secs(30),
+        };
+        let idle = match idle_timeout {
+            Some(v) if !v.is_none() => governed::parse_seconds("idle_timeout", v)?,
+            _ => std::time::Duration::from_secs(5),
+        };
+        let mem_limit = governed::parse_mem_limit(mem_limit)?;
+        if !(1..=i64::from(u32::MAX)).contains(&max_attempts) {
+            return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                "max_attempts must be ≥ 1, got {max_attempts}"
+            )));
+        }
+        let deadline = governed::deadline_after("timeout", total)?;
+        governed::run_governed(
+            py,
+            &|py, deadline| self.open_governed(py, write, deadline, idle, mem_limit),
+            func,
+            deadline,
+            max_attempts as u32,
+        )
+    }
+    /// Test-only (feature `test-hooks`): make the next transaction commit on
+    /// this database fail. Not part of the API.
+    #[cfg(feature = "test-hooks")]
+    pub fn _fail_next_commit_for_tests(&self) -> PyResult<()> {
+        self.db_ref()?.fail_next_commit_for_tests();
+        Ok(())
     }
 }
 
@@ -969,7 +1163,15 @@ fn variables(py: Python<'_>, query: &str, params: &PyDict) -> PyResult<BTreeSet<
 fn mnestic(_py: Python<'_>, m: &PyModule) -> PyResult<()> {
     m.add_class::<CozoDbPy>()?;
     m.add_class::<CozoDbMulTx>()?;
-    m.add("MnesticError", _py.get_type_bound::<MnesticError>())?;
+    m.add_class::<GovernedTx>()?;
+    let error_type = _py.get_type_bound::<MnesticError>();
+    // Class-level defaults, so a user-constructed MnesticError (for example
+    // in a test or a retry predicate) has every documented attribute.
+    error_type.setattr("code", _py.None())?;
+    error_type.setattr("kind", "other")?;
+    error_type.setattr("retryable", false)?;
+    error_type.setattr("maybe_committed", false)?;
+    m.add("MnesticError", error_type)?;
     m.add_function(wrap_pyfunction!(eval_expressions, m)?)?;
     m.add_function(wrap_pyfunction!(variables, m)?)?;
     Ok(())
