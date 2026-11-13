@@ -1,6 +1,9 @@
 # Governed transactions from Python
 
-Status: **DRAFT — all review passes run (0–5), awaiting owner approval.** Selected as roadmap item 2
+Status: **APPROVED for implementation, November 13, 2026.** The owner accepted
+the recommendations ("I agree with your recommendations"): keep the retry
+helper, and refuse ordinary queries on SQLite while a governed write is open
+(D9). Targeted for 0.19.3, ahead of the TxTime index work. Selected as roadmap item 2
 by the owner on November 13, 2026. Passes (workspace `spec-authoring` method):
 
 | Pass | Date | Result |
@@ -129,6 +132,18 @@ application or hide a safe retry. The `MnesticError` docstring gains both
 meanings: for governed transactions `retryable` refers to the whole
 transaction; `maybe_committed` is `False` on every non-governed error.
 
+**D9 — SQLite: refuse instead of wait.** On a SQLite database, while a governed
+write transaction opened from this `CozoDbPy` is open, every other entry point
+on the same handle that would open a storage transaction (`run_script`,
+`multi_transact`, a second `governed_transact`, import, export, backup) raises
+`MnesticError` immediately with `code == "transaction::governed_write_open"`,
+`kind == "conflict"`, `retryable == False`, `maybe_committed == False`. Without
+this, such a call waits on the store lock until the governed transaction's
+idle limit rolls it back — silently, when the call comes from inside its own
+`with` block. The binding already tracks open governed transactions (D2), so
+the check needs no engine change. RocksDB, governed read transactions, and
+other handles or processes on the same file are unaffected.
+
 **D7 — Legacy API unchanged.** `multi_transact` keeps its behaviour and
 exception types; `db.close()` does not cancel it.
 
@@ -182,6 +197,10 @@ loop because hand-written ones retry ambiguous commits or never stop.
   blocks other queries, so the write case runs on RocksDB only).
 - SQLite: a held legacy write transaction plus a governed transaction with a
   short deadline returns `eval::timeout` to the caller.
+- SQLite D9: inside an open governed write, `db.run_script`, `multi_transact`,
+  a second `governed_transact` and `backup` each raise
+  `transaction::governed_write_open` at once; after commit they succeed; on
+  RocksDB and with a governed read they are not refused.
 - `db.close()` with an open governed transaction returns promptly and cancels
   it: its next call raises, nothing commits, and the RocksDB path can be
   reopened once the worker exits. An open `multi_transact` is unaffected.
@@ -200,11 +219,11 @@ loop because hand-written ones retry ambiguous commits or never stop.
 
 ## Residual risks
 
-- **On SQLite a governed write transaction blocks every other query on the same
-  Db**, including queries issued from inside its own `with` block. Such a query
-  waits until the transaction's idle limit rolls it back, and the clean exit
-  then raises `eval::timeout`. The README must say this; RocksDB does not have
-  it.
+- **On SQLite a governed write transaction excludes every other query on the
+  same Db.** Through the same handle they are refused at once (D9); through
+  another handle or process they wait on SQLite's lock. A governed read
+  transaction still makes writers on the same handle wait. The README says
+  so; RocksDB does not have it.
 - **The 5 s default idle limit** rolls back a block that pauses longer between
   statements, for example to call an external API or a model. The error
   surfaces at the next call or at commit as `eval::timeout`. The README says
@@ -255,10 +274,11 @@ does not change.
    SQLAlchemy all commit on clean exit.
 2. *An `outcome_unknown` flag?* Yes, as `maybe_committed` (D6).
 
-## Open questions (owner)
+## Owner decisions (November 13, 2026)
 
-1. Should the binding refuse ordinary queries on a SQLite Db while a governed
-   write transaction from the same Db is open, rather than letting them wait?
+1. Refuse ordinary queries on a SQLite handle while a governed write from it
+   is open (D9).
+2. Keep the retry helper (D8) in this batch.
 
 ## Simplification
 
@@ -269,7 +289,4 @@ Requirement-neutral cuts, applied:
 - No new `kind` values; `maybe_committed` is one attribute, `False` on every
   non-governed error rather than absent, so callers need no `hasattr`.
 
-Requirement changes, **not** applied (owner decision):
-- **Drop the retry helper (D8) from this batch.** It is the prior-art pass's
-  essential omission, and small; keeping it is recommended. Dropping it would
-  leave the new flags without the loop that makes them safe to use.
+Both requirement-level choices were settled by the owner decisions above.

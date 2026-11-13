@@ -1,6 +1,8 @@
 # Search and secondary indexes on transaction-time relations
 
-Status: **DRAFT — all review passes run (0–5), awaiting owner approval.** Selected as roadmap item 1
+Status: **APPROVED for implementation, November 13, 2026.** The owner accepted
+the recommendations on the three open questions ("I agree with your
+recommendations"); they are recorded under *Owner decisions*. Selected as roadmap item 1
 by the owner on November 13, 2026. Passes (workspace `spec-authoring` method):
 
 | Pass | Date | Result |
@@ -47,7 +49,9 @@ belief**, and defines what a search **as of** an earlier transaction time does.
 
 ## Decisions
 
-**D1 — Scope: tt-only relations, four index kinds.** `{k…, tt: TxTime => v…}`
+**D1 — Scope: tt-only relations; search indexes first.** Batch 1 admits the
+three search kinds (`::fts`, `::hnsw`, `::lsh`); B-tree secondary indexes
+(`::index`) follow in batch 3 (owner decision 2). Across the batches: `{k…, tt: TxTime => v…}`
 relations accept `::index`, `::fts`, `::hnsw` and `::lsh create`. Bitemporal
 relations stay rejected with the existing diagnostic: valid time has no
 write-time notion of "current" (a future-dated version becomes current without
@@ -297,9 +301,13 @@ history-preserving recovery and reversible enablement remain open.
 
 ## Batches (review units)
 
-1. **Current-belief indexes** (D1–D5, D7, D8, D6 errors): the unblock. Ships alone.
+1. **Current-belief search indexes**: full-text, vector and LSH (D1–D5, D7,
+   D8; D6 search-atom and `:as_of` errors). The unblock. Ships alone.
 2. **As-of vector search by bounded exact scan** (D6).
-3. **As-of full-text and LSH** — not designed here. Gate: a consumer names an
+3. **B-tree secondary indexes** (D1, D2 for `::index`; D6 planner change,
+   bounded as-of base scan and `query::as_of_scan_limit`). Gate: measure the
+   as-of lookup by secondary key first (performance table).
+4. **As-of full-text and LSH** — not designed here. Gate: a consumer names an
    as-of text-search question. Candidate: materialise postings for the beliefs
    at T into the transaction's temporary store, bounded, and run the evaluator.
 
@@ -316,25 +324,19 @@ history-preserving recovery and reversible enablement remain open.
    `::evict` (now in the section) and `::history_gc` (superseded rows only).
    System ops cannot run inside multi-statement transactions.
 
-## Open questions (owner)
+## Owner decisions (November 13, 2026)
 
-1. **Synchronous or deferred maintenance.** Prior art's essential omission:
-   every system surveyed keeps expensive search-index work out of the serial
-   commit path. Datomic commits to an in-memory index and merges in the
-   background; Neo4j offers eventually-consistent full-text indexes because
-   synchronous Lucene writes were its main write bottleneck; Lance tracks
-   which data each index covers and scans the rest exactly. A mnestic version:
-   commits record touched keys against an indexed-up-to tt; a later writer or
-   an explicit `::index catch_up` applies them; reads scan the unindexed tail
-   exactly. mnestic has no engine-owned background threads, so catch-up would
-   ride on writers or be explicit. **Recommendation:** ship synchronous
-   maintenance in batch 1 behind the release gates above; build the deferred
-   mode only if the section-wait gates fail. It is a larger design (tail
-   scans must merge with BM25 ranking and HNSW results) that can reuse D5's
-   touched-key registration.
-2. Should batch 1 include B-tree indexes, or only the three search kinds
-   (simplification candidate below)?
-3. Are the 1.5× and 1.3× gates the right bar?
+1. **Synchronous maintenance.** Index maintenance runs in the commit section
+   (D3) behind the release gates. The deferred mode — commits record touched
+   keys against an indexed-up-to tt, catch-up applies them, reads scan the
+   unindexed tail exactly, as Datomic, Neo4j's eventually-consistent full-text
+   indexes and Lance do — is built only if the section-wait gates fail. It can
+   reuse D5's touched-key registration. mnestic has no engine-owned background
+   threads, so its catch-up would ride on writers or be explicit.
+2. **B-tree secondary indexes move to batch 3.** Batch 1 is the three search
+   kinds, which is what combining history and search asked for, and does not
+   need the planner change or the as-of base-scan cap.
+3. **Release gates as proposed** in the performance table.
 
 ## Simplification
 
@@ -347,8 +349,5 @@ Requirement-neutral cuts, applied:
 - Moving tokenisation and vector normalisation out of the section was not
   added to batch 1; it is the first lever if the section gates fail.
 
-Requirement changes, **not** applied (owner decision):
-- **Defer B-tree secondary indexes to a later batch.** Batch 1 would then not
-  need the planner change, the as-of base-scan cap or its error (D6 first two
-  bullets), and the selected roadmap item would still be met for search,
-  which is what "combine history and search" asked for. Recommended.
+B-tree deferral (owner decision 2) applied as a batch change; D6's planner
+bullets now land with batch 3.
