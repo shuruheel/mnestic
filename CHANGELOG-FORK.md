@@ -5,6 +5,109 @@ provenance and licensing.
 
 ## Unreleased
 
+## 0.19.2 — 2026-11-12
+
+Patch release focused on the gaps a head-to-head comparison with Neo4j Labs'
+Relate measured: slow single-row writes, a multi-second first write after
+reopening, ANN-unreachable rows after churn, incomplete selective filtered
+search, and unstructured Python errors. No storage-format change; existing
+files keep working and `mnestic-rocks` stays 0.1.12. SQLite files switch to
+write-ahead logging on first open (below).
+
+Measured with `mnestic-benchmarks` (40,000 memories, dim 384, synthetic
+clustered vectors; lifecycle churn = 10% re-embedded + 5% deleted; SQLite unless
+noted; same machine, one run each):
+
+| | 0.19.0 | 0.19.2 | Relate 1.0.0 |
+|---|---|---|---|
+| writes rejected during churn | 517 of 6,000 | 0 | 0 |
+| update / delete p50 | 300 / 193 ms | 20 / 7.2 ms | 0.8 / 0.2 ms |
+| update / delete p50, RocksDB | — | 37 / 78 ms | — |
+| first write after reopen | 7.8 s | 0.03 s | 0.01 s |
+| reopen / first query | 38 / 285 ms | 43 / 19.5 ms | 4,988 / 247 ms |
+| recall@10 after churn and reopen | 0.9985 | 0.999 | 1.0 (exact scan) |
+| filtered search, 1.9% filter, `ef: 100` | recall 0.18 | recall 1.0, 100 ms | recall 1.0, 45 ms |
+| hybrid search p50 / fused p99 | 189 / 4,454 ms | 37 / 65 ms | 440 / 737 ms |
+
+BEIR SciFact (real embeddings) nDCG@10, vector / BM25 / fused: mnestic 0.717 /
+0.662 / 0.715, Relate 0.721 / 0.662 / 0.719 (Relate's vector search is exact).
+Neither engine lost an acknowledged write when killed mid-write.
+
+### Changed — SQLite connections (write-ahead log, larger cache)
+
+- Every SQLite connection previously ran with SQLite's defaults: a rollback
+  journal (each write copied its touched pages to a journal and fsynced twice),
+  a 2 MB page cache and no busy timeout. Defaults are now `journal_mode = WAL`
+  with `synchronous = FULL` (an acknowledged commit still survives power loss),
+  a 32 MiB page cache per pooled connection, a 5 s busy timeout, and
+  `BEGIN IMMEDIATE` for write transactions, so a second process waits instead
+  of failing with `database is locked`. A write transaction now finalizes its
+  cached lookup statements before `COMMIT`; one left on a row kept a read open
+  on the writer's connection, which would have blocked every WAL checkpoint
+  (the log reached 326 MB over 105 MB of data until close). Opening an existing file converts it to
+  WAL; the database then has `-wal`/`-shm` sidecar files while open. Copy a
+  database with `::backup` (still a single rollback-journal file), not by
+  copying the file of an open database. Opt out with
+  `{"journal_mode": "delete"}`; other keys: `synchronous`, `cache_mb`,
+  `busy_timeout_ms`, `mmap_mb` (Rust: `SqliteOptions`,
+  `new_cozo_sqlite_with_options`). Unknown keys are still ignored.
+- Newly created SQLite files store the key-value table `WITHOUT ROWID`, so a
+  key lookup or range scan reads one B-tree instead of an index plus the table.
+  Existing files keep their layout; a `::backup` file has the new layout and can
+  be opened directly as the database. Older mnestic versions open both layouts.
+
+### Fixed — writes no longer scan the full-text corpus
+
+- A write to a relation with an FTS index seeded BM25's corpus totals (`N`,
+  `avgdl`) with a full scan of every posting whenever the in-memory totals were
+  absent — always on the first write after opening the database. At 10,000
+  documents that write took 6.8–30 s on SQLite. Writes now apply deltas only to
+  totals they already hold; otherwise they invalidate them and the next search
+  seeds them (its cost moves to the first search after opening: about 0.5 s at
+  10,000 documents). Scores are unchanged.
+
+### Changed — unchanged fields skip index maintenance
+
+- `:put` and `:update` now skip index work whose inputs did not change. Editing
+  only a row's text keeps its HNSW graph entry (previously removed with path
+  repair and searched back in); re-embedding only its vector keeps its FTS
+  postings. Identical rows touch no index. Index contents are the same as before.
+
+### Fixed — HNSW orphan guards
+
+- The 0.19.1 fallbacks could leave a vector with no active in-edge on a layer,
+  so no ANN search could reach it at any `ef` (1–2 such rows per 4,000 after ten
+  churn rounds). Insertion now restores an in-link when every neighbour declined
+  it, the heuristic fallback shrink keeps an edge that is its target's only
+  in-edge, and the removal fallback reconnects out-neighbours that would lose
+  their only in-edge first. Degree caps are preserved and no write fails. Same
+  churn, three runs: 0 orphans (0.19.1: 2, 1, 2); the remaining misses (3–24 of
+  4,000) are ordinary approximate-search misses found at a wider `ef`. Spec:
+  `docs/specs/hnsw-mutation-repair.md` § Orphan guards.
+
+### Fixed — selective filtered vector search returns complete results
+
+- A filtered HNSW search (`filter:` in `~rel:idx{...}`) took the `ef` vertices
+  nearest the query and then filtered them, so a selective filter returned
+  fewer than `k` rows or the wrong ones (recall@10 0.18 for a 1.9% filter at
+  40,000 rows with default `ef`). When fewer than `k` candidates pass the
+  filter, the search now scores every eligible row exactly and returns the true
+  top `k`. When at least `k` pass, the result is as good as unfiltered ANN, as
+  before. The exact pass reads at most 200,000 base rows; past that it keeps the
+  ANN result and warns `hnsw.filtered_incomplete`. For frequent selective
+  filters, a partial index (`::hnsw create ... filter: <expr>`) stays faster.
+
+### Added — Python `MnesticError`
+
+- Engine errors from `run_script`, multi-statement transactions, `hybrid_search`,
+  `run_cypher`, `eval_expressions` and `variables` now raise
+  `mnestic.MnesticError`, a subclass of `Exception`: existing handlers still
+  catch it and `args[0]` is the same diagnostic dict. New stable attributes:
+  `code` (diagnostic code or `None`), `kind` (`parse`, `query`, `timeout`,
+  `conflict`, `limit` or `other`), `retryable` (true only for lock or
+  transaction conflicts, where rerunning the same call can succeed) and
+  `message`.
+
 ## 0.19.1 — 2026-11-12
 
 Patch release. No storage-format or API change; `mnestic-rocks` stays 0.1.12.

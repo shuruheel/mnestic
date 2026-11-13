@@ -27,6 +27,96 @@ pub struct SqliteStorage {
     lock: Arc<ShardedLock<()>>,
     name: PathBuf,
     pool: Arc<Mutex<Vec<ConnectionThreadSafe>>>,
+    options: Arc<SqliteOptions>,
+}
+
+/// Connection settings for the SQLite engine (mnestic fork, 0.19.2).
+///
+/// Before 0.19.2 every connection ran with SQLite's defaults: a rollback
+/// journal, a 2 MB page cache and no busy timeout. A single-row write then
+/// paid a journal copy of every touched page plus two fsyncs, and most reads
+/// missed the cache. The defaults below keep the same durability
+/// (`synchronous = FULL`: an acknowledged commit survives power loss) while
+/// appending to a write-ahead log instead.
+///
+/// From JSON options (`DbInstance::new("sqlite", path, options)`), all keys
+/// optional: `{"journal_mode": "wal" | "delete" | "keep", "synchronous":
+/// "full" | "normal", "cache_mb": 32, "busy_timeout_ms": 5000, "mmap_mb": 0}`.
+#[derive(Clone, Debug, serde_derive::Deserialize)]
+// Unknown keys are ignored, as before 0.19.2: hosts pass one options object to
+// whichever engine they open (e.g. RocksDB's `shared_memory`).
+#[serde(default)]
+pub struct SqliteOptions {
+    /// `wal` (default), `delete` (single-file rollback journal, the pre-0.19.2
+    /// behaviour) or `keep` (leave the file's existing mode untouched).
+    pub journal_mode: String,
+    /// `full` (default) or `normal`. In WAL mode `normal` can lose the most
+    /// recent commits on power loss (never on a process crash) and never
+    /// corrupts the database.
+    pub synchronous: String,
+    /// Page cache per pooled connection, in MiB. Allocated only as pages are read.
+    pub cache_mb: u32,
+    /// How long a connection waits for another process's lock before failing.
+    pub busy_timeout_ms: u32,
+    /// Memory-map up to this many MiB of the file for reads (0 disables).
+    pub mmap_mb: u32,
+}
+
+impl Default for SqliteOptions {
+    fn default() -> Self {
+        Self {
+            journal_mode: "wal".to_string(),
+            synchronous: "full".to_string(),
+            cache_mb: 32,
+            busy_timeout_ms: 5000,
+            mmap_mb: 0,
+        }
+    }
+}
+
+impl SqliteOptions {
+    /// Self-contained single file: backup outputs stay one portable file.
+    pub(crate) fn single_file() -> Self {
+        Self {
+            journal_mode: "delete".to_string(),
+            ..Self::default()
+        }
+    }
+    /// Opening someone else's file (a backup being restored or imported from)
+    /// must not rewrite its header.
+    pub(crate) fn keep_file_mode() -> Self {
+        Self {
+            journal_mode: "keep".to_string(),
+            ..Self::default()
+        }
+    }
+
+    fn validate(&self) -> Result<()> {
+        match self.journal_mode.as_str() {
+            "wal" | "delete" | "keep" => {}
+            other => bail!("sqlite option journal_mode must be wal, delete or keep, got {other:?}"),
+        }
+        match self.synchronous.as_str() {
+            "full" | "normal" => {}
+            other => bail!("sqlite option synchronous must be full or normal, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    /// Per-connection settings; SQLite does not persist these in the file.
+    /// `wal_autocheckpoint` is the SQLite default, stated explicitly; see
+    /// `commit` for what actually blocked checkpoints.
+    fn configure(&self, conn: &Connection) -> Result<()> {
+        let cache_kib = i64::from(self.cache_mb) * 1024;
+        let mmap_bytes = i64::from(self.mmap_mb) * 1024 * 1024;
+        conn.execute(format!(
+            "pragma busy_timeout = {}; pragma synchronous = {}; \
+             pragma cache_size = -{cache_kib}; pragma mmap_size = {mmap_bytes}; \
+             pragma wal_autocheckpoint = 1000;",
+            self.busy_timeout_ms, self.synchronous
+        ))
+        .into_diagnostic()
+    }
 }
 
 /// Create a sqlite backed database.
@@ -34,25 +124,53 @@ pub struct SqliteStorage {
 ///
 /// You must provide a disk-based path: `:memory:` is not OK.
 /// If you want a pure memory storage, use [`new_cozo_mem`](crate::new_cozo_mem).
+///
+/// Uses [`SqliteOptions::default`]: write-ahead logging with full sync.
 pub fn new_cozo_sqlite(path: impl AsRef<Path>) -> Result<crate::Db<SqliteStorage>> {
+    new_cozo_sqlite_with_options(path, SqliteOptions::default())
+}
+
+/// Create a sqlite backed database with explicit connection settings.
+///
+/// A newly created file stores its key-value table `WITHOUT ROWID` (0.19.2),
+/// so a key lookup or range scan reads one B-tree instead of an index plus
+/// the table. Existing files keep their layout; `::backup` writes the new
+/// layout, and opening that backup file migrates.
+pub fn new_cozo_sqlite_with_options(
+    path: impl AsRef<Path>,
+    options: SqliteOptions,
+) -> Result<crate::Db<SqliteStorage>> {
     if path.as_ref().to_str() == Some("") {
         bail!("empty path for sqlite storage")
     }
+    options.validate()?;
     let conn = Connection::open_thread_safe(&path).into_diagnostic()?;
+    options.configure(&conn)?;
+    match options.journal_mode.as_str() {
+        "wal" => conn
+            .execute("pragma journal_mode = wal;")
+            .into_diagnostic()?,
+        "delete" => conn
+            .execute("pragma journal_mode = delete;")
+            .into_diagnostic()?,
+        _ => {}
+    }
     let query = r#"
         create table if not exists cozo
         (
             k BLOB primary key,
             v BLOB
-        );
+        ) without rowid;
     "#;
     let mut statement = conn.prepare(query).unwrap();
     while statement.next().into_diagnostic()? != State::Done {}
+    drop(statement);
 
     let ret = crate::Db::new(SqliteStorage {
         lock: Default::default(),
         name: PathBuf::from(path.as_ref()),
-        pool: Default::default(),
+        pool: Arc::new(Mutex::new(vec![conn])),
+        options: Arc::new(options),
     })?;
 
     ret.initialize()?;
@@ -64,8 +182,13 @@ impl<'s> Storage<'s> for SqliteStorage {
 
     fn transact(&'s self, write: bool) -> Result<Self::Tx> {
         let conn = {
-            match self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop() {
-                None => Connection::open_thread_safe(&self.name).into_diagnostic()?,
+            let pooled = self.pool.lock().unwrap_or_else(|e| e.into_inner()).pop();
+            match pooled {
+                None => {
+                    let conn = Connection::open_thread_safe(&self.name).into_diagnostic()?;
+                    self.options.configure(&conn)?;
+                    conn
+                }
                 Some(conn) => conn,
             }
         };
@@ -75,7 +198,10 @@ impl<'s> Storage<'s> for SqliteStorage {
             Left(self.lock.read().unwrap_or_else(|e| e.into_inner()))
         };
         if write {
-            let mut stmt = conn.prepare("begin;").into_diagnostic()?;
+            // IMMEDIATE takes SQLite's write lock up front, so a competing
+            // process makes this wait (busy_timeout) instead of failing a
+            // deferred lock upgrade halfway through the transaction.
+            let mut stmt = conn.prepare("begin immediate;").into_diagnostic()?;
             while stmt.next().into_diagnostic()? != State::Done {}
         }
         Ok(SqliteTx {
@@ -258,6 +384,13 @@ impl<'s> StoreTx<'s> for SqliteTx<'s> {
     fn commit(&mut self) -> Result<()> {
         if let Right(ShardedLockWriteGuard { .. }) = self.lock {
             if !self.committed {
+                // A cached lookup statement left on a row keeps a read open on
+                // this connection, which blocks every WAL checkpoint from it,
+                // automatic or explicit: the log grew to 326 MB over 105 MB of
+                // data until close. Finalize them before committing.
+                for stmt in &self.stmts {
+                    *stmt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 let query = r#"commit;"#;
                 let mut statement = self.conn.as_ref().unwrap().prepare(query).unwrap();
                 while statement.next().into_diagnostic()? != State::Done {}

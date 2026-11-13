@@ -110,7 +110,9 @@ pub use storage::rocks::{
 #[cfg(feature = "storage-sled")]
 pub use storage::sled::{new_cozo_sled, SledStorage};
 #[cfg(feature = "storage-sqlite")]
-pub use storage::sqlite::{new_cozo_sqlite, SqliteStorage};
+pub use storage::sqlite::{
+    new_cozo_sqlite, new_cozo_sqlite_with_options, SqliteOptions, SqliteStorage,
+};
 #[cfg(feature = "storage-tikv")]
 pub use storage::tikv::{new_cozo_tikv, TiKvStorage};
 pub use storage::{Storage, StoreTx};
@@ -202,7 +204,10 @@ impl DbInstance {
     /// some of the engines are available. The `mem` engine is always available.
     ///
     /// `path` is ignored for `mem` and `tikv` engines.
-    /// `options` is ignored for every engine except `tikv` and `rocksdb`.
+    /// `options` is ignored for every engine except `sqlite`, `tikv` and `rocksdb`.
+    ///
+    /// For `sqlite`, `options` may set connection behaviour; see
+    /// [`SqliteOptions`]. `{}` selects write-ahead logging with full sync.
     ///
     /// For `rocksdb`, `options` may carry a `shared_memory` key —
     /// `{"shared_memory": {"total_bytes": 268435456, "memtable_fraction": 0.25}}`
@@ -220,7 +225,10 @@ impl DbInstance {
         Ok(match engine {
             "mem" => Self::Mem(new_cozo_mem()?),
             #[cfg(feature = "storage-sqlite")]
-            "sqlite" => Self::Sqlite(new_cozo_sqlite(path)?),
+            "sqlite" => {
+                let opts: SqliteOptions = serde_json::from_str(options).into_diagnostic()?;
+                Self::Sqlite(new_cozo_sqlite_with_options(path, opts)?)
+            }
             #[cfg(feature = "storage-rocksdb")]
             "rocksdb" => {
                 fn default_memtable_fraction() -> f64 {

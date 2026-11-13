@@ -166,10 +166,32 @@ unreachable, recall 0.998; reconnect 0 rejected, 32 unreachable, recall 0.997.
 A diagnostic at 4,000 rows classified the reconnect build's 6 misses: 4 still had
 live in-edges and were found at `ef: 400` (ordinary approximate-search misses,
 which 0.19.0 also shows), and 2 had no active in-edge (orphans, unreachable by
-any ANN search). Exact scans found all 6 and `::reindex` restored them. Orphans
-are the fallback's residual cost; a guard that keeps at least one in-edge for a
-re-inserted vertex is the candidate follow-up. Until then, count
-`hnsw.repair_fallback` warnings and `::reindex` during maintenance.
+any ANN search). Exact scans found all 6 and `::reindex` restored them.
+
+### Orphan guards (0.19.2)
+
+A vertex with no active in-edge on a layer cannot be reached by any search, at
+any `ef`. The fallbacks above could create one three ways; each now checks
+before it drops the last in-edge. "Has another in-edge" is decided from the
+vertex's own bookkeeping rows (every active `u -> y` has a row `y -> u`), with
+the usual adjacency-scan bound; over the bound the guard leaves the edge set
+alone rather than failing the write.
+
+- Insertion: if every neighbour declined or pruned its link back to the new
+  vertex on a layer, the nearest neighbour that can takes it back: with spare
+  degree it simply adds the link; at the cap it swaps out its farthest edge
+  whose target keeps another in-edge.
+- Heuristic fallback shrink: an edge the heuristic would drop that is its
+  target's only in-edge is kept, in exchange for the farthest selected edge
+  whose target keeps another. The selection never grows.
+- Removal fallback: out-neighbours of the deleted vertex whose only in-edge
+  came from it are covered first, each by its nearest still-unassigned
+  in-neighbour; the other in-neighbours then take their nearest target as in
+  0.19.1. Still one new edge per in-neighbour.
+
+Each guard preserves degree caps and adds no new failure mode. The churn
+regression asserts no bottom-layer orphans. Ordinary search-width misses remain
+(found at a wider `ef`); `::reindex` remains the full rebuild.
 
 Each fallback emits a structured `hnsw.repair_fallback` warning (`::warnings`,
 `Db::recent_warnings`) naming the relation, operation, layer and limit. Writes

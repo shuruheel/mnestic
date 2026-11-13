@@ -176,6 +176,18 @@ impl TxFtsStats {
         }
     }
 
+    /// A successful posting change made without cached totals (0.19.2). The
+    /// totals stay unknown: later reads in this transaction scan its pending
+    /// postings, and commit publishes nothing for this index, so the next
+    /// reader seeds exact totals. Same uncertainty rule as `complete_write`.
+    pub(crate) fn complete_write_unseeded(&self, id: RelationId, scan_only: bool) {
+        let mut local = self.local();
+        local.entries.remove(&id);
+        if !scan_only {
+            local.uncertain.remove(&id);
+        }
+    }
+
     pub(crate) fn committed(&self) {
         self.finish(true);
     }
@@ -334,6 +346,29 @@ mod tests {
         // Only an explicit complete rebuild restores the coherent invariant.
         writer.complete_write(id, (100, 3), false);
         assert!(writer.can_commit());
+    }
+
+    #[test]
+    fn unseeded_writes_commit_and_leave_totals_for_the_next_reader() {
+        let cache = Arc::new(FtsStatsCache::default());
+        let id = RelationId(1);
+        let writer = cache.transaction();
+        assert_eq!(writer.get(id), None);
+        assert!(!writer.before_write(id));
+        writer.complete_write_unseeded(id, false);
+        assert!(writer.can_commit());
+        assert_eq!(writer.get(id), None);
+        writer.committed();
+        let reader = cache.transaction();
+        assert_eq!(reader.get(id), None);
+        reader.remember(id, (100, 3));
+        assert_eq!(cache.transaction().get(id), Some((100, 3)));
+        // After a partial failure an unseeded success must not clear the guard.
+        let failed = cache.transaction();
+        failed.before_write(id);
+        assert!(failed.before_write(id));
+        failed.complete_write_unseeded(id, true);
+        assert!(!failed.can_commit());
     }
 
     #[test]

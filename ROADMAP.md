@@ -50,6 +50,15 @@ release/issue descriptions retain their September 6 reconciliation date.
   "measured degradation after churn" evidence gate for HNSW long-run prevention is
   now met by those measurements; a guard against orphaned re-inserted vertices is
   the candidate follow-up.
+- `mnestic` 0.19.2 is a patch driven by the head-to-head comparison with Neo4j Labs'
+  Relate (`mnestic-benchmarks`): SQLite write-ahead logging and `WITHOUT ROWID` for
+  new files, no corpus scan on the write path, index work skipped for unchanged
+  fields, HNSW orphan guards, complete results for selective filtered search, and a
+  structured Python `MnesticError`. Numbers are in the
+  [0.19.2 changelog](CHANGELOG-FORK.md). Remaining measured gaps against Relate:
+  single-row write latency (tens of milliseconds against under one), and filtered
+  search that falls back to an exact scan (149 ms against 45 ms at 40,000 rows; a
+  partial index is 8 ms).
 - The preceding engine release is 0.18.0.
 - Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
@@ -118,7 +127,7 @@ remains incomplete and the follow-up pair remains separate in the evidence.
 | Plan caching | Parameter-binding guidance first; require residual planning cost on a real high-frequency workload |
 | General HNSW integrity verifier ([#56](https://github.com/shuruheel/mnestic/issues/56)) | Separate bounded contract, failure corpus and accepted evidence |
 | [Temporary-relation diagnostics #12](https://github.com/shuruheel/mnestic/issues/12) | Agree warning behavior and preserve legitimate transaction-scoped relations |
-| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Demonstrate benefit across representative row sizes and workloads; preserve existing databases |
+| [SQLite WITHOUT ROWID #6](https://github.com/shuruheel/mnestic/issues/6) | Shipped for newly created files in 0.19.2 after profiles showed rowid indirection dominating range scans; existing files keep their layout (migrate via `::backup`) |
 
 Layered storage is not selected. Broader HNSW, Arrow export and quantization work
 retain the gates below. A refreshed public 0.18-to-0.19 performance comparison is
@@ -153,7 +162,7 @@ demand-gated export work. Its import half shipped in 0.17.0 and is retained as c
 | Arrow export | A released-import user names an Arrow-native or zero-copy workflow |
 | HNSW long-run prevention | Measured degradation after churn — **met November 12, 2026** (0.18.0: 7.9% of 10,000 rows unreachable after ten churn rounds; 0.19.1: 0.32%). Remaining work: the orphan guard, then a decision on automatic consolidation |
 | Plan cache | Repeated planning cost on a real high-frequency workload |
-| Filtered-vector redesign | A measured low-selectivity failure beyond bounded widening |
+| Filtered-vector redesign | Measured November 12, 2026 (recall@10 0.18 for a 1.9% filter at default `ef`); 0.19.2 answers it with a bounded exact fallback. A faster in-graph method (ACORN-style) still needs a measured latency case beyond partial indexes |
 | FTS scale work | User-visible latency or documented corpus-scale pressure |
 | Phrase-prefix / phrases inside NEAR | Concrete demand beyond current named errors and workarounds; agree matching and resource-limit contracts |
 | Vector quantization | Corpus-scale storage pressure plus accepted recall bounds |

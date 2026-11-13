@@ -530,6 +530,159 @@ impl SessionTx<'_> {
         Ok(ret)
     }
 
+    /// Whether `node` has an active incoming edge on `layer` from a vertex
+    /// outside `exclude` (0.19.2 orphan guard). Every active edge `u -> node`
+    /// has a bookkeeping row `node -> u`, so `node`'s own rows enumerate its
+    /// possible predecessors. Over the scan bound this answers `true`: the
+    /// guard then leaves the vertex alone rather than failing the write.
+    pub(super) fn has_other_live_in(
+        &self,
+        table: &RelationHandle,
+        layer: i64,
+        node: &CompoundKey,
+        exclude: &[&CompoundKey],
+    ) -> Result<bool> {
+        let mut rows = usize::MAX;
+        let rows = match self.repair_neighbours_with_budget(table, layer, node, &mut rows) {
+            Ok(rows) => rows,
+            Err(err) if repair_limit_reason(&err).is_some() => return Ok(true),
+            Err(err) => return Err(err),
+        };
+        for (u, _) in rows {
+            if exclude.contains(&&u) {
+                continue;
+            }
+            if let Some(value) = self.repair_edge_value(table, layer, &u, node)? {
+                let ignored = value[2]
+                    .get_bool()
+                    .ok_or_else(|| miette!("corrupt HNSW edge flag"))?;
+                if !ignored {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Orphan guard for the heuristic fallback shrink (0.19.2). The heuristic
+    /// selection may drop `n -> y` where that edge is `y`'s only active
+    /// in-edge. Keep each such edge by swapping out the farthest selected edge
+    /// whose target keeps another in-edge; the selection size never grows.
+    pub(super) fn hnsw_protect_sole_in_edges(
+        &self,
+        n: &CompoundKey,
+        layer: i64,
+        table: &RelationHandle,
+        candidates: &PriorityQueue<CompoundKey, OrderedFloat<f64>>,
+        mut selected: PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>,
+    ) -> Result<PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>> {
+        let mut dropped: Vec<(CompoundKey, f64)> = candidates
+            .iter()
+            .filter(|(k, _)| selected.get(*k).is_none())
+            .map(|(k, d)| (k.clone(), d.0))
+            .collect();
+        dropped.sort_by(|a, b| {
+            OrderedFloat(a.1)
+                .cmp(&OrderedFloat(b.1))
+                .then_with(|| a.0.cmp(&b.0))
+        });
+        for (y, d) in dropped {
+            if self.has_other_live_in(table, layer, &y, &[n])? {
+                continue;
+            }
+            let mut kept: Vec<(CompoundKey, f64)> = selected
+                .iter()
+                .map(|(k, Reverse(OrderedFloat(d)))| (k.clone(), *d))
+                .collect();
+            kept.sort_by(|a, b| {
+                OrderedFloat(b.1)
+                    .cmp(&OrderedFloat(a.1))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            for (z, _) in kept {
+                if self.has_other_live_in(table, layer, &z, &[n])? {
+                    selected.remove(&z);
+                    selected.push(y.clone(), Reverse(OrderedFloat(d)));
+                    break;
+                }
+            }
+        }
+        Ok(selected)
+    }
+
+    /// Orphan guard for insertion (0.19.2). Called when every neighbour of a
+    /// newly inserted vertex declined or pruned its link back on `layer`.
+    /// Tries the neighbours nearest first: one with spare degree simply takes
+    /// the link; a full one swaps out its farthest edge whose target keeps
+    /// another active in-edge, so its degree stays at `cap` and no other vertex
+    /// is orphaned in exchange. Returns whether a link was restored.
+    pub(super) fn hnsw_restore_in_link(
+        &mut self,
+        inserted: &CompoundKey,
+        neighbours: &[(CompoundKey, f64)],
+        layer: i64,
+        cap: usize,
+        table: &RelationHandle,
+    ) -> Result<bool> {
+        for (n, dist) in neighbours {
+            let mut rows = usize::MAX;
+            let outgoing = match self.repair_neighbours_with_budget(table, layer, n, &mut rows) {
+                Ok(list) => list,
+                Err(err) if repair_limit_reason(&err).is_some() => continue,
+                Err(err) => return Err(err),
+            };
+            let live: Vec<CompoundKey> = outgoing
+                .into_iter()
+                .filter(|(k, live)| *live && k != inserted)
+                .map(|(k, _)| k)
+                .collect();
+            let link = [
+                DataValue::from(*dist),
+                DataValue::Null,
+                DataValue::from(false),
+            ];
+            if live.len() < cap {
+                self.repair_put_edge(table, layer, n, inserted, &link)?;
+                let mut value = self
+                    .repair_edge_value(table, layer, n, n)?
+                    .ok_or_else(|| miette!("corrupt HNSW index: missing neighbour self row"))?;
+                value[0] = DataValue::from((live.len() + 1) as f64);
+                self.repair_put_edge(table, layer, n, n, &value)?;
+                return Ok(true);
+            }
+            let mut by_distance = Vec::with_capacity(live.len());
+            for y in live {
+                let value = self
+                    .repair_edge_value(table, layer, n, &y)?
+                    .ok_or_else(|| miette!("corrupt HNSW index: missing edge row"))?;
+                let d = value[0]
+                    .get_float()
+                    .ok_or_else(|| miette!("corrupt HNSW edge distance"))?;
+                by_distance.push((d, y));
+            }
+            by_distance.sort_by(|a, b| {
+                OrderedFloat(b.0)
+                    .cmp(&OrderedFloat(a.0))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+            for (_, y) in by_distance {
+                if !self.has_other_live_in(table, layer, &y, &[n])? {
+                    continue;
+                }
+                // Same demotion `hnsw_shrink_neighbour` applies to a pruned
+                // edge: the row stays as an ignored reverse-bookkeeping marker.
+                let mut dropped = self
+                    .repair_edge_value(table, layer, n, &y)?
+                    .ok_or_else(|| miette!("corrupt HNSW index: missing edge row"))?;
+                dropped[2] = DataValue::from(true);
+                self.repair_put_edge(table, layer, n, &y, &dropped)?;
+                self.repair_put_edge(table, layer, n, inserted, &link)?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Bounded-fallback removal (0.19.1), used when the path-preserving repair
     /// exceeds its work bounds. Each in-neighbour `u` of the removed vertex `x`
     /// replaces its edge `u -> x` with an edge to the out-neighbour of `x` nearest
@@ -566,7 +719,8 @@ impl SessionTx<'_> {
         if outs.is_empty() {
             return Ok(0);
         }
-        let mut reconnected = 0;
+        // Active in-neighbours of x and their current out-sets.
+        let mut ins: Vec<(CompoundKey, FxHashSet<CompoundKey>)> = Vec::new();
         for (u, _) in &incident {
             let reverse = self
                 .repair_edge_value(table, layer, u, node)?
@@ -589,12 +743,48 @@ impl SessionTx<'_> {
                     Err(err) => return Err(err),
                 };
             cache.ensure_key(u, orig, self)?;
+            ins.push((u.clone(), u_out));
+        }
+        for v in &outs {
+            cache.ensure_key(v, orig, self)?;
+        }
+        // Orphan guard (0.19.2): an out-neighbour whose only active in-edge is
+        // x -> v loses it in the unlink. Cover those first, each by its nearest
+        // still-unassigned in-neighbour; everyone else then takes its nearest
+        // target as before. Still one new edge per in-neighbour.
+        let mut assigned: Vec<Option<(f64, CompoundKey)>> = vec![None; ins.len()];
+        for v in &outs {
+            if self.has_other_live_in(table, layer, v, &[node])? {
+                continue;
+            }
+            let mut best: Option<(f64, usize)> = None;
+            for (i, (u, u_out)) in ins.iter().enumerate() {
+                if assigned[i].is_some() || u == v || u_out.contains(v) {
+                    continue;
+                }
+                let d = cache.k_dist(u, v);
+                if best.is_none_or(|(bd, bi)| {
+                    OrderedFloat(d)
+                        .cmp(&OrderedFloat(bd))
+                        .then_with(|| u.cmp(&ins[bi].0))
+                        .is_lt()
+                }) {
+                    best = Some((d, i));
+                }
+            }
+            if let Some((d, i)) = best {
+                assigned[i] = Some((d, v.clone()));
+            }
+        }
+        for (i, (u, u_out)) in ins.iter().enumerate() {
+            if assigned[i].is_some() {
+                continue;
+            }
             let mut best: Option<(f64, &CompoundKey)> = None;
             for v in &outs {
                 if v == u || u_out.contains(v) {
                     continue;
                 }
-                cache.ensure_key(v, orig, self)?;
                 let d = cache.k_dist(u, v);
                 if best.is_none_or(|(bd, bv)| {
                     OrderedFloat(d)
@@ -605,11 +795,14 @@ impl SessionTx<'_> {
                     best = Some((d, v));
                 }
             }
-            let Some((distance, v)) = best else {
-                // u already links to every out-neighbour of x: it stays attached.
+            // None: u already links to every out-neighbour of x; it stays attached.
+            assigned[i] = best.map(|(d, v)| (d, v.clone()));
+        }
+        let mut reconnected = 0;
+        for ((u, _), target) in ins.iter().zip(assigned) {
+            let Some((distance, v)) = target else {
                 continue;
             };
-            let v = v.clone();
             self.repair_put_edge(
                 table,
                 layer,

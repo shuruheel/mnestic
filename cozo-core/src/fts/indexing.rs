@@ -724,7 +724,11 @@ impl<'a> SessionTx<'a> {
         if rows.is_empty() {
             return Ok(());
         }
-        let previous = self.fts_doc_stats(idx_handle)?;
+        // 0.19.2: the write path never seeds totals it does not already hold.
+        // Seeding meant a full posting scan inside the first write after every
+        // open (seconds at 10k documents). Without cached totals the write just
+        // invalidates them; the next search seeds them.
+        let previous = self.fts_stats.get(idx_handle.id);
         // Count the document only if it is not *already* in the index. Most update paths
         // are del-then-put, so the old document has been subtracted by the time we get
         // here — but a **value-unchanged `:put` is not**: `query/stored.rs` skips the
@@ -740,13 +744,20 @@ impl<'a> SessionTx<'a> {
         for (key_bytes, val_bytes) in rows {
             self.store_tx.put(&key_bytes, &val_bytes)?;
         }
-        self.finish_fts_change(
-            idx_handle,
-            previous,
-            if already_indexed { 0 } else { count },
-            if already_indexed { 0 } else { 1 },
-            scan_only,
-        )
+        match previous {
+            Some(previous) => self.finish_fts_change(
+                idx_handle,
+                previous,
+                if already_indexed { 0 } else { count },
+                if already_indexed { 0 } else { 1 },
+                scan_only,
+            ),
+            None => {
+                self.fts_stats
+                    .complete_write_unseeded(idx_handle.id, scan_only);
+                Ok(())
+            }
+        }
     }
     pub(crate) fn del_fts_index_item(
         &mut self,
@@ -790,7 +801,8 @@ impl<'a> SessionTx<'a> {
         if collector.is_empty() {
             return Ok(());
         }
-        let previous = self.fts_doc_stats(idx_handle)?;
+        // See `put_fts_index_item`: never seed totals on the write path.
+        let previous = self.fts_stats.get(idx_handle.id);
         let term = collector.iter().next().expect("nonempty token set");
         let mut probe = key.clone();
         probe[0] = DataValue::Str(term.clone());
@@ -802,13 +814,20 @@ impl<'a> SessionTx<'a> {
             let key_bytes = idx_handle.encode_key_for_store(&key, Default::default())?;
             self.store_tx.del(&key_bytes)?;
         }
-        self.finish_fts_change(
-            idx_handle,
-            previous,
-            if indexed { -count } else { 0 },
-            if indexed { -1 } else { 0 },
-            scan_only,
-        )
+        match previous {
+            Some(previous) => self.finish_fts_change(
+                idx_handle,
+                previous,
+                if indexed { -count } else { 0 },
+                if indexed { -1 } else { 0 },
+                scan_only,
+            ),
+            None => {
+                self.fts_stats
+                    .complete_write_unseeded(idx_handle.id, scan_only);
+                Ok(())
+            }
+        }
     }
 }
 

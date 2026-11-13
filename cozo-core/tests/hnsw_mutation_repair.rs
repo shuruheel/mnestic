@@ -480,4 +480,17 @@ fn sustained_clustered_churn_never_fails_a_write() {
         unreachable.len(),
         live.len()
     );
+    // 0.19.2 orphan guard: no vector on the bottom layer may lose every active
+    // in-edge, since no search can reach such a vertex at any ef.
+    let orphans = run(
+        &db,
+        "verts[id] := *t:vec{layer: 0, fr_id: id, to_id: id}
+         has_in[id] := *t:vec{layer: 0, fr_id: f, to_id: id, ignore_link: false}, f != id
+         ?[id] := verts[id], not has_in[id]",
+    );
+    assert!(
+        orphans.rows.is_empty(),
+        "orphaned bottom-layer vertices: {:?}",
+        orphans.rows
+    );
 }

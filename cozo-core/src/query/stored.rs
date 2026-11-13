@@ -15,7 +15,7 @@ use pest::Parser;
 use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
-use crate::data::expr::{Bytecode, Expr};
+use crate::data::expr::{eval_bytecode, eval_bytecode_pred, Bytecode, Expr};
 use crate::data::program::{FixedRuleApply, InputInlineRulesOrFixed, InputProgram, RelationOp};
 use crate::data::relation::{ColumnDef, NullableColType, StoredRelationMetadata};
 use crate::data::symb::Symbol;
@@ -353,31 +353,33 @@ impl<'a> SessionTx<'a> {
                 || has_fts_indices
                 || has_lsh_indices
             {
-                if let Some(existing) = self.store_tx.get(&key, false)? {
-                    let mut tup = extracted[0..relation_store.metadata.keys.len()].to_vec();
-                    try_extend_tuple_from_v(&mut tup, &existing)?;
+                let old_tup = match self.store_tx.get(&key, false)? {
+                    Some(existing) => {
+                        let mut tup = extracted[0..relation_store.metadata.keys.len()].to_vec();
+                        try_extend_tuple_from_v(&mut tup, &existing)?;
+                        Some(tup)
+                    }
+                    None => None,
+                };
+                if let Some(tup) = &old_tup {
                     // mnestic fork (0.12.1): posting deletion must NOT be gated on
                     // `has_indices` — that flag means *plain B-tree secondary
                     // indexes only*. A relation carrying only an FTS index therefore
                     // never deleted the old document's postings on a `:put` update:
                     // terms it no longer contains kept matching (ghost hits), the
                     // index grew without bound, and the BM25 df/avgdl statistics
-                    // skewed. (`rm` at the bottom of this file and the `update` op
-                    // above both always deleted; only `:put`-over-an-existing-key
-                    // leaked.) `del_in_fts`/`del_in_lsh` iterate the relation's own
-                    // index maps and are no-ops when those are empty, so each
-                    // concern gates itself. The value-unchanged skip stays: an
-                    // identical tuple derives identical postings.
-                    if extracted != tup {
+                    // skewed. FTS replacement now happens per index in
+                    // `replace_in_fts` below, which deletes the old postings
+                    // whenever that index's extracted text changed.
+                    if extracted != *tup {
                         if has_indices {
-                            self.update_in_index(relation_store, &extracted, &tup)?;
+                            self.update_in_index(relation_store, &extracted, tup)?;
                         }
-                        self.del_in_fts(relation_store, &mut stack, &fts_lsh_processors, &tup)?;
-                        self.del_in_lsh(relation_store, &tup)?;
+                        self.del_in_lsh(relation_store, tup)?;
                     }
 
                     if need_to_collect {
-                        old_tuples.push(DataValue::List(tup));
+                        old_tuples.push(DataValue::List(tup.clone()));
                     }
                 } else if has_indices {
                     for (idx_rel, extractor) in relation_store.indices.values() {
@@ -391,15 +393,34 @@ impl<'a> SessionTx<'a> {
                     }
                 }
 
-                self.update_in_hnsw(relation_store, &mut stack, &hnsw_filters, &extracted)?;
-                self.put_in_fts(relation_store, &mut stack, &fts_lsh_processors, &extracted)?;
-                self.put_in_lsh(
-                    relation_store,
-                    &mut stack,
-                    &fts_lsh_processors,
-                    &extracted,
-                    &lsh_perms,
-                )?;
+                // 0.19.2: an identical tuple derives identical index entries, and
+                // an index whose inputs did not change keeps its entry (see
+                // `update_in_hnsw_changed`, `replace_in_fts`). Re-embedding no
+                // longer rewrites postings; editing text no longer re-inserts the
+                // vector into the HNSW graph.
+                if old_tup.as_ref() != Some(&extracted) {
+                    self.update_in_hnsw_changed(
+                        relation_store,
+                        &mut stack,
+                        &hnsw_filters,
+                        old_tup.as_deref(),
+                        &extracted,
+                    )?;
+                    self.replace_in_fts(
+                        relation_store,
+                        &mut stack,
+                        &fts_lsh_processors,
+                        old_tup.as_deref(),
+                        &extracted,
+                    )?;
+                    self.put_in_lsh(
+                        relation_store,
+                        &mut stack,
+                        &fts_lsh_processors,
+                        &extracted,
+                        &lsh_perms,
+                    )?;
+                }
 
                 if need_to_collect {
                     new_tuples.push(DataValue::List(extracted));
@@ -486,6 +507,72 @@ impl<'a> SessionTx<'a> {
     fn del_in_lsh(&mut self, rel_handle: &RelationHandle, old_kv: &[DataValue]) -> Result<()> {
         for (idx_handle, inv_idx_handle, _) in rel_handle.lsh_indices.values() {
             self.del_lsh_index_item(old_kv, None, idx_handle, inv_idx_handle)?;
+        }
+        Ok(())
+    }
+
+    /// Replace one row's postings in every FTS index whose extracted text
+    /// changed (0.19.2). `old` is the stored row, if any.
+    fn replace_in_fts(
+        &mut self,
+        rel_handle: &RelationHandle,
+        stack: &mut Vec<DataValue>,
+        processors: &BTreeMap<SmartString<LazyCompact>, (Arc<TextAnalyzer>, Vec<Bytecode>)>,
+        old: Option<&[DataValue]>,
+        new_kv: &[DataValue],
+    ) -> Result<()> {
+        for (k, (idx_handle, _)) in rel_handle.fts_indices.iter() {
+            let (tokenizer, extractor) = processors.get(k).unwrap();
+            if let Some(old) = old {
+                if eval_bytecode(extractor, old, stack)? == eval_bytecode(extractor, new_kv, stack)?
+                {
+                    continue;
+                }
+                self.del_fts_index_item(old, extractor, stack, tokenizer, rel_handle, idx_handle)?;
+            }
+            self.put_fts_index_item(new_kv, extractor, stack, tokenizer, rel_handle, idx_handle)?;
+        }
+        Ok(())
+    }
+
+    /// `update_in_hnsw` for a row that may already be indexed (0.19.2). An
+    /// index whose vector fields and filter outcome are unchanged keeps its
+    /// graph entry: re-inserting an identical vector removes it from the graph
+    /// (with path repair) and searches it back in, for no change in results.
+    pub(crate) fn update_in_hnsw_changed(
+        &mut self,
+        relation_store: &RelationHandle,
+        stack: &mut Vec<DataValue>,
+        hnsw_filters: &BTreeMap<SmartString<LazyCompact>, Vec<Bytecode>>,
+        old: Option<&[DataValue]>,
+        new_kv: &[DataValue],
+    ) -> Result<()> {
+        for (name, (idx_handle, idx_manifest)) in relation_store.hnsw_indices.iter() {
+            let filter = hnsw_filters.get(name);
+            if let Some(old) = old {
+                let vectors_same = idx_manifest
+                    .vec_fields
+                    .iter()
+                    .all(|&i| old.get(i) == new_kv.get(i));
+                let filter_same = match filter {
+                    None => true,
+                    Some(code) => {
+                        eval_bytecode_pred(code, old, stack, Default::default())?
+                            == eval_bytecode_pred(code, new_kv, stack, Default::default())?
+                    }
+                };
+                if vectors_same && filter_same {
+                    continue;
+                }
+            }
+            self.hnsw_put(
+                idx_manifest,
+                relation_store,
+                idx_handle,
+                filter,
+                stack,
+                new_kv,
+            )?;
         }
         Ok(())
     }
@@ -698,23 +785,37 @@ impl<'a> SessionTx<'a> {
                 || has_fts_indices
                 || has_lsh_indices
             {
-                self.del_in_fts(relation_store, &mut stack, &fts_lsh_processors, &old_kv)?;
-                self.del_in_lsh(relation_store, &old_kv)?;
-                self.update_in_index(relation_store, &new_kv, &old_kv)?;
+                // 0.19.2: skip index work whose inputs did not change; see
+                // `put_into_relation`.
+                if new_kv != old_kv {
+                    self.del_in_lsh(relation_store, &old_kv)?;
+                    self.update_in_index(relation_store, &new_kv, &old_kv)?;
+                    self.update_in_hnsw_changed(
+                        relation_store,
+                        &mut stack,
+                        &hnsw_filters,
+                        Some(&old_kv),
+                        &new_kv,
+                    )?;
+                    self.replace_in_fts(
+                        relation_store,
+                        &mut stack,
+                        &fts_lsh_processors,
+                        Some(&old_kv),
+                        &new_kv,
+                    )?;
+                    self.put_in_lsh(
+                        relation_store,
+                        &mut stack,
+                        &fts_lsh_processors,
+                        &new_kv,
+                        &lsh_perms,
+                    )?;
+                }
 
                 if need_to_collect {
                     old_tuples.push(DataValue::List(old_kv));
                 }
-
-                self.update_in_hnsw(relation_store, &mut stack, &hnsw_filters, &new_kv)?;
-                self.put_in_fts(relation_store, &mut stack, &fts_lsh_processors, &new_kv)?;
-                self.put_in_lsh(
-                    relation_store,
-                    &mut stack,
-                    &fts_lsh_processors,
-                    &new_kv,
-                    &lsh_perms,
-                )?;
 
                 if need_to_collect {
                     new_tuples.push(DataValue::List(new_kv));
