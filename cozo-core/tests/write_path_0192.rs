@@ -218,3 +218,31 @@ fn sqlite_defaults_to_wal_and_new_files_without_rowid() {
     assert!(!dir.path().join("backup.sqlite-wal").exists());
     assert!(DbInstance::new("sqlite", path.to_str().unwrap(), r#"{"journal_mode":"x"}"#).is_err());
 }
+
+#[cfg(feature = "storage-sqlite")]
+#[test]
+fn sqlite_wal_is_checkpointed_while_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db.sqlite");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    run(&db, ":create c {id:Int => v:Int}");
+    for i in 0..3000 {
+        let mut params = BTreeMap::new();
+        params.insert("i".to_string(), cozo::DataValue::from(i as i64));
+        db.run_script(
+            "?[id,v] <- [[$i,$i]] :put c {id=>v}",
+            params,
+            ScriptMutability::Mutable,
+        )
+        .unwrap();
+    }
+    // Before 0.19.2's fix a cached lookup statement kept a read open on the
+    // writer's connection and no checkpoint ever ran: this log reached ~15 MB
+    // with nothing copied into the database file.
+    let wal = std::fs::metadata(dir.path().join("db.sqlite-wal"))
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let main = std::fs::metadata(&path).unwrap().len();
+    assert!(wal < 6 * 1024 * 1024, "WAL {wal} bytes");
+    assert!(main > 64 * 1024, "database file {main} bytes");
+}

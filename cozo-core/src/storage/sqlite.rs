@@ -104,12 +104,15 @@ impl SqliteOptions {
     }
 
     /// Per-connection settings; SQLite does not persist these in the file.
+    /// `wal_autocheckpoint` is the SQLite default, stated explicitly; see
+    /// `commit` for what actually blocked checkpoints.
     fn configure(&self, conn: &Connection) -> Result<()> {
         let cache_kib = i64::from(self.cache_mb) * 1024;
         let mmap_bytes = i64::from(self.mmap_mb) * 1024 * 1024;
         conn.execute(format!(
             "pragma busy_timeout = {}; pragma synchronous = {}; \
-             pragma cache_size = -{cache_kib}; pragma mmap_size = {mmap_bytes};",
+             pragma cache_size = -{cache_kib}; pragma mmap_size = {mmap_bytes}; \
+             pragma wal_autocheckpoint = 1000;",
             self.busy_timeout_ms, self.synchronous
         ))
         .into_diagnostic()
@@ -381,6 +384,13 @@ impl<'s> StoreTx<'s> for SqliteTx<'s> {
     fn commit(&mut self) -> Result<()> {
         if let Right(ShardedLockWriteGuard { .. }) = self.lock {
             if !self.committed {
+                // A cached lookup statement left on a row keeps a read open on
+                // this connection, which blocks every WAL checkpoint from it,
+                // automatic or explicit: the log grew to 326 MB over 105 MB of
+                // data until close. Finalize them before committing.
+                for stmt in &self.stmts {
+                    *stmt.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
                 let query = r#"commit;"#;
                 let mut statement = self.conn.as_ref().unwrap().prepare(query).unwrap();
                 while statement.next().into_diagnostic()? != State::Done {}

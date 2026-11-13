@@ -103,20 +103,40 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](https://github.com/shuruheel/mnestic/blob/main/CHANGELOG-FORK.md).
 
-## New in 0.19.1
+## New in 0.19.2
 
-**HNSW repair limits no longer fail writes.** 0.19.0 rejected an update, delete or
-insert with `hnsw::repair_limit` when path-preserving repair exceeded its local
-work bounds; under sustained churn on clustered vectors that refused a growing
-share of ordinary writes (3,293 over ten rounds at 10,000 rows). The write now
-continues from an untouched graph with a bounded step — a removal first reconnects
-each in-neighbour of the removed vertex by one edge, an insertion keeps the
-neighbour's existing edges — and records a structured `hnsw.repair_fallback`
-warning. Ten churn rounds at 10,000 rows: no writes rejected, recall@10 0.997, 32
-rows unreachable by ANN (0.18.0: 789, recall 0.912). Those rows stay reachable by
-exact scans, keyed queries and other indexes, and `::reindex <relation>` restores
-them; count `hnsw.repair_fallback` warnings to schedule it. Other errors still fail
-the write. No storage or API change.
+**Faster writes, complete filtered search, no ANN-orphaned rows.** Measured at
+40,000 rows (dim 384) against 0.19.0 on SQLite:
+
+- **SQLite uses a write-ahead log by default** (`synchronous = FULL`, so an
+  acknowledged commit still survives power loss), a 32 MiB page cache, a 5 s busy
+  timeout, and `WITHOUT ROWID` storage for new files. Update p50 300 → 20 ms,
+  delete p50 193 → 7 ms, hybrid search p50 189 → 37 ms. Existing files switch to WAL on
+  first open and gain `-wal`/`-shm` sidecars while open; use `::backup` to copy a
+  database. Opt out with `{"journal_mode": "delete"}`.
+- **No corpus scan on the write path:** the first write after opening a database
+  with a full-text index took 7.8 s; it now takes 0.03 s. The first search seeds
+  BM25 totals instead.
+- **Unchanged fields skip index work:** editing only text keeps the HNSW entry;
+  re-embedding keeps the FTS postings.
+- **Filtered vector search is complete:** when fewer than `k` candidates pass a
+  `filter:`, the search scores every eligible row exactly (bounded at 200,000
+  rows, else warns `hnsw.filtered_incomplete`). A 1.9% filter went from recall@10
+  0.18 to 1.0; a partial index remains the fast path (0.999 at 8 ms).
+- **HNSW orphan guards:** fallback repairs no longer leave a vector with no
+  incoming edge, which no search could reach. No writes are rejected under churn
+  (0.19.0: 517 of 6,000).
+- **Python `mnestic.MnesticError`** (an `Exception` subclass; `args[0]` unchanged)
+  with `code`, `kind`, `retryable` and `message`.
+
+No storage-format change; `mnestic-rocks` stays 0.1.12.
+
+### From 0.19.1
+
+HNSW repair limits fall back with a structured `hnsw.repair_fallback` warning
+instead of failing the write (0.19.0 rejected 3,293 writes over ten churn rounds
+at 10,000 rows). Rows the fallback leaves hard to reach stay available to exact
+scans, keyed queries and other indexes; `::reindex <relation>` rebuilds the graph.
 
 ### From 0.19.0
 
@@ -161,7 +181,7 @@ so existing CozoDB code works unchanged:
 
 ```toml
 [dependencies]
-mnestic = "0.19.1"
+mnestic = "0.19.2"
 ```
 
 ```rust
