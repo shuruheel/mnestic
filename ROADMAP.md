@@ -48,8 +48,7 @@ release/issue descriptions retain their September 6 reconciliation date.
   [0.19.1 changelog](CHANGELOG-FORK.md#0191--2026-11-12) and the
   [repair spec](docs/specs/hnsw-mutation-repair.md#bounded-fallback-0191). The
   "measured degradation after churn" evidence gate for HNSW long-run prevention is
-  now met by those measurements; a guard against orphaned re-inserted vertices is
-  the candidate follow-up.
+  now met by those measurements; 0.19.2 adds the guards against orphaned vertices.
 - `mnestic` 0.19.2 is a patch driven by the head-to-head comparison with Neo4j Labs'
   Relate (`mnestic-benchmarks`): SQLite write-ahead logging and `WITHOUT ROWID` for
   new files, no corpus scan on the write path, index work skipped for unchanged
@@ -57,8 +56,25 @@ release/issue descriptions retain their September 6 reconciliation date.
   structured Python `MnesticError`. Numbers are in the
   [0.19.2 changelog](CHANGELOG-FORK.md). Remaining measured gaps against Relate:
   single-row write latency (tens of milliseconds against under one), and filtered
-  search that falls back to an exact scan (149 ms against 45 ms at 40,000 rows; a
-  partial index is 8 ms).
+  search that falls back to an exact scan (100 ms against 45 ms at 40,000 rows; a
+  partial index is 8.9 ms).
+
+### Selected next — owner decision, November 13, 2026
+
+| Order | Work | Current state and scope |
+|---:|---|---|
+| 1 | Search indexes on transaction-time relations | `::fts`, `::hnsw`, `::lsh` and `::index create` are rejected on `TxTime` relations ([bitemporality spec](docs/specs/bitemporality.md), deferred in v1), so history and search cannot be combined. Scope: legalize them, stamp index entries with the base row's commit time, and let `:as_of` searches return what was live at that time. Needs a spec (index versioning, history GC/evict of index entries, cost of as-of search) before code |
+| 2 | Governed transactions from Python | `db.governed_transaction(write, options)` (deadline, idle wait, statement limits, abort on error) is Rust-only since 0.19.0; Python's `multi_transact` uses the ungoverned path. Scope: expose the governed client and its options in `cozo-lib-python`, with `MnesticError` kinds for deadline and limit aborts |
+
+Considered and not selected on November 13, 2026:
+
+- **Sub-millisecond single-row writes.** The gap to Relate is architectural (in-RAM
+  graph against durable disk-resident indexes). Closing it means deferred or batched
+  index maintenance, with consistency trade-offs. Revisit when a consumer workload
+  shows write latency, not LLM extraction, bounding throughput.
+- **Persisted FTS corpus statistics.** The first full-text search after opening a
+  database rebuilds BM25 totals (about 0.5 s at 10,000 documents, growing with the
+  corpus). Saving them would change the storage format; skipped for now.
 - The preceding engine release is 0.18.0.
 - Atomic Parquet/Arrow import and candidate-aware FTS shipped in 0.17.0.
 - Arrow export is not implemented and remains demand-gated.
@@ -160,7 +176,7 @@ demand-gated export work. Its import half shipped in 0.17.0 and is retained as c
 | Area | Activation evidence |
 |---|---|
 | Arrow export | A released-import user names an Arrow-native or zero-copy workflow |
-| HNSW long-run prevention | Measured degradation after churn — **met November 12, 2026** (0.18.0: 7.9% of 10,000 rows unreachable after ten churn rounds; 0.19.1: 0.32%). Remaining work: the orphan guard, then a decision on automatic consolidation |
+| HNSW long-run prevention | Measured degradation after churn — **met November 12, 2026** (0.18.0: 7.9% of 10,000 rows unreachable after ten churn rounds; 0.19.1: 0.32%). Orphan guards shipped in 0.19.2 (0 orphans across three 4,000-row churn runs); remaining: a decision on automatic consolidation |
 | Plan cache | Repeated planning cost on a real high-frequency workload |
 | Filtered-vector redesign | Measured November 12, 2026 (recall@10 0.18 for a 1.9% filter at default `ef`); 0.19.2 answers it with a bounded exact fallback. A faster in-graph method (ACORN-style) still needs a measured latency case beyond partial indexes |
 | FTS scale work | User-visible latency or documented corpus-scale pressure |
