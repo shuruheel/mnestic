@@ -1,6 +1,7 @@
 # Keyed access for equality filters and key-plus-value joins
 
-Status: **DRAFT, November 13, 2026.** Not approved. Passes (workspace
+Status: **DRAFT, November 13, 2026. All authoring passes run; awaiting owner
+review.** Not approved. Passes (workspace
 `spec-authoring` method):
 
 | Pass | Date | Result |
@@ -8,8 +9,8 @@ Status: **DRAFT, November 13, 2026.** Not approved. Passes (workspace
 | 1 Code facts | Nov 13 | Verified against `main` `99a87cd8` with `::explain` on SQLite and result probes on mem, SQLite and RocksDB (0.19.2 engine plus unreleased binding work) |
 | 2 Draft | Nov 13 | First version, commit `c9e168c3` |
 | 3 Panel | Nov 13 | Three lenses: code grounding, semantics, planner and performance. 22 findings: 2 blockers, 11 major, 9 minor. All folded; none rejected. Blockers: a widened join gate seeks the wrong key on composite keys (D2); numeric hoisting changes magic-set adornments (D1). Decisions narrowed as a result: D1 hoists only onto a leading key position, D2 covers only the full-key case, D3 reuses the hoisting mechanism |
-| 4 Prior art | — | Not run |
-| 5 Simplification | — | Not run |
+| 4 Prior art | Nov 13 | Two areas (equality pushdown and type semantics; join operator choice). CONFIRMS: D0, D1, D2, D3, invariant 3, the partial-key rejection. CONTRADICTS: D4 (prior art keeps a disable switch for differential testing). GAPS: a volatility guard on folding (D1), explain labels that separate seek pairs from checked pairs (D2, invariant 5), batched key lookups (D2). All folded; batching deferred by pass 5 |
+| 5 Simplification | Nov 13 | Requirement-neutral cuts applied: the disable switch is test-only, not a Db option; batched lookups deferred until the benchmark shows a need; checked pairs go in the existing explain output, not a new column. One requirement change left to the owner: open question 3 |
 
 Pass 0 does not apply (no user interface).
 
@@ -46,6 +47,8 @@ results, so no consumer needs the rewrites or the lint.
 | `materialized_join` reads the whole right relation into a sorted set once, then binary-searches it per left row. A per-left-row scan over a leading-key range is output-sensitive only when every scanned row is emitted | `ra.rs:2760-2806` | A partial seek run with residual checks can cost left rows × range size, worse than one materialization when the leading column has few distinct values. D2 is limited to the full key for that reason |
 | The greedy join reorder and `::explain` are stat-free: the plan for empty relations equals the plan for loaded ones. `tests/planner_shape.rs` compares plans across backends and pins, in `tests/planner_baseline.json`, **only the ordered `load_stored` relation sequence** of five LSQB queries. Those relations have two-column keys, no value columns and no constants | `cozo-core/tests/planner_shape.rs:58-78`, `:177-191`; `planner_baseline.json` `_comment`; `.github/workflows/planner-guard.yml` | Plan shapes are checkable without data, but the baseline cannot see a join-operator change and the LSQB tier never reaches the new paths. New tests must assert the `op` and `joins_on` columns |
 | Stored relations get the same `stored_*` join labels on every backend; `mem_*` labels belong to derived-rule temp relations (`RelAlgebra::TempStore`) on every backend. The storage-layer scan code differs per backend | `ra.rs:2567-2579`, `:2661-2680`; `planner_shape.rs` cross-backend check; `CLAUDE.md` test-backend note | Plan-shape tests run on SQLite; result-equivalence tests must cover mem, SQLite and RocksDB because the scans differ |
+| `Expr::partial_eval` folds every `Apply` whose arguments are constants, with no determinism check, and propagates evaluation errors. That includes `rand_int`, `rand_uuid_v4`, `now` and the other `rand_*` ops | `data/expr.rs:411-423`; ops `data/functions.rs:2302-2334`, `:2438`, `:2920-3022` | Folding a unification's right-hand side could turn a per-row `rand_int(0, 9)` into one seek value, or a never-evaluated error into a compile error (D1 condition 2). Predicates are already folded this way today |
+| `Int` and `Float` columns coerce on write, so a declared `Int` column holds only `Num::Int` (or `Null` if nullable), and a `Float` column only `Num::Float`. `op_eq` compares `Int` with `Float` as `i as f64 == f`, so it is not transitive (`Int(2^53)` and `Int(2^53+1)` both equal `Float(2^53)`); `Float` with `Float` compares by `total_cmp`, like storage | `data/relation.rs:227-228`; `data/functions.rs:235-241`; `data/value.rs:557-623` | The declared type stands in for the stored variant. Same-variant `Float` hoisting agrees with today's filter, including `-0.0` and `NaN` |
 | MindGraph's lint fences the numeric hazard for T3 rewrites by hand: brace-binding is valid only on non-numeric columns | `mindgraph-rs/scripts/cozo-query-lint.sh:27-31`, test `brace_bind_and_eq_disagree_on_numeric_key_but_agree_on_string` | The engine must apply the same rule, or a stricter one |
 
 ## Decisions
@@ -65,7 +68,13 @@ hold:
 1. It is a `NormalFormAtom::Unification` with `one_many_unif == false`, or a
    `Predicate` `eq(v, g)` as converted today.
 2. Its right-hand side, after partial evaluation, is an `Expr::Const`
-   (parameters are constants by this stage).
+   (parameters are constants by this stage). The expression must contain no
+   non-deterministic function (`rand_*`, `now`; a determinism flag on the op
+   table, which `define_op!` lacks today). If evaluation fails, the
+   unification is left unfolded and in place, so the error stays a runtime
+   error as today. PostgreSQL states the same rule for index conditions: an
+   index scan evaluates its comparison value once, so a volatile function
+   cannot be one.
 3. The variable is bound by exactly one positive stored atom, and no earlier
    positive atom in the body binds it.
 4. After the hoist, the positions of that atom bound by hoisted constants form
@@ -88,11 +97,16 @@ both dispatch (`ra.rs:2683`) and `::explain` labelling (`ra.rs:2584`):
 join positions, cut at the key length. If `seek_len` equals the key length,
 use a point lookup: build the key from the run positions only, and check every
 other join pair on the found row (`point_lookup_join` already does the check).
-If the positions are exactly `0..n`, nothing changes. Otherwise keep
-`materialized_join`. Inside `prefix_join`, the point-lookup branch is taken when
+This is MySQL's `eq_ref` and the rule-based Oracle optimizer's "single row
+by primary key": at most one right row per left row, the one case a stat-free
+planner can choose without guessing cardinality. If the positions are exactly
+`0..n`, nothing changes. Otherwise keep `materialized_join`. Inside `prefix_join`, the point-lookup branch is taken when
 `seek_len` equals the key length, not when the number of positions reaches it,
-and the bounds slice starts at `seek_len`. `::explain` keeps
-`stored_prefix_join` and lists the checked pairs in `joins_on`. Validity and
+and the bounds slice starts at `seek_len`. `::explain` labels the
+full-key case `stored_point_join` (prefix scans keep `stored_prefix_join`),
+lists the seek pairs in `joins_on`, and lists the checked pairs separately in
+the existing output, so a plan shows which columns are sought and which are
+checked, as PostgreSQL's `Index Cond` and `Filter` do. Validity and
 bitemporal relations, and all negated joins, keep today's gates in batch 1.
 
 **D3 — Variable equalities through the same mechanism (T3).** Extend D1's
@@ -105,12 +119,19 @@ stored atom, which then seeks on `u`. If `x` is bound only after the stored
 atom, the unification lands after it and compiles to today's filter. `u` must
 be bound by a positive stored atom (`NormalFormAtom::Relation`); a variable
 that appears only in a negated atom is not rewritten, so the query still
-fails with `eval::unsafe_negation`.
+fails with `eval::unsafe_negation`. Propagating a constant through a variable
+equality (from `u == x` and `x = $c`, seek `u = $c`, as PostgreSQL equivalence
+classes and SQLite constant propagation do) is out of scope; it is the next
+step if T3 survives MindGraph's rewrites, under the same type condition.
 
-**D4 — No switch.** Results are unchanged by construction (each rewrite is
-restricted to cases where `op_eq` and storage identity agree), so there is no
-`:pushdown off` option. `:reorder written` continues to control only the join
-reorder; D0, D1 and D3 apply in both modes.
+**D4 — A test-only switch, no user option.** Results are unchanged by
+construction (each rewrite is restricted to cases where `op_eq` and storage
+identity agree), so there is no `:pushdown off` query option. Behind the
+existing `test-hooks` feature, one flag disables D1, D2 and D3 together, and
+the equivalence tests run every case with it on and off and compare rows, as
+SQLite's test suite does with its optimization mask. `:reorder written`
+continues to control only the join reorder; D0, D1 and D3 apply in both
+modes.
 
 ## Invariants
 
@@ -118,10 +139,11 @@ reorder; D0, D1 and D3 apply in both modes.
    backends, including for `Int`/`Float` cross-type values and `Null`.
 2. A query that compiled before compiles after; a query that failed with an
    unbound-variable or unsafe-negation error still fails.
-3. No rewrite introduces a `stored_mat_join` that the unrewritten plan did not
-   have.
+3. No rewrite introduces a materialized join or an unkeyed full scan that
+   the unrewritten plan did not have.
 4. No seek prefix includes a validity or transaction-time column.
-5. The `::explain` label of a stored join names the operator that runs.
+5. The `::explain` label of a stored join names the operator that runs, and
+   the output separates sought pairs from checked pairs.
 6. Plans stay stat-free and deterministic.
 
 ## Acceptance tests
@@ -133,20 +155,28 @@ reorder; D0, D1 and D3 apply in both modes.
   filter, no `stored_mat_join`), a three-relation body with a trailing `=` on a
   variable an earlier keyed join already binds, a partial key run with a
   value position (`materialized_join`), a temporal relation, a negated atom.
-  `planner_baseline.json` is expected to stay unchanged; any change is reviewed.
-- **Result equivalence** on mem, SQLite and RocksDB, for each shape: string
+  Each case also diffs the `op` column against the plan with the test-only
+  switch off (invariant 3). `planner_baseline.json` is expected to stay
+  unchanged; any change is reviewed.
+- **Result equivalence** on mem, SQLite and RocksDB, rewrite on against
+  rewrite off, for each shape: string
   keys; `Int` and `Float` keys with matching and cross-type constants; `Null`
   values; composite keys of two and three columns joined on `{0, 2}` and
   `{0, 3}` (these fail on a naive gate change); a variable also bound by a
   derived rule with a cross-type constant (the magic-set case); validity and
-  bitemporal relations; a negated atom.
+  bitemporal relations; a negated atom; `Float` keys `-0.0`, `0.0` and
+  `NaN`; `Int` keys `2^53` and `2^53+1` probed with `Float(2^53)` (must stay
+  a filter and return both); `k = rand_int(0, 9)` and `ts = now()` (must stay
+  filters); a right-hand side that fails to evaluate after an atom with no
+  rows (must still run).
 - **The numeric fence**: `t = 5.0` and `t == 5.0` on an `Int` column still
   return the `Int(5)` row; `t = 5` on an `Int` column becomes keyed.
 - **MindGraph's lint fixtures** (`mindgraph-rs/scripts/fixtures/cozo-query-lint/`)
   replayed as plan-shape tests: every flagged line compiles keyed.
 - **Benchmarks**, RocksDB and SQLite, warm, compile time excluded: the existence
   check `*node{uid}, uid = $u` at 10k and 1M rows, ratio under 2×; the T2 join
-  with 10k left rows at 1M right rows, against today's plan; and adversarial
+  with 10k left rows at 1M right rows, against today's plan and against a
+  `multi_get` variant; and adversarial
   shapes that must be no slower than today: a three-column key with a
   low-cardinality leading column and a residual on a value column, and the
   three-relation greedy shape.
@@ -165,12 +195,32 @@ advisory once production runs the release, which is a MindGraph decision.
   with few distinct leading values it costs left rows × range size, where
   `materialized_join` costs one sort and a binary search per row. Without
   statistics the engine cannot tell the cases apart. T2 needs only the full key.
+  Prior art agrees: SQLite seeks partial prefixes on a default guess of 10
+  rows per leading value, and its query-planner case study shows that guess
+  failing on a leading column with over 10,000 duplicates; Oracle's rule-based
+  optimizer took any leading portion and was deprecated partly for choosing
+  indexes over faster full scans.
 - **Hoisting every qualifying equality** (the first draft's D1). On a value
   column it replaces a streaming filter with a full materialization, and in
   longer bodies it can reseed the greedy reorder onto non-key joins.
 - **Substituting `x` for `u` in the stored atom with an alias** (the first
   draft's D3). The hoisted non-constant unification gives the same plan with
   machinery the planner already has.
+- **Coercing a cross-type numeric constant to the column type** (`5.0` to
+  `Int(5)` on an `Int` key). `op_eq` is not transitive across `Int` and
+  `Float`: above `2^53` several `Int` keys equal one `Float`, so one seek
+  cannot return them all. PostgreSQL keeps `float8` and `numeric` in separate
+  operator families for the same reason.
+- **Batched key lookups in batch 1.** MySQL, TiDB and CockroachDB batch the
+  keys of many left rows into one fetch, and the engine has
+  `StoreTx::multi_get`. T2's left side is small in MindGraph's queries (the
+  edges of one page), so batch 1 does one `get` per left row and the T2
+  benchmark records it against `multi_get`; batching follows if the numbers
+  call for it.
+- **A Db-level disable option.** Prior art keeps a switch for diagnosing plan
+  regressions; the stat-free plans are visible in `::explain` and pinned by
+  tests, so a test-only switch covers the differential-testing need without a
+  new public option.
 - **Cost-based choice between prefix and materialized join.** The engine has
   no statistics, and the plans are stat-free by design. A full-key match is
   always a point lookup, which is what D2 adds.
