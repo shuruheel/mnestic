@@ -1,157 +1,255 @@
 # Search and secondary indexes on transaction-time relations
 
-Status: **DRAFT — not reviewed, not approved.** Selected as roadmap item 1 by the
-owner on November 13, 2026. Passes run (workspace `spec-authoring` method): 1 (code
-facts, verified against `main` at `fd0d3d0d` and the published 0.19.2 wheel on
-November 13, 2026) and 2 (this draft). Pass 0 does not apply (no user interface).
-Passes 3–5 (adversarial panel, prior-art grounding, simplification) have **not**
-run; the open questions at the end are the ones they should attack first.
+Status: **DRAFT — all review passes run (0–5), awaiting owner approval.** Selected as roadmap item 1
+by the owner on November 13, 2026. Passes (workspace `spec-authoring` method):
+
+| Pass | Date | Result |
+|---|---|---|
+| 1 Code facts | Nov 13 | Verified against `main` `fd0d3d0d` and the 0.19.2 wheel |
+| 2 Draft | Nov 13 | Merged as `23cae8a4` (PR #73) |
+| 3 Panel (code grounding, concurrency and crash, semantics) | Nov 13 | 21 findings, 6 blockers; all folded, none rejected. Changes: three-phase commit section (D3), index DDL under the commit lock (D5), `::evict` deletes moved into the section (D7), planner seam moved to `compile.rs` (D6), tt column barred from index specs (D2) |
+| 4 Prior art (SQL Server, MariaDB, XTDB, Datomic, Lucene/Elasticsearch, Neo4j, Lance, Milvus) | Nov 13 | D1, D2 confirmed; D3, D5, D6, D7 gaps, all folded: index builds no longer pause commits (D5), as-of secondary lookups bounded (D6), evict capped and its storage caveat stated (D7), commit-section time made a release gate. Essential omission (deferred, watermark-based indexing) recorded as an owner decision |
+| 5 Simplification | Nov 13 | See *Simplification* below |
+
+Pass 0 does not apply (no user interface).
 
 ## Goal
 
 Today a relation can keep transaction-time history (`TxTime`) or have search
 indexes, never both. This spec lets a system-versioned (tt-only) relation carry
-B-tree, full-text, vector and LSH indexes that answer for the **current belief**,
-and defines what a search **as of** an earlier transaction time does.
+B-tree, full-text, vector and LSH indexes that answer for the **current
+belief**, and defines what a search **as of** an earlier transaction time does.
 
 ## Verified current state
 
 | Claim | Where | Consequence |
 |---|---|---|
 | `::index`, `::fts`, `::hnsw`, `::lsh create` and `::set_triggers` reject `TxTime` relations with `eval::txtime_unsupported_op` | `runtime/relation.rs:984-992`; call sites `:1006`, `:1226`, `:1357`, `:1571`, `:1891`; confirmed on the 0.19.2 wheel | The gate this spec lifts for four of the five |
-| Writes to a `TxTime` relation are buffered on the transaction and written at commit with one engine-assigned tt | `runtime/transact.rs:60` (`pending_tt_writes`), `:322`, `:390`, `:406-479`; every write op funnels there (`query/stored.rs:1420`, `:1586`, `:1727`, `:1821`, `:1930`; `runtime/db.rs:1421`) | One place to maintain indexes; statement-time maintenance cannot know the tt |
-| The tt commit runs under a per-`Db` mutex: allocate tt, stamp rows, persist the high-water mark, commit | `commit_tx_with_tt`, `runtime/transact.rs:380-398` | tt order equals commit order; the section's length is paid by every tt committer |
-| On RocksDB a write transaction validates its **writes** against a begin snapshot, but its **reads** see the latest committed state | `storage/rocks.rs:283` (`set_snapshot(true)`); `cozorocks/bridge/tx.h:20-34`, `:87-103` (`ReadOptions` never receives a snapshot) | A read of "the current belief" at commit time is fresh; index-row writes can still hit a snapshot conflict |
-| `put_externally_serialized` drops the begin snapshot so a mutex-serialized key cannot conflict | `storage/rocks.rs:435-446` | Precedent for index rows written inside the tt section |
-| Script writers hold a **shared** guard on each relation lock; index DDL takes it exclusively. A vector index is built from a snapshot without the lock, then reconciled against the base under it | `runtime/db.rs:2083-2086`; `:2455-2507`, `:3208`, `:3239`; `reconcile_hnsw_index`, `runtime/relation.rs:1791-1805` | Writers to one relation run concurrently on RocksDB; commits landing during a vector build are picked up by the reconcile |
-| SQLite and `mem` admit one writer at a time | `storage/sqlite.rs:204` (`begin immediate`); `storage/mem.rs:51-54` | The concurrency questions below are RocksDB-only |
-| A current-belief point read for a tt-only key exists | `tt_current_row`, `query/stored.rs:1128-1142` (one skip-scan seek) | Reusable as the "old tuple" lookup and the base fetch |
-| Index maintenance helpers take an old tuple and a new tuple and skip unchanged fields | `query/stored.rs:958` (`update_in_index`), `:516` (`replace_in_fts`), `:542` (`update_in_hnsw_changed`), `:482`/`:507` (LSH) | Reusable unchanged once the old tuple is supplied |
-| Index backfill, the vector-build reconcile, rebuild and the filtered exact scan read `scan_all`, which on a `TxTime` relation would return every version | `runtime/relation.rs:1319`, `:1455`, `:1738`, `:1805`, `:2007`, `:2021`; `runtime/reindex.rs:117`; `runtime/hnsw.rs:1505` | Each must read current beliefs instead |
-| `:as_of` sets a default tt on relation atoms and fixed-rule inputs but skips search atoms | `data/program.rs:1020-1061` | Harmless today (search cannot reach a tt relation); a silent-current-result hazard once it can |
-| `choose_index` skips an index for a time-travel query unless the index's last column is the relation's last key | `runtime/relation.rs:247-274` | The seam for "no index on a historical read" |
-| On a valid-time-only relation, search indexes hold **every version** and a secondary index answers from superseded versions | 0.19.2 probe: FTS returned the superseded text; `*d:byt{text: 'alpha old', k @ 'NOW'}` returned the key although the current text differs | Existing behaviour, not changed here; the reason valid time is out of scope |
+| Buffered writes to a `TxTime` relation are stamped and written at commit with one engine-assigned tt | `runtime/transact.rs:60` (`pending_tt_writes`), `:322`, `:406-479`; write ops `query/stored.rs:1420`, `:1586`, `:1727`, `:1821`, `:1930`; `runtime/db.rs:1421` | One place to maintain indexes |
+| `::evict` is the exception: it deletes every base version and allocates its tt at **statement** time, then commits through the section via `tt_hwm_dirty` | `runtime/db.rs:3076-3085`, `:3112-3126` | The section cannot see what evict removed (D7) |
+| `PendingTtWrite.handle` is captured at statement time | `runtime/transact.rs:110-120`, used at `:458-476` | Its index set can be stale by commit (D3) |
+| The tt commit runs under a per-`Db` mutex: allocate tt, stamp rows, persist the high-water mark, commit. The mutex wait has no timeout | `commit_tx_with_tt`, `runtime/transact.rs:380-398` | Index work inside it serializes tt committers (residual risks); deadline handling needed (D8) |
+| On RocksDB a write transaction's plain reads (`get`, `multi_get`, iterators) see the latest committed state plus its own writes; `GetForUpdate` and `Put` validate against the begin snapshot when they lock the key | `storage/rocks.rs:283`, `:411-416`; `cozorocks/bridge/tx.h:20-34`, `:87-103`; HNSW neighbour reads use `for_update` (`runtime/hnsw.rs:1253`) | Index-row writes **and** locking reads can raise a snapshot conflict; clearing the snapshot covers both, and only affects later operations |
+| `put_externally_serialized` clears the begin snapshot for a mutex-serialized key | `storage/rocks.rs:435-446` | Precedent, sound only when the mutex is the sole writer of the key |
+| The shared relation guard spans commit only in single-script execution. Multi-transactions never take it; governed transactions hold it per statement; top-level system ops (index DDL, `::reindex`) drop it before their commit | `runtime/db.rs:2083-2121`; `:559-570`; `:899-910` vs `:868-872`; `:3203-3207`, `:3272-3283` vs `:3507-3508` | Relation locks do not order index DDL against tt commits (D5) |
+| System ops run only as top-level scripts, never inside a multi-statement or governed transaction | `parse/mod.rs:231-241` (`get_single_program` rejects `Sys`) | DDL, `::reindex`, `::evict` each own their transaction |
+| SQLite and `mem` admit one writer at a time | `storage/sqlite.rs:204` (`begin immediate`); `storage/mem.rs:51-54` | Concurrency cases below are RocksDB-only |
+| `tt_current_row` resolves a tt-only key's current belief with one skip-scan seek, through the transaction's own writes | `query/stored.rs:1128-1142` | Basis for old/new resolution and base fetches |
+| HNSW insertion and neighbour shrinking fetch the entry point's and neighbours' vectors from the **base relation** | `VectorCache::ensure_key`/`ensure_keys`, `runtime/hnsw.rs:162-205`; call sites `:322`, `:548`, `:711`, `:724-725`, `:779` | Base rows of this commit must be written before vector maintenance (D3) |
+| Index code derives the base key width from `metadata.keys.len()` in about twenty places | `runtime/hnsw.rs:285`, `:318-320`, `:352`, `:402`, `:421`, `:449`, `:620`, `:641`, `:864`, `:948`, `:1160-1165`, `:1322`, `:1385-1393`, `:1504`, `:1595-1599`; `fts/indexing.rs:791-793`, `:869-871`; `runtime/minhash_lsh.rs:39`, `:83`, `:118`; `runtime/relation.rs:212` | One accessor needed (D2) |
+| Nine index build, rebuild and reconcile paths read `scan_all`, which on a `TxTime` relation returns every version | `runtime/relation.rs:1319`, `:1455`, `:1738`, `:1805`, `:2007`, `:2021`; `runtime/db.rs:2485` (unlocked vector build); `runtime/reindex.rs:117`; `runtime/hnsw.rs:1505` (filtered exact scan) | D5. (`relation.rs:227` and `db.rs:2942` are full-history by intent) |
+| Both planner call sites pass `validity_query = valid_at.is_some() \|\| has_txtime()`, so every read of a tt relation is treated as time travel, and `choose_index` then admits only an index whose last column is the relation's last key | `query/compile.rs:298-305`, `:493-500`; `runtime/relation.rs:263-274` | The D6 seam is in `compile.rs` |
+| The secondary-index join back to the base is a relation join (`StoredWithValidity` prefix skip-scan on tt relations); the index-only plan does no base fetch | `query/compile.rs:319-335`, `:378-388`; `query/ra.rs` | No new point-read helper for B-tree indexes |
+| `:as_of` pins atoms whose named relation `has_txtime()`; index atoms (`*rel:idx`) and search atoms are not pinned | `data/program.rs:1020-1061` | Silent current results once indexes exist (D6) |
+| Hybrid search is a CozoScript generator emitting ordinary search atoms | `runtime/hybrid.rs:331`, `:886-887`, `:935`, `:953` | Covered by the search-atom rule |
+| On a valid-time-only relation, search indexes hold **every version** and a secondary index answers from superseded versions | 0.19.2 probe: FTS returned the superseded text; `*d:byt{text: 'alpha old', k @ 'NOW'}` returned the key although the current text differs | Existing behaviour, unchanged here; why bitemporal relations stay out |
 | `:returning`, event callbacks and graph-projection sources reject `TxTime` relations | `query/stored.rs:1183-1186`; `runtime/graph_projection.rs:1462` | Unchanged |
 
 ## Decisions
 
 **D1 — Scope: tt-only relations, four index kinds.** `{k…, tt: TxTime => v…}`
 relations accept `::index`, `::fts`, `::hnsw` and `::lsh create`. Bitemporal
-relations (`Validity` + `TxTime`) stay rejected with the existing diagnostic:
-valid time has no write-time notion of "current" (a future-dated version becomes
-current without any write), and the valid-time index behaviour verified above
-would be inherited. Triggers, `:returning`, callbacks and graph projections stay
-rejected. Seam: `reject_txtime_relation` gains the tt-only exception for the four
-index call sites.
+relations stay rejected with the existing diagnostic: valid time has no
+write-time notion of "current" (a future-dated version becomes current without
+a write), and the valid-time behaviour verified above would be inherited.
+Triggers, `:returning`, callbacks and graph projections stay rejected. Seam:
+`reject_txtime_relation` admits `is_tt_only()` relations at the four index call
+sites.
 
-**D2 — An index holds the current belief only.** For each logical key whose
-latest record is an assertion, the index holds exactly the entries a plain
-relation would hold for that row. Superseded and retracted versions have no
-entries. Index rows are keyed by the **logical key** (the base key without the
-tt column), so an update that leaves an indexed field unchanged leaves its
-entries untouched, as on plain relations since 0.19.2. Seam: the four index
-creation functions build their `src_*` columns from the keys minus the trailing
-`TxTime` column.
+**D2 — An index holds the current belief, keyed by the logical key.** For each
+logical key whose latest record is an assertion, the index holds exactly the
+entries a plain relation would hold for that row; superseded and retracted
+versions have none. Index rows carry the logical key (base key without the tt
+column), so an update that leaves indexed fields unchanged leaves the entries
+untouched, as on plain relations since 0.19.2.
+- Seam: `RelationHandle::index_key_len()` returns `keys.len() - 1` for tt-only
+  relations and `keys.len()` otherwise. Index creation (`src_*` columns) and
+  every index site listed in the table use it instead of `metadata.keys.len()`.
+- The tt column may not appear in an index spec (indexed column, extractor
+  input, vector field or filter). Error `eval::txtime_index_column`. An index
+  keyed on tt would re-key on every write and is the one shape the existing
+  time-travel rule in `choose_index` would admit for historical reads.
 
-**D3 — Maintenance runs at commit, inside the tt section.** In
-`commit_tx_with_tt`, after the tt is allocated and before base rows are stamped:
-collapse each relation's buffered rows to the last row per logical key; read
-that key's current belief with `tt_current_row` (latest committed, see the
-table); call the existing helpers with (old, new). A retraction calls only the
-delete side. On RocksDB the begin snapshot is cleared on entry to the section,
-as `put_externally_serialized` already does, so index rows written by an
-earlier committer do not raise a snapshot conflict. Nothing is written to an
-index at statement time, so a script still cannot see its own writes to a
-`TxTime` relation through the base relation or through any index.
+**D3 — Maintenance runs in the commit section, in three phases.** Assigning
+the tt at commit under the lock avoids the conflict SQL Server's begin-time
+stamping produces (error 13535); serial maintenance matches Datomic's single
+transactor. Inside
+`commit_tx_with_tt`, under `tt_commit_lock`:
+1. **Resolve.** Re-read each touched relation's handle by id (its current
+   index set); `PendingTtWrite.handle` is not trusted. Clear the RocksDB begin
+   snapshot (sound by D5: the section is the only writer of these index rows).
+   Collect every touched logical key: buffered rows plus evicted keys (D7).
+   Read `old = tt_current_row(key)` for each, before any write.
+2. **Write the base.** Apply evict deletes, then stamp and write buffered rows
+   (unchanged code), then the high-water mark.
+3. **Maintain.** For each touched key read `new = tt_current_row(key)`, which
+   now sees this commit's writes; where `old ≠ new`, call the existing helpers
+   with (old, new): `update_in_index`, `replace_in_fts`,
+   `update_in_hnsw_changed`, LSH delete and put. `new = None` calls only the
+   delete side. Vector fetches during maintenance see this commit's rows.
+   Full-text statistics go through `finish_fts_change`, so they reach the
+   committed cache only after the storage commit succeeds. Keys touched in
+   this phase are appended to any registered index build (D5).
 
-**D4 — Reads resolve the logical key.** Every base fetch made from an index
-(HNSW vector fetch and result rows, FTS and LSH result rows, the join back from
-a secondary index) uses a `RelationHandle::get_current` helper generalised from
-`tt_current_row`. The tt column in a result is the resolved row's tt.
+Reading old and new from storage, rather than from the buffer, makes repeated
+writes to one key, retract and re-assert, `:reconcile` and evict uniform.
+Nothing reaches an index at statement time, so a script still cannot see its
+own writes to a `TxTime` relation, through the base or any index.
 
-**D5 — Backfill and rebuild read current beliefs.** The eight `scan_all` sites
-in the table use `skip_scan_all` at end-of-time for tt-only relations. The
-vector-build reconcile compares current beliefs by logical key.
+**D4 — Reads resolve the logical key.** HNSW, FTS and LSH fetch base rows
+through `RelationHandle::get_current` (generalised from `tt_current_row`),
+both at search time (result rows, vector fetches) and inside `VectorCache`
+during maintenance. A tt column in a result is the resolved row's tt. The
+B-tree join back is the existing `StoredWithValidity` prefix join and needs no
+change once D6 admits the index.
+
+**D5 — Index builds do not pause commits.** On a tt-only relation every
+index build (`::index`/`::fts`/`::hnsw`/`::lsh create`, `::reindex`) follows
+the pattern the vector build already uses, made exact:
+1. Under `tt_commit_lock`, register the build on the relation and record the
+   current tt as its watermark. Release the lock.
+2. Build without the lock from current beliefs read at the watermark
+   (`skip_scan_all` at end-of-time; the nine `scan_all` sites in the table).
+   Meanwhile every commit to the relation appends its touched logical keys to
+   the registration (D3 phase 3).
+3. Under `tt_commit_lock`, re-derive the index entries of exactly the
+   appended keys from their current beliefs, attach the index, deregister,
+   and commit.
+
+Index drop takes the lock, deregisters any build and commits. Builds hold the
+lock only for steps 1 and 3, whose cost scales with the writes made during the
+build, not with the relation. This replaces the vector build's
+whole-relation snapshot diff (`reconcile_hnsw_index`) for tt-only relations
+and makes `tt_commit_lock` the sole authority for writing an attached index's
+rows, which is what makes the snapshot clear in D3 sound. Lance's index
+coverage bitmaps and Datomic's background index merges follow the same split.
 
 **D6 — No silent history.** A historical tt never reaches an index.
-- Secondary index: `choose_index` is not consulted when the atom carries a
-  historical tt (explicit selector or `:as_of`); the base relation answers. An
-  explicit index atom with a historical tt is an error.
-- Search atom in a block with `:as_of`, or hybrid search: error
-  `search::as_of_unsupported` in batch 1. A search atom on a tt relation counts
-  as a tt reference for the `:as_of` typo guard.
+- Planner (`query/compile.rs:298`, `:493`): for a tt-only relation, call
+  `choose_index` with `validity_query = false` unless the atom carries a tt
+  selector (explicit, or from `:as_of`); with one, skip index selection and
+  read the base. The index-only plan is not used when the atom binds the tt
+  column. No tt selector is passed to the index relation.
+- That historical base read is bounded like the vector fallback: past
+  `FILTERED_EXACT_MAX_ROWS` scanned records it raises
+  `query::as_of_scan_limit`, never a partial result, and `::explain` shows it
+  as a history scan. Datomic answers such questions from covering history
+  indexes and SQL Server recommends indexing its history table; mnestic does
+  neither in batch 1 (rejected alternatives).
+- `:as_of` (`data/program.rs:1020-1061`): an index atom or fixed-rule input
+  naming an index of a tt relation, and any search atom on a tt relation,
+  raises `search::as_of_unsupported` and counts as a tt reference for the typo
+  guard. An explicit tt selector on an index atom keeps its existing error.
+  Hybrid queries are covered because they compile to search atoms.
 - Batch 2 replaces the vector error with an exact scan of the beliefs held at
   T, bounded by `FILTERED_EXACT_MAX_ROWS` (200,000 scanned rows,
-  `runtime/hnsw.rs:1633`); beyond the cap it is an error, never a partial list.
+  `runtime/hnsw.rs:1633`); past the cap it is an error, never a partial list.
+  Versioned approximate search is not offered: Milvus removed its time-travel
+  search in 2.3, and Lance supports it only because its index files are
+  immutable per version, which an in-place graph is not.
 - Full-text and LSH as-of stay errors until batch 3 is activated.
 
-**D7 — History operations.** `::history_gc` removes only superseded records, so
-it never changes an index. `::evict` removes the key's index entries; that work
-is deferred into the commit section like any other index write (evict already
-commits through it, `runtime/db.rs:3085`).
+**D7 — History operations.** `::history_gc` removes only superseded records and
+never changes an index. `::evict` on a relation with indexes records the keys
+at statement time (validation and the audit row stay there) and performs its
+base deletes in D3 phase 2, so phase 1 sees the evicted belief and phase 3 the
+outcome. A version committed by another writer between evict's statement and
+its commit is outside evict's view; it survives in the base, as today, and the
+index follows the base.
+- Because its index work runs inside the commit section, one `::evict` call on
+  an indexed relation accepts at most 1,000 keys and raises
+  `eval::evict_batch_limit` past that (Datomic advises excising a few thousand
+  datoms at a time).
+- Eviction is logical until storage compaction: removed rows and index entries
+  remain in RocksDB files, the write-ahead log and earlier backups until
+  compacted or rotated, and neighbour lists in the vector graph were chosen
+  using the evicted vector's distances. Documented, not changed: physical
+  erasure is the operator's compaction and backup policy. Current-only indexes
+  avoid Datomic's documented failure of excision leaving history-index entries.
 
-**D8 — Failure and budgets.** An index error inside the section fails the
-commit; nothing is committed and the allocated tt is burned, which the clock
-already permits. The transaction's deadline is checked before entering the
-section. Work inside it is not preempted.
+**D8 — Failure, deadline and cancellation.** The section waits for
+`tt_commit_lock` with a `try_lock` loop that checks the transaction's deadline
+and cancellation flag (the pattern of the governed relation-lock wait,
+`runtime/db.rs:900-907`), and checks both once more after acquiring the lock
+and before allocating the tt. An error in phases 1–3 fails the commit; nothing
+is committed and any allocated tt is burned, which the clock permits. Work
+inside the section is not preempted.
 
 ## Invariants
 
 1. At every committed state, each index on a tt-only relation equals the index
    a plain relation holding exactly the current asserted beliefs would have.
-2. No index row of a `TxTime` relation is written outside the commit section,
-   except by index DDL: under the exclusive relation lock, or into a
-   not-yet-attached vector index during its unlocked build.
+2. A tt relation's index rows are read for maintenance, written and committed
+   only under `tt_commit_lock`, except by an unlocked build (D5) into an
+   index that is not yet attached.
 3. Plain and valid-time-only relations keep byte-identical storage and cost.
 4. tt order equals commit order (unchanged).
-5. A query naming a historical tt returns the belief at that tt or an error;
-   it never returns current-belief rows from an index.
+5. A query naming a historical tt, explicitly or by `:as_of`, returns the
+   belief at that tt or an error; it never returns current rows from an index.
 
 ## Acceptance tests
 
-SQLite with `tempfile::tempdir()` and RocksDB; `mem` only for parser-level cases.
+SQLite with `tempfile::tempdir()` and RocksDB; `mem` only for parser cases.
 
 - Create each index kind on a populated tt-only relation: superseded and
   retracted versions are absent; results equal an exact scan of current beliefs.
 - Correct a row: search finds the new version only; `@ (tt: T)` on the base
   still returns the old one. Retract, then re-assert: entries follow.
+- One transaction inserts many new keys into an **empty** HNSW-indexed relation,
+  and one updates several keys that are each other's neighbours: no error;
+  graph equals a rebuild.
 - Same key written twice in one transaction: one entry, last write wins.
-- Update only a non-indexed field: FTS postings and HNSW rows are untouched
-  (row-identity check, as in `tests/write_path_0192.rs`).
+- Update only a non-indexed field: FTS postings and HNSW rows untouched.
 - A script that writes then searches sees neither base nor index changes.
-- Concurrent RocksDB writers on one key, and on two new keys: invariant 1
-  holds after both commit; no snapshot-conflict error from index rows.
-- `::evict`, `::history_gc`, `::reindex`, `import_relations`, `:reconcile`,
-  backup and restore: invariant 1 after each.
-- Index failure injected inside the section: commit fails, base and indexes
+- RocksDB concurrency: two writers on one key, and on two new keys; a
+  multi-transaction and a governed transaction each buffer a write, then
+  `::fts create` (and separately index drop, `::reindex`) runs, then they
+  commit; `::reindex` concurrent with a commit; `::evict` concurrent with a
+  commit to the same key. Invariant 1 after each; no snapshot-conflict errors.
+- `::evict`, `::history_gc`, `import_relations`, `:reconcile`, backup and
+  restore: invariant 1 after each. After evict no B-tree entry, FTS posting,
+  LSH bucket or HNSW row contains the key, and BM25 document count and token
+  total drop by exactly that document; 1,001 keys raise the batch limit.
+- After N corrections to one key, BM25 document count and token total equal a
+  plain relation holding the current beliefs, and ranked results match it.
+- Index builds: commits during an unlocked build of each kind are reflected
+  after attach (invariant 1); commits are not blocked for the build's
+  duration (measured below).
+- Index failure injected in each phase: commit fails, base and indexes
   unchanged, later commits proceed.
-- Every D6 case: error codes, and (batch 2) as-of vector results equal the
-  exact top-k of the beliefs at T; the cap produces the named error.
+- A commit waiting on the section past its deadline returns `eval::timeout`
+  without allocating a tt.
+- D2: tt column in each index spec kind is rejected.
+- D6: current reads use a secondary index (`::explain`); historical reads do
+  not; `:as_of` with a search atom, an index atom and an index passed to a
+  fixed rule each raise `search::as_of_unsupported`; an as-of base read past
+  the cap raises `query::as_of_scan_limit`; batch 2 as-of vector results equal
+  the exact top-k of the beliefs at T; the cap raises its error.
 - Bitemporal relations, triggers, callbacks, projections: still rejected.
 
-Performance, measured on the 40,000-row benchmark shape and recorded before
-release (targets to be confirmed by the panel):
+Performance, on the 40,000-row benchmark shape. These are release gates:
 
-| Measure | Target |
+| Measure | Gate |
 |---|---|
-| Plain-relation read and write latency | unchanged (dispatch only) |
+| Plain-relation read and write latency | unchanged |
 | Vector and full-text search p50, tt-only against plain | ≤ 1.5× |
-| Single-row update p50, tt-only against plain | ≤ 1.3× |
-| Time inside the tt section per indexed row (RocksDB) | reported, with p99 |
+| Single-row update p50 and p99, tt-only against plain with the same indexes | ≤ 1.3× |
+| Longest time a tt commit waits on another commit's section, 4 concurrent single-row writers, p99 (RocksDB) | ≤ 3× the single-row update p99 |
+| Longest commit wait while `::fts create` or `::hnsw create` runs on 40,000 rows | ≤ 3× the single-row update p99 |
+| As-of lookup by secondary key, 5 versions per key, base-scan fallback | reported; input to open question 1 |
 
 ## Residual risks
 
-- **Writers serialize on RocksDB.** The tt section now includes index work
-  (tens of milliseconds per row with a vector index), so concurrent commits to
-  any `TxTime` relation in the same database wait for it. A 1,000-row batch
-  can hold the section for seconds. SQLite and `mem` already admit one writer.
+- **Writers serialize on RocksDB.** The section now includes index work (tens
+  of milliseconds per row with a vector index), so concurrent commits to any
+  `TxTime` relation in the database wait for it. A 1,000-row batch can hold it
+  for seconds.
 - **Search fetches cost a seek, not a point read**, and lose the batched
   `multi_get` on vector fetches. The 1.5× target exists to catch this.
 - **Bulk `import_relations` maintains every index** on a tt relation (it flows
-  through the same funnel), unlike plain relations where it skips search
-  indexes. Guidance: drop, import, recreate.
+  through the buffer), unlike plain relations. Guidance: drop, import, recreate.
 - **As-of vector search is exact, not the approximate result the index gave at
-  the time.** It reproduces the belief, not the historical ranking noise.
+  the time.** It reproduces the belief, not the historical ranking.
 
 ## Layering ruling
 
@@ -164,48 +262,93 @@ history-preserving recovery and reversible enablement remain open.
 
 - **Statement-time maintenance.** The base row's tt does not exist yet, and an
   index would show writes the base relation hides.
-- **Index rows keyed by the full base key including tt** (no creation-code
-  change, exact point reads). Every new version would re-key the row's entries:
-  a full vector remove and insert even when the vector did not change.
-- **Versioned index entries** (assert and retract rows stamped with tt, as
-  sketched in the bitemporality spec §8). Gives indexed as-of reads for
-  secondary indexes, at the cost of history in every index, coupling to
-  `::history_gc` and `::evict`, and no answer for vector graphs. Revisit for
-  B-tree indexes alone if an as-of lookup by secondary key is shown to be too
-  slow as a base scan.
-- **A per-key "current head" row** (logical key → current tt). Would give
-  point-read resolution and row-level conflict detection, allowing index work
-  outside the tt section. New storage on every indexed relation; revisit if the
-  serialization or the 1.5× search target fails in measurement.
-- **Maintenance before the tt lock, relying on row conflicts.** Two concurrent
-  inserts of one new key touch disjoint index rows and both commit, leaving
-  entries for a superseded version.
+- **Maintenance before writing the base rows** (the first draft). Vector
+  insertion fetches neighbours from the base, so a commit adding two new keys
+  fails and updated neighbours are measured at stale positions (panel, three
+  lenses independently).
+- **Relying on relation locks to order DDL and commits.** They span commit only
+  in single-script execution (table). Rejected for `tt_commit_lock` (D5).
+- **Index builds holding `tt_commit_lock` for the whole backfill** (the
+  post-panel draft). Correct, but pauses every tt commit for the build; every
+  system surveyed builds without blocking writers.
+- **Synchronous full-text maintenance only, as Neo4j's default; an
+  eventually-consistent mode** (Neo4j `eventually_consistent`) was the model
+  for the deferred option in the open questions.
+- **Keeping the begin snapshot and failing on conflict.** Safe without D5, but
+  turns every overlapping commit into an error; unnecessary once D5 holds.
+- **Index rows keyed by the full base key including tt.** Every new version
+  would re-key its entries: a full vector remove and insert even when the
+  vector did not change.
+- **Bitemporal indexes now.** Possible later without a write-time notion of
+  "current": index every valid-time version of the current tt belief and filter
+  valid time at read, as XTDB's recency partitions do. Out of scope; the
+  exclusion is a scope choice, not an impossibility.
+- **Versioned index entries** (bitemporality spec §8 sketch). Gives indexed
+  as-of reads for secondary indexes, at the cost of history in every index,
+  coupling to `::history_gc` and `::evict`, and no answer for vector graphs.
+  Revisit for B-tree indexes alone if an as-of lookup by secondary key is shown
+  to be too slow as a base scan.
+- **A per-key "current head" row.** Point-read resolution and row-level
+  conflicts, allowing index work outside the section. New storage on every
+  indexed relation; revisit if the serialization or the 1.5× target fails.
 - **A versioned vector graph.** Edge history multiplies with every neighbour
   rewrite; no consumer.
-- **Per-atom tt selectors on search atoms.** `:as_of` covers the reproduction
-  case; add later if pulled.
+- **Per-atom tt selectors on search atoms.** `:as_of` covers reproduction.
 
 ## Batches (review units)
 
-1. **Current-belief indexes** (D1–D5, D7, D8, D6 errors): the unblock. Largest
-   batch; ships alone.
+1. **Current-belief indexes** (D1–D5, D7, D8, D6 errors): the unblock. Ships alone.
 2. **As-of vector search by bounded exact scan** (D6).
 3. **As-of full-text and LSH** — not designed here. Gate: a consumer names an
    as-of text-search question. Candidate: materialise postings for the beliefs
-   at T into the transaction's temporary store, bounded, and run the existing
-   evaluator.
+   at T into the transaction's temporary store, bounded, and run the evaluator.
 
-## Open questions for review
+## Resolved review questions
 
-1. Is clearing the begin snapshot at section entry sound for every key the
-   transaction wrote earlier, or only for the final high-water-mark write it
-   was introduced for?
-2. Can `::evict`'s statement-time base deletes and a concurrent committer's
-   index work deadlock or interleave, given evict also runs under a shared
-   relation guard?
-3. Does any path write a `TxTime` relation without passing through
-   `stamp_pending_tt_writes`?
-4. Should batch 1 ship secondary indexes at all before the as-of base-scan
-   fallback is measured, or only the three search kinds?
-5. Are the 1.5× and 1.3× targets the right bar, and what is the measured cost
-   of a seek against a point read on both backends?
+1. *Is clearing the begin snapshot sound?* Yes for keys the transaction locked
+   earlier (pessimistic validation happens when a key is locked; the clear
+   affects only later operations), and for index rows once D5 makes the
+   section their only writer. Without D5 it would let a commit overwrite a
+   concurrent `::reindex` silently.
+2. *Can `::evict` and a concurrent committer corrupt an index?* They could
+   under the draft; D7 moves evict's deletes into the section.
+3. *Does any path write a `TxTime` relation outside `stamp_pending_tt_writes`?*
+   `::evict` (now in the section) and `::history_gc` (superseded rows only).
+   System ops cannot run inside multi-statement transactions.
+
+## Open questions (owner)
+
+1. **Synchronous or deferred maintenance.** Prior art's essential omission:
+   every system surveyed keeps expensive search-index work out of the serial
+   commit path. Datomic commits to an in-memory index and merges in the
+   background; Neo4j offers eventually-consistent full-text indexes because
+   synchronous Lucene writes were its main write bottleneck; Lance tracks
+   which data each index covers and scans the rest exactly. A mnestic version:
+   commits record touched keys against an indexed-up-to tt; a later writer or
+   an explicit `::index catch_up` applies them; reads scan the unindexed tail
+   exactly. mnestic has no engine-owned background threads, so catch-up would
+   ride on writers or be explicit. **Recommendation:** ship synchronous
+   maintenance in batch 1 behind the release gates above; build the deferred
+   mode only if the section-wait gates fail. It is a larger design (tail
+   scans must merge with BM25 ranking and HNSW results) that can reuse D5's
+   touched-key registration.
+2. Should batch 1 include B-tree indexes, or only the three search kinds
+   (simplification candidate below)?
+3. Are the 1.5× and 1.3× gates the right bar?
+
+## Simplification
+
+Requirement-neutral cuts, applied:
+- A runtime warning and metric for slow commit sections (suggested by the
+  prior-art pass) were dropped in favour of the release gates; a warning adds
+  a threshold to tune and a diagnostic to support, with no consumer yet.
+- Physical erasure after `::evict` (compaction of evicted ranges) was not
+  added; documented as operator policy (D7).
+- Moving tokenisation and vector normalisation out of the section was not
+  added to batch 1; it is the first lever if the section gates fail.
+
+Requirement changes, **not** applied (owner decision):
+- **Defer B-tree secondary indexes to a later batch.** Batch 1 would then not
+  need the planner change, the as-of base-scan cap or its error (D6 first two
+  bullets), and the selected roadmap item would still be met for search,
+  which is what "combine history and search" asked for. Recommended.
