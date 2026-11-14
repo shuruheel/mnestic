@@ -287,3 +287,118 @@ fn without_enabling_nothing_is_written_and_seed_is_a_no_op() {
     assert_eq!(db.seed_fts_stats().unwrap(), 0);
     assert_unseeded(&db);
 }
+
+fn deltas(db: &DbInstance) -> usize {
+    db.verify_fts_stats().unwrap()[0].deltas
+}
+
+#[test]
+fn folding_shortens_the_record_read_and_keeps_totals_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("db");
+    let db = open(&path);
+    db.enable_persisted_fts_stats().unwrap();
+    setup(&db, 20);
+    db.seed_fts_stats().unwrap();
+    for i in 0..300 {
+        write(
+            &db,
+            &format!(
+                "?[id, body] <- [['f{}', 'alpha {}']] :put doc {{id => body}}",
+                i,
+                "x ".repeat(i % 5)
+            ),
+        );
+    }
+    // Each write inserts a new document, so each commits one delta.
+    assert_eq!(deltas(&db), 300);
+    assert_eq!(
+        db.fold_fts_stats(1_000).unwrap(),
+        0,
+        "below the threshold nothing folds"
+    );
+    assert_eq!(db.fold_fts_stats(256).unwrap(), 1);
+    assert_eq!(deltas(&db), 0);
+    assert_exact(&db);
+    write(&db, "?[id] <- [['f1']] :rm doc {id}");
+    assert_eq!(deltas(&db), 1);
+    assert_exact(&db);
+    drop(db);
+    let db = open(&path);
+    assert_eq!(
+        db.enable_persisted_fts_stats().unwrap(),
+        FtsStatsOpen::Trusted
+    );
+    assert_exact(&db);
+}
+
+#[test]
+fn folds_racing_writers_and_each_other_keep_totals_exact() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir.path().join("db"));
+    db.enable_persisted_fts_stats().unwrap();
+    setup(&db, 50);
+    db.seed_fts_stats().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let mut threads = Vec::new();
+    for w in 0..2 {
+        let (db, stop) = (db.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            let mut i = 0;
+            while !stop.load(Ordering::Relaxed) {
+                let id = format!("w{w}-{}", i % 30);
+                let script = if i % 3 == 2 {
+                    format!("?[id] <- [['{id}']] :rm doc {{id}}")
+                } else {
+                    format!(
+                        "?[id, body] <- [['{id}', 'alpha {}']] :put doc {{id => body}}",
+                        "y ".repeat(i % 4)
+                    )
+                };
+                let _ = db.run_script(&script, BTreeMap::new(), ScriptMutability::Mutable);
+                i += 1;
+            }
+        }));
+    }
+    for _ in 0..2 {
+        let (db, stop) = (db.clone(), stop.clone());
+        threads.push(std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                db.fold_fts_stats(1).unwrap();
+            }
+        }));
+    }
+    let before = scans();
+    for _ in 0..150 {
+        read(&db, SEARCH);
+    }
+    assert_eq!(scans(), before, "a search scanned postings while folds ran");
+    stop.store(true, Ordering::Relaxed);
+    for t in threads {
+        t.join().unwrap();
+    }
+    assert_exact(&db);
+}
+
+#[test]
+fn folding_an_unseeded_index_does_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open(&dir.path().join("db"));
+    db.enable_persisted_fts_stats().unwrap();
+    setup(&db, 10);
+    for i in 0..5 {
+        write(
+            &db,
+            &format!("?[id, body] <- [['u{i}', 'alpha']] :put doc {{id => body}}"),
+        );
+    }
+    assert_eq!(db.fold_fts_stats(1).unwrap(), 0);
+    assert_unseeded(&db);
+    db.seed_fts_stats().unwrap();
+    assert_eq!(
+        deltas(&db),
+        0,
+        "the seed removed the deltas its scan included"
+    );
+    assert_exact(&db);
+}
