@@ -3623,10 +3623,14 @@ fn step5_review_pins() {
         "floor not lowered"
     );
 
-    // an imperative program containing only a destructive sysop must get a
-    // write transaction (on RocksDB the read-tx bridge rejects writes)
-    db.run_default(&format!("{{::history_gc hist {cutoff}}}"))
-        .unwrap();
+    // History GC must be standalone: it cannot retain physical-version locks
+    // while a surrounding imperative transaction waits for the TT section.
+    let err = db.run_default(&format!("{{::history_gc hist {cutoff}}}"))
+        .expect_err("imperative history GC must fail");
+    assert!(format!("{err:?}").contains("eval::txtime_ddl_standalone"), "{err:?}");
+    // An allowed destructive imperative sysop still needs a write transaction
+    // (the RocksDB read-tx bridge rejects even the eviction audit writes).
+    db.run_default("{::evict hist []}").unwrap();
 
     // access levels guard the destructive ops and history reads
     db.run_default("::access_level read_only hist").unwrap();
