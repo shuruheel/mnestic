@@ -15,6 +15,19 @@ by the owner on November 13, 2026. Passes (workspace `spec-authoring` method):
 
 Pass 0 does not apply (no user interface).
 
+Creation history: first committed November 13, 2026 at 09:58:27 Eastern in
+`23cae8a4` (PR #73); review revisions merged at 11:16:14 in `3dcf8e58`
+(PR #74); owner approval merged at 11:28:19 in `d2934708` (PR #75).
+
+Implementation preflight, November 13, against engine `99a87cd8`: the approved
+scope and synchronous-maintenance decision stand. D2–D5, D7/D8 and their tests
+below clarify gaps found while preparing the combined TxTime/keyed-access PR:
+physical snapshots, detached rebuilds, old-vector availability, lock ordering,
+rollback and relation identity. These refinements have not yet been validated
+by an implementation. The owner subsequently requested one branch and PR with
+[planner keyed access](planner-keyed-access.md); this changes packaging, not the
+later-batch demand and measurement gates.
+
 ## Goal
 
 Today a relation can keep transaction-time history (`TxTime`) or have search
@@ -68,7 +81,11 @@ column), so an update that leaves indexed fields unchanged leaves the entries
 untouched, as on plain relations since 0.19.2.
 - Seam: `RelationHandle::index_key_len()` returns `keys.len() - 1` for tt-only
   relations and `keys.len()` otherwise. Index creation (`src_*` columns) and
-  every index site listed in the table use it instead of `metadata.keys.len()`.
+  every index identity site listed in the table use it. Do **not** replace
+  physical tuple-layout offsets: base rows still contain tt, and non-key field
+  positions, extractors, vector field indices and stored-row encoding still use
+  the full base schema. Audit each use as logical identity or physical layout,
+  including `runtime/hnsw/repair.rs` and bulk-build code, not just `hnsw.rs`.
 - The tt column may not appear in an index spec (indexed column, extractor
   input, vector field or filter). Error `eval::txtime_index_column`. An index
   keyed on tt would re-key on every write and is the one shape the existing
@@ -79,9 +96,14 @@ the tt at commit under the lock avoids the conflict SQL Server's begin-time
 stamping produces (error 13535); serial maintenance matches Datomic's single
 transactor. Inside
 `commit_tx_with_tt`, under `tt_commit_lock`:
-1. **Resolve.** Re-read each touched relation's handle by id (its current
-   index set); `PendingTtWrite.handle` is not trusted. Clear the RocksDB begin
-   snapshot (sound by D5: the section is the only writer of these index rows).
+1. **Resolve.** Resolve each touched relation's current handle and verify its
+   immutable id against the captured id; `PendingTtWrite.handle`'s index set is
+   not trusted. A dropped/recreated relation with the same name must not receive
+   the old transaction's writes. Rename/drop/replace and index DDL participate
+   in D5's identity protocol. Clear the RocksDB begin snapshot only after
+   acquiring the section (sound for index keys by D5); preserve the validation
+   already performed for earlier user-key locks. Do not waive ordinary
+   catalog/user-key conflict checks outside this serialized domain.
    Collect every touched logical key: buffered rows plus evicted keys (D7).
    Read `old = tt_current_row(key)` for each, before any write.
 2. **Write the base.** Apply evict deletes, then stamp and write buffered rows
@@ -91,9 +113,22 @@ transactor. Inside
    with (old, new): `update_in_index`, `replace_in_fts`,
    `update_in_hnsw_changed`, LSH delete and put. `new = None` calls only the
    delete side. Vector fetches during maintenance see this commit's rows.
+   HNSW maintenance is batched per index: seed a removal cache with **all**
+   changed/deleted old vectors before removing any, remove stale graph entries,
+   then insert changed/new vectors against the new base. Reuse the pattern in
+   `hnsw_remove_snapshot_rows` (`runtime/hnsw/repair.rs:410-451`), with logical
+   keys. Calling the single-row helper repeatedly after all base writes is
+   insufficient: a deleted neighbour is no longer fetchable, and an updated
+   neighbour's current vector is not the vector represented by the old graph.
+   Unchanged vectors/filter membership retain their graph entries.
    Full-text statistics go through `finish_fts_change`, so they reach the
-   committed cache only after the storage commit succeeds. Keys touched in
-   this phase are appended to any registered index build (D5).
+   committed cache only after the storage commit succeeds.
+4. **Commit and notify.** Commit storage while holding the section, then append
+   the touched keys to registered builds before releasing it. Failed/aborted
+   commits do not publish index statistics or successful-write notifications.
+   If a build cannot retain its notification, invalidate that build and prevent
+   its publication; never silently lose a key or report a committed write as
+   rolled back. The three data phases remain resolve, base write, maintenance.
 
 Reading old and new from storage, rather than from the buffer, makes repeated
 writes to one key, retract and re-assert, `:reconcile` and evict uniform.
@@ -107,26 +142,67 @@ during maintenance. A tt column in a result is the resolved row's tt. The
 B-tree join back is the existing `StoredWithValidity` prefix join and needs no
 change once D6 admits the index.
 
-**D5 — Index builds do not pause commits.** On a tt-only relation every
-index build (`::index`/`::fts`/`::hnsw`/`::lsh create`, `::reindex`) follows
-the pattern the vector build already uses, made exact:
-1. Under `tt_commit_lock`, register the build on the relation and record the
-   current tt as its watermark. Release the lock.
-2. Build without the lock from current beliefs read at the watermark
-   (`skip_scan_all` at end-of-time; the nine `scan_all` sites in the table).
-   Meanwhile every commit to the relation appends its touched logical keys to
-   the registration (D3 phase 3).
-3. Under `tt_commit_lock`, re-derive the index entries of exactly the
-   appended keys from their current beliefs, attach the index, deregister,
-   and commit.
+**D5 — Detached builds with a pinned snapshot and atomic publication.**
+On RocksDB, every tt-only create/rebuild uses fresh, durably reserved index ids;
+its rows are not reachable through a public index name before attachment.
+`::reindex` does **not** clear/repopulate the attached index: readers and
+committers continue using it while its replacement builds. Preserve the stored
+manifests, including LSH permutations, without reconstructing configuration.
 
-Index drop takes the lock, deregisters any build and commits. Builds hold the
-lock only for steps 1 and 3, whose cost scales with the writes made during the
-build, not with the relation. This replaces the vector build's
-whole-relation snapshot diff (`reconcile_hnsw_index`) for tt-only relations
-and makes `tt_commit_lock` the sole authority for writing an attached index's
-rows, which is what makes the snapshot clear in D3 sound. Lance's index
-coverage bitmaps and Datomic's background index merges follow the same split.
+1. **Register and pin.** Register a unique build token with the immutable base
+   relation id, requested index name/kind and expected old index ids (for a
+   rebuild). Under `tt_commit_lock`, pin a read-only storage snapshot and record
+   the clock watermark W consistently with that snapshot. Register before
+   allowing a subsequent tt commit. A scan at `MAX_VALIDITY_TS` is valid only
+   **inside that pinned snapshot**; do not record W and then scan a newer write
+   transaction at end-of-time. All base reads, including HNSW vector fetches,
+   use this same snapshot throughout backfill. Its lifetime also protects the
+   required old versions from concurrent history GC/eviction.
+2. **Build detached.** Release the section and bulk-build private index rows
+   from the snapshot's resolved current beliefs, retaining the build's old rows
+   needed to remove stale entries during catch-up. Committed writes append
+   touched logical keys to its registration. No corpus-duration relation write
+   lock or attached-index/catalog key lock may block ordinary tt commits.
+3. **Catch up and attach.** Under the section, verify the build token, immutable
+   base id, current ACL/schema, index name and expected old ids. Resolve the
+   current beliefs of its touched keys. Remove their snapshot entries (using
+   the saved old rows/vectors), then derive their current entries; handle keys
+   inserted, corrected, retracted, reasserted or evicted during backfill.
+   Atomically attach the new ids/manifests and commit. Old readers keep a
+   coherent old index/base snapshot; new readers see the attached generation.
+   Deregister only after successful publication or a terminal failure. No
+   complete-base diff or scan is allowed inside this section.
+
+A drop invalidates the corresponding build token under the section, detaches
+any attached generation and commits. Dropping/renaming/replacing the base also
+invalidates its builds, so a builder cannot resurrect an index or attach it to
+a newly created relation of the same name. Publication merges into the current
+catalog handle; it must not overwrite unrelated index changes from backfill.
+Use one RAII-owned registration through every error/cancellation path. Cleanup
+of detached/retired data is explicit, scoped to the reserved ids and safe for
+existing reader snapshots. A crash before attachment may leave unreachable
+private rows, never an attached partial index; reopening must remain usable.
+Do not run non-transactional destructive range cleanup before catalog commit.
+
+**Lock order and backend boundary.** Existing transactions may hold storage or
+relation locks before reaching `tt_commit_lock`. Establish one audited order for
+registration, DDL, eviction and commit; never wait for a lock held by a waiting
+committer while owning `tt_commit_lock`. In particular, do not acquire SQLite's
+single-writer admission (or mem's write guard) under the section. Its holder
+might be waiting to enter the section. RocksDB publication must likewise avoid
+catalog locks held by a transaction waiting for the section. Keep catalog DDL
+serialization distinct from the corpus-duration build and use cancellation-aware
+waits. The RocksDB unlocked-build and concurrent-writer acceptance gates below
+apply to RocksDB. SQLite and mem retain their existing transaction admission
+limits; this feature does not promise concurrent writers on those backends.
+
+The registration tracks keys, not a sequence of whole-row events; repeated keys
+may be deduplicated because catch-up resolves final belief. Bound registration
+memory and fail the **build** explicitly on overflow, leaving ordinary commits
+and the old attached index usable. Measure catch-up and snapshot-retention costs;
+publication can still be long if many distinct keys changed during backfill.
+This protocol makes the section the sole authority for attached-index mutations;
+an unlocked builder writes only its own detached ids.
 
 **D6 — No silent history.** A historical tt never reaches an index.
 - Planner (`query/compile.rs:298`, `:493`): for a tt-only relation, call
@@ -157,7 +233,12 @@ coverage bitmaps and Datomic's background index merges follow the same split.
 never changes an index. `::evict` on a relation with indexes records the keys
 at statement time (validation and the audit row stay there) and performs its
 base deletes in D3 phase 2, so phase 1 sees the evicted belief and phase 3 the
-outcome. A version committed by another writer between evict's statement and
+outcome. Capture the exact physical version keys selected by the statement,
+not a logical prefix to rescan at commit; otherwise a newer concurrent version
+would be erased. Apply the same deferred-delete protocol to tt-only eviction
+even if no index is attached at statement time: an index can attach before the
+eviction commits. Check the current handle under the section, and apply the
+1,000-key limit there too if an index attached after statement validation. A version committed by another writer between evict's statement and
 its commit is outside evict's view; it survives in the base, as today, and the
 index follows the base.
 - Because its index work runs inside the commit section, one `::evict` call on
@@ -176,8 +257,13 @@ index follows the base.
 and cancellation flag (the pattern of the governed relation-lock wait,
 `runtime/db.rs:900-907`), and checks both once more after acquiring the lock
 and before allocating the tt. An error in phases 1–3 fails the commit; nothing
-is committed and any allocated tt is burned, which the clock permits. Work
-inside the section is not preempted.
+is committed and any allocated tt is burned, which the clock permits. Latch
+that transaction as failed: retrying `commit` on a legacy handle must not commit
+partial base/index writes after a maintenance error or after the pending buffer
+was drained. Further statements/commit fail until abort. Work inside the section
+is not preempted; the deadline bounds waiting/cooperative checks, not a hard
+wall-clock commit duration. Successful storage commit is the durability boundary;
+post-commit bookkeeping cannot turn that success into a rollback claim.
 
 ## Invariants
 
@@ -201,7 +287,10 @@ SQLite with `tempfile::tempdir()` and RocksDB; `mem` only for parser cases.
   still returns the old one. Retract, then re-assert: entries follow.
 - One transaction inserts many new keys into an **empty** HNSW-indexed relation,
   and one updates several keys that are each other's neighbours: no error;
-  graph equals a rebuild.
+  membership equals a rebuilt index and graph integrity/reachability invariants
+  hold. Do not require byte-identical HNSW topology or identical approximate
+  top-k from independently randomized builds. Include multi-key deletion and
+  filter exclusion after the base rows have changed.
 - Same key written twice in one transaction: one entry, last write wins.
 - Update only a non-indexed field: FTS postings and HNSW rows untouched.
 - A script that writes then searches sees neither base nor index changes.
@@ -216,11 +305,21 @@ SQLite with `tempfile::tempdir()` and RocksDB; `mem` only for parser cases.
   total drop by exactly that document; 1,001 keys raise the batch limit.
 - After N corrections to one key, BM25 document count and token total equal a
   plain relation holding the current beliefs, and ranked results match it.
-- Index builds: commits during an unlocked build of each kind are reflected
-  after attach (invariant 1); commits are not blocked for the build's
-  duration (measured below).
+- Index builds (RocksDB): commits during an unlocked build of each kind are
+  reflected after attach (invariant 1); commits are not blocked for the build's
+  duration (measured below). Fence registration/snapshot creation, mid-backfill
+  and pre-attach. Exercise eviction/history GC during the pinned snapshot,
+  drop/rename/recreate of the base, index drop and competing publication,
+  failed attach, cancellation and registration overflow. The old index remains
+  usable during a detached rebuild and after every failed rebuild. Cover the
+  no-index-at-eviction-statement / index-attached-before-commit race.
+- Lock-order fixtures: a transaction admitted by SQLite/mem before a build
+  attempts the section can still commit; RocksDB metadata-lock holders cannot
+  deadlock with a section holder. Use deterministic barriers and bounded waits.
 - Index failure injected in each phase: commit fails, base and indexes
-  unchanged, later commits proceed.
+  unchanged, later commits on fresh transactions proceed. Reusing the failed
+  legacy handle cannot commit or run another statement. Failed builds leave no
+  usable partial index name, registration or stale FTS statistics.
 - A commit waiting on the section past its deadline returns `eval::timeout`
   without allocating a tt.
 - D2: tt column in each index spec kind is rejected.
@@ -239,7 +338,7 @@ Performance, on the 40,000-row benchmark shape. These are release gates:
 | Vector and full-text search p50, tt-only against plain | ≤ 1.5× |
 | Single-row update p50 and p99, tt-only against plain with the same indexes | ≤ 1.3× |
 | Longest time a tt commit waits on another commit's section, 4 concurrent single-row writers, p99 (RocksDB) | ≤ 3× the single-row update p99 |
-| Longest commit wait while `::fts create` or `::hnsw create` runs on 40,000 rows | ≤ 3× the single-row update p99 |
+| Longest commit wait while `::fts create` or `::hnsw create` runs on 40,000 rows (RocksDB) | ≤ 3× the single-row update p99 |
 | As-of lookup by secondary key, 5 versions per key, base-scan fallback | reported; input to open question 1 |
 
 ## Residual risks
@@ -302,7 +401,8 @@ history-preserving recovery and reversible enablement remain open.
 ## Batches (review units)
 
 1. **Current-belief search indexes**: full-text, vector and LSH (D1–D5, D7,
-   D8; D6 search-atom and `:as_of` errors). The unblock. Ships alone.
+   D8; D6 search-atom and `:as_of` errors). The first implementation unit;
+   packaged with keyed access in the combined PR requested November 13.
 2. **As-of vector search by bounded exact scan** (D6).
 3. **B-tree secondary indexes** (D1, D2 for `::index`; D6 planner change,
    bounded as-of base scan and `query::as_of_scan_limit`). Gate: measure the
