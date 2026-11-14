@@ -2379,7 +2379,7 @@ fn txtime_remove_relation_with_pending_writes_rejected() {
         .run_default("{?[k, v] <- [[9, 9]] :put zomb {k => v}} {::remove zomb}")
         .expect_err("::remove with pending tt writes must fail");
     assert!(
-        format!("{err:?}").contains("pending transaction-time writes"),
+        format!("{err:?}").contains("eval::txtime_ddl_standalone"),
         "{err:?}"
     );
 }

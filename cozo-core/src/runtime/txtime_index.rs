@@ -13,6 +13,8 @@ use thiserror::Error;
 
 use crate::data::expr::{eval_bytecode, eval_bytecode_pred};
 use crate::data::tuple::{Tuple, TupleT};
+use crate::data::value::DataValue;
+use crate::runtime::minhash_lsh::HashValues;
 use crate::runtime::relation::RelationHandle;
 use crate::runtime::transact::SessionTx;
 
@@ -219,9 +221,22 @@ impl SessionTx<'_> {
                 for (name, (index, inverse, manifest)) in &handle.lsh_indices {
                     let (tokenizer, extractor) = processors.get(name).unwrap();
                     if let (Some(old), Some(new)) = (old, new) {
-                        if eval_bytecode(extractor, old, &mut stack)?
-                            == eval_bytecode(extractor, new, &mut stack)?
-                        {
+                        let old_value = eval_bytecode(extractor, old, &mut stack)?;
+                        let new_value = eval_bytecode(extractor, new, &mut stack)?;
+                        // List element equality need not match hashing (JSON
+                        // signed zero is one example). Compare actual derived
+                        // signatures for lists; strings/null have exact identity.
+                        let unchanged = match (&old_value, &new_value) {
+                            (DataValue::Null, DataValue::Null) => true,
+                            (DataValue::Str(a), DataValue::Str(b)) => a == b,
+                            (DataValue::List(a), DataValue::List(b)) => {
+                                let perms = hashes.get(name).unwrap();
+                                HashValues::new(a.iter(), perms).0
+                                    == HashValues::new(b.iter(), perms).0
+                            }
+                            _ => false,
+                        };
+                        if unchanged {
                             continue;
                         }
                     }

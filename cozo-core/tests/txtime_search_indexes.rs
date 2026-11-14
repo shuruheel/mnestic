@@ -366,6 +366,7 @@ fn reconcile_and_duplicate_writes_keep_only_current_documents() {
 #[test]
 fn backup_restore_and_reopen_preserve_current_search_and_future_updates() {
     let dir = tempfile::tempdir().unwrap();
+    #[allow(unused_mut)]
     let mut engines = vec!["sqlite"];
     #[cfg(feature = "storage-rocksdb")]
     engines.push("rocksdb");
@@ -445,5 +446,55 @@ fn rename_moves_attached_search_catalogs_and_embedded_handles() {
         run(db, "::remove renamed");
         create_doc(db);
         create_indexes(db);
+    });
+}
+
+#[test]
+fn lsh_list_extractor_uses_hash_identity_for_json_signed_zero() {
+    engines(|db| {
+        run(db, ":create doc {id:String,tt:TxTime => payload:Json}");
+        run(db, ":create plain {id:String => payload:Json}");
+        for relation in ["doc", "plain"] {
+            run(db, &format!("::lsh create {relation}:similar {{extractor:[payload],tokenizer:Simple,n_perm:64,target_threshold:0.5,n_gram:1}}"));
+        }
+        run(
+            db,
+            "?[id,payload] <- [['a',parse_json('-0.0')]] :put doc{id=>payload}",
+        );
+        assert_eq!(
+            rows(
+                db,
+                "?[id] := ~doc:similar{id | query:[parse_json('-0.0')],k:10}"
+            ),
+            json!([["a"]])
+        );
+        for relation in ["doc", "plain"] {
+            run(
+                db,
+                &format!(
+                    "?[id,payload] <- [['a',parse_json('0.0')]] :put {relation}{{id=>payload}}"
+                ),
+            );
+        }
+        let expected = rows(
+            db,
+            "?[id] := ~plain:similar{id | query:[parse_json('0.0')],k:10}",
+        );
+        assert_eq!(expected, json!([["a"]]));
+        assert_eq!(
+            rows(
+                db,
+                "?[id] := ~doc:similar{id | query:[parse_json('0.0')],k:10}"
+            ),
+            expected
+        );
+        run(db, "::reindex doc");
+        assert_eq!(
+            rows(
+                db,
+                "?[id] := ~doc:similar{id | query:[parse_json('0.0')],k:10}"
+            ),
+            expected
+        );
     });
 }
