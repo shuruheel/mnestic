@@ -50,6 +50,91 @@ pub(crate) fn is_plain(store: &RelationHandle) -> bool {
         .any(|c| matches!(c.typing.coltype, ColType::Validity | ColType::TxTime))
 }
 
+/// Vector/JSON equality is not guaranteed to agree with byte-key identity.
+/// Any can contain those values. Keep existing seeks, but do not introduce
+/// new seek-based equality for these types (including nested containers).
+pub(crate) fn exact_key_type(ty: &ColType) -> bool {
+    match ty {
+        ColType::Bool
+        | ColType::Int
+        | ColType::Float
+        | ColType::String
+        | ColType::Bytes
+        | ColType::Uuid => true,
+        ColType::List { eltype, .. } => exact_key_type(&eltype.coltype),
+        ColType::Tuple(types) => types.iter().all(|t| exact_key_type(&t.coltype)),
+        _ => false,
+    }
+}
+
+fn exact_key_value(value: &DataValue) -> bool {
+    match value {
+        DataValue::Null
+        | DataValue::Bool(_)
+        | DataValue::Num(_)
+        | DataValue::Str(_)
+        | DataValue::Bytes(_)
+        | DataValue::Uuid(_) => true,
+        DataValue::List(values) => values.iter().all(exact_key_value),
+        _ => false,
+    }
+}
+
+pub(crate) fn stored_access(
+    store: &RelationHandle,
+    positions: &[usize],
+    filters: &[Expr],
+    enabled: bool,
+) -> StoredAccess {
+    classify(
+        positions,
+        store.metadata.keys.len(),
+        enabled
+            && is_plain(store)
+            && store
+                .metadata
+                .keys
+                .iter()
+                .all(|c| exact_key_type(&c.typing.coltype))
+            && filters.iter().all(total_predicate),
+    )
+}
+
+fn total_predicate(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Const {
+            val: DataValue::Bool(_),
+            ..
+        }
+    ) || matches!(expr, Expr::Apply { op, args, .. } if op.name == "OP_EQ" && args.iter().all(|a| matches!(a, Expr::Const { .. } | Expr::Binding { .. })))
+}
+
+fn safe_residual(atom: &MagicAtom) -> bool {
+    match atom {
+        MagicAtom::Predicate(expr) => total_predicate(expr),
+        MagicAtom::Unification(u) => {
+            if matches!(&u.expr, Expr::Binding { .. } | Expr::Const { .. }) {
+                return true;
+            }
+            if !deterministic(&u.expr) || !u.expr.bindings().is_ok_and(|b| b.is_empty()) {
+                return false;
+            }
+            let mut copy = u.expr.clone();
+            copy.partial_eval().is_ok() && matches!(copy, Expr::Const { .. })
+        }
+        _ => true,
+    }
+}
+
+fn expression(atom: &MagicAtom) -> Option<&Expr> {
+    match atom {
+        MagicAtom::Predicate(expr) => Some(expr),
+        MagicAtom::Unification(u) => Some(&u.expr),
+        _ => None,
+    }
+}
+
 struct Access {
     id: u64,
     prefix: usize,
@@ -89,13 +174,14 @@ fn access(store: &RelationHandle, args: &[Symbol], bound: &BTreeSet<Symbol>) -> 
     Access {
         id: physical.id.0,
         prefix,
-        seek: prefix > 0 && classify(&positions, key_len, true) != StoredAccess::Materialized,
+        seek: prefix > 0
+            && stored_access(&physical, &positions, &[], true) != StoredAccess::Materialized,
         full_primary: physical.id == store.id && prefix == key_len,
         base_fetch,
     }
 }
 
-fn deterministic(expr: &Expr) -> bool {
+pub(crate) fn deterministic(expr: &Expr) -> bool {
     match expr {
         Expr::Const { .. } | Expr::Binding { .. } => true,
         Expr::Apply { op, args, .. } => op.deterministic && args.iter().all(deterministic),
@@ -113,7 +199,12 @@ pub(crate) fn local_bindings(
     index: usize,
     bound: &BTreeSet<Symbol>,
 ) -> Vec<(Symbol, Expr)> {
-    if !is_plain(store) {
+    if !is_plain(store)
+        || body
+            .iter()
+            .filter_map(expression)
+            .any(|e| !deterministic(e))
+    {
         return vec![];
     }
     let types: Vec<_> = store
@@ -147,7 +238,8 @@ pub(crate) fn local_bindings(
         let mut expr = expr.clone();
         if let Expr::Binding { var: source, .. } = &expr {
             if !bound.contains(source)
-                || matches!(types[pos], ColType::Any | ColType::Int | ColType::Float)
+                || !exact_key_type(types[pos])
+                || matches!(types[pos], ColType::Int | ColType::Float)
             {
                 return;
             }
@@ -161,6 +253,9 @@ pub(crate) fn local_bindings(
             let Expr::Const { val, .. } = &expr else {
                 return;
             };
+            if !exact_key_value(val) {
+                return;
+            }
             if let DataValue::Num(n) = val {
                 if !matches!(
                     (n, types[pos]),
@@ -200,6 +295,11 @@ pub(crate) fn local_bindings(
         }
     }
     if candidates.is_empty() {
+        return vec![];
+    }
+    // Changing a scan into a seek can skip evaluations on nonmatching rows,
+    // even for a residual that does not mention the newly bound key.
+    if !body[index + 1..].iter().all(safe_residual) {
         return vec![];
     }
     let before = access(store, args, bound);

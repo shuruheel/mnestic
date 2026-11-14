@@ -312,3 +312,70 @@ fn a_partial_primary_prefix_cannot_displace_a_secondary_seek() {
         assert!(ops(&p).contains(&"stored_point_join"));
     });
 }
+
+#[test]
+fn volatile_filters_keep_their_baseline_evaluation_location() {
+    engines(|db| {
+        run(db, ":create s {k:String => name:String}");
+        run(db, "::index create s:by_name {name}");
+        run(db, "?[k,name] <- [['x','a'],['y','a']] :put s{k=>name}");
+        let q = "?[k] := *s{k,name}, name=rand_choose(['a','b']), name='a'";
+        assert_eq!(plan(db, q, false), plan(db, q, true));
+        run(db, ":create n {id:String => a:String,b:String}");
+        run(db, "?[id,a,b] <- [['x','gap','yes']] :put n{id=>a,b}");
+        let q = "?[count(id)] := z in [1,1], id='x', b='yes', *n{id,a,b}, a=rand_choose(['gap','other']) :reorder written";
+        assert_eq!(plan(db, q, false), plan(db, q, true));
+    });
+}
+
+#[test]
+fn vector_equality_is_not_replaced_by_bitwise_key_identity() {
+    engines(|db| {
+        run(db, ":create v {k:<F32;1> => a:String,label:String}");
+        run(
+            db,
+            "?[k,a,label] <- [[vec([-0.0]),'gap','hit']] :put v{k=>a,label}",
+        );
+        let q = "?[label] := *v{k,label}, k=vec([0.0])";
+        equivalent(db, q, json!([["hit"]]));
+        assert_eq!(plan(db, q, false), plan(db, q, true));
+        let q = "?[label] := k=vec([0.0]), label='hit', *v{k,a,label} :reorder written";
+        equivalent(db, q, json!([["hit"]]));
+        assert_eq!(plan(db, q, false), plan(db, q, true));
+    });
+}
+
+#[test]
+fn new_bindings_do_not_evaluate_fallible_filters_before_an_empty_lookup() {
+    engines(|db| {
+        run(db, ":create empty {k:String}");
+        let q = "?[k] := *empty{k}, k='a', assert(k=='b')";
+        equivalent(db, q, json!([]));
+        assert_eq!(plan(db, q, false), plan(db, q, true));
+    });
+}
+
+#[test]
+fn fallible_right_filters_are_not_skipped_on_nonmatching_rows() {
+    engines(|db| {
+        run(db, ":create n {id:String => a:String,b:String}");
+        run(
+            db,
+            "?[id,a,b] <- [['x','1','yes'],['z','invalid','no']] :put n{id=>a,b}",
+        );
+        for q in [
+            "?[id] := id='x', b='yes', *n{id,a,b}, assert(to_int(a)>0) :reorder written",
+            "?[id] := *n{id,a,b}, id='x', assert(to_int(a)>0) :reorder written",
+        ] {
+            for enabled in [false, true] {
+                db.set_keyed_access_for_tests(enabled);
+                assert!(
+                    db.run_script(q, BTreeMap::new(), ScriptMutability::Immutable)
+                        .is_err(),
+                    "{enabled}: {q}"
+                );
+            }
+            assert_eq!(plan(db, q, false), plan(db, q, true));
+        }
+    });
+}
