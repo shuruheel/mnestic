@@ -59,13 +59,19 @@ release/issue descriptions retain their September 6 reconciliation date.
   search that falls back to an exact scan (100 ms against 45 ms at 40,000 rows; a
   partial index is 8.9 ms).
 
+- `mnestic` 0.19.3 (November 14, 2026) ships selected items 2 and 3: governed
+  transactions from Python, and persisted BM25 corpus totals on RocksDB (opt-in;
+  full-text searches no longer rescan the index after opening or while writes
+  commit). `mnestic-rocks` moves to 0.1.13. Numbers are in the
+  [0.19.3 changelog](CHANGELOG-FORK.md).
+
 ### Selected next — owner decision, November 13, 2026
 
 | Order | Work | Current state and scope |
 |---:|---|---|
 | 1 | Search indexes on transaction-time relations | `::fts`, `::hnsw`, `::lsh` and `::index create` are rejected on `TxTime` relations ([bitemporality spec](docs/specs/bitemporality.md), deferred in v1), so history and search cannot be combined. Scope: legalize them, stamp index entries with the base row's commit time, and let `:as_of` searches return what was live at that time. Approved spec (November 13, 2026): [search and secondary indexes on transaction-time relations](docs/specs/txtime-search-indexes.md) |
-| 2 | Governed transactions from Python | `db.governed_transaction(write, options)` (deadline, idle wait, statement limits, abort on error) is Rust-only since 0.19.0; Python's `multi_transact` uses the ungoverned path. Scope: expose the governed client and its options in `cozo-lib-python`, with `MnesticError` kinds for deadline and limit aborts. Approved spec (November 13, 2026): [governed transactions from Python](docs/specs/python-governed-transactions.md) |
-| 3 | Persisted FTS corpus statistics (reopened November 13, 2026) | BM25 totals live only in memory. A search rebuilds them with a scan of every posting after the database opens and whenever its snapshot overlaps a write, so searches slow down in proportion to index size while writes continue. Measured on RocksDB at 40,000 documents: 122 ms warm, 592 ms first after reopen, 1,168 ms p50 while a writer commits; an emulated totals read costs about 2 ms and adds about 1% to a write. Scope: a base record plus one delta record per writing transaction, folded and seeded off the request path, trusted at open only if nothing else has written to the store since a clean close; RocksDB only; no storage-version change. Spec drafted, not yet approved; it needs one `mnestic-rocks` bridge function. |
+| 2 | Governed transactions from Python (shipped in 0.19.3) | `db.governed_transaction(write, options)` (deadline, idle wait, statement limits, abort on error) is Rust-only since 0.19.0; Python's `multi_transact` uses the ungoverned path. Scope: expose the governed client and its options in `cozo-lib-python`, with `MnesticError` kinds for deadline and limit aborts. Approved spec (November 13, 2026): [governed transactions from Python](docs/specs/python-governed-transactions.md) |
+| 3 | Persisted FTS corpus statistics (reopened November 13, 2026; shipped in 0.19.3) | BM25 totals live only in memory. A search rebuilds them with a scan of every posting after the database opens and whenever its snapshot overlaps a write, so searches slow down in proportion to index size while writes continue. Measured on RocksDB at 40,000 documents: 122 ms warm, 592 ms first after reopen, 1,168 ms p50 while a writer commits; an emulated totals read costs about 2 ms and adds about 1% to a write. Scope: a base record plus one delta record per writing transaction, folded and seeded off the request path, trusted at open only if nothing else has written to the store since a clean close; RocksDB only; no storage-version change. Spec drafted, not yet approved; it needs one `mnestic-rocks` bridge function. |
 
 Considered and not selected on November 13, 2026:
 
