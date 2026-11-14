@@ -106,3 +106,22 @@ its original allowance of one complete repeat of a contaminated cell within
 the six-hour budget; phase 3 permits no repeat. If host admission fails, record
 that outcome and retain the prepared work; do not start qualification on a
 smaller fixture or a contaminated host.
+
+## Prospective compiler-compatibility amendment
+
+The first phase-3 attempt (`keyed-txtime-phase3-20261114-v1/controls`) was
+interrupted during its first host preflight, before any benchmark process or
+measured block. Hosted Rust 1.100 Clippy rejected a tail `miette::bail!` macro;
+commit `be394ba4` replaces it with the equivalent explicit error return. Preserve
+the original freeze, preflight observations and operator termination record.
+
+Independent review permits one source-driven replacement, identified as
+`keyed-txtime-phase3-20261114-v2/controls`, with freshly built/exported binaries,
+runtime smokes, reviewed hashes and a new manifest. This remains phase 3 with
+all sampling, estimator, threshold, host and budget rules unchanged. No earlier
+observations count toward acceptance. This exception does not authorize a retry
+after host admission fails or after any measured block fails or is inconclusive.
+Reserve 120 seconds of the original two-hour campaign budget for the interrupted
+attempt (113.329 seconds from output-directory creation through the termination
+record). The replacement has at most 7,080 seconds for its preflights, execution,
+compression and analysis; record both elapsed and combined accounted time.

@@ -19,7 +19,10 @@ from analyze_timing_diagnostics import quantile
 BLOCKS = 10
 PAIRS = 100
 DRAWS = 10000
-BUDGET = 7200
+# The source-driven replacement retains the original two-hour campaign cap.
+# Reserve 120s for the interrupted first attempt (113.329s through its stop record).
+PRIOR_ATTEMPT_SECONDS = 120
+BUDGET = 7200 - PRIOR_ATTEMPT_SECONDS
 
 
 def save(path, value):
@@ -198,7 +201,8 @@ def run(candidate, baseline, output, review_manifest):
                   order=[dict(block=b,cell=c['name']) for b in range(BLOCKS) for c in cells],
                   script_sha256={str(p.resolve()):file_hash(p) for p in scripts},
                   protocol=str(protocol),protocol_sha256=file_hash(protocol),environment=environment,
-                  blocks=BLOCKS,pairs_per_block=PAIRS,draws=DRAWS,total_budget_seconds=BUDGET,
+                  blocks=BLOCKS,pairs_per_block=PAIRS,draws=DRAWS,total_budget_seconds=7200,
+                  prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,remaining_budget_seconds=BUDGET,
                   host=dict(idle_seconds=30,max_preflight_seconds=300,other_cpu_percent=25),
                   cell_seconds=180,rss_mib=4096,min_free_mib=2048)
     save(output/'campaign-manifest.json',frozen)
@@ -263,7 +267,9 @@ def run(candidate, baseline, output, review_manifest):
     passed = (stop is None and elapsed <= BUDGET and unchanged and completed == 180 and len(aggregate) == 18
               and all(r['freeze_control_passed'] for r in aggregate.values()))
     result = dict(version=1,phase=3,status='complete' if completed == 180 and len(aggregate) == 18 and not stop else 'incomplete',
-                  elapsed_s=elapsed,stop_reason=stop,completed_blocks=completed,required_blocks=180,
+                  elapsed_s=elapsed,prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,
+                  accounted_elapsed_s=elapsed+PRIOR_ATTEMPT_SECONDS,
+                  stop_reason=stop,completed_blocks=completed,required_blocks=180,
                   scripts_and_protocol_unchanged=unchanged,all_recording_controls_passed=passed,
                   performance_qualified=False,campaign_manifest_sha256=file_hash(output/'campaign-manifest.json'))
     save(output/'campaign-completion.json',result)
