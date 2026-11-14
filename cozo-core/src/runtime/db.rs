@@ -3830,6 +3830,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         // the query is reported successful or any transaction can commit.
         let governed_poison = tx.script_cancellation.as_ref().map(|_| poison.clone());
 
+        // Compilation is complete; include evaluation and full output materialization.
+        #[cfg(feature = "test-hooks")]
+        let execution_span = crate::measurement::Span::new("query_execution");
         // the real evaluation
         let (result_store, early_return) = tx.stratified_magic_evaluate(
             &compiled,
@@ -3997,6 +4000,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         if let Some(poison) = governed_poison {
             poison.check()?;
         }
+        #[cfg(feature = "test-hooks")]
+        if result.is_ok() { execution_span.finish(); }
         result
     }
     pub(crate) fn list_running(&self) -> Result<NamedRows> {

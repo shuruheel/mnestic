@@ -107,9 +107,11 @@ The PR stays draft until the following acceptance work is complete:
   unchanged thresholds. No gate is relaxed by the passing correctness tests.
 - The [measurement protocol](../plans/keyed-txtime-measurement-protocol.md)
   has passed [independent design review](keyed-txtime-measurement-protocol.md).
-  Implement and review its measurement harness, then freeze executable
-  and input hashes before the costly comparison. The protocol pins source
-  comparisons, resource limits and unchanged gates; no measurements are claimed.
+  The [timing harness](keyed-txtime-timing-harness.md) is implemented and
+  independently reviewed, with development runs and retained failures. Resolve
+  the observed FTS build-progress timeout, missing C2 overlap coverage and
+  contention measurement noise, then freeze the qualifying executable/input
+  manifest before the costly comparison. No qualifying performance is claimed.
   Run without competing engine/native workloads on this 8 GB host. Do not treat
   the deterministic concurrency fixtures as latency evidence.
 - Integrate newer main changes and requalify the resulting candidate before

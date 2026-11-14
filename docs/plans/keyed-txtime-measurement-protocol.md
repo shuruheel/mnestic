@@ -1,7 +1,7 @@
 # Keyed access and TxTime search: measurement protocol
 
 Prepared November 14, 2026 for draft PR #81. Status: independently reviewed design;
-**not yet runnable or performance-qualified**. See the
+**qualifying execution is not yet enabled or performance-qualified**. See the
 [review record](../reviews/keyed-txtime-measurement-protocol.md). The harness,
 input artifacts and executable hashes must be frozen before qualifying runs.
 
@@ -331,5 +331,6 @@ Required next deliverables, in order:
 5. Requalify after any newer-main integration, update PR #81 with measured limits,
    and remove draft status only if all required gates and final CI pass.
 
-This document supplies the experimental design. It does not claim that the
-harness exists, that measurements have run, or that PR #81 is ready to merge.
+This document supplies the experimental design. The
+[development harness and its validation](../reviews/keyed-txtime-timing-harness.md)
+are now available. Qualifying measurements have not run, and PR #81 remains draft.

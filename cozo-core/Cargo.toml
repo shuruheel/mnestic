@@ -246,3 +246,8 @@ harness = false
 name = "graph_projection"
 harness = false
 required-features = ["graph-algo"]
+
+# Internal timing runner; never available in a production feature build.
+[[example]]
+name = "keyed_txtime_timing"
+required-features = ["test-hooks"]

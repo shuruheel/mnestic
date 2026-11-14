@@ -39,6 +39,17 @@ provenance and licensing.
   qualification remains pending; see
   [implementation evidence](docs/reviews/keyed-txtime-implementation.md).
 
+### Added — internal keyed/TxTime timing harness
+
+- `test-hooks` instrumentation records compile-excluded execution, commits,
+  direct TxTime section waits/holds and detached index-build phases. A bounded
+  thread-local trace preserves errors and reports overflow.
+- A development-only runner validates a batched T2 comparator, concurrent
+  writers, build phase coverage and recording overhead. Source/binary manifests,
+  resource logs and fail-closed reports support later qualification; no release
+  performance acceptance is claimed. See
+  [harness evidence](docs/reviews/keyed-txtime-timing-harness.md).
+
 ### Added — persisted BM25 corpus totals (opt-in, RocksDB)
 
 - A full-text search needs each index's document and token totals. They lived

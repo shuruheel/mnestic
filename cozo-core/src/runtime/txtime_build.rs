@@ -7,7 +7,9 @@
 
 //! Detached current-belief search-index generations and atomic publication.
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::{Mutex, TryLockError};
+#[cfg(not(feature = "test-hooks"))]
+use std::sync::MutexGuard;
 use std::time::{Duration, Instant};
 
 use miette::{ensure, Result};
@@ -21,17 +23,29 @@ use crate::runtime::txtime_index::{BuildRegistration, TouchedRelation};
 use crate::storage::Storage;
 use crate::{DataValue, NamedRows};
 
-pub(crate) fn section<'a>(lock: &'a Mutex<()>, poison: &Poison) -> Result<MutexGuard<'a, ()>> {
+#[cfg(feature = "test-hooks")]
+type SectionGuard<'a> = crate::measurement::SectionGuard<'a>;
+#[cfg(not(feature = "test-hooks"))]
+type SectionGuard<'a> = MutexGuard<'a, ()>;
+
+pub(crate) fn section<'a>(lock: &'a Mutex<()>, poison: &Poison) -> Result<SectionGuard<'a>> {
+    #[cfg(feature = "test-hooks")]
+    let wait = crate::measurement::Span::new("tt_ddl_section");
     loop {
         poison.check()?;
         match lock.try_lock() {
             Ok(guard) => {
+                #[cfg(feature = "test-hooks")]
+                let guard = wait.acquired(guard);
                 poison.check()?;
                 return Ok(guard);
             }
             Err(TryLockError::Poisoned(error)) => {
+                let guard = error.into_inner();
+                #[cfg(feature = "test-hooks")]
+                let guard = wait.acquired(guard);
                 poison.check()?;
-                return Ok(error.into_inner());
+                return Ok(guard);
             }
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
         }
@@ -281,12 +295,24 @@ impl<'s, S: Storage<'s>> Db<S> {
             let mut tx = self.transact_write()?;
             let current = tx.get_relation(name, true)?;
             let _section = section(&self.tt_commit_lock, &poison)?;
+            #[cfg(feature = "test-hooks")]
+            let registration_span = crate::measurement::Span::new("build_registration");
             let build = tx.prepare_tt_indexes(&current, op)?;
+            #[cfg(feature = "test-hooks")]
+            registration_span.finish();
+            #[cfg(feature = "test-hooks")]
+            let backfill_span = crate::measurement::Span::new("build_backfill");
             let rows = current.scan_current(&tx).collect::<Result<Vec<_>>>()?;
             tx.populate_tt_indexes(&build, &rows, &poison)?;
+            #[cfg(feature = "test-hooks")]
+            backfill_span.finish();
+            #[cfg(feature = "test-hooks")]
+            let publication_span = crate::measurement::Span::new("build_publication");
             tx.publish_tt_indexes(current.clone(), &build)?;
             poison.check()?;
             self.commit_tx_with_test_hook(&mut tx)?;
+            #[cfg(feature = "test-hooks")]
+            publication_span.finish();
             let result = result_rows(op, &build, rows.len());
             drop(tx);
             drop(_section);
@@ -311,6 +337,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         let mut publication_attempted = false;
         let outcome = (|| {
             // Pin the actual read snapshot and registration in one commit gap.
+            #[cfg(feature = "test-hooks")]
+            let registration_span = crate::measurement::Span::new("build_registration");
             let (snapshot, registration) = {
                 let _section = section(&self.tt_commit_lock, &poison)?;
                 let snapshot = self.transact()?;
@@ -325,7 +353,11 @@ impl<'s, S: Storage<'s>> Db<S> {
                 (snapshot, registration)
             };
             #[cfg(feature = "test-hooks")]
+            registration_span.finish();
+            #[cfg(feature = "test-hooks")]
             self.run_tt_index_build_fence("registered");
+            #[cfg(feature = "test-hooks")]
+            let backfill_span = crate::measurement::Span::new("build_backfill");
             let rows = original
                 .scan_current(&snapshot)
                 .collect::<Result<Vec<_>>>()?;
@@ -335,10 +367,14 @@ impl<'s, S: Storage<'s>> Db<S> {
                 tx.populate_tt_indexes(&build, &rows, &poison)?;
                 self.commit_tx_with_test_hook(&mut tx)?;
             }
+            #[cfg(feature = "test-hooks")]
+            backfill_span.finish();
             drop(rows);
             #[cfg(feature = "test-hooks")]
             self.run_tt_index_build_fence("populated");
             {
+                #[cfg(feature = "test-hooks")]
+                let publication_span = crate::measurement::Span::new("build_publication");
                 let _relation = relation_write(&locks[0], &poison)?;
                 let mut tx = self.transact_write()?;
                 // Catalog lock before the commit section, never while owning it.
@@ -358,6 +394,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                 }
                 let _section = section(&self.tt_commit_lock, &poison)?;
                 validate(&original, &current, &build)?;
+                #[cfg(feature = "test-hooks")]
+                let catchup_span = crate::measurement::Span::new("build_catchup");
                 let mut old = BTreeMap::new();
                 for key in registration.keys()? {
                     let prior = original.get_current(&snapshot, &key)?;
@@ -373,10 +411,14 @@ impl<'s, S: Storage<'s>> Db<S> {
                     },
                 )]);
                 tx.maintain_tt_indexes(&changes)?;
+                #[cfg(feature = "test-hooks")]
+                catchup_span.finish();
                 tx.publish_tt_indexes(current, &build)?;
                 poison.check()?;
                 publication_attempted = true;
                 self.commit_tx_with_test_hook(&mut tx)?;
+                #[cfg(feature = "test-hooks")]
+                publication_span.finish();
             }
             drop(registration);
             Ok(result_rows(op, &build, count))

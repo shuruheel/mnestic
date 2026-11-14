@@ -151,6 +151,8 @@ pub use fts::{FTS_BASE_ROW_FETCHES, FTS_DOC_STATS_SCANS, FTS_LITERAL_SCANS};
 pub mod parse;
 pub(crate) mod query;
 pub(crate) mod runtime;
+#[cfg(feature = "test-hooks")]
+pub mod measurement;
 pub(crate) mod storage;
 pub(crate) mod utils;
 

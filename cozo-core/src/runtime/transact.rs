@@ -303,6 +303,8 @@ impl<'a> SessionTx<'a> {
     /// can escape the protocol. Taking the dirty set here also disarms
     /// [`Drop`], whose bump exists for transactions that never reach a commit.
     pub fn commit_tx(&mut self) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        let commit_span = crate::measurement::Span::new("commit");
         self.ensure_tt_usable()?;
         if self.hnsw_mutations_incomplete != 0 {
             bail!("cannot commit after an incomplete HNSW mutation; abort the transaction");
@@ -316,6 +318,8 @@ impl<'a> SessionTx<'a> {
             if result.is_ok() {
                 self.fts_stats.committed();
             }
+            #[cfg(feature = "test-hooks")]
+            if result.is_ok() { commit_span.finish(); }
             return result;
         }
         self.projections.begin_commit(&self.dirty_relations);
@@ -329,6 +333,8 @@ impl<'a> SessionTx<'a> {
         if res.is_ok() {
             self.fts_stats.committed();
         }
+        #[cfg(feature = "test-hooks")]
+        if res.is_ok() { commit_span.finish(); }
         res
     }
 
@@ -401,6 +407,8 @@ impl<'a> SessionTx<'a> {
             ..Default::default()
         };
         let result = (|| {
+            #[cfg(feature = "test-hooks")]
+            let wait = crate::measurement::Span::new("tt_commit_section");
             let _guard = loop {
                 poison.check()?;
                 match lock.try_lock() {
@@ -409,6 +417,8 @@ impl<'a> SessionTx<'a> {
                     Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(2)),
                 }
             };
+            #[cfg(feature = "test-hooks")]
+            let _guard = wait.acquired(_guard);
             poison.check()?;
             let tt = self.tt_clock.advance();
             // Clear RocksDB's begin validation snapshot only inside the sole
