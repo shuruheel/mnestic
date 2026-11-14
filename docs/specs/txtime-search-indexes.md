@@ -79,7 +79,9 @@ logical key whose latest record is an assertion, the index holds exactly the
 entries a plain relation would hold for that row; superseded and retracted
 versions have none. Index rows carry the logical key (base key without the tt
 column), so an update that leaves indexed fields unchanged leaves the entries
-untouched, as on plain relations since 0.19.2.
+untouched, as on plain relations since 0.19.2. For LSH list extractors,
+unchanged means equal derived signatures under the persisted permutations;
+ordinary value equality is insufficient (JSON signed zero hashes differently).
 - Seam: `RelationHandle::index_key_len()` returns `keys.len() - 1` for tt-only
   relations and `keys.len()` otherwise. Index creation (`src_*` columns) and
   every index identity site listed in the table use it. Do **not** replace
@@ -106,9 +108,11 @@ transactor. Inside
    already performed for earlier user-key locks. Do not waive ordinary
    catalog/user-key conflict checks outside this serialized domain.
    Collect every touched logical key: buffered rows plus evicted keys (D7).
-   Read `old = tt_current_row(key)` for each, before any write.
+   Read `old = tt_current_row(key)` for each, before any base/index write.
+   The externally serialized high-water-mark write also clears the RocksDB
+   validation snapshot and therefore precedes those current-row reads.
 2. **Write the base.** Apply evict deletes, then stamp and write buffered rows
-   (unchanged code), then the high-water mark.
+   (unchanged code); the high-water mark was written in phase 1.
 3. **Maintain.** For each touched key read `new = tt_current_row(key)`, which
    now sees this commit's writes; where `old ≠ new`, call the existing helpers
    with (old, new): `update_in_index`, `replace_in_fts`,
@@ -123,7 +127,9 @@ transactor. Inside
    neighbour's current vector is not the vector represented by the old graph.
    Unchanged vectors/filter membership retain their graph entries.
    Full-text statistics go through `finish_fts_change`, so they reach the
-   committed cache only after the storage commit succeeds.
+   committed cache only after the storage commit succeeds. When persisted
+   FTS totals are enabled, flush their transaction-local deltas after the final
+   posting change and before the same storage commit.
 4. **Commit and notify.** Commit storage while holding the section, then append
    the touched keys to registered builds before releasing it. Failed/aborted
    commits do not publish index statistics or successful-write notifications.
@@ -180,7 +186,10 @@ manifests, including LSH permutations, without reconstructing configuration.
 A drop invalidates the corresponding build token under the section, detaches
 any attached generation and commits. Dropping/renaming/replacing the base also
 invalidates its builds, so a builder cannot resurrect an index or attach it to
-a newly created relation of the same name. Publication merges into the current
+a newly created relation of the same name. Renaming an attached generation
+moves its public and embedded index names and manifests atomically, including
+LSH inverse handles. Corrupt-base repair also invalidates pending builds under
+the section. Publication merges into the current
 catalog handle; it must not overwrite unrelated index changes from backfill.
 Use one RAII-owned registration through every error/cancellation path. Cleanup
 of detached/retired data is explicit, scoped to the reserved ids and safe for
@@ -194,7 +203,8 @@ registration, DDL, eviction and commit; never wait for a lock held by a waiting
 committer while owning `tt_commit_lock`. In particular, do not acquire SQLite's
 single-writer admission (or mem's write guard) under the section. Its holder
 might be waiting to enter the section. RocksDB publication must likewise avoid
-catalog locks held by a transaction waiting for the section. Keep catalog DDL
+catalog locks held by a transaction waiting for the section: lock every base
+and public index catalog key before entering the section. Keep catalog DDL
 serialization distinct from the corpus-duration build and use cancellation-aware
 waits. The RocksDB unlocked-build and concurrent-writer acceptance gates below
 apply to RocksDB. SQLite and mem retain their existing transaction admission

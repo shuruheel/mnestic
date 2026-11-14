@@ -33,6 +33,11 @@ standalone commands. Repair requires attached search indexes to be dropped first
 - `a385cde9`: initial current-belief index implementation.
 - `63a3e59f`: storage review fixes and lifecycle regression coverage.
 - `eed47efc`: LSH signature identity and JSON signed-zero regression.
+- `0480d352`: integrate main `595fdaa6`, including opt-in persisted FTS totals;
+  a bounded integration review found no additional blockers.
+- `a76910b26d6391148ccee4b00a7e48bcc61600fd`: final tested source (the
+  final commit updates a legacy maintenance fixture; runtime source is unchanged
+  from `0480d352`).
 
 Independent bounded read-only reviews completed for both subsystems. All
 reported findings were addressed on source verification. The reviews did not
@@ -55,8 +60,9 @@ This is local source-test evidence, not a published package test.
 |---|---:|---|
 | `keyed_access` | 16 | On/off row equivalence and plans on mem, SQLite, RocksDB; complete positive consumer lint shapes with declared schemas/string parameters |
 | `txtime_search_indexes` | 11 | All three backends: current beliefs, multi-row graph changes, retract/reassert, imports, reconciliation, eviction, rollback, standalone guards, rename, historical-search errors; SQLite/RocksDB backup/restore and reopen; JSON signed-zero LSH |
-| `txtime_index_concurrency` | 9 | RocksDB: writers during create/rebuild, old-generation availability, bounded-log overflow, drop/rename/repair cancellation, exact eviction race, legacy/governed writers, failure injection at backfill/publication, publication deadline and catalog locks |
-| Library filter `txtime` | 23 | Existing temporal invariants plus commit-section timeout without allocating a transaction time |
+| `txtime_index_concurrency` | 10 | RocksDB: writers during create/rebuild, old-generation availability, bounded-log overflow, drop/rename/repair cancellation, exact eviction race, legacy/governed writers, failure injection at backfill/publication, publication deadline and catalog locks; persisted FTS totals across corrections, four writers, eviction, rebuild and reopen |
+| Full library | 409 | All library tests, including 23 TxTime tests and commit-section timeout without allocating a transaction time |
+| Existing affected integration suites | 63 | FTS persisted/transaction/governed statistics, FTS/LSH updates, HNSW correctness/repair, reindex, planner and recursive regressions; four existing ignored tests |
 
 Commands (from the worktree; local native-library environment described above):
 
@@ -65,15 +71,18 @@ cargo test -p mnestic --features storage-rocksdb,test-hooks -j 2 \
   --test keyed_access --test txtime_search_indexes \
   --test txtime_index_concurrency -- --test-threads=1
 cargo test -p mnestic --features storage-rocksdb,test-hooks -j 2 \
-  --lib txtime -- --test-threads=1
+  --lib --test fts_persisted_stats --test fork_regressions \
+  --test matjoin_regression --test planner_shape --test recursive_workload \
+  --test reindex --test fts_transaction_stats --test fts_governed_stats \
+  --test fts_lsh_update_leak --test hnsw_correctness \
+  --test hnsw_mutation_repair -- --test-threads=1
 ```
 
-The existing `fork_regressions`, `matjoin_regression`, `planner_shape`,
-`recursive_workload`, `reindex`, `fts_transaction_stats`, `fts_governed_stats`,
-`fts_lsh_update_leak`, `hnsw_correctness`, and `hnsw_mutation_repair` suites also
-passed during implementation: 55 tests, with four existing ignored tests.
-The committed planner baseline was not changed. Final lint/regression results
-and hosted CI state are recorded in the PR.
+The final merged-source run passed **509 tests**, with four existing ignored
+tests, across the full library and 14 integration suites. The planner baseline
+was not changed. Strict Clippy also passed with `-D warnings`: all targets with
+default features plus `test-hooks`, and the library/new integration suites with
+`storage-rocksdb,test-hooks`. The PR records hosted-CI status.
 
 Failure injection returns before the actual storage commit through the existing
 `test-hooks` seam. It proves transaction rollback and publication behavior for
