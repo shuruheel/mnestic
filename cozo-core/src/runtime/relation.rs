@@ -572,6 +572,40 @@ impl RelationHandle {
         }
     }
 
+    /// Search-index identity omits the engine-assigned TxTime axis. Physical
+    /// row offsets and base storage encoding still use the complete key schema.
+    pub(crate) fn index_key_len(&self) -> usize {
+        self.metadata.keys.len() - usize::from(self.is_tt_only())
+    }
+
+    /// Resolve a search hit's logical identity to its current asserted row.
+    /// Plain relations retain their existing point-read path.
+    pub(crate) fn get_current(&self, tx: &SessionTx<'_>, key: &[DataValue]) -> Result<Option<Tuple>> {
+        if self.is_tt_only() {
+            self.skip_scan_prefix(tx, &key.to_vec(), crate::data::functions::MAX_VALIDITY_TS)
+                .next().transpose()
+        } else {
+            self.get(tx, key)
+        }
+    }
+
+    pub(crate) fn get_current_batch(&self, tx: &SessionTx<'_>, keys: &[&[DataValue]]) -> Result<Vec<Option<Tuple>>> {
+        if self.is_tt_only() {
+            keys.iter().map(|key| self.get_current(tx, key)).collect()
+        } else {
+            self.get_batch(tx, keys)
+        }
+    }
+
+    /// Current-belief corpus for search builds and exact-search fallback.
+    pub(crate) fn scan_current<'a>(&self, tx: &'a SessionTx<'_>) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        if self.is_tt_only() {
+            Box::new(self.skip_scan_all(tx, crate::data::functions::MAX_VALIDITY_TS))
+        } else {
+            Box::new(self.scan_all(tx))
+        }
+    }
+
     /// After `::history_gc`, an as-of read below the persisted floor would
     /// silently return a post-hoc reconstruction as if it were the historical
     /// belief — error instead (mnestic fork, bitemporality step 5).
@@ -1030,6 +1064,14 @@ impl<'a> SessionTx<'a> {
         &mut self,
         input_meta: InputRelationHandle,
     ) -> Result<RelationHandle> {
+        self.create_relation_with_visibility(input_meta, true)
+    }
+
+    fn create_relation_with_visibility(
+        &mut self,
+        input_meta: InputRelationHandle,
+        publish: bool,
+    ) -> Result<RelationHandle> {
         validate_temporal_axes(&input_meta)?;
         let key = DataValue::Str(input_meta.name.name.clone());
         let encoded = vec![key].encode_as_key(RelationId::SYSTEM);
@@ -1093,7 +1135,10 @@ impl<'a> SessionTx<'a> {
         let mut meta_val = vec![];
         meta.serialize(&mut Serializer::new(&mut meta_val).with_struct_map())
             .unwrap();
-        if is_temp {
+        if !publish {
+            // Reserve the id durably without installing any addressable name.
+            self.store_tx.put(&t_encoded, &meta.id.raw_encode())?;
+        } else if is_temp {
             self.temp_store_tx.put(&encoded, &meta.id.raw_encode())?;
             self.temp_store_tx.put(&name_key, &meta_val)?;
             self.temp_store_tx.put(&t_encoded, &meta.id.raw_encode())?;
@@ -1182,6 +1227,7 @@ impl<'a> SessionTx<'a> {
         // a permanent tombstone, because a transaction whose snapshot predates
         // the destroy still resolves this id, and only the tombstone's bumped
         // token denies it a cache exchange (Phase 3/4 review, 2026-07-10).
+        self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate(store.id.0, None);
         self.mark_dirty(&store);
 
         for k in store.indices.keys() {
@@ -1223,7 +1269,9 @@ impl<'a> SessionTx<'a> {
     pub(crate) fn create_minhash_lsh_index(&mut self, config: &MinHashLshConfig) -> Result<()> {
         // Get relation handle
         let mut rel_handle = self.get_relation(&config.base_relation, true)?;
-        Self::reject_txtime_relation(&rel_handle, "::lsh create")?;
+        if !self.preparing_tt_index || !rel_handle.is_tt_only() {
+            Self::reject_txtime_relation(&rel_handle, "::lsh create")?;
+        }
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1233,7 +1281,7 @@ impl<'a> SessionTx<'a> {
             ));
         }
 
-        let inv_idx_keys = rel_handle.metadata.keys.clone();
+        let inv_idx_keys = rel_handle.metadata.keys[..rel_handle.index_key_len()].to_vec();
         let inv_idx_vals = vec![ColumnDef {
             name: SmartString::from("minhash"),
             typing: NullableColType {
@@ -1251,7 +1299,7 @@ impl<'a> SessionTx<'a> {
             },
             default_gen: None,
         }];
-        for k in rel_handle.metadata.keys.iter() {
+        for k in rel_handle.metadata.keys.iter().take(rel_handle.index_key_len()) {
             idx_keys.push(ColumnDef {
                 name: format!("src_{}", k.name).into(),
                 typing: k.typing.clone(),
@@ -1299,6 +1347,12 @@ impl<'a> SessionTx<'a> {
             perms: perms.as_bytes().to_vec(),
         };
 
+        if self.preparing_tt_index {
+            rel_handle.lsh_indices.insert(manifest.index_name.clone(), (idx_handle, inv_idx_handle, manifest));
+            self.prepared_tt_index = Some(rel_handle);
+            return Ok(());
+        }
+
         // populate index
         let tokenizer =
             self.tokenizers
@@ -1316,7 +1370,7 @@ impl<'a> SessionTx<'a> {
 
         let hash_perms = manifest.get_hash_perms();
         let mut existing = TempCollector::default();
-        for tuple in rel_handle.scan_all(self) {
+        for tuple in rel_handle.scan_current(self) {
             existing.push(tuple?);
         }
 
@@ -1354,7 +1408,9 @@ impl<'a> SessionTx<'a> {
     pub(crate) fn create_fts_index(&mut self, config: &FtsIndexConfig) -> Result<()> {
         // Get relation handle
         let mut rel_handle = self.get_relation(&config.base_relation, true)?;
-        Self::reject_txtime_relation(&rel_handle, "::fts create")?;
+        if !self.preparing_tt_index || !rel_handle.is_tt_only() {
+            Self::reject_txtime_relation(&rel_handle, "::fts create")?;
+        }
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1374,7 +1430,7 @@ impl<'a> SessionTx<'a> {
             default_gen: None,
         }];
 
-        for k in rel_handle.metadata.keys.iter() {
+        for k in rel_handle.metadata.keys.iter().take(rel_handle.index_key_len()) {
             idx_keys.push(ColumnDef {
                 name: format!("src_{}", k.name).into(),
                 typing: k.typing.clone(),
@@ -1426,8 +1482,6 @@ impl<'a> SessionTx<'a> {
             non_idx_keys,
         )?;
 
-        self.fts_stats.before_write(idx_handle.id);
-
         // add index to relation
         let manifest = FtsIndexManifest {
             base_relation: config.base_relation.clone(),
@@ -1436,6 +1490,14 @@ impl<'a> SessionTx<'a> {
             tokenizer: config.tokenizer.clone(),
             filters: config.filters.clone(),
         };
+
+        if self.preparing_tt_index {
+            rel_handle.fts_indices.insert(manifest.index_name.clone(), (idx_handle, manifest));
+            self.prepared_tt_index = Some(rel_handle);
+            return Ok(());
+        }
+
+        self.fts_stats.before_write(idx_handle.id);
 
         // populate index
         let tokenizer =
@@ -1452,7 +1514,7 @@ impl<'a> SessionTx<'a> {
         let extractor = code_expr.compile()?;
 
         let mut existing = TempCollector::default();
-        for tuple in rel_handle.scan_all(self) {
+        for tuple in rel_handle.scan_current(self) {
             existing.push(tuple?);
         }
         let tuples: Vec<Tuple> = existing.into_iter().collect();
@@ -1568,7 +1630,9 @@ impl<'a> SessionTx<'a> {
     )> {
         // Get relation handle
         let rel_handle = self.get_relation(&config.base_relation, true)?;
-        Self::reject_txtime_relation(&rel_handle, "::hnsw create")?;
+        if !self.preparing_tt_index || !rel_handle.is_tt_only() {
+            Self::reject_txtime_relation(&rel_handle, "::hnsw create")?;
+        }
 
         // Check if index already exists
         if rel_handle.has_index(&config.index_name) {
@@ -1577,6 +1641,8 @@ impl<'a> SessionTx<'a> {
                 config.index_name.to_string()
             ));
         }
+
+        crate::runtime::txtime_index::reject_tt_index_columns(&rel_handle, config.vec_fields.iter().map(ToString::to_string))?;
 
         // Check that what we are indexing are really vectors
         if config.vec_fields.is_empty() {
@@ -1631,7 +1697,7 @@ impl<'a> SessionTx<'a> {
         }];
         // for self-loops, fr and to are identical
         for prefix in ["fr", "to"] {
-            for col in rel_handle.metadata.keys.iter() {
+            for col in rel_handle.metadata.keys.iter().take(rel_handle.index_key_len()) {
                 let mut col = col.clone();
                 col.name = SmartString::from(format!("{}_{}", prefix, col.name));
                 idx_keys.push(col);
@@ -1715,6 +1781,7 @@ impl<'a> SessionTx<'a> {
                 .next()
                 .unwrap();
             let mut code_expr = build_expr(parsed, &Default::default())?;
+            crate::runtime::txtime_index::reject_tt_index_columns(&rel_handle, code_expr.get_variables()?.into_iter())?;
             let binding_map = rel_handle.raw_binding_map();
             code_expr.fill_binding_indices(&binding_map)?;
             code_expr.compile()?
@@ -1732,10 +1799,17 @@ impl<'a> SessionTx<'a> {
     /// off-lock build orchestrated at the `Db` level.
     pub(crate) fn create_hnsw_index(&mut self, config: &HnswIndexConfig) -> Result<RelationId> {
         let (rel_handle, mut idx_handle, manifest, filter) = self.prepare_hnsw_index(config)?;
+        if self.preparing_tt_index {
+            let id = idx_handle.id;
+            let mut rel_handle = rel_handle;
+            rel_handle.hnsw_indices.insert(config.index_name.clone(), (idx_handle, manifest));
+            self.prepared_tt_index = Some(rel_handle);
+            return Ok(id);
+        }
 
         // populate index
         let mut all_tuples = TempCollector::default();
-        for tuple in rel_handle.scan_all(self) {
+        for tuple in rel_handle.scan_current(self) {
             all_tuples.push(tuple?);
         }
         let filter_ref = if filter.is_empty() {
@@ -1869,8 +1943,24 @@ impl<'a> SessionTx<'a> {
             dep_bindings,
             span: Default::default(),
         };
-        let idx_handle = self.create_relation(idx_handle)?;
+        let idx_handle = self.create_relation_with_visibility(idx_handle, !self.preparing_tt_index)?;
         Ok(idx_handle)
+    }
+
+    pub(crate) fn reserve_detached_index(&mut self, old: &RelationHandle) -> Result<RelationHandle> {
+        let input = InputRelationHandle {
+            name: Symbol::new(old.name.clone(), Default::default()),
+            metadata: old.metadata.clone(),
+            key_bindings: Vec::new(), dep_bindings: Vec::new(), span: Default::default(),
+        };
+        self.create_relation_with_visibility(input, false)
+    }
+
+    pub(crate) fn publish_relation_metadata(&mut self, handle: &RelationHandle) -> Result<()> {
+        let key = vec![DataValue::from(handle.name.as_str())].encode_as_key(RelationId::SYSTEM);
+        let mut value = Vec::new();
+        handle.serialize(&mut Serializer::new(&mut value).with_struct_map()).unwrap();
+        self.store_tx.put(&key, &value)
     }
 
     pub(crate) fn create_index(
@@ -2064,6 +2154,10 @@ impl<'a> SessionTx<'a> {
         idx_name: &Symbol,
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         let mut rel = self.get_relation(rel_name, true)?;
+        ensure!(rel.access_level >= AccessLevel::Normal, "insufficient access to drop index");
+        let cancelled = self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate(rel.id.0, Some(&idx_name.name));
+        if cancelled && !rel.has_index(&idx_name.name) { return Ok(Vec::new()); }
+
         let is_lsh = rel.lsh_indices.contains_key(&idx_name.name);
         let is_fts = rel.fts_indices.contains_key(&idx_name.name);
         let fts_index_id = rel
@@ -2133,6 +2227,7 @@ impl<'a> SessionTx<'a> {
                 rel.access_level
             ));
         }
+        self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate(rel.id.0, None);
         rel.name = new.name.clone();
 
         let mut meta_val = vec![];

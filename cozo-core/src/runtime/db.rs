@@ -152,7 +152,7 @@ pub struct Db<S> {
     /// `max(persisted TT_HWM system key, wall clock)`.
     tt_clock: Arc<TtClock>,
     /// Critical section for tt allocation + persist + commit (spec §13.10).
-    tt_commit_lock: Arc<Mutex<()>>,
+    pub(crate) tt_commit_lock: Arc<Mutex<()>>,
     /// User-registered aggregates (mnestic fork, provenance semirings R0b) —
     /// mirrors `fixed_rules`. In-memory, `Db`-scoped; consulted by the parser
     /// when a head aggregate is not a builtin. NOT consulted when parsing
@@ -211,6 +211,9 @@ pub struct Db<S> {
     /// change the `AtomicBool::new(false)` in [`Db::new`] to `true`.
     enable_factorize: Arc<AtomicBool>,
     enable_keyed_access: Arc<AtomicBool>,
+    pub(crate) tt_index_builds: crate::runtime::txtime_index::SharedBuildRegistry,
+    #[cfg(feature = "test-hooks")]
+    tt_index_build_fence: Arc<Mutex<Option<Arc<dyn Fn(&str) + Send + Sync>>>>,
     /// Freshness substrate for cached graph projections (mnestic fork;
     /// `runtime/graph_projection.rs`, spec §3.3). Cloned into every
     /// `SessionTx`, which captures a watermark off it before its storage
@@ -432,6 +435,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             // to `AtomicBool::new(false)` to make the rewrite opt-in again.
             enable_factorize: Arc::new(AtomicBool::new(true)),
             enable_keyed_access: Arc::new(AtomicBool::new(true)),
+            tt_index_builds: Default::default(),
+            #[cfg(feature = "test-hooks")]
+            tt_index_build_fence: Default::default(),
             graph_projections: Default::default(),
             warnings: Default::default(),
             warning_seq: Default::default(),
@@ -994,6 +1000,24 @@ impl<'s, S: Storage<'s>> Db<S> {
         self.default_query_mem_limit.store(v, Ordering::Relaxed);
     }
 
+    /// Install a test fence after snapshot registration or detached backfill.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_tt_index_build_fence_for_tests(&self, fence: Option<Arc<dyn Fn(&str) + Send + Sync>>) {
+        *self.tt_index_build_fence.lock().unwrap() = fence;
+    }
+
+    #[cfg(feature = "test-hooks")]
+    pub(crate) fn run_tt_index_build_fence(&self, stage: &str) {
+        let fence = self.tt_index_build_fence.lock().unwrap().clone();
+        if let Some(fence) = fence { fence(stage); }
+    }
+
+    /// Bound the touched-key log in overflow tests.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_tt_index_build_key_limit_for_tests(&self, limit: usize) {
+        self.tt_index_builds.lock().unwrap().key_limit = limit;
+    }
+
     /// Toggle keyed-access optimizations for differential tests.
     /// Existing equality pushdown remains enabled in both modes.
     #[cfg(feature = "test-hooks")]
@@ -1367,7 +1391,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             // to vector/text/LSH search until the index is rebuilt. Warn
             // loudly rather than corrupt-silently; a hard error would break
             // legitimate import-then-reindex callers. (mnestic fork, hardening)
-            warn_if_indexes_stranded(&handle, relation, "bulk import into");
+            if !handle.has_txtime() {
+                warn_if_indexes_stranded(&handle, relation, "bulk import into");
+            }
             self.flush_warnings();
 
             if handle.access_level < AccessLevel::Protected {
@@ -2016,6 +2042,13 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
+            pending_tt_evicts: Vec::new(),
+            tt_commit_failed: false,
+            tt_index_builds: self.tt_index_builds.clone(),
+            preparing_tt_index: false,
+            prepared_tt_index: None,
+            defer_tt_cleanup: false,
+            tt_cleanup_ranges: Vec::new(),
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
             script_cancellation: None,
@@ -2044,6 +2077,13 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
+            pending_tt_evicts: Vec::new(),
+            tt_commit_failed: false,
+            tt_index_builds: self.tt_index_builds.clone(),
+            preparing_tt_index: false,
+            prepared_tt_index: None,
+            defer_tt_cleanup: false,
+            tt_cleanup_ranges: Vec::new(),
             reconciled_tt_relations: Default::default(),
             script_deadline: None,
             script_cancellation: None,
@@ -2616,6 +2656,25 @@ impl<'s, S: Storage<'s>> Db<S> {
         read_only: bool,
         skip_locking: bool,
     ) -> Result<NamedRows> {
+        // Imperative programs embed SysOps in their existing transaction. They
+        // cannot use detached publication or acquire the TT commit section here.
+        if !tx.defer_tt_cleanup {
+            let targets: Vec<_> = match op {
+                SysOp::Reindex(name) | SysOp::RemoveIndex(name, _) => vec![name],
+                SysOp::RemoveRelation(names) => names.iter().collect(),
+                SysOp::RenameRelation(pairs) => pairs.iter().flat_map(|(a, b)| [a, b]).collect(),
+                _ => vec![],
+            };
+            for name in targets {
+                if tx.get_relation(name, false).is_ok_and(|h| h.has_txtime()) {
+                    #[derive(Debug, Error, Diagnostic)]
+                    #[error("transaction-time index and catalog changes must run as standalone commands")]
+                    #[diagnostic(code(eval::txtime_ddl_standalone))]
+                    struct TxTimeDdlStandalone;
+                    bail!(TxTimeDdlStandalone);
+                }
+            }
+        }
         match op {
             SysOp::Explain(prog) => {
                 let mut prog = prog.as_ref().clone();
@@ -3056,7 +3115,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                 };
                 let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
 
-                let handle = tx.get_relation(rel, true)?;
+                let mut handle = tx.get_relation(rel, false)?;
+                if !handle.is_tt_only() { handle = tx.get_relation(rel, true)?; }
                 // Graph-projection dirty-set hook (spec §3.4 row 12). The audit
                 // relation this arm also writes is marked where it is resolved.
                 tx.mark_dirty(&handle);
@@ -3152,8 +3212,13 @@ impl<'s, S: Storage<'s>> Db<S> {
                         kill.push(t[..=kpos].to_vec().encode_as_key(handle.id));
                     }
                     let n = kill.len();
-                    for kb in kill {
-                        tx.store_tx.del(&kb)?;
+                    if handle.is_tt_only() {
+                        crate::runtime::txtime_index::check_evict_limit(&handle, seen_keys.len())?;
+                        tx.pending_tt_evicts.push(crate::runtime::txtime_index::PendingTtEvict {
+                            handle: handle.clone(), logical_key: key.clone(), physical_keys: kill,
+                        });
+                    } else {
+                        for kb in kill { tx.store_tx.del(&kb)?; }
                     }
                     // the audit marker: a salted hash by default — storing
                     // the key itself would re-enshrine the PII the eviction
@@ -3202,7 +3267,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                     }
                 }
                 for (lower, upper) in bounds {
-                    tx.store_tx.del_range_from_persisted(&lower, &upper)?;
+                    if tx.defer_tt_cleanup { tx.tt_cleanup_ranges.push((lower, upper)); }
+                    else { tx.store_tx.del_range_from_persisted(&lower, &upper)?; }
                 }
                 Ok(NamedRows::new(
                     vec![STATUS_STR.to_string()],
@@ -3268,6 +3334,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                 };
                 let _guards = locks.iter().map(|lock| lock.write().unwrap()).collect_vec();
                 let handle = tx.get_relation(rel_name, true)?;
+                ensure!(
+                    !handle.has_txtime() || !crate::runtime::txtime_index::has_search_indexes(&handle),
+                    "drop transaction-time search indexes before repairing corrupt base rows, then recreate them"
+                );
                 // Graph-projection dirty-set hook (spec §3.4 row 10).
                 tx.mark_dirty(&handle);
                 let expected = handle.metadata.keys.len() + handle.metadata.non_keys.len();
@@ -3388,7 +3458,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                 };
 
                 for (lower, upper) in bounds {
-                    tx.store_tx.del_range_from_persisted(&lower, &upper)?;
+                    if tx.defer_tt_cleanup { tx.tt_cleanup_ranges.push((lower, upper)); }
+                    else { tx.store_tx.del_range_from_persisted(&lower, &upper)?; }
                 }
                 Ok(NamedRows::new(
                     vec![STATUS_STR.to_string()],
@@ -3512,6 +3583,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
             _ => {}
         }
+        if let Some(rows) = self.run_tt_index_op(&op, read_only, outer_deadline)? { return Ok(rows); }
+        if let Some(rows) = self.run_tt_metadata_op(&op, read_only, outer_deadline)? { return Ok(rows); }
+
         // RocksDB builds HNSW indexes off-lock so reads aren't blocked for
         // minutes; that path manages its own transactions and locks, so it runs
         // outside the single-tx wrapper below. (mnestic fork)
@@ -3535,6 +3609,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         tx.script_deadline = outer_deadline;
         tx.script_mem_limit = outer_mem_limit;
         let res = self.run_sys_op_with_tx(&mut tx, &op, read_only, false)?;
+        #[cfg(feature = "test-hooks")]
+        if matches!(&op, SysOp::TtEvict(_, _, _)) { self.run_tt_index_build_fence("evict_pre_commit"); }
+
         tx.commit_tx()?;
         Ok(res)
     }
@@ -3548,6 +3625,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         callback_collector: &mut CallbackCollector,
         top_level: bool,
     ) -> Result<(NamedRows, Vec<(Vec<u8>, Vec<u8>)>)> {
+        tx.ensure_tt_usable()?;
         let mut input_program = input_program;
         let fixed_rules = self.fixed_rules.read().unwrap().clone();
         let custom_aggrs = self.custom_aggrs.read().unwrap().clone();

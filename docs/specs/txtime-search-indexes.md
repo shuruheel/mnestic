@@ -47,7 +47,7 @@ belief**, and defines what a search **as of** an earlier transaction time does.
 | On RocksDB a write transaction's plain reads (`get`, `multi_get`, iterators) see the latest committed state plus its own writes; `GetForUpdate` and `Put` validate against the begin snapshot when they lock the key | `storage/rocks.rs:283`, `:411-416`; `cozorocks/bridge/tx.h:20-34`, `:87-103`; HNSW neighbour reads use `for_update` (`runtime/hnsw.rs:1253`) | Index-row writes **and** locking reads can raise a snapshot conflict; clearing the snapshot covers both, and only affects later operations |
 | `put_externally_serialized` clears the begin snapshot for a mutex-serialized key | `storage/rocks.rs:435-446` | Precedent, sound only when the mutex is the sole writer of the key |
 | The shared relation guard spans commit only in single-script execution. Multi-transactions never take it; governed transactions hold it per statement; top-level system ops (index DDL, `::reindex`) drop it before their commit | `runtime/db.rs:2083-2121`; `:559-570`; `:899-910` vs `:868-872`; `:3203-3207`, `:3272-3283` vs `:3507-3508` | Relation locks do not order index DDL against tt commits (D5) |
-| System ops run only as top-level scripts, never inside a multi-statement or governed transaction | `parse/mod.rs:231-241` (`get_single_program` rejects `Sys`) | DDL, `::reindex`, `::evict` each own their transaction |
+| Legacy and governed transaction APIs reject system ops; imperative programs can embed them | `parse/mod.rs` (`get_single_program`) and `runtime/imperative.rs` | TxTime index/catalog DDL must be standalone; imperative attempts fail with `eval::txtime_ddl_standalone`. Buffered `::evict` still commits through D7 |
 | SQLite and `mem` admit one writer at a time | `storage/sqlite.rs:204` (`begin immediate`); `storage/mem.rs:51-54` | Concurrency cases below are RocksDB-only |
 | `tt_current_row` resolves a tt-only key's current belief with one skip-scan seek, through the transaction's own writes | `query/stored.rs:1128-1142` | Basis for old/new resolution and base fetches |
 | HNSW insertion and neighbour shrinking fetch the entry point's and neighbours' vectors from the **base relation** | `VectorCache::ensure_key`/`ensure_keys`, `runtime/hnsw.rs:162-205`; call sites `:322`, `:548`, `:711`, `:724-725`, `:779` | Base rows of this commit must be written before vector maintenance (D3) |
@@ -439,7 +439,10 @@ history-preserving recovery and reversible enablement remain open.
    under the draft; D7 moves evict's deletes into the section.
 3. *Does any path write a `TxTime` relation outside `stamp_pending_tt_writes`?*
    `::evict` (now in the section) and `::history_gc` (superseded rows only).
-   System ops cannot run inside multi-statement transactions.
+   Transaction APIs reject system ops, but imperative programs can embed them.
+   TxTime index/catalog changes require standalone commands so they cannot
+   bypass serialized publication. Corrupt-base repair requires dropping search
+   indexes first and recreating them after repair.
 
 ## Owner decisions (November 13, 2026)
 

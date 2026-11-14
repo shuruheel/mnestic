@@ -5,6 +5,24 @@ provenance and licensing.
 
 ## Unreleased
 
+### Added — current-belief search on transaction-time relations
+
+- FTS, HNSW and LSH indexes can be created on tt-only relations. Index identity
+  uses logical keys; corrections, retractions, imports and evictions maintain
+  the current belief atomically with the base rows. Historical base reads
+  remain available; historical search fails with `search::as_of_unsupported`.
+- RocksDB builds and rebuilds use private generations, a pinned snapshot and a
+  bounded touched-key log; publication catches up concurrent commits before
+  attaching the generation. Mem and SQLite use their existing single-writer
+  transaction model. Failed rebuilds preserve the attached generation.
+- TxTime index/catalog DDL must be standalone. The tt column cannot appear in
+  indexed fields, extractors or filters. Eviction of an indexed relation is
+  limited to 1,000 logical keys per command. Bitemporal search and B-tree
+  indexes remain deferred.
+- Qualification is in progress: correctness coverage is recorded in the two
+  `txtime_*` integration suites; the specification's performance release gates
+  must pass before release acceptance.
+
 ### Changed — planner keyed access
 
 - Eligible trailing equalities now bind immediately before their stored-relation

@@ -166,7 +166,7 @@ impl VectorCache {
         tx: &SessionTx<'_>,
     ) -> Result<()> {
         if !self.cache.contains_key(key) {
-            match handle.get(tx, &key.0)? {
+            match handle.get_current(tx, &key.0)? {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
                 None => bail!("Cannot find compound key for HNSW: {:?}", key),
             }
@@ -195,7 +195,7 @@ impl VectorCache {
             return self.ensure_key(missing[0], handle, tx);
         }
         let key_slices: Vec<&[DataValue]> = missing.iter().map(|k| k.0.as_slice()).collect();
-        let tuples = handle.get_batch(tx, &key_slices)?;
+        let tuples = handle.get_current_batch(tx, &key_slices)?;
         for (key, tuple) in missing.iter().zip(tuples) {
             match tuple {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
@@ -282,7 +282,7 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         vec_cache: &mut VectorCache,
     ) -> Result<()> {
-        let tuple_key = &tuple[..orig_table.metadata.keys.len()];
+        let tuple_key = &tuple[..orig_table.index_key_len()];
         let inserted_key = (tuple_key.to_vec(), idx, subidx);
         vec_cache.insert(inserted_key.clone(), q.clone());
         let hash = q.get_hash();
@@ -315,9 +315,9 @@ impl<'a> SessionTx<'a> {
             let ep = ep?;
             // bottom level since we are going up
             let bottom_level = ep[0].get_int().unwrap();
-            let ep_t_key = ep[1..orig_table.metadata.keys.len() + 1].to_vec();
-            let ep_idx = ep[orig_table.metadata.keys.len() + 1].get_int().unwrap() as usize;
-            let ep_subidx = ep[orig_table.metadata.keys.len() + 2].get_int().unwrap() as i32;
+            let ep_t_key = ep[1..orig_table.index_key_len() + 1].to_vec();
+            let ep_idx = ep[orig_table.index_key_len() + 1].get_int().unwrap() as usize;
+            let ep_subidx = ep[orig_table.index_key_len() + 2].get_int().unwrap() as i32;
             let ep_key = (ep_t_key, ep_idx, ep_subidx);
             vec_cache.ensure_key(&ep_key, orig_table, self)?;
             let ep_distance = vec_cache.v_dist(q, &ep_key);
@@ -349,7 +349,7 @@ impl<'a> SessionTx<'a> {
                     vec_cache,
                 )?;
             }
-            let mut self_tuple_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+            let mut self_tuple_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
             self_tuple_key.push(DataValue::from(0));
             for _ in 0..2 {
                 self_tuple_key.extend_from_slice(tuple_key);
@@ -399,7 +399,7 @@ impl<'a> SessionTx<'a> {
 
                 // add bidirectional links
                 for (neighbour, Reverse(OrderedFloat(dist))) in neighbours.iter() {
-                    let mut out_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                    let mut out_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                     let out_val = vec![
                         DataValue::from(*dist),
                         DataValue::Null,
@@ -418,7 +418,7 @@ impl<'a> SessionTx<'a> {
                         idx_table.encode_val_only_for_store(&out_val, Default::default())?;
                     self.idx_put(idx_table, &out_key_bytes, &out_val_bytes)?;
 
-                    let mut in_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                    let mut in_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                     let in_val = vec![
                         DataValue::from(*dist),
                         DataValue::Null,
@@ -446,7 +446,7 @@ impl<'a> SessionTx<'a> {
                 for (neighbour, _) in neighbours.iter() {
                     // shrink links if necessary
                     let mut target_self_key =
-                        Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                        Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                     target_self_key.push(DataValue::from(current_level));
                     for _ in 0..2 {
                         target_self_key.extend_from_slice(&neighbour.0);
@@ -617,7 +617,7 @@ impl<'a> SessionTx<'a> {
         let kept_inserted = new_candidate_set.contains(inserted);
         for (new, Reverse(OrderedFloat(new_dist))) in new_candidates {
             if !old_candidate_set.contains(&new) {
-                let mut new_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                let mut new_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                 let new_val = vec![
                     DataValue::from(new_dist),
                     DataValue::Null,
@@ -638,7 +638,7 @@ impl<'a> SessionTx<'a> {
         }
         for (old, OrderedFloat(old_dist)) in candidates {
             if !new_candidate_set.contains(&old) {
-                let mut old_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                let mut old_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                 old_key.push(DataValue::from(level));
                 old_key.extend_from_slice(&target_key.0);
                 old_key.push(DataValue::from(target_key.1 as i64));
@@ -861,7 +861,7 @@ impl<'a> SessionTx<'a> {
         let mut target_key = vec![DataValue::Null];
         let mut canary_key = vec![DataValue::from(1)];
         for _ in 0..2 {
-            for i in 0..orig_table.metadata.keys.len() {
+            for i in 0..orig_table.index_key_len() {
                 target_key.push(tuple.get(i).unwrap().clone());
                 canary_key.push(DataValue::Null);
             }
@@ -945,7 +945,7 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         use crate::runtime::hnsw_build::{build_threads, FlatHnswBuilder, NodeMeta};
 
-        let key_len = orig_table.metadata.keys.len();
+        let key_len = orig_table.index_key_len();
         let mut builder = FlatHnswBuilder::new(manifest);
         let mut stack = vec![];
         for tuple in tuples {
@@ -1157,12 +1157,12 @@ impl<'a> SessionTx<'a> {
         vec_cache: &mut VectorCache,
     ) -> Result<()> {
         let mut prefix = vec![DataValue::from(0)];
-        prefix.extend_from_slice(&tuple[0..orig_table.metadata.keys.len()]);
+        prefix.extend_from_slice(&tuple[0..orig_table.index_key_len()]);
         let candidates: FxHashSet<_> = idx_table
             .scan_prefix(self, &prefix)
             .map(|t| {
                 let t = t?;
-                let key_len = orig_table.metadata.keys.len();
+                let key_len = orig_table.index_key_len();
                 if t.len() < key_len + 3 {
                     bail!(
                         "corrupt HNSW self-row: expected at least {} fields, got {}",
@@ -1319,7 +1319,7 @@ impl<'a> SessionTx<'a> {
                 .next();
             let mut canary_key = vec![DataValue::from(1)];
             for _ in 0..2 {
-                for _ in 0..orig_table.metadata.keys.len() {
+                for _ in 0..orig_table.index_key_len() {
                     canary_key.push(DataValue::Null);
                 }
                 canary_key.push(DataValue::Null);
@@ -1382,15 +1382,15 @@ impl<'a> SessionTx<'a> {
         if let Some(ep) = ep_res {
             let ep = ep?;
             let bottom_level = ep[0].get_int().unwrap();
-            let ep_idx = match ep[config.base_handle.metadata.keys.len() + 1].get_int() {
+            let ep_idx = match ep[config.base_handle.index_key_len() + 1].get_int() {
                 Some(x) => x as usize,
                 None => {
                     // this occurs if the index is empty
                     return Ok(vec![]);
                 }
             };
-            let ep_t_key = ep[1..config.base_handle.metadata.keys.len() + 1].to_vec();
-            let ep_subidx = ep[config.base_handle.metadata.keys.len() + 2]
+            let ep_t_key = ep[1..config.base_handle.index_key_len() + 1].to_vec();
+            let ep_subidx = ep[config.base_handle.index_key_len() + 2]
                 .get_int()
                 .unwrap() as i32;
             let ep_key = (ep_t_key, ep_idx, ep_subidx);
@@ -1439,7 +1439,7 @@ impl<'a> SessionTx<'a> {
 
                 let base_row = config
                     .base_handle
-                    .get(self, &cand_key.0)?
+                    .get_current(self, &cand_key.0)?
                     .ok_or_else(|| miette!("corrupted index"))?;
                 let cand_tuple = Self::hnsw_result_tuple(config, base_row, &cand_key, distance)?;
 
@@ -1501,8 +1501,8 @@ impl<'a> SessionTx<'a> {
         };
         type Ranked = (OrderedFloat<f64>, Tuple, usize, i32);
         let mut best: std::collections::BinaryHeap<(Ranked, Tuple)> = Default::default();
-        let n_keys = config.base_handle.metadata.keys.len();
-        for (scanned, row) in config.base_handle.scan_all(self).enumerate() {
+        let n_keys = config.base_handle.index_key_len();
+        for (scanned, row) in config.base_handle.scan_current(self).enumerate() {
             if scanned >= FILTERED_EXACT_MAX_ROWS {
                 crate::runtime::diagnostics::emit(
                     "hnsw.filtered_incomplete",
