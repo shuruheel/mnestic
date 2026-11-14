@@ -425,11 +425,14 @@ advisory once production runs the release, which is a MindGraph decision.
 The open questions are closed:
 
 1. **Stored negation: yes, as its own follow-up PR after this one merges.**
-   MindGraph negates on a key plus a value column, for example
-   `not *node{uid: source, tombstone_at: 0.0}` and
-   `not *node{uid: to_uid, node_type: 'Chunk'}`. Join positions such as
-   `{0, k}` fail `join_is_prefix`, so these probably materialize `node` today.
-   The follow-up first confirms that with `::explain`. `StoredRA::neg_join`
+   MindGraph negates on a key plus a value column. `::explain` on 0.19.2
+   (SQLite, MindGraph's column order) shows the plan depends on the value
+   column's position: `not *node{uid: to_uid, node_type: 'Chunk'}` joins on
+   `{0, 1}`, which already passes `join_is_prefix` (`stored_neg_prefix_join`);
+   `not *node{uid: source, tombstone_at: 0.0}`
+   (`mindgraph-rs/src/storage/relation_repair.rs:173`) joins on `{0, k}` with
+   `k > 1` and runs `stored_neg_mat_join`, reading all of `node` per call.
+   `StoredRA::neg_join`
    already seeks on the leading run and checks every pair, so the change is the
    D2 full-key gate and label, with the same equivalence and adversarial tests.
    It stays out of this PR so the PR's qualification is not restarted.
