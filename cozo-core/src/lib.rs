@@ -326,7 +326,10 @@ impl DbInstance {
             #[cfg(feature = "storage-rocksdb")]
             DbInstance::RocksDb(db) => db.fold_fts_stats(min_deltas),
             #[allow(unreachable_patterns)]
-            _ => Ok(0),
+            _ => {
+                let _ = min_deltas;
+                Ok(0)
+            }
         }
     }
 
