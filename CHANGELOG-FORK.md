@@ -35,6 +35,20 @@ provenance and licensing.
   drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
   a build before 0.13.0 (`f125fbd2`) can hold such IDs.
 
+### Changed — planner keyed access
+
+- Eligible trailing equalities now bind immediately before their stored-relation
+  read, enabling primary or secondary index seeks without changing join order.
+  Earlier binding producers, generator multiplicity, numeric type boundaries,
+  temporal reads and volatile expressions retain their existing behavior.
+- Positive plain-relation joins with every primary-key column bound now use a
+  point lookup even when additional joined value columns are nonadjacent.
+  `::explain` reports `stored_point_join`, with sought pairs in `joins_on` and
+  residual equality checks in `filters/expr`.
+- Differential coverage is in `tests/keyed_access.rs` under `test-hooks`;
+  existing planner and recursive-workload shape baselines remain unchanged.
+  Performance qualification and RocksDB validation are still pending.
+
 ## 0.19.4 — 2026-11-15
 
 One fix: a full-text search no longer fails on a posting whose row is gone. No
