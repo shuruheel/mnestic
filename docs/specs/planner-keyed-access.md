@@ -13,7 +13,7 @@ performance acceptance remains pending. Original authoring passes (workspace
 | 2 Draft | Nov 13 | First version, commit `c9e168c3` |
 | 3 Panel | Nov 13 | Three lenses: code grounding, semantics, planner and performance. 22 findings: 2 blockers, 11 major, 9 minor. All folded; none rejected. Blockers: a widened join gate seeks the wrong key on composite keys (D2); numeric hoisting changes magic-set adornments (D1). Decisions narrowed as a result: D1 hoists only onto a leading key position, D2 covers only the full-key case, D3 reuses the hoisting mechanism |
 | 4 Prior art | Nov 13 | Two areas (equality pushdown and type semantics; join operator choice). CONFIRMS: D0, D1, D2, D3, invariant 3, the partial-key rejection. CONTRADICTS: D4 (prior art keeps a disable switch for differential testing). GAPS: a volatility guard on folding (D1), explain labels that separate seek pairs from checked pairs (D2, invariant 5), batched key lookups (D2). All folded; batching deferred by pass 5 |
-| 5 Simplification | Nov 13 | Requirement-neutral cuts applied: the disable switch is test-only, not a Db option; batched lookups deferred until the benchmark shows a need; checked pairs go in the existing explain output, not a new column. One requirement change left to the owner: open question 3 |
+| 5 Simplification | Nov 13 | Requirement-neutral cuts applied: the disable switch is test-only, not a Db option; batched lookups deferred until the benchmark shows a need; checked pairs go in the existing explain output, not a new column. One requirement change left to the owner (closed: fork #1 unchanged) |
 
 Pass 0 does not apply (no user interface). The pass table above records the
 original authoring history. The review revision below supersedes its D0/D1/D3
@@ -55,7 +55,7 @@ results, so no consumer needs the rewrites or the lint.
 | The physical join is chosen by `join_is_prefix`, which requires the right-side join positions, sorted, to be exactly `0..n`. Its comment: partial index matches are deliberately not treated as prefix, "as it is not clear that using prefix scanning in this case will really save us computation" | `ra.rs:1920-1928`; dispatch `ra.rs:2683-2700`; labels `ra.rs:2584-2594` | Join positions `{0, 2}` (key `uid` plus value `tombstone_reason`) fall back to `materialized_join` (T2) |
 | `StoredRA::prefix_join` builds its seek prefix from **all** join positions, takes the point-lookup branch when the **number** of join positions is at least the key length, and then uses `prefix[0..key_len]` as the key. `point_lookup_join` checks every join pair on the found row. The bounded-scan path slices its range-bound columns from `right_join_indices.len()` | `ra.rs:1697-1724`, `point_lookup_join` `ra.rs:1650-1695`, bounds `ra.rs:1739` | Today the `0..n` gate makes "count ≥ key length" mean "key covered". Widening the gate alone breaks that: on `comp{a, b => c}` joined on `{0, 2}` the engine would look up `[a, c]` and drop matching rows. The probe that returned correct rows for `*node{uid: t, name: 'x'}` used a one-column key, where `{0, 1}` already passes the gate |
 | Validity and bitemporal relations have their own `prefix_join` (`StoredWithValidityRA` `ra.rs:1544-1630`, `StoredBitemporalRA` `ra.rs:972-1017`). Both seek on every join position, have no point lookup and no residual check, and the validity one slices bounds from `right_join_indices.len()` (`ra.rs:1570`). Dispatch uses `join_prefix_is_temporally_safe` (every position a plain key column), while `::explain` labels with `join_is_prefix` | `ra.rs:1916-1918`; dispatch `ra.rs:2702-2740`; labels `ra.rs:2584-2594` | A temporal join that reaches the temporal column is labelled `stored_prefix_join` but runs `materialized_join` today. Batch 1 leaves temporal relations on their current gate |
-| Stored negation (`StoredRA::neg_join`) already seeks on the leading `0..n` run of the join positions only and checks every join pair on each found row. It is still gated by `join_is_prefix`. Derived-rule negation is `TempStoreRA::neg_join`; the temporal negations use `join_prefix_is_temporally_safe` | `ra.rs:1800-1826`; `ra.rs:2001`; `ra.rs:1037`, `:1431`; labels `ra.rs:2394-2437` | Extending D2 to stored negation is a gate and label change only (open question 1) |
+| Stored negation (`StoredRA::neg_join`) already seeks on the leading `0..n` run of the join positions only and checks every join pair on each found row. It is still gated by `join_is_prefix`. Derived-rule negation is `TempStoreRA::neg_join`; the temporal negations use `join_prefix_is_temporally_safe` | `ra.rs:1800-1826`; `ra.rs:2001`; `ra.rs:1037`, `:1431`; labels `ra.rs:2394-2437` | Extending D2 to stored negation is a gate and label change only (owner decision 1: follow-up PR) |
 | `materialized_join` reads the whole right relation into a sorted set once, then binary-searches it per left row. A per-left-row scan over a leading-key range is output-sensitive only when every scanned row is emitted | `ra.rs:2760-2806` | A partial seek run with residual checks can cost left rows × range size, worse than one materialization when the leading column has few distinct values. D2 is limited to the full key for that reason |
 | The greedy join reorder and `::explain` are stat-free: the plan for empty relations equals the plan for loaded ones. `tests/planner_shape.rs` compares plans across backends and pins, in `tests/planner_baseline.json`, **only the ordered `load_stored` relation sequence** of five LSQB queries. Those relations have two-column keys, no value columns and no constants | `cozo-core/tests/planner_shape.rs:58-78`, `:177-191`; `planner_baseline.json` `_comment`; `.github/workflows/planner-guard.yml` | Plan shapes are checkable without data, but the baseline cannot see a join-operator change and the LSQB tier never reaches the new paths. New tests must assert the `op` and `joins_on` columns |
 | Stored relations get the same `stored_*` join labels on every backend; `mem_*` labels belong to derived-rule temp relations (`RelAlgebra::TempStore`) on every backend. The storage-layer scan code differs per backend | `ra.rs:2567-2579`, `:2661-2680`; `planner_shape.rs` cross-backend check; `CLAUDE.md` test-backend note | Plan-shape tests run on SQLite; result-equivalence tests must cover mem, SQLite and RocksDB because the scans differ |
@@ -420,18 +420,30 @@ advisory once production runs the release, which is a MindGraph decision.
 - **A warning instead of a rewrite.** Warnings move the burden to every
   consumer; the shapes are the natural way to write the queries.
 
-## Open questions
+## Owner decisions (November 14, 2026)
 
-1. Should D2 cover stored negation in the same batch? `StoredRA::neg_join`
-   already seeks on the leading run and checks every pair, so it is a gate and
-   label change.
-2. Should D3 ship with D1 and D2, or wait for evidence that T3 still occurs
-   after MindGraph's lint rewrites?
+The open questions are closed:
+
+1. **Stored negation: yes, as its own follow-up PR after this one merges.**
+   MindGraph negates on a key plus a value column, for example
+   `not *node{uid: source, tombstone_at: 0.0}` and
+   `not *node{uid: to_uid, node_type: 'Chunk'}`. Join positions such as
+   `{0, k}` fail `join_is_prefix`, so these probably materialize `node` today.
+   The follow-up first confirms that with `::explain`. `StoredRA::neg_join`
+   already seeks on the leading run and checks every pair, so the change is the
+   D2 full-key gate and label, with the same equivalence and adversarial tests.
+   It stays out of this PR so the PR's qualification is not restarted.
+2. **D3 ships with D1 and D2.** It is implemented in `local_bindings`
+   (`query/keyed_access.rs`): a bound non-numeric source, exactly one positive
+   stored producer. MindGraph's lint stays in place either way.
+3. **Fork #1 is unchanged** (the review revision above). Narrowing the
+   existing `==` conversion could slow queries that use it today, and the
+   local-binding design no longer needs it.
 
 ## Batches (review units)
 
-1. D0, D1 and D2, with the plan-shape, equivalence and adversarial tests and
-   the benchmarks.
-2. D3, and stored negation if question 1 says so.
+1. D0, D1, D2 and D3, with the plan-shape, equivalence and adversarial tests
+   and the benchmarks (this PR, combined with TxTime search indexes batch 1).
+2. Stored negation: the D2 full-key gate and label in `StoredRA::neg_join`.
 3. Temporal relations, if a consumer needs them: the same full-key rule in
    `StoredWithValidityRA` and `StoredBitemporalRA`, with their own labels.
