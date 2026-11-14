@@ -92,19 +92,29 @@ crash or ambiguous commit; cleanup never deletes a possibly attached generation.
 
 ## Remaining qualification
 
+Hosted CI on `851404aec49bebf58f67a4a854326b1fca01c3e2` passed: [CI](https://github.com/shuruheel/mnestic/actions/runs/43539654744),
+[planner-guard](https://github.com/shuruheel/mnestic/actions/runs/43539654692)
+(including the release-mode LSQB and deep-recursion tiers), and
+[version-check](https://github.com/shuruheel/mnestic/actions/runs/43539654605).
+
 The PR stays draft until the following acceptance work is complete:
 
-- Final hosted CI, including the release-mode LSQB and deep-recursion tiers.
 - Keyed-access warm execution benchmarks on SQLite/RocksDB: 10k versus 1M
   existence probes, the 10k-left/1M-right join versus baseline and `multi_get`,
   and the adversarial composite-key/greedy controls. Compilation must be excluded.
 - TxTime 40k-row search and update latency comparisons, four-writer section
   contention, and commit waits during FTS/HNSW builds, using the specification's
   unchanged thresholds. No gate is relaxed by the passing correctness tests.
-- Freeze an immutable candidate and benchmark protocol, resource budget, inputs,
-  and raw-output location; obtain the required experiment review before the
-  costly comparison. Run without competing engine/native workloads on this 8 GB
-  host. Do not treat the deterministic concurrency fixtures as latency evidence.
+- The [measurement protocol](../plans/keyed-txtime-measurement-protocol.md)
+  has passed [independent design review](keyed-txtime-measurement-protocol.md).
+  Implement and review its measurement harness, then freeze executable
+  and input hashes before the costly comparison. The protocol pins source
+  comparisons, resource limits and unchanged gates; no measurements are claimed.
+  Run without competing engine/native workloads on this 8 GB host. Do not treat
+  the deterministic concurrency fixtures as latency evidence.
+- Integrate newer main changes and requalify the resulting candidate before
+  readiness. Main `cd039989` adds FTS persisted-statistics fold/repair after this
+  candidate's base; the current source review and CI do not cover that integration.
 
 The later historical-vector and B-tree batches retain their separate demand and
 measurement gates. This combined PR does not authorize them.
