@@ -323,7 +323,7 @@ pub(crate) fn local_bindings(
     if body[index + 1..].iter().any(|atom| {
         matches!(atom,
             MagicAtom::Unification(u) if !candidates.contains_key(&u.binding)
-                && !matches!(&u.expr, Expr::Const { .. } | Expr::Binding { .. })
+                && (u.one_many_unif || !matches!(&u.expr, Expr::Const { .. } | Expr::Binding { .. }))
         )
     }) {
         return vec![];
