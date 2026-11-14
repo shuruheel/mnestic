@@ -420,3 +420,67 @@ fn publication_waits_for_index_catalog_before_taking_the_commit_section() {
     }
     assert_eq!(rows(&db, "?[id] := *other{id}"), json!([["committed"]]));
 }
+
+#[test]
+fn persisted_fts_totals_follow_tt_commits_eviction_rebuild_and_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let assert_exact = |db: &DbInstance| {
+        let checks = db.verify_fts_stats().unwrap();
+        assert_eq!(checks.len(), 1);
+        for check in checks {
+            assert_eq!(check.persisted, Some(check.scanned), "{}", check.index);
+        }
+    };
+    {
+        let db = database(&dir);
+        db.enable_persisted_fts_stats().unwrap();
+        run(&db, FTS);
+        assert_eq!(db.seed_fts_stats().unwrap(), 1);
+        assert_exact(&db);
+        for n in 0..5 {
+            run(
+                &db,
+                &format!(
+                    "?[id,body,v] <- [['a','alpha {}',[0,0]]] :put doc{{id=>body,v}}",
+                    "extra ".repeat(n)
+                ),
+            );
+            assert_exact(&db);
+        }
+        let writers: Vec<_> = (0..4)
+            .map(|n| {
+                start(
+                    &db,
+                    &format!("?[id,body,v] <- [['w{n}','new alpha',[1,1]]] :put doc{{id=>body,v}}"),
+                )
+            })
+            .collect();
+        for writer in writers {
+            finish(writer).unwrap();
+        }
+        assert_exact(&db);
+        run(&db, "::evict doc [['a']]");
+        assert_exact(&db);
+        run(&db, "?[id] <- [['b']] :rm doc{id}");
+        assert_exact(&db);
+        run(&db, "::reindex doc");
+        assert!(db
+            .verify_fts_stats()
+            .unwrap()
+            .iter()
+            .all(|c| c.persisted.is_none()));
+        assert_eq!(db.seed_fts_stats().unwrap(), 1);
+        assert_exact(&db);
+    }
+    let db = DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "{}").unwrap();
+    assert_eq!(
+        db.enable_persisted_fts_stats().unwrap(),
+        cozo::FtsStatsOpen::Trusted
+    );
+    assert_exact(&db);
+    run(
+        &db,
+        "?[id,body,v] <- [['z','after reopen',[1,1]]] :put doc{id=>body,v}",
+    );
+    assert_exact(&db);
+}

@@ -140,7 +140,7 @@ jobs:
       # pins with a snapshot and takes no such guard. This is the only job that
       # can run the interleaving suite.
       - name: Test (graph-projection interleaving)
-        run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --verbose
+        run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --test fts_persisted_stats --verbose
       - name: Test (governed read and write transactions)
         run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --test keyed_access --test txtime_search_indexes --test txtime_index_concurrency --verbose
       - name: Test (HNSW mutation repair, reconciliation and rebuild)

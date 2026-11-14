@@ -189,6 +189,8 @@ pub struct Db<S> {
     /// seed from their own posting scan; warm serialized work stays O(1).
     /// See `fts/stats.rs` and `docs/specs/fts-transaction-stats.md`.
     fts_doc_stats_cache: Arc<FtsStatsCache>,
+    /// Persisted corpus totals, off unless enabled; see `fts/persist.rs`.
+    pub(crate) fts_persist: Arc<crate::fts::persist::FtsPersist>,
     /// Db-wide default per-query wall-clock budget in milliseconds (mnestic
     /// fork, query budget). `0` = unset. Set via
     /// [`Db::set_default_query_timeout`]; folded (via `min`) into every
@@ -428,6 +430,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             relation_locks: Default::default(),
             index_builds_in_progress: Default::default(),
             fts_doc_stats_cache: Default::default(),
+            fts_persist: Default::default(),
             default_query_timeout_ms: Default::default(),
             default_query_mem_limit: Default::default(),
             // DEFAULT for the automatic factorized-count rewrite: ON as of
@@ -1049,6 +1052,62 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// commits; with the knob on, it cannot, at a per-commit fsync cost.
     /// SQLite is already durable (`synchronous=FULL`), `mem` has nothing to
     /// sync — both return `false`.
+    /// Seed persisted BM25 totals for every full-text index whose records are
+    /// missing or invalid (mnestic fork; see `fts/persist.rs`). Each index is
+    /// scanned once in a read-only transaction; a short write transaction
+    /// then installs the base and deletes the delta records the scan already
+    /// includes. Writers are not paused. Returns the number of indexes seeded.
+    /// A no-op returning 0 when persisted totals are not enabled.
+    pub fn seed_fts_stats(&'s self) -> Result<usize> {
+        let Some(epoch) = self.fts_persist.epoch() else {
+            return Ok(0);
+        };
+        let indexes = {
+            let tx = self.transact()?;
+            crate::fts::persist::list_fts_indexes(&tx)?
+        };
+        let mut seeded = 0;
+        for idx in indexes {
+            for _attempt in 0..3 {
+                let plan = {
+                    let tx = self.transact()?;
+                    if tx.persisted_fts_doc_stats(&idx)?.is_some() {
+                        break;
+                    }
+                    crate::fts::persist::plan_seed(&tx, &idx, epoch)?
+                };
+                let mut tx = self.transact_write()?;
+                if crate::fts::persist::apply_seed(&mut tx, &idx, epoch, plan)? {
+                    tx.commit_tx()?;
+                    seeded += 1;
+                    break;
+                }
+            }
+        }
+        Ok(seeded)
+    }
+
+    /// Compare persisted totals with a full posting scan in the same
+    /// read-only snapshot, for every full-text index.
+    pub fn verify_fts_stats(&'s self) -> Result<Vec<crate::fts::persist::FtsStatsCheck>> {
+        let tx = self.transact()?;
+        let mut out = Vec::new();
+        for idx in crate::fts::persist::list_fts_indexes(&tx)? {
+            out.push(crate::fts::persist::FtsStatsCheck {
+                index: idx.name.to_string(),
+                persisted: tx.persisted_fts_doc_stats(&idx)?,
+                scanned: tx.scan_fts_doc_stats(&idx)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Stop maintaining persisted BM25 totals in this process. No marker is
+    /// written at close, so the next enabled open resets the records.
+    pub fn disable_persisted_fts_stats(&self) {
+        self.fts_persist.disable();
+    }
+
     pub fn set_durable_writes(&self, durable: bool) -> bool {
         self.db.set_durable_writes(durable)
     }
@@ -2036,6 +2095,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
             fts_stats,
+            fts_persist: self.fts_persist.clone(),
+            fts_pending: Default::default(),
             hnsw_mutations_incomplete: 0,
             keyed_access: self.enable_keyed_access.load(Ordering::Relaxed),
             tt_clock: self.tt_clock.clone(),
@@ -2071,6 +2132,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             temp_store_id: Default::default(),
             tokenizers: self.tokenizers.clone(),
             fts_stats,
+            fts_persist: self.fts_persist.clone(),
+            fts_pending: Default::default(),
             hnsw_mutations_incomplete: 0,
             keyed_access: self.enable_keyed_access.load(Ordering::Relaxed),
             tt_clock: self.tt_clock.clone(),

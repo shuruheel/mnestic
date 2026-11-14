@@ -42,6 +42,11 @@ pub struct SessionTx<'a> {
     /// totals over a newer committed corpus. Field order keeps the abort fence
     /// alive until store_tx is dropped, including failed commit and unwind.
     pub(crate) fts_stats: TxFtsStats,
+    /// Persisted corpus totals (opt-in): shared state and this transaction's
+    /// pending per-index change, written as one delta record at commit.
+    /// See `fts/persist.rs`.
+    pub(crate) fts_persist: Arc<crate::fts::persist::FtsPersist>,
+    pub(crate) fts_pending: crate::fts::persist::FtsPending,
     /// An interrupted graph mutation must never be committed by a legacy client.
     pub(crate) hnsw_mutations_incomplete: usize,
     pub(crate) keyed_access: bool,
@@ -339,6 +344,7 @@ impl<'a> SessionTx<'a> {
             self.commit_tx_with_tt()?;
             return Ok(());
         }
+        self.write_fts_deltas()?;
         self.store_tx.commit()?;
         Ok(())
     }
@@ -413,6 +419,8 @@ impl<'a> SessionTx<'a> {
             self.apply_tt_evicts()?;
             self.stamp_pending_tt_writes(tt)?;
             self.maintain_tt_indexes(&touched)?;
+            // Persist totals after the final current-belief posting change.
+            self.write_fts_deltas()?;
             poison.check()?;
             let notification = crate::runtime::txtime_index::BuildCommitNotification::new(
                 self.tt_index_builds.clone(), &touched,
