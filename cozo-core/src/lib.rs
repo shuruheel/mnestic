@@ -322,6 +322,29 @@ impl DbInstance {
         }
     }
 
+    /// Dispatcher method. See [crate::Db::fold_fts_stats].
+    pub fn fold_fts_stats(&self, min_deltas: usize) -> Result<usize> {
+        match self {
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.fold_fts_stats(min_deltas),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = min_deltas;
+                Ok(0)
+            }
+        }
+    }
+
+    /// Dispatcher method. See [crate::Db::repair_fts_stats].
+    pub fn repair_fts_stats(&self) -> Result<Vec<String>> {
+        match self {
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.repair_fts_stats(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(Vec::new()),
+        }
+    }
+
     /// Dispatcher method. See [crate::Db::verify_fts_stats].
     pub fn verify_fts_stats(&self) -> Result<Vec<FtsStatsCheck>> {
         match self {

@@ -150,7 +150,19 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.19.2
+## New in 0.19.3
+
+- **Governed transactions** (`db.governed_transact`, `db.run_governed`,
+  `MnesticError.maybe_committed`): one deadline per transaction, a bounded wait
+  between statements, an optional memory limit, rollback on error, and retries
+  that never repeat an ambiguous commit. See "Governed transactions" above.
+- **Persisted BM25 corpus totals** (Rust API, RocksDB, opt-in): full-text
+  searches no longer rescan the index after opening or while writes commit. Not
+  yet exposed in Python.
+
+No storage version change.
+
+## From 0.19.2
 
 **Faster writes, complete filtered search, no ANN-orphaned rows.** Measured at
 40,000 rows (dim 384) against 0.19.0 on SQLite:

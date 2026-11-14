@@ -1062,29 +1062,114 @@ impl<'s, S: Storage<'s>> Db<S> {
         let Some(epoch) = self.fts_persist.epoch() else {
             return Ok(0);
         };
-        let indexes = {
-            let tx = self.transact()?;
-            crate::fts::persist::list_fts_indexes(&tx)?
-        };
         let mut seeded = 0;
-        for idx in indexes {
-            for _attempt in 0..3 {
-                let plan = {
-                    let tx = self.transact()?;
-                    if tx.persisted_fts_doc_stats(&idx)?.is_some() {
-                        break;
-                    }
-                    crate::fts::persist::plan_seed(&tx, &idx, epoch)?
-                };
-                let mut tx = self.transact_write()?;
-                if crate::fts::persist::apply_seed(&mut tx, &idx, epoch, plan)? {
-                    tx.commit_tx()?;
-                    seeded += 1;
-                    break;
-                }
+        for idx in self.fts_indexes()? {
+            if self.seed_fts_index(&idx, epoch, false)? {
+                seeded += 1;
             }
         }
         Ok(seeded)
+    }
+
+    fn fts_indexes(&'s self) -> Result<Vec<crate::runtime::relation::RelationHandle>> {
+        let tx = self.transact()?;
+        crate::fts::persist::list_fts_indexes(&tx)
+    }
+
+    /// Seed one index: a scan in a read-only snapshot, then a write
+    /// transaction that installs the base if no other seed or fold changed it.
+    /// Without `force`, an index whose records are already usable is skipped.
+    fn seed_fts_index(
+        &'s self,
+        idx: &crate::runtime::relation::RelationHandle,
+        epoch: u64,
+        force: bool,
+    ) -> Result<bool> {
+        for _attempt in 0..3 {
+            let plan = {
+                let tx = self.transact()?;
+                if !force && tx.persisted_fts_doc_stats(idx)?.is_some() {
+                    return Ok(false);
+                }
+                crate::fts::persist::plan_seed(&tx, idx, epoch)?
+            };
+            // A conflict on the base record means another seed or fold won
+            // the race; take a fresh plan.
+            let mut tx = self.transact_write()?;
+            if matches!(
+                crate::fts::persist::apply_seed(&mut tx, idx, epoch, plan),
+                Ok(true)
+            ) && tx.commit_tx().is_ok()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fold delta records into the base for every seeded full-text index that
+    /// holds at least `min_deltas` of them (mnestic fork; see
+    /// `fts/persist.rs`). Reading the totals costs one range read over the
+    /// base and the unfolded deltas, so folding keeps that read short. The
+    /// sum is taken in a read-only snapshot; a short write transaction then
+    /// rewrites the base and deletes exactly the deltas it summed. Deltas
+    /// committed in between stay and still count. Writers are not paused.
+    ///
+    /// The engine does not schedule this itself: call it periodically, for
+    /// example every few seconds while writes are flowing. A fold that loses
+    /// a race with another fold or a seed is skipped, not retried. Returns the
+    /// number of indexes folded; 0 when persisted totals are not enabled.
+    pub fn fold_fts_stats(&'s self, min_deltas: usize) -> Result<usize> {
+        let Some(epoch) = self.fts_persist.epoch() else {
+            return Ok(0);
+        };
+        let mut folded = 0;
+        for idx in self.fts_indexes()? {
+            let plan = {
+                let tx = self.transact()?;
+                crate::fts::persist::plan_fold(&tx, &idx, epoch, min_deltas.max(1))?
+            };
+            let Some(plan) = plan else {
+                continue;
+            };
+            // A lock or commit conflict on the base means a concurrent fold or
+            // seed rewrote it first; skip, the next call folds what remains.
+            let mut tx = self.transact_write()?;
+            if matches!(
+                crate::fts::persist::apply_seed(&mut tx, &idx, epoch, plan),
+                Ok(true)
+            ) && tx.commit_tx().is_ok()
+            {
+                folded += 1;
+            }
+        }
+        Ok(folded)
+    }
+
+    /// Recompute the persisted totals of every full-text index whose records
+    /// disagree with a full posting scan, or are unusable. Each index is
+    /// checked in one read-only snapshot and reseeded from a fresh scan.
+    /// Returns the names of the indexes repaired.
+    pub fn repair_fts_stats(&'s self) -> Result<Vec<String>> {
+        let Some(epoch) = self.fts_persist.epoch() else {
+            return Ok(Vec::new());
+        };
+        let mut repaired = Vec::new();
+        for check in self.verify_fts_stats()? {
+            if check.persisted == Some(check.scanned) {
+                continue;
+            }
+            let idx = self
+                .fts_indexes()?
+                .into_iter()
+                .find(|idx| idx.name.as_str() == check.index);
+            if let Some(idx) = idx {
+                if self.seed_fts_index(&idx, epoch, true)? {
+                    repaired.push(check.index);
+                }
+            }
+        }
+        Ok(repaired)
     }
 
     /// Compare persisted totals with a full posting scan in the same
@@ -1093,10 +1178,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         let tx = self.transact()?;
         let mut out = Vec::new();
         for idx in crate::fts::persist::list_fts_indexes(&tx)? {
+            let epoch = self.fts_persist.epoch().unwrap_or(0);
             out.push(crate::fts::persist::FtsStatsCheck {
                 index: idx.name.to_string(),
                 persisted: tx.persisted_fts_doc_stats(&idx)?,
                 scanned: tx.scan_fts_doc_stats(&idx)?,
+                deltas: crate::fts::persist::count_fts_deltas(&tx, &idx, epoch)?,
             });
         }
         Ok(out)

@@ -103,6 +103,8 @@ pub struct FtsStatsCheck {
     pub persisted: Option<(u64, u64)>,
     /// `(tokens, documents)` from a full posting scan in the same snapshot.
     pub scanned: (u64, u64),
+    /// Delta records not yet folded into the base.
+    pub deltas: usize,
 }
 
 pub(crate) fn marker_key() -> Vec<u8> {
@@ -386,5 +388,96 @@ pub(crate) fn apply_seed(
     Ok(true)
 }
 
+/// Number of delta records of `idx` visible to `tx`, whatever their epoch.
+pub(crate) fn count_fts_deltas(
+    tx: &SessionTx<'_>,
+    idx: &RelationHandle,
+    epoch: u64,
+) -> Result<usize> {
+    Ok(tx.read_fts_records(idx, epoch)?.delta_keys.len())
+}
+
+/// Read-only half of a fold: the base plus the deltas in one snapshot. `None`
+/// when the index is unseeded, holds fewer than `min_deltas` deltas, or its
+/// records fail the sanity guard (a seed or repair fixes those).
+pub(crate) fn plan_fold(
+    tx: &SessionTx<'_>,
+    idx: &RelationHandle,
+    epoch: u64,
+    min_deltas: usize,
+) -> Result<Option<SeedPlan>> {
+    let records = tx.read_fts_records(idx, epoch)?;
+    let Some(base) = records.base.filter(|b| b.epoch == epoch) else {
+        return Ok(None);
+    };
+    if records.malformed || records.delta_keys.is_empty() || records.delta_keys.len() < min_deltas {
+        return Ok(None);
+    }
+    let tokens = i128::from(base.tokens) + records.delta_tokens;
+    let docs = i128::from(base.docs) + records.delta_docs;
+    if tokens < 0 || docs < 0 || (tokens == 0) != (docs == 0) || tokens > i128::from(u64::MAX) {
+        log::warn!(
+            "fts.persisted_stats_invalid: not folding index {}: totals would be tokens {tokens}, \
+             documents {docs}; run repair_fts_stats",
+            idx.name
+        );
+        return Ok(None);
+    }
+    Ok(Some(SeedPlan {
+        base_raw: records.base_raw,
+        generation: base.generation,
+        tokens: tokens as u64,
+        docs: docs as u64,
+        delta_keys: records.delta_keys,
+    }))
+}
+
 /// Pending per-index change of one write transaction: the index, tokens, docs.
 pub(crate) type FtsPending = BTreeMap<RelationId, (RelationHandle, i64, i64)>;
+
+#[cfg(all(test, feature = "storage-rocksdb"))]
+mod tests {
+    use super::{base_key, encode_base, list_fts_indexes, Base};
+    use std::collections::BTreeMap;
+
+    #[test]
+    fn repair_rewrites_plausible_but_wrong_totals() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::new_cozo_rocksdb(dir.path().join("db")).unwrap();
+        db.enable_persisted_fts_stats().unwrap();
+        let run = |s: &str| {
+            db.run_script(s, BTreeMap::new(), crate::ScriptMutability::Mutable)
+                .unwrap()
+        };
+        run(":create doc {id: String => body: String}");
+        run("::fts create doc:idx {extractor: body, tokenizer: Simple, filters: [Lowercase]}");
+        run("?[id, body] <- [['a', 'alpha beta'], ['b', 'alpha']] :put doc {id => body}");
+        assert_eq!(db.seed_fts_stats().unwrap(), 1);
+        let epoch = db.fts_persist.epoch().unwrap();
+
+        // Overwrite the base with positive, plausible, wrong totals.
+        let idx = {
+            let tx = db.transact().unwrap();
+            list_fts_indexes(&tx).unwrap().remove(0)
+        };
+        let mut tx = db.transact_write().unwrap();
+        let wrong = Base {
+            epoch,
+            generation: 7,
+            tokens: 999,
+            docs: 9,
+        };
+        tx.store_tx
+            .put(&base_key(&idx), &encode_base(wrong))
+            .unwrap();
+        tx.commit_tx().unwrap();
+        let check = db.verify_fts_stats().unwrap().remove(0);
+        assert_eq!(check.persisted, Some((999, 9)));
+
+        assert_eq!(db.repair_fts_stats().unwrap(), vec!["doc:idx".to_string()]);
+        let check = db.verify_fts_stats().unwrap().remove(0);
+        assert_eq!(check.persisted, Some(check.scanned));
+        assert_eq!(check.scanned, (3, 2));
+        assert!(db.repair_fts_stats().unwrap().is_empty());
+    }
+}
