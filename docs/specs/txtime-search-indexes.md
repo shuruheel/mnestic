@@ -131,7 +131,10 @@ transactor. Inside
    rolled back. The three data phases remain resolve, base write, maintenance.
 
 Reading old and new from storage, rather than from the buffer, makes repeated
-writes to one key, retract and re-assert, `:reconcile` and evict uniform.
+writes to one key, retraction and later reassertion, `:reconcile` and evict
+uniform. Preserve the existing `eval::txtime_assert_retract_conflict`: asserting
+and retracting one key within the same transaction remains an error; retraction
+and reassertion here mean separate committed transactions.
 Nothing reaches an index at statement time, so a script still cannot see its
 own writes to a `TxTime` relation, through the base or any index.
 
@@ -227,7 +230,8 @@ an unlocked builder writes only its own detached ids.
   Versioned approximate search is not offered: Milvus removed its time-travel
   search in 2.3, and Lance supports it only because its index files are
   immutable per version, which an in-place graph is not.
-- Full-text and LSH as-of stay errors until batch 3 is activated.
+- Full-text and LSH as-of stay errors unless batch 4 is separately designed,
+  approved and implemented. Batch 3 only adds B-tree secondary indexes.
 
 **D7 — History operations.** `::history_gc` removes only superseded records and
 never changes an index. `::evict` on a relation with indexes records the keys
@@ -238,9 +242,10 @@ not a logical prefix to rescan at commit; otherwise a newer concurrent version
 would be erased. Apply the same deferred-delete protocol to tt-only eviction
 even if no index is attached at statement time: an index can attach before the
 eviction commits. Check the current handle under the section, and apply the
-1,000-key limit there too if an index attached after statement validation. A version committed by another writer between evict's statement and
-its commit is outside evict's view; it survives in the base, as today, and the
-index follows the base.
+1,000-key limit there too if an index attached after statement validation.
+A version committed by another writer between evict's statement and its commit
+is outside evict's view; it survives in the base, as today, and the index follows
+the base.
 - Because its index work runs inside the commit section, one `::evict` call on
   an indexed relation accepts at most 1,000 keys and raises
   `eval::evict_batch_limit` past that (Datomic advises excising a few thousand
@@ -267,8 +272,11 @@ post-commit bookkeeping cannot turn that success into a rollback claim.
 
 ## Invariants
 
-1. At every committed state, each index on a tt-only relation equals the index
-   a plain relation holding exactly the current asserted beliefs would have.
+1. At every committed state, each index on a tt-only relation represents exactly
+   the current asserted beliefs, with the same membership, indexed values and
+   search semantics as the equivalent plain relation. HNSW topology and
+   approximate rankings need not equal an independently randomized rebuild;
+   graph integrity and the existing recall gates still apply.
 2. A tt relation's index rows are read for maintenance, written and committed
    only under `tt_commit_lock`, except by an unlocked build (D5) into an
    index that is not yet attached.
@@ -280,11 +288,18 @@ post-commit bookkeeping cannot turn that success into a rollback claim.
 ## Acceptance tests
 
 SQLite with `tempfile::tempdir()` and RocksDB; `mem` only for parser cases.
+The tests below cover the whole specification. Batch 1 runs the applicable
+FTS/HNSW/LSH cases and verifies that B-tree creation and all historical search
+remain rejected. B-tree plans and historical base-scan caps belong to batch 3;
+historical vector results belong to batch 2. Later-batch tests do not imply
+authorization to implement those batches in the combined PR.
 
 - Create each index kind on a populated tt-only relation: superseded and
   retracted versions are absent; results equal an exact scan of current beliefs.
 - Correct a row: search finds the new version only; `@ (tt: T)` on the base
-  still returns the old one. Retract, then re-assert: entries follow.
+  still returns the old one. Retract, then re-assert in a later transaction:
+  entries follow. An assert and retract in one transaction retain the existing
+  conflict error and commit neither base nor index changes.
 - One transaction inserts many new keys into an **empty** HNSW-indexed relation,
   and one updates several keys that are each other's neighbours: no error;
   membership equals a rebuilt index and graph integrity/reachability invariants
@@ -300,9 +315,11 @@ SQLite with `tempfile::tempdir()` and RocksDB; `mem` only for parser cases.
   commit; `::reindex` concurrent with a commit; `::evict` concurrent with a
   commit to the same key. Invariant 1 after each; no snapshot-conflict errors.
 - `::evict`, `::history_gc`, `import_relations`, `:reconcile`, backup and
-  restore: invariant 1 after each. After evict no B-tree entry, FTS posting,
-  LSH bucket or HNSW row contains the key, and BM25 document count and token
-  total drop by exactly that document; 1,001 keys raise the batch limit.
+  restore: invariant 1 after each. When evict removes all versions of a key,
+  no B-tree entry, FTS posting, LSH bucket or HNSW row contains it, and BM25
+  document count and token total drop by exactly that document. When a newer
+  concurrent version survives the captured deletions, the index and statistics
+  retain that version instead. 1,001 keys raise the batch limit.
 - After N corrections to one key, BM25 document count and token total equal a
   plain relation holding the current beliefs, and ranked results match it.
 - Index builds (RocksDB): commits during an unlocked build of each kind are
