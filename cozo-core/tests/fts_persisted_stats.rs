@@ -305,12 +305,13 @@ fn folding_shortens_the_record_read_and_keeps_totals_exact() {
             &db,
             &format!(
                 "?[id, body] <- [['f{}', 'alpha {}']] :put doc {{id => body}}",
-                i % 50,
+                i,
                 "x ".repeat(i % 5)
             ),
         );
     }
-    assert!(deltas(&db) >= 300);
+    // Each write inserts a new document, so each commits one delta.
+    assert_eq!(deltas(&db), 300);
     assert_eq!(
         db.fold_fts_stats(1_000).unwrap(),
         0,
