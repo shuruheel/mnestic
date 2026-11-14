@@ -110,6 +110,11 @@ impl<'a> SessionTx<'a> {
     /// before the scan; generation checks prevent stale scans from being
     /// published into a newer committed cache.
     fn fts_doc_stats(&self, idx: &RelationHandle) -> Result<(u64, u64)> {
+        // Persisted totals, when enabled and seeded, are exact for this
+        // snapshot and need no scan; see `fts/persist.rs`.
+        if let Some(stats) = self.persisted_fts_doc_stats(idx)? {
+            return Ok(stats);
+        }
         if let Some(stats) = self.fts_stats.get(idx.id) {
             return Ok(stats);
         }
@@ -199,6 +204,8 @@ impl<'a> SessionTx<'a> {
         n_docs: u64,
     ) -> Result<()> {
         self.fts_stats.before_write(idx.id);
+        // Build and reindex leave persisted totals unseeded.
+        self.drop_fts_base(idx)?;
         let legacy_key = Self::fts_stats_key(idx);
         if self.store_tx.exists(&legacy_key, false)? {
             self.store_tx.del(&legacy_key)?;
@@ -744,6 +751,9 @@ impl<'a> SessionTx<'a> {
         for (key_bytes, val_bytes) in rows {
             self.store_tx.put(&key_bytes, &val_bytes)?;
         }
+        if !already_indexed {
+            self.record_fts_delta(idx_handle, count, 1);
+        }
         match previous {
             Some(previous) => self.finish_fts_change(
                 idx_handle,
@@ -813,6 +823,9 @@ impl<'a> SessionTx<'a> {
             key[0] = DataValue::Str(text);
             let key_bytes = idx_handle.encode_key_for_store(&key, Default::default())?;
             self.store_tx.del(&key_bytes)?;
+        }
+        if indexed {
+            self.record_fts_delta(idx_handle, -count, -1);
         }
         match previous {
             Some(previous) => self.finish_fts_change(

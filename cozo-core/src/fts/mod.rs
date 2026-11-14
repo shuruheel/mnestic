@@ -25,6 +25,7 @@ use std::sync::{Arc, RwLock};
 pub(crate) mod ast;
 pub(crate) mod cangjie;
 pub(crate) mod indexing;
+pub(crate) mod persist;
 pub(crate) mod stats;
 pub(crate) mod tokenizer;
 

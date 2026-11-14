@@ -245,6 +245,17 @@ struct RocksDbBridge {
         return db->GetBaseDB();
     }
 
+    // Sequence number of the most recent write (mnestic fork). Every write
+    // through any handle advances it; background flush and compaction do not.
+    // Lets the engine tell whether anything wrote to the store between a
+    // clean close and the next open. Returns 0 when the handle is closed.
+    inline uint64_t latest_sequence_number() const {
+        if (db == nullptr) {
+            return 0;
+        }
+        return db->GetLatestSequenceNumber();
+    }
+
     // Int-property read on the base DB (mnestic fork,
     // docs/specs/cross-instance-memory.md §5). Follows the status-out-param
     // convention: kNotFound is written when RocksDB does not recognise the
