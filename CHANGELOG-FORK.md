@@ -39,6 +39,16 @@ provenance and licensing.
   qualification remains pending; see
   [implementation evidence](docs/reviews/keyed-txtime-implementation.md).
 
+### Fixed — maintenance admission under sustained writes
+
+- Queue maintenance fairly and cancel expired admission requests without
+  stranding later work. Resolve multiple relation guards in canonical order.
+- Drain native-lock-owning writers before maintenance takes relation guards;
+  release global admission before maintenance storage work. Buffered TT-only
+  multi-transactions retain their ability to span index attachment and rebuild.
+- Regression coverage includes governed writers, index publication, eviction,
+  caller deadlines and cancellation. Performance qualification remains pending.
+
 ### Added — internal keyed/TxTime timing harness
 
 - `test-hooks` instrumentation records compile-excluded execution, commits,

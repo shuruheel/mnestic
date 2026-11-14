@@ -32,9 +32,9 @@ manifest and inferential analysis are separate prerequisites.
   just as the normal query's execution interval does. The scan iterator is fused
   to prevent a backend cursor restarting after exhaustion between batches.
 
-All hooks disappear without `test-hooks`; no production feature, schema or
-storage-format change is introduced. Lock guards keep their existing lifetime
-and poisoning behavior. Recording introduces no shared trace mutex. The API is
+All measurement hooks disappear without `test-hooks`; instrumentation changes no
+schema or storage format. The subsequent admission fix changes production lock
+ordering and is covered separately by the TxTime specification. Recording introduces no shared trace mutex. The API is
 thread-local: it does not propagate a capture into governed-transaction workers.
 The harness uses synchronous, single-query scripts with no triggers or callbacks;
 its scalar execution total is not an accounting model for nested query spans.
@@ -58,7 +58,7 @@ natural overlap or that any latency threshold passed.
 - `fixture`: deterministic seed-99 plans, at most 600 stored rows per relation
   and 64 vector dimensions. Search/update, error, four-writer, FTS/HNSW build,
   and 100-pair recording-on/off fixtures are included.
-- `build`: release build with two Cargo jobs; source file hashes before/after
+- `build`: release build with one or two Cargo jobs; source file hashes before/after
   compilation, compiler/native-library provenance and a copied executable hash.
   Source changes during compilation reject the artifact.
 - `run`: verify the binary against its build manifest; preserve prelaunch
@@ -92,7 +92,7 @@ python3 scripts/timing_harness.py report /path/to/run
 ## Matched baseline
 
 `scripts/prepare_timing_baseline.py` requires a clean detached worktree at
-`595fdaa6f3327fdd737b0fa0151cc922d624edbb`. It copies the shared measurement
+`272c7b7196de9acd8d4aa66ec3e6e2f10f0057ea` (0.19.3). It copies the shared measurement
 module/runner and inserts the same query/commit boundaries. It does not copy
 optimizer or TxTime-search implementation code. The runner's only baseline
 adaptation rejects requests for the absent keyed-access toggle. Baseline plans
@@ -175,3 +175,24 @@ admission starvation and confounding in the contention overhead fixture. The
 reporter now requires confirmed-held section overlap, and the original evidence
 is preserved unchanged. Original validation counts above describe that earlier
 binary; diagnostic validation is recorded separately.
+
+## Admission and replacement recording controls
+
+The [measurement amendment](../plans/keyed-txtime-measurement-amendment.md)
+retains the specification latency gates and adds the union of transaction/
+relation admission and TT waits, avoiding double-counting nested spans. Candidate
+traces also expose maintenance admission. The old diagnostic evidence remains
+preserved and does not qualify the integrated candidate.
+
+`scripts/run_overhead_controls.py` freezes all 18 matched-snapshot controls before
+launch. Each on/off pair runs identical operations after 100 read-only probes,
+using persistent workers and barriers before and after all captures. Snapshot
+copy, open, warm-up, output encoding and validation are excluded from timing and
+recorded separately. `scripts/overhead_controls.py` checks exact rows, indexes,
+history counts, complete pairs, hashes and resource limits before estimating
+paired block-bootstrap and IID sensitivity bounds. Any failed cell blocks
+freezing the qualification campaign; no overhead is subtracted from results.
+
+Independent implementation review closed the snapshot, oracle, postprocessing,
+provenance and budget findings. The complete K1-K4/P1/T1/T2/C1/C2/H1 campaign
+implementation and qualification remain prerequisites to merge acceptance.

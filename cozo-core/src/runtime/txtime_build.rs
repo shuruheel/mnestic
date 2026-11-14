@@ -53,27 +53,15 @@ pub(crate) fn section<'a>(lock: &'a Mutex<()>, poison: &Poison) -> Result<Sectio
 }
 
 fn relation_write<'a>(
-    lock: &'a crossbeam::sync::ShardedLock<()>,
+    lock: &'a crate::runtime::relation_lock::RelationLock,
     poison: &Poison,
-) -> Result<crossbeam::sync::ShardedLockWriteGuard<'a, ()>> {
+) -> Result<crate::runtime::relation_lock::RelationGuard<'a>> {
     #[cfg(feature = "test-hooks")]
     let admission = crate::measurement::Span::new("relation_write_admission");
-    loop {
-        poison.check()?;
-        match lock.try_write() {
-            Ok(guard) => {
-                #[cfg(feature = "test-hooks")]
-                admission.finish();
-                return Ok(guard);
-            }
-            Err(TryLockError::Poisoned(error)) => {
-                #[cfg(feature = "test-hooks")]
-                admission.finish();
-                return Ok(error.into_inner());
-            }
-            Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
-        }
-    }
+    let guard = lock.write_with_poison(poison)?;
+    #[cfg(feature = "test-hooks")]
+    admission.finish();
+    Ok(guard)
 }
 
 fn index_ids(handle: &RelationHandle, name: &str) -> Option<Vec<u64>> {
@@ -301,7 +289,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         if !self.db.supports_sst_ingest() {
             // Admission before the commit section: SQLite/mem may already have
             // a writer waiting for that section. Never invert those locks.
+            let admission = self.admit_relation_maintenance(&poison)?;
             let _relation = relation_write(&locks[0], &poison)?;
+            drop(admission);
             let mut tx = self.transact_write()?;
             let current = tx.get_relation(name, true)?;
             let _section = section(&self.tt_commit_lock, &poison)?;
@@ -335,7 +325,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         let reservation_span = crate::measurement::Span::new("build_reservation");
         // Durable reservation only; no public index name exists yet.
         let (original, build) = {
+            let admission = self.admit_relation_maintenance(&poison)?;
             let _relation = relation_write(&locks[0], &poison)?;
+            drop(admission);
             let mut tx = self.transact_write()?;
             let current = tx.get_relation(name, true)?;
             ensure!(
@@ -389,7 +381,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             {
                 #[cfg(feature = "test-hooks")]
                 let publication_span = crate::measurement::Span::new("build_publication");
-                let _relation = relation_write(&locks[0], &poison)?;
+                let admission = self.admit_relation_maintenance(&poison)?;
+            let _relation = relation_write(&locks[0], &poison)?;
+            drop(admission);
                 let mut tx = self.transact_write()?;
                 // Catalog lock before the commit section, never while owning it.
                 #[cfg(feature = "test-hooks")]
@@ -521,10 +515,12 @@ impl<'s, S: Storage<'s>> Db<S> {
             ..Default::default()
         };
         let locks = self.obtain_relation_locks(targets.iter());
+        let admission = self.admit_relation_maintenance(&poison)?;
         let mut guards = Vec::new();
         for lock in &locks {
             guards.push(relation_write(lock, &poison)?);
         }
+        drop(admission);
         let mut tx = self.transact_write()?;
         // Lock catalog keys before the commit section. A transaction holding
         // one of these keys may itself be queued for that section.
@@ -553,7 +549,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
         let guard = section(&self.tt_commit_lock, &poison)?;
         tx.defer_tt_cleanup = true;
-        let rows = self.run_sys_op_with_tx(&mut tx, op, false, true)?;
+        let rows = self.run_sys_op_with_tx(&mut tx, op, false, true, true)?;
         poison.check()?;
         self.commit_tx_with_test_hook(&mut tx)?;
         let cleanup = std::mem::take(&mut tx.tt_cleanup_ranges);
@@ -592,20 +588,19 @@ mod admission_measurement_tests {
 
     #[test]
     fn admission_timeout_and_later_success_are_distinguishable() {
-        let lock = crossbeam::sync::ShardedLock::new(());
-        let reader = lock.read().unwrap();
-        let poison = Poison {
-            deadline: Some(Instant::now() + Duration::from_millis(15)),
-            ..Default::default()
-        };
-        let (result, trace) = capture(1, true, || relation_write(&lock, &poison).map(drop));
-        assert!(result.is_err());
-        assert_eq!(trace.events.len(), 1);
-        assert_eq!(trace.events[0].phase, "relation_write_admission");
-        assert!(!trace.events[0].completed);
-        // A polling exclusive waiter did not stop new shared admission.
-        assert!(lock.try_read().is_ok());
-        drop(reader);
+        let lock = crate::runtime::relation_lock::RelationLock::default();
+        std::thread::scope(|scope| {
+            let reader = lock.read().unwrap();
+            scope.spawn(|| {
+                let poison = Poison { deadline: Some(Instant::now() + Duration::from_millis(15)), ..Default::default() };
+                let (result, trace) = capture(1, true, || relation_write(&lock, &poison).map(drop));
+                assert!(result.is_err());
+                assert_eq!(trace.events.len(), 1);
+                assert_eq!(trace.events[0].phase, "relation_write_admission");
+                assert!(!trace.events[0].completed);
+            }).join().unwrap();
+            drop(reader);
+        });
         let (result, trace) = capture(2, true, || relation_write(&lock, &Poison::default()).map(drop));
         result.unwrap();
         assert!(trace.events[0].completed);

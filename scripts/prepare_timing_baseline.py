@@ -11,7 +11,7 @@ import json
 from pathlib import Path
 import subprocess
 
-BASE = '595fdaa6f3327fdd737b0fa0151cc922d624edbb'
+BASE = '272c7b7196de9acd8d4aa66ec3e6e2f10f0057ea'
 
 
 def replace_once(text, old, new):
@@ -30,7 +30,7 @@ def prepare(destination, evidence):
     if evidence.exists():
         raise ValueError('evidence file already exists')
     files = {}
-    for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime_timing.rs']:
+    for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']:
         files[name] = (source/name).read_text()
     # The baseline has no optimizer toggle. Refuse a toggle request rather than
     # silently label an identical run candidate-on/off. Timing code stays shared.
@@ -38,6 +38,10 @@ def prepare(destination, evidence):
     files[runner] = replace_once(files[runner],
         '    if let Some(enabled) = plan.keyed_access {\n        db.set_keyed_access_for_tests(enabled);\n    }',
         '    ensure!(plan.keyed_access.is_none(), "baseline has no keyed-access toggle");')
+    control = 'cozo-core/examples/keyed_txtime/overhead.rs'
+    files[control] = replace_once(files[control],
+        '                    if let Some(enabled) = plan.keyed_access {\n                        db.set_keyed_access_for_tests(enabled);\n                    }',
+        '                    ensure!(plan.keyed_access.is_none(), "baseline has no keyed-access toggle");')
     name = 'cozo-core/Cargo.toml'
     files[name] = (destination/name).read_text() + '\n[[example]]\nname = "keyed_txtime_timing"\nrequired-features = ["test-hooks"]\n'
     name = 'cozo-core/src/lib.rs'
@@ -62,7 +66,7 @@ def prepare(destination, evidence):
         path.write_text(text)
     hashes = {name:hashlib.sha256(text.encode()).hexdigest() for name,text in files.items()}
     patch = git('diff', '--binary')
-    for name in ['cozo-core/src/measurement.rs', 'cozo-core/examples/keyed_txtime_timing.rs']:
+    for name in ['cozo-core/src/measurement.rs', 'cozo-core/examples/keyed_txtime_timing.rs', 'cozo-core/examples/keyed_txtime/overhead.rs']:
         addition = f'diff --git a/{name} b/{name}\nnew file mode 100644\n'
         addition += ''.join(difflib.unified_diff([], files[name].splitlines(keepends=True), fromfile='/dev/null', tofile='b/'+name))
         patch += addition.encode()

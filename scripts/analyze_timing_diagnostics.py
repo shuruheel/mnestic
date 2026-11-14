@@ -47,8 +47,17 @@ def build_analysis(rows, cell):
     events = ddl[0]['timing']['events']
     writers = [r for r in rows if r['cell']==cell and r['writer']>0 and r.get('timing')]
     waits, admissions, held_lower_bounds = [], [], []
+    writer_waits = []
     for row in writers:
         es = row['timing']['events']
+        complete_admission = [(e['start_ns'],e['end_ns']) for e in es
+                              if e['phase'] in ['transaction_admission','relation_read_admission']]
+        tt_waits = [(e['start_ns'],e['acquired_ns'] if e['acquired_ns'] is not None else e['end_ns'])
+                    for e in es if e['phase']=='tt_commit_section']
+        window = (row['timing']['start_ns'],row['timing']['end_ns'])
+        writer_waits.append(dict(operation_id=row['operation_id'],writer=row['writer'],status=row['status'],
+            admission_union_ns=covered_ns(complete_admission,window),tt_wait_union_ns=covered_ns(tt_waits,window),
+            admission_and_tt_wait_union_ns=covered_ns(complete_admission+tt_waits,window)))
         for e in es:
             if e['phase']=='tt_commit_section':
                 waits.append((e['start_ns'],e['acquired_ns'] if e['acquired_ns'] is not None else e['end_ns']))
@@ -95,6 +104,10 @@ def build_analysis(rows, cell):
                 ddl_shared_guard_covered_fraction=ddl_covered/(ddl_window[1]-ddl_window[0]),
                 shared_guard_basis='admission-end to commit-end when available; otherwise commit interval',
                 phases=phases,relation_write_waits=relation_waits,
+                maintenance_admissions=[dict(completed=e['completed'],duration_ns=e['end_ns']-e['start_ns'])
+                                        for e in events if e['phase']=='maintenance_admission'],
+                writer_waits=writer_waits,
+                max_writer_admission_and_tt_wait_union_ns=max((w['admission_and_tt_wait_union_ns'] for w in writer_waits),default=0),
                 writer_operations=len(writers),writer_errors=sum(r['status']!='ok' for r in writers),
                 interpretation='development diagnostic; phase envelopes are not acquired critical sections')
 

@@ -3,6 +3,38 @@
 Status: implemented on `spec-planner-keyed-access`; draft PR qualification.
 No release or performance acceptance is claimed.
 
+## November 14 admission follow-up
+
+Main `272c7b71` (0.19.3) is integrated by `dff2d1a7`. Sustained writers exposed
+starvation in the earlier polling admission policy. The follow-up adds FIFO
+relation admission, canonical multi-relation ordering, cancellation cleanup and
+a global admission gate that drains native writers before maintenance takes
+relation guards. Buffered TT-only multi-transactions can still span index
+attachment/rebuild; native-locking statements retain admission until transaction
+end. An independent storage review found no remaining blocker in this change.
+
+Latest local checks on the admission source: 421 release library tests, 31
+governed-transaction tests and 11 TxTime concurrency tests passed. The library
+run excludes the existing debug-only `custom_aggr_debug_probe_catches_non_absorptive_meet`
+panic test; that is not a release-mode test pass. Strict Clippy passed for the
+library, tests and timing example. Production compilation with RocksDB and
+`columnar-io`, without `test-hooks`, passed. Python reporting checks passed
+(12 timing/diagnostic tests and 5 matched-snapshot control tests).
+
+Earlier attempts are retained: disk exhaustion during compilation, three
+concurrency fixture failures under the overly broad first admission policy,
+and a timing-runner enum lint. The refined policy preserves buffered TT
+transactions; revised race fixtures respect native writer admission. No failed
+run is replaced by a successful subset. Resource constraints required one Cargo
+job; the independent experiment reviewer accepted that build-only deviation.
+Evidence is retained in the workspace artifact directory
+`benchmark-artifacts/keyed-txtime-admission-20261114-v1`.
+
+The [measurement amendment](../plans/keyed-txtime-measurement-amendment.md) and
+replacement overhead controls passed independent source review. Development
+execution, recording-cost acceptance and full performance qualification are
+separate gates; this correctness evidence does not establish merge readiness.
+
 ## Scope
 
 One branch combines [planner keyed access](../specs/planner-keyed-access.md)

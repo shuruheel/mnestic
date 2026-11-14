@@ -162,7 +162,9 @@ def source_snapshot(repo):
                 rocksdb_vendor=git('ls-tree','HEAD','cozorocks/rocksdb').decode().strip())
 
 
-def build(source, target, output):
+def build(source, target, output, jobs=2):
+    if jobs not in [1, 2]:
+        raise ValueError("native builds require one or two jobs")
     source, target, output = map(lambda p: Path(p).resolve(), (source,target,output))
     output.mkdir()
     before = source_snapshot(source)
@@ -172,7 +174,7 @@ def build(source, target, output):
     if env.get('ROCKSDB_LIB_DIR') and not (Path(env['ROCKSDB_LIB_DIR'])/'librocksdb.a').is_file():
         raise ValueError('native RocksDB archive is missing; refusing a build with incomplete provenance')
     command = ['cargo','build','--locked','-p','mnestic','--features','storage-rocksdb,test-hooks',
-               '--example','keyed_txtime_timing','--release','-j','2']
+               '--example','keyed_txtime_timing','--release','-j',str(jobs)]
     started = time.time()
     with (output/'build.log').open('x') as log:
         proc = subprocess.Popen(command,cwd=source,env=env,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
@@ -396,6 +398,7 @@ def main():
     run.add_argument('--min-free-mib', type=int, default=2048)
     comp = sub.add_parser('build')
     comp.add_argument('source'); comp.add_argument('target'); comp.add_argument('output')
+    comp.add_argument('--jobs', type=int, choices=[1,2], default=2)
     rep = sub.add_parser('report'); rep.add_argument('directory')
     args = parser.parse_args()
     if args.command == 'fixture':
@@ -404,7 +407,7 @@ def main():
     elif args.command == 'run':
         print(json.dumps(supervise(args.binary,args.plan,args.output,args.build_manifest,args.seconds,args.max_rss_mib,args.min_free_mib)))
     elif args.command == 'build':
-        print(json.dumps(build(args.source,args.target,args.output),indent=2))
+        print(json.dumps(build(args.source,args.target,args.output,args.jobs),indent=2))
     else:
         print(json.dumps(report(args.directory),indent=2))
 

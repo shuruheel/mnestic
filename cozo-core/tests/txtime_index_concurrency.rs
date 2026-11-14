@@ -217,21 +217,24 @@ fn catchup_overflow_fails_the_rebuild_and_keeps_the_attached_index() {
 }
 
 #[test]
-fn eviction_uses_exact_captured_versions_when_index_attaches_before_commit() {
+fn eviction_uses_exact_captured_versions_before_queued_index_build() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(&dir);
     run(&db, "::evict doc []"); // reserve audit metadata before the race
     let (arrived, release) = fence(&db, "evict_pre_commit");
     let eviction = start(&db, "::evict doc [['a']]");
     arrive(&arrived);
-    finish(start(&db, FTS)).unwrap();
     finish(start(
         &db,
         "?[id,body,v] <- [['a','surviving alpha',[9,9]]] :put doc{id=>body,v}",
     ))
     .unwrap();
+    // Eviction holds the native audit-salt lock, so maintenance must drain it.
+    // A newer version committed before eviction still survives exact deletion.
+    let building = start(&db, FTS);
     release.send(()).unwrap();
     finish(eviction).unwrap();
+    finish(building).unwrap();
     assert_eq!(
         rows(&db, "?[id] := ~doc:text{id | query:'surviving',k:10}"),
         json!([["a"]])
@@ -381,7 +384,7 @@ fn deadline_after_backfill_does_not_attach_a_partial_index() {
 }
 
 #[test]
-fn publication_waits_for_index_catalog_before_taking_the_commit_section() {
+fn maintenance_drains_catalog_writers_then_releases_global_admission() {
     let dir = tempfile::tempdir().unwrap();
     let db = database(&dir);
     run(&db, FTS);
@@ -403,22 +406,24 @@ fn publication_waits_for_index_catalog_before_taking_the_commit_section() {
     holding.recv_timeout(Duration::from_secs(20)).unwrap();
     let (arrived, release) = fence(&db, "publication_before_catalog");
     let building = start(&db, "::reindex doc");
-    arrive(&arrived);
-    release.send(()).unwrap();
-    // The holder must be able to enter the global commit section while the
-    // publication thread waits for its catalog lock.
+    // Maintenance must first drain the admitted transaction. The holder can
+    // finish its next statement and commit without waiting behind the build.
     release_writer.send(()).unwrap();
     finish(writer).unwrap();
-    // Catalog writes concurrent with transaction creation may legitimately
-    // trigger RocksDB validation; neither path may deadlock waiting for TT.
-    let result = finish(building);
-    if let Err(error) = result {
-        assert!(
-            error.contains("Resource busy") || error.contains("Busy"),
-            "{error}"
-        );
-    }
-    assert_eq!(rows(&db, "?[id] := *other{id}"), json!([["committed"]]));
+    arrive(&arrived);
+    // Once the target relation is exclusive, global admission is released:
+    // an unrelated writer can still commit while publication is paused.
+    finish(start(
+        &db,
+        "?[id] <- [['during publication']] :put other{id}",
+    ))
+    .unwrap();
+    release.send(()).unwrap();
+    finish(building).unwrap();
+    assert_eq!(
+        rows(&db, "?[id] := *other{id}"),
+        json!([["committed"], ["during publication"]])
+    );
 }
 
 #[test]
@@ -483,4 +488,42 @@ fn persisted_fts_totals_follow_tt_commits_eviction_rebuild_and_reopen() {
         "?[id,body,v] <- [['z','after reopen',[1,1]]] :put doc{id=>body,v}",
     );
     assert_exact(&db);
+}
+
+#[test]
+fn mutation_deadlines_cover_admission_and_cancelled_waiters_do_not_block_publication() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(&dir);
+    let (arrived, release) = fence(&db, "publication_before_catalog");
+    let building = start(&db, FTS);
+    arrive(&arrived); // builder owns exclusive relation admission
+    for script in [
+        "?[id,body,v] <- [['a','cancelled alpha',[2,2]]] :put doc{id=>body,v}",
+        "{?[id,body,v] <- [['a','cancelled alpha',[2,2]]] :put doc{id=>body,v}}",
+        "::evict doc [['a']]",
+    ] {
+        let error = db
+            .run_script_with_options(
+                script,
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+                cozo::ScriptRunOptions::new().with_timeout(0.02),
+            )
+            .unwrap_err();
+        assert!(format!("{error:?}").contains("eval::timeout"));
+    }
+    release.send(()).unwrap();
+    finish(building).unwrap();
+    assert_eq!(
+        rows(&db, "?[id] := ~doc:text{id | query:'old',k:10}"),
+        json!([["a"], ["b"]])
+    );
+    run(
+        &db,
+        "?[id,body,v] <- [['a','after alpha',[3,3]]] :put doc{id=>body,v}",
+    );
+    assert_eq!(
+        rows(&db, "?[id] := ~doc:text{id | query:'after',k:10}"),
+        json!([["a"]])
+    );
 }

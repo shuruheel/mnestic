@@ -15,6 +15,9 @@ use std::sync::{
     mpsc, Arc, Barrier,
 };
 use std::time::{Duration, Instant};
+#[path = "keyed_txtime/overhead.rs"]
+mod overhead;
+
 static NEXT_CONTEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 use cozo::{
@@ -35,6 +38,8 @@ struct Plan {
     backend: String,
     #[serde(default)]
     keyed_access: Option<bool>,
+    #[serde(default)]
+    overhead_control: Option<overhead::Control>,
     #[serde(default)]
     setup: Vec<Operation>,
     steps: Vec<Step>,
@@ -60,6 +65,8 @@ struct Operation {
     #[serde(default)]
     expected_rows: Option<Value>,
     #[serde(default)]
+    expected_row_count: Option<usize>,
+    #[serde(default)]
     save_rows: bool,
     #[serde(default)]
     expected_error: Option<String>,
@@ -79,7 +86,7 @@ enum Step {
     },
     Build {
         cell: String,
-        ddl: Operation,
+        ddl: Box<Operation>,
         workers: Vec<Vec<Operation>>,
         interval_ms: u64,
         max_attempts_per_writer: usize,
@@ -130,6 +137,15 @@ impl Context {
         })
     }
     fn run(&mut self, db: &DbInstance, op: &Operation, timeout: Duration) -> Result<()> {
+        self.run_synchronized(db, op, timeout, None)
+    }
+    fn run_synchronized(
+        &mut self,
+        db: &DbInstance,
+        op: &Operation,
+        timeout: Duration,
+        boundary: Option<&Barrier>,
+    ) -> Result<()> {
         // Decode parameters and initialize capture storage outside run_script timing.
         let params = op
             .params
@@ -143,6 +159,9 @@ impl Context {
         } else {
             ScriptMutability::Mutable
         };
+        if let Some(boundary) = boundary {
+            boundary.wait();
+        }
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             capture(id, !op.disabled, || {
                 if op.batch {
@@ -160,6 +179,11 @@ impl Context {
                 }
             })
         }));
+        // Concurrent controls emit nothing until every measured capture ends,
+        // including captures that unwind. Encoding/flush must not perturb peers.
+        if let Some(boundary) = boundary {
+            boundary.wait();
+        }
         let (result, trace) = match execution {
             Ok(pair) => pair,
             Err(_) => {
@@ -181,6 +205,11 @@ impl Context {
             error.as_ref().is_some_and(|e| e.contains(expected))
         } else {
             error.is_none()
+                && op.expected_row_count.is_none_or(|n| {
+                    rows.as_ref()
+                        .and_then(Value::as_array)
+                        .is_some_and(|rows| rows.len() == n)
+                })
                 && op
                     .expected_rows
                     .as_ref()
@@ -251,6 +280,9 @@ fn validate_trace(t: &Trace) -> bool {
 }
 
 fn run(plan: &Plan, dir: &Path) -> Result<()> {
+    if let Some(control) = &plan.overhead_control {
+        return overhead::run(plan, dir, control);
+    }
     let db = DbInstance::new(&plan.backend, dir.join("database").to_str().unwrap(), "{}")?;
     if let Some(enabled) = plan.keyed_access {
         db.set_keyed_access_for_tests(enabled);

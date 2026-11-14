@@ -23,6 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 #[allow(unused_imports)]
 use crossbeam::channel::{bounded, unbounded, Receiver, Sender};
 use crossbeam::sync::ShardedLock;
+use crate::runtime::relation_lock::RelationLock;
 use either::{Left, Right};
 use itertools::Itertools;
 use miette::Report;
@@ -173,7 +174,11 @@ pub struct Db<S> {
     callback_count: Arc<AtomicU32>,
     #[cfg(not(target_arch = "wasm32"))]
     pub(crate) event_callbacks: Arc<ShardedLock<EventCallbackRegistry>>,
-    relation_locks: Arc<ShardedLock<BTreeMap<SmartString<LazyCompact>, Arc<ShardedLock<()>>>>>,
+    relation_locks: Arc<ShardedLock<BTreeMap<SmartString<LazyCompact>, Arc<RelationLock>>>>,
+    // Writer transactions enter before relation/storage locks. Exclusive
+    // relation operations drain this gate before acquiring relation guards,
+    // so a dynamic transaction can finish without queuing behind its waiter.
+    writer_admission: Arc<RelationLock>,
     /// Index relations currently being built off-lock (mnestic fork). The
     /// non-blocking HNSW build releases the relation write lock during the heavy
     /// build phase, so this set serialises concurrent builds of the *same* index
@@ -428,6 +433,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             #[cfg(not(target_arch = "wasm32"))]
             event_callbacks: Default::default(),
             relation_locks: Default::default(),
+            writer_admission: Default::default(),
             index_builds_in_progress: Default::default(),
             fts_doc_stats_cache: Default::default(),
             fts_persist: Default::default(),
@@ -469,6 +475,11 @@ impl<'s, S: Storage<'s>> Db<S> {
         payloads: Receiver<TransactionPayload>,
         results: Sender<Result<NamedRows>>,
     ) {
+        let mut admission_pinned = !self.db.supports_sst_ingest();
+        let mut writer_admission = match self.admit_writer(is_write && admission_pinned, &Poison::default()) {
+            Ok(guard) => guard,
+            Err(error) => { let _ = results.send(Err(error)); return; }
+        };
         let tx = if is_write {
             self.transact_write()
         } else {
@@ -491,6 +502,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         for payload in payloads {
             match payload {
                 TransactionPayload::Commit => {
+                    if is_write && writer_admission.is_none() {
+                        match self.admit_writer(true, &Poison::default()) {
+                            Ok(guard) => writer_admission = guard,
+                            Err(error) => { let _ = results.send(Err(error)); break; }
+                        }
+                    }
                     for (lower, upper) in cleanups {
                         if let Err(err) = tx.store_tx.del_range_from_persisted(&lower, &upper) {
                             eprintln!("{err:?}")
@@ -511,6 +528,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                     // likewise correct — it breaks without dispatching.
                     let commit_result = self.commit_tx_with_test_hook(&mut tx);
                     let committed = commit_result.is_ok();
+                    drop(tx);
+                    drop(writer_admission);
                     let _ = results.send(commit_result.map(|_| NamedRows::default()));
                     #[cfg(not(target_arch = "wasm32"))]
                     if committed && !callback_collector.is_empty() {
@@ -567,6 +586,13 @@ impl<'s, S: Storage<'s>> Db<S> {
                             continue;
                         }
                     }
+                    if is_write && writer_admission.is_none() {
+                        match self.admit_writer(true, &Poison::default()) {
+                            Ok(guard) => writer_admission = guard,
+                            Err(error) => { let _ = results.send(Err(error)); break; }
+                        }
+                    }
+                    admission_pinned |= !Self::statement_has_no_native_locks(&tx, &p);
                     if let Some(write_lock_name) = write_lock_name {
                         match write_locks.entry(write_lock_name) {
                             Entry::Vacant(e) => {
@@ -588,6 +614,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         &callback_targets,
                         &mut callback_collector,
                     );
+                    if !admission_pinned { drop(writer_admission.take()); }
                     if results.send(res).is_err() {
                         break;
                     }
@@ -855,6 +882,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         worker: &crate::GovernedTransactionWorker,
     ) -> Result<()> {
         worker.poison.check()?;
+        let mut admission_pinned = !self.db.supports_sst_ingest();
+        let mut writer_admission = self.admit_writer(worker.write && admission_pinned, &worker.poison)?;
         let mut tx = if worker.write {
             self.transact_write()?
         } else {
@@ -875,6 +904,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                     return worker.reply(NamedRows::default());
                 }
                 TransactionPayload::Commit => {
+                    if worker.write && writer_admission.is_none() {
+                        writer_admission = self.admit_writer(true, &worker.poison)?;
+                    }
                     for (lower, upper) in cleanups {
                         worker.poison.check()?;
                         tx.store_tx.del_range_from_persisted(&lower, &upper)?;
@@ -882,6 +914,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     worker.poison.check()?;
                     self.commit_tx_with_test_hook(&mut tx)?;
                     drop(tx);
+                    drop(writer_admission);
                     // The commit already succeeded. Its success is independent
                     // of caller disconnect or change-feed backpressure.
                     let reply = worker.reply(NamedRows::default());
@@ -907,15 +940,13 @@ impl<'s, S: Storage<'s>> Db<S> {
                             worker.write || lock_name.is_none(),
                             "write lock required for read-only transaction"
                         );
+                        if worker.write && writer_admission.is_none() {
+                            writer_admission = self.admit_writer(true, &worker.poison)?;
+                        }
+                        admission_pinned |= !Self::statement_has_no_native_locks(&tx, &p);
                         let locks = self.obtain_relation_locks(lock_name.iter());
                         let _guard = if let Some(lock) = locks.first() {
-                            Some(loop {
-                                worker.poison.check()?;
-                                if let Ok(guard) = lock.try_read() {
-                                    break guard;
-                                }
-                                worker.sleep(Duration::from_millis(2), None)?;
-                            })
+                            Some(lock.read_with_poison(&worker.poison)?)
                         } else {
                             None
                         };
@@ -942,6 +973,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         worker.poison.check()?;
                         Ok(rows)
                     })();
+                    if !admission_pinned { drop(writer_admission.take()); }
                     // Includes parse/compile/evaluation failures. Any error
                     // exits this worker and drops all uncommitted writes.
                     self.flush_warnings();
@@ -1503,7 +1535,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         #[diagnostic(code(import::bad_data))]
         struct BadDataForRelation(String, JsonValue);
 
-        let rel_names = data.keys().map(SmartString::from).collect_vec();
+        let _writer_admission = self.admit_writer(true, &Poison::default())?;
+        let rel_names = data.keys().map(|name| SmartString::from(name.strip_prefix('-').unwrap_or(name))).collect_vec();
         let locks = self.obtain_relation_locks(rel_names.iter());
         let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
 
@@ -1757,6 +1790,7 @@ impl<'s, S: Storage<'s>> Db<S> {
 
         #[cfg(feature = "storage-sqlite")]
         {
+            let _writer_admission = self.admit_writer(true, &Poison::default())?;
             let rel_names = relations.iter().map(SmartString::from).collect_vec();
             let locks = self.obtain_relation_locks(rel_names.iter());
             let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
@@ -2106,31 +2140,58 @@ impl<'s, S: Storage<'s>> Db<S> {
         ret.is_some()
     }
 
+    fn statement_has_no_native_locks(tx: &SessionTx<'_>, program: &InputProgram) -> bool {
+        match &program.out_opts.store_relation {
+            None => true,
+            Some((_, RelationOp::Create | RelationOp::Replace, _)) => false,
+            Some((relation, _, _)) => tx.get_relation(&relation.name, false)
+                .is_ok_and(|handle| handle.is_tt_only()),
+        }
+    }
+
+    pub(crate) fn admit_writer(&self, write: bool, poison: &Poison) -> Result<Option<crate::runtime::relation_lock::RelationGuard<'_>>> {
+        if !write { return Ok(None); }
+        #[cfg(feature = "test-hooks")]
+        let admission = crate::measurement::Span::new("transaction_admission");
+        let guard = if self.db.supports_sst_ingest() {
+            self.writer_admission.read_with_poison(poison)?
+        } else {
+            self.writer_admission.write_with_poison(poison)?
+        };
+        #[cfg(feature = "test-hooks")]
+        admission.finish();
+        Ok(Some(guard))
+    }
+
+    // Non-Rocks standalone operations already hold the single-writer gate.
+    // Rocks builders hold this only while obtaining their relation guards,
+    // never throughout backfill or the subsequent storage/TT critical section.
+    pub(crate) fn admit_relation_maintenance(&self, poison: &Poison) -> Result<Option<crate::runtime::relation_lock::RelationGuard<'_>>> {
+        if self.db.supports_sst_ingest() {
+            #[cfg(feature = "test-hooks")]
+            let admission = crate::measurement::Span::new("maintenance_admission");
+            let guard = self.writer_admission.write_with_poison(poison)?;
+            #[cfg(feature = "test-hooks")]
+            admission.finish();
+            Ok(Some(guard))
+        } else { Ok(None) }
+    }
+
     pub(crate) fn obtain_relation_locks<'a, T: Iterator<Item = &'a SmartString<LazyCompact>>>(
         &'s self,
         rels: T,
-    ) -> Vec<Arc<ShardedLock<()>>> {
-        let mut collected = vec![];
-        let mut pending = vec![];
+    ) -> Vec<Arc<RelationLock>> {
+        // Canonical order and deduplication must hold even when only some names
+        // already exist. Partitioning existing/missing locks inverted order.
+        let names = rels.collect::<BTreeSet<_>>();
         {
             let locks = self.relation_locks.read().unwrap();
-            for rel in rels {
-                match locks.get(rel) {
-                    None => {
-                        pending.push(rel);
-                    }
-                    Some(lock) => collected.push(lock.clone()),
-                }
+            if names.iter().all(|name| locks.contains_key(*name)) {
+                return names.iter().map(|name| locks[*name].clone()).collect();
             }
         }
-        if !pending.is_empty() {
-            let mut locks = self.relation_locks.write().unwrap();
-            for rel in pending {
-                let lock = locks.entry(rel.clone()).or_default().clone();
-                collected.push(lock);
-            }
-        }
-        collected
+        let mut locks = self.relation_locks.write().unwrap();
+        names.into_iter().map(|name| locks.entry(name.clone()).or_default().clone()).collect()
     }
 
     fn compact_relation(&'s self) -> Result<()> {
@@ -2281,13 +2342,18 @@ impl<'s, S: Storage<'s>> Db<S> {
         if read_only && is_write {
             bail!("write lock required for read-only query");
         }
+        let block_deadline = p.out_opts.timeout.and_then(|seconds|
+            budget_now().and_then(|start| deadline_from_secs(start, seconds)));
+        let outer_deadline = outer_deadline.into_iter().chain(block_deadline).min();
+        let admission_poison = Poison { deadline: outer_deadline, ..Default::default() };
+        #[cfg(feature = "test-hooks")]
+        let admission = is_write.then(|| crate::measurement::Span::new("relation_read_admission"));
+        let writer_admission = self.admit_writer(is_write, &admission_poison)?;
         let write_lock = self.obtain_relation_locks(write_lock_names.iter());
         let _write_lock_guards = if is_write {
+            let guard = write_lock[0].read_with_poison(&admission_poison)?;
             #[cfg(feature = "test-hooks")]
-            let admission = crate::measurement::Span::new("relation_read_admission");
-            let guard = write_lock[0].read().unwrap();
-            #[cfg(feature = "test-hooks")]
-            admission.finish();
+            admission.unwrap().finish();
             Some(guard)
         } else {
             None
@@ -2326,6 +2392,8 @@ impl<'s, S: Storage<'s>> Db<S> {
 
             tx.commit_tx()?;
         }
+        drop(_write_lock_guards);
+        drop(writer_admission);
         #[cfg(not(target_arch = "wasm32"))]
         if !callback_collector.is_empty() {
             self.send_callbacks(callback_collector)
@@ -2658,6 +2726,7 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// its metadata is committed, so a reader can never observe the index before
     /// its keys exist. RocksDB only (requires SST ingest).
     fn create_hnsw_index_nonblocking(&'s self, config: &HnswIndexConfig) -> Result<()> {
+        let admission_poison = Poison::default();
         let idx_full_name = SmartString::<LazyCompact>::from(format!(
             "{}:{}",
             config.base_relation, config.index_name
@@ -2684,7 +2753,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         // PHASE A — brief write lock: create the empty index relation and commit,
         // so its relation id is durably consumed (never reused, even on crash).
         let (idx_handle, manifest, filter) = {
-            let _guard = rel_lock.write().unwrap();
+            let admission = self.admit_relation_maintenance(&admission_poison)?;
+            let _guard = rel_lock.write_with_poison(&admission_poison)?;
+            drop(admission);
             let mut tx = self.transact_write()?;
             let (_rel_handle, idx_handle, manifest, filter) = tx.prepare_hnsw_index(config)?;
             tx.commit_tx()?;
@@ -2729,7 +2800,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         // window, then publish the metadata. Data is already live (ingested);
         // metadata becomes visible at commit, strictly after the data.
         {
-            let _guard = rel_lock.write().unwrap();
+            let admission = self.admit_relation_maintenance(&admission_poison)?;
+            let _guard = rel_lock.write_with_poison(&admission_poison)?;
+            drop(admission);
             let mut tx = self.transact_write()?;
             let rel_handle = tx.get_relation(&config.base_relation, true)?;
             if rel_handle.has_index(&config.index_name) {
@@ -2810,10 +2883,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         op: &SysOp,
         read_only: bool,
         skip_locking: bool,
+        standalone: bool,
     ) -> Result<NamedRows> {
+        let admission_poison = Poison { deadline: tx.script_deadline, parent_cancellation: tx.script_cancellation.clone(), ..Default::default() };
         // Imperative programs embed SysOps in their existing transaction. They
         // cannot use detached publication or acquire the TT commit section here.
-        if skip_locking && !tx.defer_tt_cleanup {
+        if skip_locking && !standalone && !tx.defer_tt_cleanup {
             let targets: Vec<_> = match op {
                 SysOp::Reindex(name) | SysOp::RemoveIndex(name, _) => vec![name],
                 SysOp::TtHistoryGc(name, _) | SysOp::RepairCorrupt(name) if skip_locking => vec![name],
@@ -2888,7 +2963,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(iter::once(&catalog_name))
                 };
-                let _guards = locks.iter().map(|lock| lock.read().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|lock| lock.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
                 let fixed_rules = self.get_fixed_rules();
                 let custom_aggrs = self.get_custom_aggrs();
                 let custom_bounded = self.get_custom_bounded_meets();
@@ -2915,7 +2990,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(iter::once(&catalog_name))
                 };
-                let _guards = locks.iter().map(|lock| lock.read().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|lock| lock.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
                 stored_queries::remove(tx, name)
             }
             SysOp::ListStoredQueries => stored_queries::list(tx),
@@ -3115,7 +3190,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks([&rel.name].into_iter())
                 };
-                let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|l| l.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
 
                 let mut handle = tx.get_relation(rel, true)?;
                 // Graph-projection dirty-set hook (spec §3.4 row 11).
@@ -3269,7 +3344,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks([&rel.name, &audit_name].into_iter())
                 };
-                let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|l| l.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
 
                 let mut handle = tx.get_relation(rel, false)?;
                 if !handle.is_tt_only() { handle = tx.get_relation(rel, true)?; }
@@ -3414,7 +3489,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(rel_name_strs)
                 };
-                let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|l| l.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
                 let mut bounds = vec![];
                 for rs in rel_names {
                     let bound = tx.destroy_relation(rs)?;
@@ -3457,7 +3532,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(iter::once(&rel_name.name))
                 };
-                let _guards = locks.iter().map(|lock| lock.write().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|lock| lock.write_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
 
                 let handle = tx.get_relation(rel_name, true)?;
                 // Graph-projection dirty-set hook: the index rows below are
@@ -3488,7 +3563,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(iter::once(&rel_name.name))
                 };
-                let _guards = locks.iter().map(|lock| lock.write().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|lock| lock.write_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
                 let handle = tx.get_relation(rel_name, true)?;
                 ensure!(
                     !handle.has_txtime() || !crate::runtime::txtime_index::has_search_indexes(&handle),
@@ -3535,7 +3610,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .obtain_relation_locks(iter::once(&rel_name.name))
                         .pop()
                         .unwrap();
-                    let _guard = lock.write().unwrap();
+                    let _guard = lock.write_with_poison(&admission_poison)?;
                     tx.create_index(rel_name, idx_name, cols)?;
                 }
                 Ok(NamedRows::new(
@@ -3554,7 +3629,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .obtain_relation_locks(iter::once(&config.base_relation))
                         .pop()
                         .unwrap();
-                    let _guard = lock.write().unwrap();
+                    let _guard = lock.write_with_poison(&admission_poison)?;
                     self.build_and_publish_hnsw(tx, config)?;
                 }
                 Ok(NamedRows::new(
@@ -3573,7 +3648,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .obtain_relation_locks(iter::once(&config.base_relation))
                         .pop()
                         .unwrap();
-                    let _guard = lock.write().unwrap();
+                    let _guard = lock.write_with_poison(&admission_poison)?;
                     tx.create_fts_index(config)?;
                 }
                 Ok(NamedRows::new(
@@ -3592,7 +3667,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .obtain_relation_locks(iter::once(&config.base_relation))
                         .pop()
                         .unwrap();
-                    let _guard = lock.write().unwrap();
+                    let _guard = lock.write_with_poison(&admission_poison)?;
                     tx.create_minhash_lsh_index(config)?;
                 }
 
@@ -3612,7 +3687,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .obtain_relation_locks(iter::once(&rel_name.name))
                         .pop()
                         .unwrap();
-                    let _guard = lock.read().unwrap();
+                    let _guard = lock.read_with_poison(&admission_poison)?;
                     tx.remove_index(rel_name, idx_name)?
                 };
 
@@ -3637,7 +3712,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 } else {
                     self.obtain_relation_locks(rel_names)
                 };
-                let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
+                let _guards = locks.iter().map(|l| l.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
                 for (old, new) in rename_pairs {
                     tx.rename_relation(old, new)?;
                 }
@@ -3742,6 +3817,9 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
             _ => {}
         }
+        let writer_poison = Poison { deadline: outer_deadline, ..Default::default() };
+        let mut writer_admission = if self.db.supports_sst_ingest() { None }
+            else { self.admit_writer(!read_only, &writer_poison)? };
         if let Some(rows) = self.run_tt_index_op(&op, read_only, outer_deadline)? { return Ok(rows); }
         if let Some(rows) = self.run_tt_metadata_op(&op, read_only, outer_deadline)? { return Ok(rows); }
 
@@ -3757,6 +3835,40 @@ impl<'s, S: Storage<'s>> Db<S> {
                 ));
             }
         }
+        // Relation admission precedes storage writer/catalog locks on every
+        // standalone path. Otherwise a queued build can wait for a mutation
+        // whose storage lock is held by a later request waiting for admission.
+        let mut admission_names = BTreeSet::new();
+        let exclusive = match &op {
+            SysOp::Reindex(name) | SysOp::RepairCorrupt(name) | SysOp::CreateIndex(name, _, _) => {
+                admission_names.insert(name.name.clone()); true
+            }
+            SysOp::CreateVectorIndex(c) => { admission_names.insert(c.base_relation.clone()); true }
+            SysOp::CreateFtsIndex(c) => { admission_names.insert(c.base_relation.clone()); true }
+            SysOp::CreateMinHashLshIndex(c) => { admission_names.insert(c.base_relation.clone()); true }
+            SysOp::RemoveRelation(names) => { admission_names.extend(names.iter().map(|n| n.name.clone())); false }
+            SysOp::RenameRelation(pairs) => { admission_names.extend(pairs.iter().flat_map(|(a,b)| [a.name.clone(),b.name.clone()])); false }
+            SysOp::RemoveIndex(name, _) | SysOp::TtHistoryGc(name, _) => { admission_names.insert(name.name.clone()); false }
+            SysOp::TtEvict(name, _, _) => {
+                admission_names.insert(name.name.clone());
+                admission_names.insert(SmartString::from("mnestic_evict_audit")); false
+            }
+            SysOp::CreateStoredQuery { .. } | SysOp::RemoveStoredQuery(_) => {
+                admission_names.insert(SmartString::from(stored_queries::STORED_QUERY_CATALOG)); false
+            }
+            _ => false,
+        };
+        if self.db.supports_sst_ingest() && !read_only {
+            writer_admission = if exclusive { self.admit_relation_maintenance(&writer_poison)? }
+                else { self.admit_writer(true, &writer_poison)? };
+        }
+        let admission_locks = self.obtain_relation_locks(admission_names.iter());
+        let admission_poison = Poison { deadline: outer_deadline, ..Default::default() };
+        let _admission = admission_locks.iter().map(|lock| {
+            if exclusive { lock.write_with_poison(&admission_poison) }
+            else { lock.read_with_poison(&admission_poison) }
+        }).collect::<Result<Vec<_>>>()?;
+        if exclusive && self.db.supports_sst_ingest() { drop(writer_admission.take()); }
         let mut tx = if read_only {
             self.transact()?
         } else {
@@ -3767,7 +3879,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         // ceilings that a top-level query receives; other sysops ignore them.
         tx.script_deadline = outer_deadline;
         tx.script_mem_limit = outer_mem_limit;
-        let res = self.run_sys_op_with_tx(&mut tx, &op, read_only, false)?;
+        let res = self.run_sys_op_with_tx(&mut tx, &op, read_only, true, true)?;
         #[cfg(feature = "test-hooks")]
         if matches!(&op, SysOp::TtEvict(_, _, _)) { self.run_tt_index_build_fence("evict_pre_commit"); }
 
@@ -4706,4 +4818,75 @@ pub(crate) fn seconds_since_the_epoch() -> Result<f64> {
 
     #[cfg(target_arch = "wasm32")]
     Ok(js_sys::Date::now())
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod admission_order_tests {
+    use super::*;
+    use crate::{DbInstance, GovernedTransactionOptions, ScriptMutability, ScriptRunOptions};
+
+    fn waiting(db: &DbInstance, count: usize) {
+        let end = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pending = match db {
+                DbInstance::Mem(db) => db.writer_admission.queued_len(),
+                #[cfg(feature = "storage-sqlite")]
+                DbInstance::Sqlite(db) => db.writer_admission.queued_len(),
+                #[cfg(feature = "storage-rocksdb")]
+                DbInstance::RocksDb(db) => db.writer_admission.queued_len(),
+                #[allow(unreachable_patterns)]
+                _ => unreachable!(),
+            };
+            if pending == count { return; }
+            assert!(Instant::now() < end, "operation queued before taking relation/storage locks");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn governed_writer_can_finish_while_mutation_and_build_are_queued() {
+        let engines = ["mem", #[cfg(feature = "storage-sqlite")] "sqlite", #[cfg(feature = "storage-rocksdb")] "rocksdb"];
+        for engine in engines {
+            let dir = tempfile::tempdir().unwrap();
+            let db = DbInstance::new(engine, dir.path().join("db").to_str().unwrap(), "{}").unwrap();
+            db.run_script(":create doc {id:String => body:String}", BTreeMap::new(), ScriptMutability::Mutable).unwrap();
+            let (mut client, worker) = db.governed_transaction(true,
+                GovernedTransactionOptions::new(Instant::now() + Duration::from_secs(10))).unwrap();
+            let worker = std::thread::spawn(move || worker.run());
+            client.run_script("?[id,body] <- [['a','first']] :put doc{id=>body}", BTreeMap::new()).unwrap();
+            let other = db.clone();
+            let mutation = std::thread::spawn(move || other.run_script_with_options(
+                "?[id,body] <- [['a','second']] :put doc{id=>body}", BTreeMap::new(), ScriptMutability::Mutable,
+                ScriptRunOptions::new().with_timeout(8.0)));
+            #[cfg(feature = "storage-rocksdb")]
+            if engine == "rocksdb" {
+                // A is admitted globally and blocked by G's catalog/row lock.
+                let end = Instant::now() + Duration::from_secs(5);
+                let DbInstance::RocksDb(inner) = &db else { unreachable!() };
+                while inner.writer_admission.active_readers() < 2 {
+                    assert!(Instant::now() < end);
+                    std::thread::yield_now();
+                }
+            }
+            if engine != "rocksdb" { waiting(&db, 1); }
+            let other = db.clone();
+            let build = std::thread::spawn(move || other.run_script_with_options(
+                "::fts create doc:text {extractor:body,tokenizer:Simple,filters:[Lowercase]}",
+                BTreeMap::new(), ScriptMutability::Mutable, ScriptRunOptions::new().with_timeout(8.0)));
+            waiting(&db, if engine == "rocksdb" { 1 } else { 2 });
+            client.run_script("?[id,body] <- [['c','third']] :put doc{id=>body}", BTreeMap::new()).unwrap();
+            client.commit().unwrap();
+            worker.join().unwrap();
+            if let Err(error) = mutation.join().unwrap() {
+                // Rocks created this transaction before G committed the same
+                // key. Optimistic validation can reject its stale snapshot;
+                // that is distinct from an admission timeout/deadlock.
+                assert_eq!(engine, "rocksdb");
+                assert!(format!("{error:?}").contains("Busy"), "{error:?}");
+            }
+            build.join().unwrap().unwrap();
+            let rows = db.run_script("?[id] := *doc{id}", BTreeMap::new(), ScriptMutability::Immutable).unwrap();
+            assert_eq!(rows.rows.len(), 2);
+        }
+    }
 }

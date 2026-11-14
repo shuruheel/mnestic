@@ -210,6 +210,28 @@ waits. The RocksDB unlocked-build and concurrent-writer acceptance gates below
 apply to RocksDB. SQLite and mem retain their existing transaction admission
 limits; this feature does not promise concurrent writers on those backends.
 
+**Admission refinement (November 14).** Shared mutation and exclusive maintenance
+admission use a FIFO queue with cancellation/deadline-aware waits. Canonically
+sort and deduplicate relation names before resolving their locks. A queued
+maintenance request stops later independent readers from overtaking it;
+recursive readers may finish work they already own. Reject recursive exclusive
+acquisition and read-to-write upgrades rather than deadlocking.
+
+Before acquiring relation guards, RocksDB maintenance briefly drains a global
+writer-admission gate. Release that gate after all target relation guards are
+held, before opening storage transactions or entering the TT section. Ordinary
+writers hold shared global admission through commit. Multi-transactions may
+release it between statements only while they have performed no native-locking
+operation: no-output reads and buffered mutations of existing TT-only relations
+are eligible. Plain, temporary, create/replace and catalog writes pin admission
+through transaction end, including after an error. Reacquire admission before
+commit cleanup; never wait for it while holding relation or TT guards. This
+preserves buffered TT transactions that span index attachment or replacement
+while preventing maintenance/native-writer cycles. Mem/SQLite serialize admitted
+writers before their storage writer guard. Release admission before callbacks.
+Admission time counts against supported caller deadlines; this refinement does
+not extend the existing plain-HNSW build deadline contract.
+
 The registration tracks keys, not a sequence of whole-row events; repeated keys
 may be deduplicated because catch-up resolves final belief. Bound registration
 memory and fail the **build** explicitly on overflow, leaving ordinary commits

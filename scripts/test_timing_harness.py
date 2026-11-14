@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+import analyze_timing_diagnostics as diagnostics
 
 SPEC = importlib.util.spec_from_file_location('timing_harness', Path(__file__).with_name('timing_harness.py'))
 H = importlib.util.module_from_spec(SPEC)
@@ -12,6 +13,20 @@ SPEC.loader.exec_module(H)
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_nested_admission_waits_are_unioned(self):
+        def event(phase,a,b,acquired=None):
+            return dict(phase=phase,start_ns=a,end_ns=b,acquired_ns=acquired,completed=True)
+        rows=[dict(cell='build',writer=0,status='ok',end_to_end_ns=100,
+                   timing=dict(start_ns=0,end_ns=100,events=[event('maintenance_admission',0,10)])),
+              dict(cell='build',writer=1,status='ok',operation_id=7,
+                   timing=dict(start_ns=0,end_ns=100,events=[
+                       event('transaction_admission',10,30),event('relation_read_admission',10,40),
+                       event('tt_commit_section',50,80,60)]))]
+        result=diagnostics.build_analysis(rows,'build')
+        self.assertEqual(result['writer_waits'][0]['admission_union_ns'],30)
+        self.assertEqual(result['max_writer_admission_and_tt_wait_union_ns'],40)
+        self.assertEqual(result['maintenance_admissions'][0]['duration_ns'],10)
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
