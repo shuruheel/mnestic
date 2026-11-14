@@ -394,9 +394,12 @@ fn a_folded_noncandidate_filter_cannot_turn_a_point_into_materialization() {
         run(db, ":create other {a:String}");
         run(db, "?[id,a,b] <- [['x','gap','yes']] :put n{id=>a,b}");
         run(db, "?[a] <- [['gap']] :put other{a}");
-        let q =
-            "?[id] := id='x', *n{id,a,b}, a=concat('g','ap'), b='yes', *other{a} :reorder written";
-        equivalent(db, q, json!([["x"]]));
-        assert_eq!(plan(db, q, false), plan(db, q, true));
+        for q in [
+            "?[id] := id='x', *n{id,a,b}, a=concat('g','ap'), b='yes', *other{a} :reorder written",
+            "?[id] := id='x', *n{id,a,b}, a in ['gap'], b='yes', *other{a} :reorder written",
+        ] {
+            equivalent(db, q, json!([["x"]]));
+            assert_eq!(plan(db, q, false), plan(db, q, true));
+        }
     });
 }
