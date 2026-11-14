@@ -349,6 +349,13 @@ fn vector_equality_is_not_replaced_by_bitwise_key_identity() {
 fn new_bindings_do_not_evaluate_fallible_filters_before_an_empty_lookup() {
     engines(|db| {
         run(db, ":create empty {k:String}");
+        for q in [
+            "?[k] := *empty{k}, k='a', k in 5 :reorder written",
+            "?[k] := source=5, *empty{k}, k='a', k in source :reorder written",
+        ] {
+            equivalent(db, q, json!([]));
+            assert_eq!(plan(db, q, false), plan(db, q, true));
+        }
         let q = "?[k] := *empty{k}, k='a', assert(k=='b')";
         equivalent(db, q, json!([]));
         assert_eq!(plan(db, q, false), plan(db, q, true));
@@ -377,5 +384,19 @@ fn fallible_right_filters_are_not_skipped_on_nonmatching_rows() {
             }
             assert_eq!(plan(db, q, false), plan(db, q, true));
         }
+    });
+}
+
+#[test]
+fn a_folded_noncandidate_filter_cannot_turn_a_point_into_materialization() {
+    engines(|db| {
+        run(db, ":create n {id:String => a:String,b:String}");
+        run(db, ":create other {a:String}");
+        run(db, "?[id,a,b] <- [['x','gap','yes']] :put n{id=>a,b}");
+        run(db, "?[a] <- [['gap']] :put other{a}");
+        let q =
+            "?[id] := id='x', *n{id,a,b}, a=concat('g','ap'), b='yes', *other{a} :reorder written";
+        equivalent(db, q, json!([["x"]]));
+        assert_eq!(plan(db, q, false), plan(db, q, true));
     });
 }
