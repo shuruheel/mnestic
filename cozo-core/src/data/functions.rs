@@ -41,8 +41,12 @@ use crate::runtime::hnsw::cosine_distance;
 
 macro_rules! define_op {
     ($name:ident, $min_arity:expr, $vararg:expr) => {
+        define_op!($name, $min_arity, $vararg, true);
+    };
+    ($name:ident, $min_arity:expr, $vararg:expr, $deterministic:expr) => {
         pub(crate) const $name: Op = Op {
             name: stringify!($name),
+            deterministic: $deterministic,
             min_arity: $min_arity,
             vararg: $vararg,
             inner: ::casey::lower!($name),
@@ -2126,7 +2130,7 @@ pub(crate) fn op_vec(args: &[DataValue]) -> Result<DataValue> {
     }
 }
 
-define_op!(OP_RAND_VEC, 1, true);
+define_op!(OP_RAND_VEC, 1, true, false);
 pub(crate) fn op_rand_vec(args: &[DataValue]) -> Result<DataValue> {
     let len = args[0]
         .get_int()
@@ -2299,12 +2303,12 @@ pub(crate) fn op_int_range(args: &[DataValue]) -> Result<DataValue> {
     Ok(DataValue::List((start..end).map(DataValue::from).collect()))
 }
 
-define_op!(OP_RAND_FLOAT, 0, false);
+define_op!(OP_RAND_FLOAT, 0, false, false);
 pub(crate) fn op_rand_float(_args: &[DataValue]) -> Result<DataValue> {
     Ok(thread_rng().gen::<f64>().into())
 }
 
-define_op!(OP_RAND_BERNOULLI, 1, false);
+define_op!(OP_RAND_BERNOULLI, 1, false, false);
 pub(crate) fn op_rand_bernoulli(args: &[DataValue]) -> Result<DataValue> {
     let prob = match &args[0] {
         DataValue::Num(n) => {
@@ -2320,7 +2324,7 @@ pub(crate) fn op_rand_bernoulli(args: &[DataValue]) -> Result<DataValue> {
     Ok(DataValue::from(thread_rng().gen_bool(prob)))
 }
 
-define_op!(OP_RAND_INT, 2, false);
+define_op!(OP_RAND_INT, 2, false, false);
 pub(crate) fn op_rand_int(args: &[DataValue]) -> Result<DataValue> {
     let lower = &args[0]
         .get_int()
@@ -2331,7 +2335,7 @@ pub(crate) fn op_rand_int(args: &[DataValue]) -> Result<DataValue> {
     Ok(thread_rng().gen_range(*lower..=*upper).into())
 }
 
-define_op!(OP_RAND_CHOOSE, 1, false);
+define_op!(OP_RAND_CHOOSE, 1, false, false);
 pub(crate) fn op_rand_choose(args: &[DataValue]) -> Result<DataValue> {
     match &args[0] {
         DataValue::List(l) => Ok(l
@@ -2435,7 +2439,7 @@ pub(crate) fn op_to_uuid(args: &[DataValue]) -> Result<DataValue> {
     }
 }
 
-define_op!(OP_NOW, 0, false);
+define_op!(OP_NOW, 0, false, false);
 #[cfg(target_arch = "wasm32")]
 pub(crate) fn op_now(_args: &[DataValue]) -> Result<DataValue> {
     let d: f64 = Date::now() / 1000.;
@@ -2917,7 +2921,7 @@ pub(crate) fn op_dt_to_validity(args: &[DataValue]) -> Result<DataValue> {
     }))
 }
 
-define_op!(OP_RAND_UUID_V1, 0, false);
+define_op!(OP_RAND_UUID_V1, 0, false, false);
 pub(crate) fn op_rand_uuid_v1(_args: &[DataValue]) -> Result<DataValue> {
     let mut rng = rand::thread_rng();
     // Keep the version-neutral alias while the platform lockfile is on UUID 1.22.
@@ -2942,7 +2946,7 @@ pub(crate) fn op_rand_uuid_v1(_args: &[DataValue]) -> Result<DataValue> {
     Ok(DataValue::uuid(id))
 }
 
-define_op!(OP_RAND_UUID_V4, 0, false);
+define_op!(OP_RAND_UUID_V4, 0, false, false);
 pub(crate) fn op_rand_uuid_v4(_args: &[DataValue]) -> Result<DataValue> {
     let id = uuid::Uuid::new_v4();
     Ok(DataValue::uuid(id))
@@ -3019,7 +3023,7 @@ fn decode_ulid(s: &str) -> Result<u128> {
     Ok(value)
 }
 
-define_op!(OP_RAND_ULID, 0, false);
+define_op!(OP_RAND_ULID, 0, false, false);
 pub(crate) fn op_rand_ulid(_args: &[DataValue]) -> Result<DataValue> {
     let mut rng = rand::thread_rng();
     #[cfg(target_arch = "wasm32")]

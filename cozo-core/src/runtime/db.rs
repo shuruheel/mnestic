@@ -210,6 +210,7 @@ pub struct Db<S> {
     /// not worth a default-on rewrite until it has soaked. To flip the default,
     /// change the `AtomicBool::new(false)` in [`Db::new`] to `true`.
     enable_factorize: Arc<AtomicBool>,
+    enable_keyed_access: Arc<AtomicBool>,
     /// Freshness substrate for cached graph projections (mnestic fork;
     /// `runtime/graph_projection.rs`, spec §3.3). Cloned into every
     /// `SessionTx`, which captures a watermark off it before its storage
@@ -430,6 +431,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // 0.13.1, after the nightly planner-guard soak. Flip this one line
             // to `AtomicBool::new(false)` to make the rewrite opt-in again.
             enable_factorize: Arc::new(AtomicBool::new(true)),
+            enable_keyed_access: Arc::new(AtomicBool::new(true)),
             graph_projections: Default::default(),
             warnings: Default::default(),
             warning_seq: Default::default(),
@@ -990,6 +992,13 @@ impl<'s, S: Storage<'s>> Db<S> {
     pub fn set_default_query_mem_limit(&self, bytes: Option<usize>) {
         let v = bytes.unwrap_or(0) as u64;
         self.default_query_mem_limit.store(v, Ordering::Relaxed);
+    }
+
+    /// Toggle keyed-access optimizations for differential tests.
+    /// Existing equality pushdown remains enabled in both modes.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_keyed_access_for_tests(&self, enabled: bool) {
+        self.enable_keyed_access.store(enabled, Ordering::Relaxed);
     }
 
     /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
@@ -2002,6 +2011,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tokenizers: self.tokenizers.clone(),
             fts_stats,
             hnsw_mutations_incomplete: 0,
+            keyed_access: self.enable_keyed_access.load(Ordering::Relaxed),
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
@@ -2029,6 +2039,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tokenizers: self.tokenizers.clone(),
             fts_stats,
             hnsw_mutations_incomplete: 0,
+            keyed_access: self.enable_keyed_access.load(Ordering::Relaxed),
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             pending_tt_writes: Vec::new(),
@@ -2248,7 +2259,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                                             rel_stack.push(&inner.right);
                                             continue;
                                         }
-                                        let t = inner.join_type();
+                                        let t = inner.join_type(self.enable_keyed_access.load(Ordering::Relaxed));
                                         let InnerJoin {
                                             left,
                                             right,
@@ -2258,7 +2269,26 @@ impl<'s, S: Storage<'s>> Db<S> {
                                         is_cartesian = joiner.left_keys.is_empty();
                                         rel_stack.push(left);
                                         rel_stack.push(right);
-                                        (t, json!(null), json!(joiner.as_map()), json!(null))
+                                        let mut seek_pairs = joiner.as_map();
+                                        let mut checked_pairs = Vec::new();
+                                        if t == "stored_point_join" {
+                                            if let RelAlgebra::Stored(stored) = right {
+                                                let (_, positions) = joiner.join_indices(
+                                                    &left.bindings_after_eliminate(),
+                                                    &right.bindings_after_eliminate(),
+                                                )?;
+                                                for ((l, r), pos) in joiner.left_keys.iter()
+                                                    .zip(&joiner.right_keys).zip(positions) {
+                                                    if pos >= stored.storage.metadata.keys.len() {
+                                                        seek_pairs.remove(l.name.as_str());
+                                                        checked_pairs.push(format!("{} == {}", l, r));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        let checked = if checked_pairs.is_empty() { json!(null) }
+                                            else { json!(checked_pairs) };
+                                        (t, json!(null), json!(seek_pairs), checked)
                                     }
                                     RelAlgebra::NegJoin(inner) => {
                                         let t = inner.join_type();

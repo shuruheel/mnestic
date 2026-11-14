@@ -412,6 +412,25 @@ impl DbInstance {
             }
         }
     }
+    /// Toggle keyed-access optimizations for differential tests.
+    /// Existing equality pushdown remains enabled in both modes.
+    #[cfg(feature = "test-hooks")]
+    pub fn set_keyed_access_for_tests(&self, enabled: bool) {
+        match self {
+            DbInstance::Mem(db) => db.set_keyed_access_for_tests(enabled),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.set_keyed_access_for_tests(enabled),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.set_keyed_access_for_tests(enabled),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.set_keyed_access_for_tests(enabled),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.set_keyed_access_for_tests(enabled),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.set_keyed_access_for_tests(enabled),
+        }
+    }
+
     /// Enable or disable the automatic factorized-count rewrite (mnestic fork,
     /// query factorization). Db-wide kill switch, default ON since 0.13.1. See
     /// [`crate::Db::set_query_factorization`].

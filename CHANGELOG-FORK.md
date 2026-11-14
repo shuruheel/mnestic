@@ -5,6 +5,21 @@ provenance and licensing.
 
 ## Unreleased
 
+### Changed — planner keyed access
+
+- Eligible trailing equalities now bind immediately before their stored-relation
+  read, enabling primary or secondary index seeks without changing join order.
+  Earlier binding producers, generator multiplicity, numeric type boundaries,
+  temporal reads and volatile expressions retain their existing behavior.
+- Positive plain-relation joins with every primary-key column bound now use a
+  point lookup even when additional joined value columns are nonadjacent.
+  `::explain` reports `stored_point_join`, with sought pairs in `joins_on` and
+  residual equality checks in `filters/expr`.
+- Differential coverage is in `tests/keyed_access.rs` under `test-hooks`;
+  existing planner and recursive-workload shape baselines remain unchanged.
+  Performance qualification and RocksDB validation are still pending.
+
+
 ### Added — governed transactions from Python
 
 Spec: `docs/specs/python-governed-transactions.md`. Binding only; no engine
