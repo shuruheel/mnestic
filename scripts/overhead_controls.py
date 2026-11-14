@@ -125,10 +125,17 @@ def report(directory):
                 report_sha256=harness.digest(Path(__file__).read_bytes()),freeze_control_passed=False,performance_qualified=False)
     if not valid: return result
     on=[]; off=[]
+    worker_durations={w:{label:[] for label in ["True","False"]} for w in range(1,width+1)}
+    rank_changes=0
     for pair in range(100):
+        ranks={}
         for label,values in [('True',on),('False',off)]:
             group=[by_key[('overhead',w,f'pair-{pair}-{label}')] for w in range(1,width+1)]
             values.append(max(r['timing']['end_ns'] for r in group)-min(r['timing']['start_ns'] for r in group))
+            for r in group:
+                worker_durations[r['writer']][label].append(r['timing']['end_ns']-r['timing']['start_ns'])
+            ranks[label]={r['writer']:i for i,r in enumerate(sorted(group,key=lambda r:(r['timing']['end_ns'],r['writer'])))}
+        rank_changes+=sum(ranks['True'][w]!=ranks['False'][w] for w in range(1,width+1))
     estimates={}
     for q in [.5,.99]:
         upper={}
@@ -144,7 +151,10 @@ def report(directory):
             upper[method]=quantile(samples,.95)
         estimates[str(q)]=dict(ratio=quantile(on,q)/quantile(off,q),upper95=upper,
                                conservative_upper95=max(upper.values()))
-    result.update(pairs=100,workers=width,statistic='complete round makespan',estimates=estimates,
+    result.update(per_writer={str(w):{label:{"p50_ns":quantile(v,.5),"p99_ns":quantile(v,.99)}
+                                              for label,v in arms.items()} for w,arms in worker_durations.items()},
+                  writer_finish_rank_changes=rank_changes,writer_pairs=100*width,
+                  pairs=100,workers=width,statistic='complete round makespan',estimates=estimates,
                   freeze_control_passed=all(e['conservative_upper95']<=1.05 for e in estimates.values()),
                   limitation='Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.')
     return result
