@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use miette::{bail, ensure, Diagnostic, Result};
 use thiserror::Error;
 
-use crate::data::expr::eval_bytecode_pred;
+use crate::data::expr::{eval_bytecode, eval_bytecode_pred};
 use crate::data::tuple::{Tuple, TupleT};
 use crate::runtime::relation::RelationHandle;
 use crate::runtime::transact::SessionTx;
@@ -216,11 +216,31 @@ impl SessionTx<'_> {
                 } else if let Some(old) = old {
                     self.del_in_fts(handle, &mut stack, &processors, old)?;
                 }
-                if let Some(old) = old {
-                    self.del_in_lsh(handle, old)?;
-                }
-                if let Some(new) = new {
-                    self.put_in_lsh(handle, &mut stack, &processors, new, &hashes)?;
+                for (name, (index, inverse, manifest)) in &handle.lsh_indices {
+                    let (tokenizer, extractor) = processors.get(name).unwrap();
+                    if let (Some(old), Some(new)) = (old, new) {
+                        if eval_bytecode(extractor, old, &mut stack)?
+                            == eval_bytecode(extractor, new, &mut stack)?
+                        {
+                            continue;
+                        }
+                    }
+                    if let Some(old) = old {
+                        self.del_lsh_index_item(old, None, index, inverse)?;
+                    }
+                    if let Some(new) = new {
+                        self.put_lsh_index_item(
+                            new,
+                            extractor,
+                            &mut stack,
+                            tokenizer,
+                            handle,
+                            index,
+                            inverse,
+                            manifest,
+                            hashes.get(name).unwrap(),
+                        )?;
+                    }
                 }
             }
         }
@@ -256,6 +276,47 @@ struct BuildLog {
 }
 
 pub(crate) type SharedBuildRegistry = std::sync::Arc<std::sync::Mutex<BuildRegistry>>;
+
+/// A commit error or unwind may be ambiguous. Invalidate catch-up logs unless
+/// notification finishes, so a build cannot attach a generation missing a write.
+pub(crate) struct BuildCommitNotification<'a> {
+    shared: SharedBuildRegistry,
+    touched: &'a BTreeMap<u64, TouchedRelation>,
+    notified: bool,
+}
+
+impl<'a> BuildCommitNotification<'a> {
+    pub(crate) fn new(
+        shared: SharedBuildRegistry,
+        touched: &'a BTreeMap<u64, TouchedRelation>,
+    ) -> Self {
+        Self {
+            shared,
+            touched,
+            notified: false,
+        }
+    }
+    pub(crate) fn committed(mut self) {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .notify(self.touched);
+        self.notified = true;
+    }
+}
+impl Drop for BuildCommitNotification<'_> {
+    fn drop(&mut self) {
+        if !self.notified {
+            let mut builds = self
+                .shared
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for id in self.touched.keys() {
+                builds.invalidate(*id, None);
+            }
+        }
+    }
+}
 
 pub(crate) struct BuildRegistration {
     shared: SharedBuildRegistry,
@@ -355,5 +416,46 @@ impl BuildRegistry {
                 log.keys.insert(encoded.clone(), key.clone());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{DbInstance, ScriptMutability, ScriptRunOptions};
+
+    #[test]
+    fn waiting_commit_times_out_without_allocating_tt() {
+        let db = DbInstance::new("mem", "", "{}").unwrap();
+        db.run_default(":create doc {id:String,tt:TxTime => body:String}")
+            .unwrap();
+        db.run_default("::fts create doc:text {extractor:body,tokenizer:Simple}")
+            .unwrap();
+        let DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let before = inner.tt_clock().peek();
+        let guard = inner.tt_commit_lock.lock().unwrap();
+        let error = db
+            .run_script_with_options(
+                "?[id,body] <- [['a','alpha']] :put doc{id=>body}",
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+                ScriptRunOptions::new().with_timeout(0.05),
+            )
+            .unwrap_err();
+        assert_eq!(error.code().unwrap().to_string(), "eval::timeout");
+        assert_eq!(inner.tt_clock().peek(), before);
+        drop(guard);
+        assert!(db.run_default("?[id] := *doc{id}").unwrap().rows.is_empty());
+        db.run_default("?[id,body] <- [['a','alpha']] :put doc{id=>body}")
+            .unwrap();
+        assert_eq!(
+            db.run_default("?[id] := ~doc:text{id | query:'alpha',k:10}")
+                .unwrap()
+                .rows
+                .len(),
+            1
+        );
     }
 }

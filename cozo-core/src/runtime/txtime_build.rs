@@ -286,7 +286,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tx.populate_tt_indexes(&build, &rows, &poison)?;
             tx.publish_tt_indexes(current.clone(), &build)?;
             poison.check()?;
-            tx.commit_tx()?;
+            self.commit_tx_with_test_hook(&mut tx)?;
             let result = result_rows(op, &build, rows.len());
             drop(tx);
             drop(_section);
@@ -305,7 +305,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 "base relation changed before index preparation"
             );
             let build = tx.prepare_tt_indexes(&current, op)?;
-            tx.commit_tx()?;
+            self.commit_tx_with_test_hook(&mut tx)?;
             (current, build)
         };
         let mut publication_attempted = false;
@@ -333,7 +333,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             {
                 let mut tx = self.transact_write()?;
                 tx.populate_tt_indexes(&build, &rows, &poison)?;
-                tx.commit_tx()?;
+                self.commit_tx_with_test_hook(&mut tx)?;
             }
             drop(rows);
             #[cfg(feature = "test-hooks")]
@@ -342,7 +342,20 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let _relation = relation_write(&locks[0], &poison)?;
                 let mut tx = self.transact_write()?;
                 // Catalog lock before the commit section, never while owning it.
+                #[cfg(feature = "test-hooks")]
+                self.run_tt_index_build_fence("publication_before_catalog");
                 let current = tx.get_relation(name, true)?;
+                // Descriptions/access metadata may lock the public index
+                // catalog independently of the base. Never wait for those
+                // locks while owning the database-wide TT commit section.
+                let mut index_names: Vec<_> =
+                    handles(&build).into_iter().map(|i| &i.name).collect();
+                index_names.sort();
+                for index_name in index_names {
+                    let key = vec![DataValue::Str(index_name.clone())]
+                        .encode_as_key(crate::runtime::relation::RelationId::SYSTEM);
+                    tx.store_tx.get(&key, true)?;
+                }
                 let _section = section(&self.tt_commit_lock, &poison)?;
                 validate(&original, &current, &build)?;
                 let mut old = BTreeMap::new();
@@ -363,7 +376,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 tx.publish_tt_indexes(current, &build)?;
                 poison.check()?;
                 publication_attempted = true;
-                tx.commit_tx()?;
+                self.commit_tx_with_test_hook(&mut tx)?;
             }
             drop(registration);
             Ok(result_rows(op, &build, count))
@@ -424,7 +437,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
         let mut targets = BTreeSet::new();
         match op {
-            SysOp::RemoveIndex(base, _) => {
+            SysOp::RemoveIndex(base, _) | SysOp::RepairCorrupt(base) => {
                 targets.insert(base.name.clone());
             }
             SysOp::RemoveRelation(relations) => {
@@ -465,6 +478,18 @@ impl<'s, S: Storage<'s>> Db<S> {
                 catalog_names.extend(handles(&handle).into_iter().map(|i| i.name.clone()));
             }
         }
+        if let SysOp::RenameRelation(pairs) = op {
+            for (old, new) in pairs {
+                if let Ok(handle) = tx.get_relation(old, false) {
+                    let prefix = format!("{}:", old.name);
+                    for index in handles(&handle) {
+                        if let Some(suffix) = index.name.strip_prefix(&prefix) {
+                            catalog_names.insert(format!("{}:{}", new.name, suffix).into());
+                        }
+                    }
+                }
+            }
+        }
         for name in catalog_names {
             let key = vec![DataValue::from(name.as_str())]
                 .encode_as_key(crate::runtime::relation::RelationId::SYSTEM);
@@ -474,7 +499,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         tx.defer_tt_cleanup = true;
         let rows = self.run_sys_op_with_tx(&mut tx, op, false, true)?;
         poison.check()?;
-        tx.commit_tx()?;
+        self.commit_tx_with_test_hook(&mut tx)?;
         let cleanup = std::mem::take(&mut tx.tt_cleanup_ranges);
         drop(tx);
         drop(guard);

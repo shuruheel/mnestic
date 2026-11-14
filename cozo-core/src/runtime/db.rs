@@ -2658,9 +2658,10 @@ impl<'s, S: Storage<'s>> Db<S> {
     ) -> Result<NamedRows> {
         // Imperative programs embed SysOps in their existing transaction. They
         // cannot use detached publication or acquire the TT commit section here.
-        if !tx.defer_tt_cleanup {
+        if skip_locking && !tx.defer_tt_cleanup {
             let targets: Vec<_> = match op {
                 SysOp::Reindex(name) | SysOp::RemoveIndex(name, _) => vec![name],
+                SysOp::TtHistoryGc(name, _) | SysOp::RepairCorrupt(name) if skip_locking => vec![name],
                 SysOp::RemoveRelation(names) => names.iter().collect(),
                 SysOp::RenameRelation(pairs) => pairs.iter().flat_map(|(a, b)| [a, b]).collect(),
                 _ => vec![],
@@ -2668,7 +2669,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             for name in targets {
                 if tx.get_relation(name, false).is_ok_and(|h| h.has_txtime()) {
                     #[derive(Debug, Error, Diagnostic)]
-                    #[error("transaction-time index and catalog changes must run as standalone commands")]
+                    #[error("transaction-time index, catalog and maintenance changes must run as standalone commands")]
                     #[diagnostic(code(eval::txtime_ddl_standalone))]
                     struct TxTimeDdlStandalone;
                     bail!(TxTimeDdlStandalone);
@@ -3338,6 +3339,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                     !handle.has_txtime() || !crate::runtime::txtime_index::has_search_indexes(&handle),
                     "drop transaction-time search indexes before repairing corrupt base rows, then recreate them"
                 );
+                if handle.has_txtime() {
+                    self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate(handle.id.0, None);
+                }
                 // Graph-projection dirty-set hook (spec §3.4 row 10).
                 tx.mark_dirty(&handle);
                 let expected = handle.metadata.keys.len() + handle.metadata.non_keys.len();

@@ -2228,6 +2228,31 @@ impl<'a> SessionTx<'a> {
             ));
         }
         self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).invalidate(rel.id.0, None);
+        if rel.is_tt_only() {
+            // The public catalog and embedded handles must move together. The
+            // standalone metadata wrapper already locked both sets of names.
+            let prefix = format!("{}:", old.name);
+            for index in rel.fts_indices.values_mut().map(|(i, _)| i)
+                .chain(rel.hnsw_indices.values_mut().map(|(i, _)| i))
+                .chain(rel.lsh_indices.values_mut().flat_map(|(i, j, _)| [i, j]))
+            {
+                let suffix = index.name.strip_prefix(&prefix).ok_or_else(||
+                    miette::miette!("index name does not belong to transaction-time base: {}", index.name))?;
+                let renamed = format!("{}:{}", new.name, suffix);
+                let key = vec![DataValue::from(renamed.as_str())].encode_as_key(RelationId::SYSTEM);
+                if self.store_tx.exists(&key, false)? {
+                    bail!(RelNameConflictError(renamed));
+                }
+                let old_key = vec![DataValue::Str(index.name.clone())].encode_as_key(RelationId::SYSTEM);
+                self.store_tx.del(&old_key)?;
+                index.name = renamed.into();
+                self.publish_relation_metadata(index)?;
+            }
+            for (_, manifest) in rel.fts_indices.values_mut() { manifest.base_relation = new.name.clone(); }
+            for (_, manifest) in rel.hnsw_indices.values_mut() { manifest.base_relation = new.name.clone(); }
+            for (_, _, manifest) in rel.lsh_indices.values_mut() { manifest.base_relation = new.name.clone(); }
+            self.tokenizers.named_cache.write().unwrap().clear();
+        }
         rel.name = new.name.clone();
 
         let mut meta_val = vec![];

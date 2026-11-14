@@ -160,6 +160,7 @@ fn drop_rename_and_recreate_invalidate_an_unpublished_build() {
         "::index drop doc:text",
         "::rename doc -> renamed",
         "::remove doc",
+        "::repair_corrupt doc",
     ] {
         let dir = tempfile::tempdir().unwrap();
         let db = database(&dir);
@@ -240,4 +241,182 @@ fn eviction_uses_exact_captured_versions_when_index_attaches_before_commit() {
         json!([["surviving alpha"]])
     );
     assert_eq!(run(&db, "::history doc [['a']]").rows.len(), 1);
+}
+
+#[test]
+fn buffered_writers_and_governed_transactions_follow_rebuilt_and_dropped_indexes() {
+    for action in ["::reindex doc", "::index drop doc:text"] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = database(&dir);
+        for config in [FTS, HNSW, LSH] {
+            run(&db, config);
+        }
+        let options = cozo::GovernedTransactionOptions::new(
+            std::time::Instant::now() + Duration::from_secs(20),
+        );
+        let (mut governed, worker) = db.governed_transaction(true, options).unwrap();
+        let worker = std::thread::spawn(move || worker.run());
+        governed
+            .run_script(
+                "?[id,body,v] <- [['a','governed alpha',[8,8]]] :put doc{id=>body,v}",
+                BTreeMap::new(),
+            )
+            .unwrap();
+        let legacy = db.multi_transaction(true);
+        legacy.run_script("?[id,body,v] <- [['a','legacy alpha',[9,9]],['c','new gamma',[7,7]]] :put doc{id=>body,v}", BTreeMap::new()).unwrap();
+        finish(start(&db, action)).unwrap();
+        governed.commit().unwrap();
+        worker.join().unwrap();
+        legacy.commit().unwrap();
+        assert_eq!(
+            rows(&db, "?[id] := ~doc:vec{id | query:vec([9,9]),k:1,ef:50}"),
+            json!([["a"]])
+        );
+        assert_eq!(
+            rows(&db, "?[body] := *doc{id:'a',body}"),
+            json!([["legacy alpha"]])
+        );
+        if action.contains("reindex") {
+            assert_eq!(
+                rows(&db, "?[id] := ~doc:text{id | query:'legacy',k:10}"),
+                json!([["a"]])
+            );
+            assert_eq!(
+                rows(&db, "?[id] := ~doc:text{id | query:'governed',k:10}"),
+                json!([])
+            );
+        } else {
+            run(&db, FTS);
+            assert_eq!(
+                rows(&db, "?[id] := ~doc:text{id | query:'legacy',k:10}"),
+                json!([["a"]])
+            );
+        }
+    }
+}
+
+#[test]
+fn failed_build_commits_leave_no_partial_name_and_rebuilds_keep_old_generation() {
+    for stage in ["registered", "populated"] {
+        for rebuild in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let db = database(&dir);
+            if rebuild {
+                run(&db, FTS);
+            }
+            let (arrived, release) = fence(&db, stage);
+            let building = start(&db, if rebuild { "::reindex doc" } else { FTS });
+            arrive(&arrived);
+            db.fail_next_commit_for_tests();
+            release.send(()).unwrap();
+            assert!(finish(building)
+                .unwrap_err()
+                .contains("injected commit failure"));
+            let DbInstance::RocksDb(inner) = &db else {
+                unreachable!()
+            };
+            inner.set_tt_index_build_fence_for_tests(None);
+            if rebuild {
+                assert_eq!(
+                    rows(&db, "?[id] := ~doc:text{id | query:'old',k:10} :order id"),
+                    json!([["a"], ["b"]])
+                );
+            } else {
+                assert!(db
+                    .run_script(
+                        "?[id] := ~doc:text{id | query:'old',k:10}",
+                        BTreeMap::new(),
+                        ScriptMutability::Immutable
+                    )
+                    .is_err());
+            }
+            run(&db, if rebuild { "::reindex doc" } else { FTS });
+            run(
+                &db,
+                "?[id,body,v] <- [['a','fresh alpha',[4,4]]] :put doc{id=>body,v}",
+            );
+            assert_eq!(
+                rows(&db, "?[id] := ~doc:text{id | query:'fresh',k:10}"),
+                json!([["a"]])
+            );
+        }
+    }
+}
+
+#[test]
+fn deadline_after_backfill_does_not_attach_a_partial_index() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(&dir);
+    let (arrived, release) = fence(&db, "populated");
+    let other = db.clone();
+    let (send, done) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let result = other
+            .run_script_with_options(
+                FTS,
+                BTreeMap::new(),
+                ScriptMutability::Mutable,
+                cozo::ScriptRunOptions::new().with_timeout(0.5),
+            )
+            .map(|_| ())
+            .map_err(|e| format!("{e:?}"));
+        send.send(result).unwrap();
+    });
+    arrive(&arrived);
+    std::thread::sleep(Duration::from_millis(550));
+    release.send(()).unwrap();
+    assert!(finish(done).unwrap_err().contains("eval::timeout"));
+    let DbInstance::RocksDb(inner) = &db else {
+        unreachable!()
+    };
+    inner.set_tt_index_build_fence_for_tests(None);
+    assert!(db
+        .run_script(
+            "?[id] := ~doc:text{id | query:'old',k:10}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable
+        )
+        .is_err());
+    run(&db, FTS);
+}
+
+#[test]
+fn publication_waits_for_index_catalog_before_taking_the_commit_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(&dir);
+    run(&db, FTS);
+    run(&db, ":create other {id:String,tt:TxTime}");
+    let (held, holding) = crossbeam::channel::bounded(1);
+    let (release_writer, writer_release) = crossbeam::channel::bounded(1);
+    db.register_fixed_rule(
+        "Hold".into(),
+        cozo::SimpleFixedRule::new(1, move |_, _| {
+            held.send(()).unwrap();
+            writer_release
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap();
+            Ok(NamedRows::new(vec!["x".into()], vec![vec![1.into()]]))
+        }),
+    )
+    .unwrap();
+    let writer = start(&db, "{ ::describe doc:text 'held metadata' } { ?[x] <~ Hold() } { ?[id] <- [['committed']] :put other{id} }");
+    holding.recv_timeout(Duration::from_secs(20)).unwrap();
+    let (arrived, release) = fence(&db, "publication_before_catalog");
+    let building = start(&db, "::reindex doc");
+    arrive(&arrived);
+    release.send(()).unwrap();
+    // The holder must be able to enter the global commit section while the
+    // publication thread waits for its catalog lock.
+    release_writer.send(()).unwrap();
+    finish(writer).unwrap();
+    // Catalog writes concurrent with transaction creation may legitimately
+    // trigger RocksDB validation; neither path may deadlock waiting for TT.
+    let result = finish(building);
+    if let Err(error) = result {
+        assert!(
+            error.contains("Resource busy") || error.contains("Busy"),
+            "{error}"
+        );
+    }
+    assert_eq!(rows(&db, "?[id] := *other{id}"), json!([["committed"]]));
 }

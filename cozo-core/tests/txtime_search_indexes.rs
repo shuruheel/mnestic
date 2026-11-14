@@ -275,6 +275,8 @@ fn imperative_ddl_cannot_bypass_publication_and_import_maintains_indexes() {
             "::index drop doc:text",
             "::rename doc -> renamed",
             "::remove doc",
+            "::history_gc doc 0",
+            "::repair_corrupt doc",
         ] {
             let script = format!("{{ ?[id,body,v] <- [['a','uncommitted',[0,0]]] :put doc{{id=>body,v}} }} {{ {command} }}");
             let error = db
@@ -339,5 +341,109 @@ fn eviction_limit_is_checked_before_any_indexed_deletion() {
             "{error:?}"
         );
         assert_eq!(fts(db, "retained"), json!([["0", "retained"]]));
+    });
+}
+
+#[test]
+fn reconcile_and_duplicate_writes_keep_only_current_documents() {
+    engines(|db| {
+        create_doc(db);
+        create_indexes(db);
+        run(db, "{ ?[id,body,v] <- [['a','first',[0,0]]] :put doc{id=>body,v} } { ?[id,body,v] <- [['a','final alpha',[1,1]],['b','remove beta',[2,2]]] :put doc{id=>body,v} }");
+        assert_eq!(fts(db, "first"), json!([]));
+        assert_eq!(fts(db, "final"), json!([["a", "final alpha"]]));
+        run(db, "?[id,body,v] <- [['a','reconciled alpha',[3,3]],['c','reconciled gamma',[4,4]]] :reconcile doc{id=>body,v}");
+        assert_eq!(fts(db, "remove"), json!([]));
+        assert_eq!(all_vectors(db), json!([["a"], ["c"]]));
+        assert_eq!(
+            fts(db, "reconciled"),
+            json!([["a", "reconciled alpha"], ["c", "reconciled gamma"]])
+        );
+    });
+}
+
+#[cfg(feature = "storage-sqlite")]
+#[test]
+fn backup_restore_and_reopen_preserve_current_search_and_future_updates() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut engines = vec!["sqlite"];
+    #[cfg(feature = "storage-rocksdb")]
+    engines.push("rocksdb");
+    for engine in engines {
+        let source = dir.path().join(format!("{engine}-source"));
+        let backup = dir.path().join(format!("{engine}-backup"));
+        let restored = dir.path().join(format!("{engine}-restored"));
+        {
+            let db = DbInstance::new(engine, source.to_str().unwrap(), "{}").unwrap();
+            create_doc(&db);
+            create_indexes(&db);
+            run(
+                &db,
+                "?[id,body,v] <- [['a','old',[0,0]]] :put doc{id=>body,v}",
+            );
+            run(
+                &db,
+                "?[id,body,v] <- [['a','current alpha',[1,1]]] :put doc{id=>body,v}",
+            );
+            db.backup_db(backup.to_str().unwrap()).unwrap();
+        }
+        for (path, restore) in [(&source, false), (&restored, true)] {
+            let db = DbInstance::new(engine, path.to_str().unwrap(), "{}").unwrap();
+            if restore {
+                db.restore_backup(backup.to_str().unwrap()).unwrap();
+            }
+            assert_eq!(fts(&db, "old"), json!([]));
+            assert_eq!(fts(&db, "current"), json!([["a", "current alpha"]]));
+            assert_eq!(all_vectors(&db), json!([["a"]]));
+            run(
+                &db,
+                "?[id,body,v] <- [['a','updated beta',[2,2]]] :put doc{id=>body,v}",
+            );
+            assert_eq!(fts(&db, "current"), json!([]));
+            assert_eq!(fts(&db, "updated"), json!([["a", "updated beta"]]));
+        }
+    }
+}
+
+#[test]
+fn rename_moves_attached_search_catalogs_and_embedded_handles() {
+    engines(|db| {
+        create_doc(db);
+        create_indexes(db);
+        run(
+            db,
+            "?[id,body,v] <- [['a','alpha',[0,0]]] :put doc{id=>body,v}",
+        );
+        run(db, "::rename doc -> renamed");
+        assert_eq!(
+            rows(db, "?[id] := ~renamed:text{id | query:'alpha',k:10}"),
+            json!([["a"]])
+        );
+        run(
+            db,
+            "?[id,body,v] <- [['a','beta',[1,1]]] :put renamed{id=>body,v}",
+        );
+        run(db, "::reindex renamed");
+        assert_eq!(
+            rows(db, "?[id] := ~renamed:text{id | query:'beta',k:10}"),
+            json!([["a"]])
+        );
+        assert_eq!(
+            rows(
+                db,
+                "?[id] := ~renamed:vec{id | query:vec([1,1]),k:10,ef:50}"
+            ),
+            json!([["a"]])
+        );
+        assert_eq!(
+            rows(db, "?[id] := ~renamed:similar{id | query:'beta',k:10}"),
+            json!([["a"]])
+        );
+        for name in ["text", "vec", "similar"] {
+            run(db, &format!("::index drop renamed:{name}"));
+        }
+        run(db, "::remove renamed");
+        create_doc(db);
+        create_indexes(db);
     });
 }

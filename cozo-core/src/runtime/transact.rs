@@ -414,14 +414,11 @@ impl<'a> SessionTx<'a> {
             self.stamp_pending_tt_writes(tt)?;
             self.maintain_tt_indexes(&touched)?;
             poison.check()?;
-            if let Err(error) = self.store_tx.commit() {
-                // An error does not prove the write was rolled back. A builder
-                // must not publish from a log that could miss that belief.
-                let mut builds = self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-                for id in touched.keys() { builds.invalidate(*id, None); }
-                return Err(error);
-            }
-            self.tt_index_builds.lock().unwrap_or_else(std::sync::PoisonError::into_inner).notify(&touched);
+            let notification = crate::runtime::txtime_index::BuildCommitNotification::new(
+                self.tt_index_builds.clone(), &touched,
+            );
+            self.store_tx.commit()?;
+            notification.committed();
             Ok(tt)
         })();
         if result.is_err() { self.tt_commit_failed = true; }

@@ -440,7 +440,8 @@ history-preserving recovery and reversible enablement remain open.
 3. *Does any path write a `TxTime` relation outside `stamp_pending_tt_writes`?*
    `::evict` (now in the section) and `::history_gc` (superseded rows only).
    Transaction APIs reject system ops, but imperative programs can embed them.
-   TxTime index/catalog changes require standalone commands so they cannot
+   TxTime index/catalog changes, history GC and corrupt-base repair require
+   standalone commands so they cannot
    bypass serialized publication. Corrupt-base repair requires dropping search
    indexes first and recreating them after repair.
 

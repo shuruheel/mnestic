@@ -403,3 +403,37 @@ fn a_folded_noncandidate_filter_cannot_turn_a_point_into_materialization() {
         }
     });
 }
+
+#[test]
+fn consumer_lint_positive_fixtures_have_keyed_plans_with_declared_string_keys() {
+    // Complete the five positive query snippets in MindGraph's
+    // scripts/fixtures/cozo-query-lint/cases.rs with explicit schema/params.
+    engines(|db| {
+        run(
+            db,
+            ":create node {uid:String => node_type:String,tombstone_at:Float}",
+        );
+        run(db, "?[uid,node_type,tombstone_at] <- [['u','memory',0.0],['v','memory',1.0]] :put node{uid=>node_type,tombstone_at}");
+        run(db, ":create edge {uid:String => a:String}");
+        run(db, "?[uid,a] <- [['u','v']] :put edge{uid=>a}");
+        run(db, ":create adjacency {from_uid:String,to_uid:String}");
+        run(
+            db,
+            "?[from_uid,to_uid] <- [['u','v']] :put adjacency{from_uid,to_uid}",
+        );
+        // The positional node fixture has a two-column schema in the lint;
+        // append an anonymous column here because this shared fixture also has tombstone_at.
+        for (query, expected) in [
+            ("?[uid] := *node[uid,node_type,_], uid == 'u'", json!([["u"]])),
+            ("frontier[s] <- [['u']] ?[t] := frontier[s], *adjacency{from_uid,to_uid:t}, from_uid == s", json!([["v"]])),
+            ("?[uid] := *node{uid}, uid = 'u' :limit 1", json!([["u"]])),
+            ("?[uid] := *node{uid,tombstone_at}, uid = 'u', tombstone_at == 0.0", json!([["u"]])),
+            ("?[a] := *edge[uid,a], uid = 'u'", json!([["v"]])),
+        ] {
+            equivalent(db, query, expected);
+            let optimized = plan(db, query, true);
+            assert!(ops(&optimized).iter().any(|op| matches!(*op, "stored_point_join" | "stored_prefix_join")), "{query}: {optimized:?}");
+            assert!(!ops(&optimized).contains(&"materialized_join"), "{query}: {optimized:?}");
+        }
+    });
+}
