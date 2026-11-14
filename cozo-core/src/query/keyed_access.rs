@@ -114,6 +114,20 @@ fn safe_residual(atom: &MagicAtom) -> bool {
     match atom {
         MagicAtom::Predicate(expr) => total_predicate(expr),
         MagicAtom::Unification(u) => {
+            if u.one_many_unif {
+                if !deterministic(&u.expr) || !u.expr.bindings().is_ok_and(|b| b.is_empty()) {
+                    return false;
+                }
+                let mut copy = u.expr.clone();
+                return copy.partial_eval().is_ok()
+                    && matches!(
+                        copy,
+                        Expr::Const {
+                            val: DataValue::List(_),
+                            ..
+                        }
+                    );
+            }
             if matches!(&u.expr, Expr::Binding { .. } | Expr::Const { .. }) {
                 return true;
             }
@@ -300,6 +314,18 @@ pub(crate) fn local_bindings(
     // Changing a scan into a seek can skip evaluations on nonmatching rows,
     // even for a residual that does not mention the newly bound key.
     if !body[index + 1..].iter().all(safe_residual) {
+        return vec![];
+    }
+    // A noncandidate's folded RHS remains an expression in the baseline RA.
+    // If it becomes a right-side filter it must satisfy the very same total
+    // filter gate as runtime dispatch. Otherwise even an existing point lookup
+    // could become a materialization after we add a nonadjacent join pair.
+    if body[index + 1..].iter().any(|atom| {
+        matches!(atom,
+            MagicAtom::Unification(u) if !candidates.contains_key(&u.binding)
+                && !matches!(&u.expr, Expr::Const { .. } | Expr::Binding { .. })
+        )
+    }) {
         return vec![];
     }
     let before = access(store, args, bound);
