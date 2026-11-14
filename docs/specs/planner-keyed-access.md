@@ -1,7 +1,10 @@
 # Keyed access for equality filters and key-plus-value joins
 
-Status: **DRAFT, November 13, 2026. Review findings resolved in the contract;
-implementation and acceptance remain pending.** Not approved. Passes (workspace
+Status: **Implementation authorized and in qualification, November 13, 2026.**
+The owner requested a combined branch and PR with TxTime search indexes.
+Correctness and review evidence is recorded in
+[the implementation review](../reviews/keyed-txtime-implementation.md);
+performance acceptance remains pending. Original authoring passes (workspace
 `spec-authoring` method):
 
 | Pass | Date | Result |

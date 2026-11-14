@@ -1781,7 +1781,7 @@ impl<'a> SessionTx<'a> {
                 .next()
                 .unwrap();
             let mut code_expr = build_expr(parsed, &Default::default())?;
-            crate::runtime::txtime_index::reject_tt_index_columns(&rel_handle, code_expr.get_variables()?.into_iter())?;
+            crate::runtime::txtime_index::reject_tt_index_columns(&rel_handle, code_expr.get_variables()?)?;
             let binding_map = rel_handle.raw_binding_map();
             code_expr.fill_binding_indices(&binding_map)?;
             code_expr.compile()?

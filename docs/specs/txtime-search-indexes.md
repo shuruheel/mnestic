@@ -23,8 +23,9 @@ Implementation preflight, November 13, against engine `99a87cd8`: the approved
 scope and synchronous-maintenance decision stand. D2–D5, D7/D8 and their tests
 below clarify gaps found while preparing the combined TxTime/keyed-access PR:
 physical snapshots, detached rebuilds, old-vector availability, lock ordering,
-rollback and relation identity. These refinements have not yet been validated
-by an implementation. The owner subsequently requested one branch and PR with
+rollback and relation identity. Batch 1 is implemented on the combined branch;
+[qualification evidence](../reviews/keyed-txtime-implementation.md) distinguishes
+passing correctness checks from pending performance release gates. The owner subsequently requested one branch and PR with
 [planner keyed access](planner-keyed-access.md); this changes packaging, not the
 later-batch demand and measurement gates.
 

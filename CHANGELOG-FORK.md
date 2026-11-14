@@ -35,7 +35,9 @@ provenance and licensing.
   residual equality checks in `filters/expr`.
 - Differential coverage is in `tests/keyed_access.rs` under `test-hooks`;
   existing planner and recursive-workload shape baselines remain unchanged.
-  Performance qualification and RocksDB validation are still pending.
+  Memory, SQLite and RocksDB differential checks pass. Performance
+  qualification remains pending; see
+  [implementation evidence](docs/reviews/keyed-txtime-implementation.md).
 
 
 ### Added — governed transactions from Python
