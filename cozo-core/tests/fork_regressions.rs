@@ -57,7 +57,7 @@ fn top_level_create_underscore_relation_is_a_silent_noop() {
 /// filter shapes to a full `load_stored` scan + `eq(..)` filter (~20× slower at
 /// 1k rows). Fix: `query/reorder.rs::push_equality_filters_to_bindings`.
 #[test]
-fn equality_post_filter_uses_prefix_lookup() {
+fn equality_post_filter_uses_point_lookup() {
     let dir = tempfile::tempdir().unwrap();
     let db = DbInstance::new(
         "sqlite",
@@ -78,7 +78,7 @@ fn equality_post_filter_uses_prefix_lookup() {
     )
     .unwrap();
 
-    let uses_prefix_join = |query: &str| {
+    let uses_point_join = |query: &str| {
         let plan = db
             .run_script(
                 &format!("::explain {{ {query} }}"),
@@ -88,15 +88,15 @@ fn equality_post_filter_uses_prefix_lookup() {
             .unwrap();
         let ops: Vec<String> = plan.rows.iter().map(|r| format!("{:?}", r[4])).collect();
         assert!(
-            ops.iter().any(|o| o.contains("prefix_join")),
-            "expected a keyed prefix_join for `{query}`, got plan ops: {ops:?}"
+            ops.iter().any(|o| o.contains("stored_point_join")),
+            "expected a stored_point_join for `{query}`, got plan ops: {ops:?}"
         );
     };
 
     // Both post-filter shapes must now use a keyed lookup, like the fast form.
-    uses_prefix_join(r#"?[uid, val] := *pk_test[uid, val], uid == 'b'"#);
-    uses_prefix_join(r#"?[uid, val] := *pk_test{uid, val}, uid == 'b'"#);
-    uses_prefix_join(r#"?[uid, val] := uid = 'b', *pk_test{uid, val}"#);
+    uses_point_join(r#"?[uid, val] := *pk_test[uid, val], uid == 'b'"#);
+    uses_point_join(r#"?[uid, val] := *pk_test{uid, val}, uid == 'b'"#);
+    uses_point_join(r#"?[uid, val] := uid = 'b', *pk_test{uid, val}"#);
 
     // ...and the rewrite must not change results.
     let rows = db

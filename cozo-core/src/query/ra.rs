@@ -1704,13 +1704,15 @@ impl StoredRA {
     ) -> Result<TupleIter<'a>> {
         let mut right_invert_indices = right_join_indices.iter().enumerate().collect_vec();
         right_invert_indices.sort_by_key(|(_, b)| **b);
+        let key_len = self.storage.metadata.keys.len();
+        let seek_len = crate::query::keyed_access::leading_len(&right_join_indices, key_len);
         let left_to_prefix_indices = right_invert_indices
             .into_iter()
+            .take(seek_len)
             .map(|(a, _)| left_join_indices[a])
             .collect_vec();
 
-        let key_len = self.storage.metadata.keys.len();
-        if left_to_prefix_indices.len() >= key_len {
+        if seek_len == key_len {
             // per-left-tuple work is a single bounded `get`; the left stream
             // is already poison-wrapped at the RelAlgebra::iter dispatch
             return self.point_lookup_join(
@@ -1736,7 +1738,7 @@ impl StoredRA {
 
                 if !skip_range_check && !self.filters.is_empty() {
                     let other_bindings =
-                        &self.bindings[right_join_indices.len()..self.storage.metadata.keys.len()];
+                        &self.bindings[seek_len..key_len];
                     let (l_bound, u_bound) =
                         compute_bounds(&self.filters, other_bindings).unwrap_or_default();
                     if !l_bound.iter().all(|v| *v == DataValue::Null)
@@ -2561,7 +2563,7 @@ impl InnerJoin {
         debug_assert_eq!(ret.len(), ret.iter().collect::<BTreeSet<_>>().len());
         ret
     }
-    pub(crate) fn join_type(&self) -> &str {
+    pub(crate) fn join_type(&self, keyed_access: bool) -> &str {
         match &self.right {
             RelAlgebra::Fixed(f) => f.join_type(),
             RelAlgebra::TempStore(_) => {
@@ -2578,24 +2580,22 @@ impl InnerJoin {
                     "mem_mat_join"
                 }
             }
-            RelAlgebra::Stored(_) => {
-                let join_indices = self
-                    .joiner
-                    .join_indices(
-                        &self.left.bindings_after_eliminate(),
-                        &self.right.bindings_after_eliminate(),
-                    )
-                    .unwrap();
-                if join_is_prefix(&join_indices.1) {
-                    "stored_prefix_join"
-                } else {
-                    "stored_mat_join"
+            RelAlgebra::Stored(r) => {
+                use crate::query::keyed_access::{stored_access, StoredAccess};
+                let (_, positions) = self.joiner.join_indices(
+                    &self.left.bindings_after_eliminate(),
+                    &self.right.bindings_after_eliminate(),
+                ).unwrap();
+                match stored_access(&r.storage, &positions, &r.filters, keyed_access) {
+                    StoredAccess::Point => "stored_point_join",
+                    StoredAccess::Prefix => "stored_prefix_join",
+                    StoredAccess::Materialized => "stored_mat_join",
                 }
             }
             RelAlgebra::HnswSearch(_) => "hnsw_search_join",
             RelAlgebra::FtsSearch(_) => "fts_search_join",
             RelAlgebra::LshSearch(_) => "lsh_search_join",
-            RelAlgebra::StoredWithValidity(_) => {
+            RelAlgebra::StoredWithValidity(r) => {
                 let join_indices = self
                     .joiner
                     .join_indices(
@@ -2603,13 +2603,13 @@ impl InnerJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_is_prefix(&join_indices.1) {
+                if join_prefix_is_temporally_safe(&join_indices.1, r.storage.metadata.keys.len().saturating_sub(1)) {
                     "stored_prefix_join"
                 } else {
                     "stored_mat_join"
                 }
             }
-            RelAlgebra::StoredBitemporal(_) => {
+            RelAlgebra::StoredBitemporal(r) => {
                 let join_indices = self
                     .joiner
                     .join_indices(
@@ -2617,7 +2617,7 @@ impl InnerJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_is_prefix(&join_indices.1) {
+                if join_prefix_is_temporally_safe(&join_indices.1, r.storage.metadata.keys.len().saturating_sub(2)) {
                     "stored_bt_prefix_join"
                 } else {
                     "stored_bt_mat_join"
@@ -2687,7 +2687,9 @@ impl InnerJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_is_prefix(&join_indices.1) {
+                if crate::query::keyed_access::stored_access(
+                    &r.storage, &join_indices.1, &r.filters, tx.keyed_access,
+                ) != crate::query::keyed_access::StoredAccess::Materialized {
                     r.prefix_join(
                         tx,
                         self.left.iter(tx, delta_rule, stores, poison.clone())?,

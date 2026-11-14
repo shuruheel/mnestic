@@ -479,9 +479,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
                 // Drop the begin-snapshot so this put validates against the
                 // latest state instead of conflicting with a concurrent
                 // committer of the same key (see StoreTx doc). Safe: this is
-                // the transaction's final write before commit, all user keys
-                // were locked (and validated) earlier, and the caller holds
-                // the process-wide serialization lock for this key.
+                // all ordinary user keys were locked (and validated) earlier.
+                // The caller owns the transaction-time commit section across
+                // subsequent TxTime base/index maintenance and storage commit;
+                // later writes stay within that serialized domain.
                 tx.clear_snapshot();
                 Ok(tx.put(key, val)?)
             }

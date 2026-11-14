@@ -80,7 +80,7 @@ impl<'a> SessionTx<'a> {
         hash_perms: &HashPermutations,
     ) -> Result<()> {
         if let Some(mut found) =
-            inv_idx_handle.get_val_only(self, &tuple[..rel_handle.metadata.keys.len()])?
+            inv_idx_handle.get_val_only(self, &tuple[..rel_handle.index_key_len()])?
         {
             let bytes = match found.pop() {
                 Some(DataValue::List(l)) => l
@@ -115,7 +115,7 @@ impl<'a> SessionTx<'a> {
             })
             .collect_vec();
 
-        let inv_key_part = &tuple[..rel_handle.metadata.keys.len()];
+        let inv_key_part = &tuple[..rel_handle.index_key_len()];
 
         let mut key = Vec::with_capacity(bytes.len() + 1);
         key.push(DataValue::Bot);
@@ -185,7 +185,7 @@ impl<'a> SessionTx<'a> {
         for key in found_tuples {
             let orig_tuple = config
                 .base_handle
-                .get(self, &key)?
+                .get_current(self, &key)?
                 .ok_or_else(|| miette!("Tuple not found in base LSH relation"))?;
             if let Some((filter_code, span)) = filter_code {
                 if !eval_bytecode_pred(filter_code, &orig_tuple, stack, *span)? {

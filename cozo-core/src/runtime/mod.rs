@@ -21,9 +21,14 @@ pub(crate) mod imperative;
 pub(crate) mod minhash_lsh;
 pub(crate) mod reindex;
 pub(crate) mod relation;
+pub(crate) mod relation_lock;
 pub(crate) mod stored_queries;
 pub(crate) mod temp_store;
 #[cfg(test)]
 mod tests;
 pub(crate) mod transact;
 pub(crate) mod tt_clock;
+
+pub(crate) mod txtime_index;
+
+pub(crate) mod txtime_build;

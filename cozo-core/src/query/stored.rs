@@ -465,7 +465,7 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    fn del_in_fts(
+    pub(crate) fn del_in_fts(
         &mut self,
         rel_handle: &RelationHandle,
         stack: &mut Vec<DataValue>,
@@ -504,7 +504,7 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
-    fn del_in_lsh(&mut self, rel_handle: &RelationHandle, old_kv: &[DataValue]) -> Result<()> {
+    pub(crate) fn del_in_lsh(&mut self, rel_handle: &RelationHandle, old_kv: &[DataValue]) -> Result<()> {
         for (idx_handle, inv_idx_handle, _) in rel_handle.lsh_indices.values() {
             self.del_lsh_index_item(old_kv, None, idx_handle, inv_idx_handle)?;
         }
@@ -513,7 +513,7 @@ impl<'a> SessionTx<'a> {
 
     /// Replace one row's postings in every FTS index whose extracted text
     /// changed (0.19.2). `old` is the stored row, if any.
-    fn replace_in_fts(
+    pub(crate) fn replace_in_fts(
         &mut self,
         rel_handle: &RelationHandle,
         stack: &mut Vec<DataValue>,
@@ -624,6 +624,7 @@ impl<'a> SessionTx<'a> {
                 .next()
                 .unwrap();
             let mut code_expr = build_expr(parsed, &Default::default())?;
+            crate::runtime::txtime_index::reject_tt_index_columns(relation_store, code_expr.get_variables()?)?;
             let binding_map = relation_store.raw_binding_map();
             code_expr.fill_binding_indices(&binding_map)?;
             let extractor = code_expr.compile()?;
@@ -639,6 +640,7 @@ impl<'a> SessionTx<'a> {
                 .next()
                 .unwrap();
             let mut code_expr = build_expr(parsed, &Default::default())?;
+            crate::runtime::txtime_index::reject_tt_index_columns(relation_store, code_expr.get_variables()?)?;
             let binding_map = relation_store.raw_binding_map();
             code_expr.fill_binding_indices(&binding_map)?;
             let extractor = code_expr.compile()?;
@@ -658,6 +660,7 @@ impl<'a> SessionTx<'a> {
                     .next()
                     .unwrap();
                 let mut code_expr = build_expr(parsed, &Default::default())?;
+            crate::runtime::txtime_index::reject_tt_index_columns(relation_store, code_expr.get_variables()?)?;
                 let binding_map = relation_store.raw_binding_map();
                 code_expr.fill_binding_indices(&binding_map)?;
                 hnsw_filters.insert(name.clone(), code_expr.compile()?);

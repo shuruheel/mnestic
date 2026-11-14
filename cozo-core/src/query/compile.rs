@@ -211,7 +211,7 @@ impl<'a> SessionTx<'a> {
             serial_id += 1;
             ret
         };
-        for atom in &rule.body {
+        for (atom_index, atom) in rule.body.iter().enumerate() {
             match atom {
                 MagicAtom::Rule(rule_app) => {
                     let store_arity = store_arities.get(&rule_app.name).ok_or_else(|| {
@@ -262,6 +262,14 @@ impl<'a> SessionTx<'a> {
                             rel_app.span
                         )
                     );
+                    if self.keyed_access && rel_app.valid_at.is_none() && rel_app.tx_valid_at.is_none() {
+                        for (binding, expr) in crate::query::keyed_access::local_bindings(
+                            &store, &rel_app.args, &rule.body, atom_index, &seen_variables,
+                        ) {
+                            seen_variables.insert(binding.clone());
+                            ret = ret.unify(binding, expr, false, rel_app.span);
+                        }
+                    }
                     // already existing vars
                     let mut prev_joiner_vars = vec![];
                     // vars introduced by right and joined
@@ -273,7 +281,7 @@ impl<'a> SessionTx<'a> {
                     // vars introduced by right, regardless of joining
                     let mut right_vars = vec![];
                     // used for choosing indices
-                    let mut join_indices = vec![];
+                    let join_indices = crate::query::keyed_access::position_uses(&rel_app.args, &seen_variables);
 
                     for (i, var) in rel_app.args.iter().enumerate() {
                         if seen_variables.contains(var) {
@@ -283,15 +291,9 @@ impl<'a> SessionTx<'a> {
                             right_joiner_vars.push(rk);
                             right_joiner_vars_pos.push(i);
                             right_joiner_vars_pos_rev[i] = Some(right_joiner_vars.len() - 1);
-                            join_indices.push(IndexPositionUse::Join)
                         } else {
                             seen_variables.insert(var.clone());
                             right_vars.push(var.clone());
-                            if var.is_generated_ignored_symbol() {
-                                join_indices.push(IndexPositionUse::Ignored)
-                            } else {
-                                join_indices.push(IndexPositionUse::BindForLater)
-                            }
                         }
                     }
 

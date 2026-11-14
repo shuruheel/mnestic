@@ -676,7 +676,7 @@ impl<'a> SessionTx<'a> {
             crate::fts::FTS_BASE_ROW_FETCHES.with(|count| count.set(count.get() + 1));
             let mut cand_tuple = config
                 .base_handle
-                .get(self, &found_key)?
+                .get_current(self, &found_key)?
                 .ok_or_else(|| miette!("corrupted index"))?;
 
             if config.bind_score.is_some() {
@@ -798,9 +798,9 @@ impl<'a> SessionTx<'a> {
             collector.insert(text);
             count += 1;
         }
-        let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
+        let mut key = Vec::with_capacity(1 + rel_handle.index_key_len());
         key.push(DataValue::Bot);
-        for k in &tuple[..rel_handle.metadata.keys.len()] {
+        for k in &tuple[..rel_handle.index_key_len()] {
             key.push(k.clone());
         }
         // Maintain doc stats only if this document is actually indexed (probe
@@ -879,9 +879,9 @@ pub(crate) fn encode_fts_rows_for_tuple(
         position.push(DataValue::from(token.position as i64));
         count += 1;
     }
-    let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
+    let mut key = Vec::with_capacity(1 + rel_handle.index_key_len());
     key.push(DataValue::Bot);
-    for k in &tuple[..rel_handle.metadata.keys.len()] {
+    for k in &tuple[..rel_handle.index_key_len()] {
         key.push(k.clone());
     }
     let mut val = vec![

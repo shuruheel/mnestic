@@ -121,7 +121,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                     ret = NamedRows::default();
                 }
                 ImperativeStmt::SysOp { sysop, .. } => {
-                    ret = self.run_sys_op_with_tx(tx, &sysop.sysop, readonly, true)?;
+                    ret = self.run_sys_op_with_tx(tx, &sysop.sysop, readonly, true, false)?;
                     if let Some(store_as) = &sysop.store_as {
                         tx.script_store_as_relation(self, store_as, &ret, cur_vld)?;
                     }
@@ -270,8 +270,10 @@ impl<'s, S: Storage<'s>> Db<S> {
             bail!("Read-only imperative program attempted to acquire write locks");
         }
         let is_write = !write_lock_names.is_empty();
+        let admission_poison = Poison { deadline: outer_deadline, ..Default::default() };
+        let writer_admission = self.admit_writer(is_write, &admission_poison)?;
         let write_lock = self.obtain_relation_locks(write_lock_names.iter());
-        let _write_lock_guards = write_lock.iter().map(|l| l.read().unwrap()).collect_vec();
+        let _write_lock_guards = write_lock.iter().map(|l| l.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
 
         let callback_targets = if is_write {
             self.current_callback_targets()
@@ -338,6 +340,8 @@ impl<'s, S: Storage<'s>> Db<S> {
 
             tx.commit_tx()?;
         }
+        drop(_write_lock_guards);
+        drop(writer_admission);
         #[cfg(not(target_arch = "wasm32"))]
         if !callback_collector.is_empty() {
             self.send_callbacks(callback_collector)

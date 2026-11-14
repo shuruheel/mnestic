@@ -49,6 +49,7 @@ pub struct SessionTx<'a> {
     pub(crate) fts_pending: crate::fts::persist::FtsPending,
     /// An interrupted graph mutation must never be committed by a legacy client.
     pub(crate) hnsw_mutations_incomplete: usize,
+    pub(crate) keyed_access: bool,
     /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
     /// shared handle to the `Db`'s high-water mark. See `runtime/tt_clock.rs`.
     pub(crate) tt_clock: Arc<TtClock>,
@@ -67,6 +68,13 @@ pub struct SessionTx<'a> {
     /// (`::evict`'s audit stamp): forces `commit_tx` through
     /// `commit_tx_with_tt` so the persisted HWM covers the burned value.
     pub(crate) tt_hwm_dirty: bool,
+    pub(crate) pending_tt_evicts: Vec<crate::runtime::txtime_index::PendingTtEvict>,
+    pub(crate) tt_commit_failed: bool,
+    pub(crate) tt_index_builds: crate::runtime::txtime_index::SharedBuildRegistry,
+    pub(crate) preparing_tt_index: bool,
+    pub(crate) prepared_tt_index: Option<RelationHandle>,
+    pub(crate) defer_tt_cleanup: bool,
+    pub(crate) tt_cleanup_ranges: Vec<(Vec<u8>, Vec<u8>)>,
     /// Relations `:reconcile`d in this transaction (provenance semirings
     /// R3). A reconcile declares its relation's COMPLETE belief; any further
     /// write to the relation in the same transaction — including another
@@ -295,6 +303,9 @@ impl<'a> SessionTx<'a> {
     /// can escape the protocol. Taking the dirty set here also disarms
     /// [`Drop`], whose bump exists for transactions that never reach a commit.
     pub fn commit_tx(&mut self) -> Result<()> {
+        #[cfg(feature = "test-hooks")]
+        let commit_span = crate::measurement::Span::new("commit");
+        self.ensure_tt_usable()?;
         if self.hnsw_mutations_incomplete != 0 {
             bail!("cannot commit after an incomplete HNSW mutation; abort the transaction");
         }
@@ -307,6 +318,8 @@ impl<'a> SessionTx<'a> {
             if result.is_ok() {
                 self.fts_stats.committed();
             }
+            #[cfg(feature = "test-hooks")]
+            if result.is_ok() { commit_span.finish(); }
             return result;
         }
         self.projections.begin_commit(&self.dirty_relations);
@@ -320,6 +333,8 @@ impl<'a> SessionTx<'a> {
         if res.is_ok() {
             self.fts_stats.committed();
         }
+        #[cfg(feature = "test-hooks")]
+        if res.is_ok() { commit_span.finish(); }
         res
     }
 
@@ -384,25 +399,48 @@ impl<'a> SessionTx<'a> {
     /// tt-stamped relations through here, stamping the buffered rows with
     /// the returned tt before `store_tx.commit()`.
     pub(crate) fn commit_tx_with_tt(&mut self) -> Result<i64> {
+        self.ensure_tt_usable()?;
         let lock = self.tt_commit_lock.clone();
-        // Poison recovery is sound here: a panic inside the section can only
-        // have advanced the atomic (a burned, never-committed value) — the
-        // invariant "atomic HWM >= persisted HWM >= every committed tt"
-        // survives, so later committers may proceed rather than fail-stop.
-        let _guard = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let tt = self.tt_clock.advance();
-        self.stamp_pending_tt_writes(tt)?;
-        // put_externally_serialized: the mutex above is the serialization
-        // authority for this key; RocksDB must not snapshot-validate it (two
-        // overlapping tt commits would otherwise abort the later one).
-        self.store_tx
-            .put_externally_serialized(&tt_hwm_key(), &tt.to_be_bytes())?;
-        // After stamping: stamped rows are the last posting writes.
-        self.write_fts_deltas()?;
-        self.store_tx.commit()?;
-        Ok(tt)
+        let poison = crate::runtime::db::Poison {
+            deadline: self.script_deadline,
+            parent_cancellation: self.script_cancellation.clone(),
+            ..Default::default()
+        };
+        let result = (|| {
+            #[cfg(feature = "test-hooks")]
+            let wait = crate::measurement::Span::new("tt_commit_section");
+            let _guard = loop {
+                poison.check()?;
+                match lock.try_lock() {
+                    Ok(guard) => break guard,
+                    Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                    Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(2)),
+                }
+            };
+            #[cfg(feature = "test-hooks")]
+            let _guard = wait.acquired(_guard);
+            poison.check()?;
+            let tt = self.tt_clock.advance();
+            // Clear RocksDB's begin validation snapshot only inside the sole
+            // writer section for the HWM and attached TxTime search-index rows.
+            // Earlier user-key locks have already validated their snapshots.
+            self.store_tx.put_externally_serialized(&tt_hwm_key(), &tt.to_be_bytes())?;
+            let touched = self.collect_tt_index_old_rows()?;
+            self.apply_tt_evicts()?;
+            self.stamp_pending_tt_writes(tt)?;
+            self.maintain_tt_indexes(&touched)?;
+            // Persist totals after the final current-belief posting change.
+            self.write_fts_deltas()?;
+            poison.check()?;
+            let notification = crate::runtime::txtime_index::BuildCommitNotification::new(
+                self.tt_index_builds.clone(), &touched,
+            );
+            self.store_tx.commit()?;
+            notification.committed();
+            Ok(tt)
+        })();
+        if result.is_err() { self.tt_commit_failed = true; }
+        result
     }
 
     /// Drain the buffered tt writes: append the allocated tt as the trailing

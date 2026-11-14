@@ -420,7 +420,7 @@ impl SessionTx<'_> {
             distance: manifest.distance,
         };
         for row in rows {
-            let key = row[..orig.metadata.keys.len()].to_vec();
+            let key = row[..orig.index_key_len()].to_vec();
             for &field in &manifest.vec_fields {
                 match &row[field] {
                     DataValue::Vec(v) => {
