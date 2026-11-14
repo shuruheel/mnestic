@@ -1,0 +1,891 @@
+{
+  "admission": {
+    "fts": {
+      "analysis": {
+        "cell": "build_fts",
+        "ddl_ns": 339273250,
+        "ddl_shared_guard_covered_fraction": 0.9979108520934085,
+        "ddl_status": "ok",
+        "interpretation": "development diagnostic; phase envelopes are not acquired critical sections",
+        "maintenance_admissions": [
+          {
+            "completed": true,
+            "duration_ns": 108324917
+          },
+          {
+            "completed": true,
+            "duration_ns": 227117459
+          }
+        ],
+        "max_writer_admission_and_tt_wait_union_ns": 415794250,
+        "phases": [
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 3,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": true,
+            "duration_ns": 108467750,
+            "phase": "build_reservation",
+            "read_admission_envelope_overlaps": 3,
+            "scripts_inflight": 6
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 16417,
+            "phase": "build_registration",
+            "read_admission_envelope_overlaps": 3,
+            "scripts_inflight": 3
+          },
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 4,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": true,
+            "duration_ns": 3110084,
+            "phase": "build_backfill",
+            "read_admission_envelope_overlaps": 4,
+            "scripts_inflight": 4
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 249583,
+            "phase": "build_catchup",
+            "read_admission_envelope_overlaps": 3,
+            "scripts_inflight": 3
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 3,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 227556750,
+            "phase": "build_publication",
+            "read_admission_envelope_overlaps": 3,
+            "scripts_inflight": 7
+          }
+        ],
+        "relation_write_waits": [
+          {
+            "completed": true,
+            "duration_ns": 500,
+            "shared_guard_covered_fraction": 0.0,
+            "shared_guard_covered_ns": 0
+          },
+          {
+            "completed": true,
+            "duration_ns": 458,
+            "shared_guard_covered_fraction": 0.0,
+            "shared_guard_covered_ns": 0
+          }
+        ],
+        "shared_guard_basis": "admission-end to commit-end when available; otherwise commit interval",
+        "writer_errors": 0,
+        "writer_operations": 27
+      },
+      "report": {
+        "build_schedule_failures": [],
+        "development_only": true,
+        "duplicate_operation_ids": 0,
+        "errors": 1,
+        "malformed": [],
+        "missing_operations": 0,
+        "operations": 35,
+        "oracle_or_trace_failures": 0,
+        "overhead_by_writer": {},
+        "overhead_estimate_valid": false,
+        "overhead_median_paired_delta_ns": null,
+        "overhead_p50_ratio": null,
+        "overhead_pairs_observed": 0,
+        "overhead_pairs_valid": 0,
+        "performance_qualified": false,
+        "phase_coverage": {
+          "build_fts/4294967296/build_backfill": {
+            "acquired_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": true,
+            "potential_section_overlaps": null,
+            "writer_attempts_overlapping": 4
+          },
+          "build_fts/4294967296/build_catchup": {
+            "acquired_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false,
+            "potential_section_overlaps": 0,
+            "writer_attempts_overlapping": 0
+          },
+          "build_fts/4294967296/build_publication": {
+            "acquired_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false,
+            "potential_section_overlaps": 0,
+            "writer_attempts_overlapping": 3
+          },
+          "build_fts/4294967296/build_registration": {
+            "acquired_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false,
+            "potential_section_overlaps": 0,
+            "writer_attempts_overlapping": 0
+          },
+          "build_fts/4294967296/build_reservation": {
+            "acquired_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": true,
+            "potential_section_overlaps": null,
+            "writer_attempts_overlapping": 3
+          }
+        },
+        "status": "complete",
+        "unexpected_operations": 0
+      }
+    },
+    "hnsw": {
+      "analysis": {
+        "cell": "build_hnsw",
+        "ddl_ns": 244383542,
+        "ddl_shared_guard_covered_fraction": 0.0477973062523171,
+        "ddl_status": "ok",
+        "interpretation": "development diagnostic; phase envelopes are not acquired critical sections",
+        "maintenance_admissions": [
+          {
+            "completed": true,
+            "duration_ns": 334
+          },
+          {
+            "completed": true,
+            "duration_ns": 5879000
+          }
+        ],
+        "max_writer_admission_and_tt_wait_union_ns": 344917416,
+        "phases": [
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": true,
+            "duration_ns": 86541,
+            "phase": "build_reservation",
+            "read_admission_envelope_overlaps": 0,
+            "scripts_inflight": 0
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 12500,
+            "phase": "build_registration",
+            "read_admission_envelope_overlaps": 0,
+            "scripts_inflight": 0
+          },
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 7,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": true,
+            "duration_ns": 15272125,
+            "phase": "build_backfill",
+            "read_admission_envelope_overlaps": 7,
+            "scripts_inflight": 7
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 215849917,
+            "phase": "build_catchup",
+            "read_admission_envelope_overlaps": 4,
+            "scripts_inflight": 4
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 2,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 228866250,
+            "phase": "build_publication",
+            "read_admission_envelope_overlaps": 4,
+            "scripts_inflight": 6
+          }
+        ],
+        "relation_write_waits": [
+          {
+            "completed": true,
+            "duration_ns": 83,
+            "shared_guard_covered_fraction": 0.0,
+            "shared_guard_covered_ns": 0
+          },
+          {
+            "completed": true,
+            "duration_ns": 167,
+            "shared_guard_covered_fraction": 0.0,
+            "shared_guard_covered_ns": 0
+          }
+        ],
+        "shared_guard_basis": "admission-end to commit-end when available; otherwise commit interval",
+        "writer_errors": 0,
+        "writer_operations": 19
+      },
+      "report": {
+        "build_schedule_failures": [],
+        "development_only": true,
+        "duplicate_operation_ids": 0,
+        "errors": 1,
+        "malformed": [],
+        "missing_operations": 0,
+        "operations": 27,
+        "oracle_or_trace_failures": 0,
+        "overhead_by_writer": {},
+        "overhead_estimate_valid": false,
+        "overhead_median_paired_delta_ns": null,
+        "overhead_p50_ratio": null,
+        "overhead_pairs_observed": 0,
+        "overhead_pairs_valid": 0,
+        "performance_qualified": false,
+        "phase_coverage": {
+          "build_hnsw/4294967296/build_backfill": {
+            "acquired_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": true,
+            "potential_section_overlaps": null,
+            "writer_attempts_overlapping": 7
+          },
+          "build_hnsw/4294967296/build_catchup": {
+            "acquired_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false,
+            "potential_section_overlaps": 0,
+            "writer_attempts_overlapping": 0
+          },
+          "build_hnsw/4294967296/build_publication": {
+            "acquired_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false,
+            "potential_section_overlaps": 0,
+            "writer_attempts_overlapping": 2
+          },
+          "build_hnsw/4294967296/build_registration": {
+            "acquired_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false,
+            "potential_section_overlaps": 0,
+            "writer_attempts_overlapping": 0
+          },
+          "build_hnsw/4294967296/build_reservation": {
+            "acquired_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": false,
+            "potential_section_overlaps": null,
+            "writer_attempts_overlapping": 0
+          }
+        },
+        "status": "complete",
+        "unexpected_operations": 0
+      }
+    }
+  },
+  "artifact_index_sha256": "db5a56690d9f4f119dde947a08d1f93aeba00c88f2509b3b4690f827c5f7eaab",
+  "baseline_source": "272c7b7196de9acd8d4aa66ec3e6e2f10f0057ea",
+  "candidate_source": "0cedce380a40280e27899b316968c48eff9afca5",
+  "executables": {
+    "baseline": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+    "candidate": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f"
+  },
+  "indexed_artifacts": 563,
+  "native": {
+    "ROCKSDB_INCLUDE_DIR": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-diagnostics-20261114-v1/native/include",
+    "ROCKSDB_LIB_DIR": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-diagnostics-20261114-v1/native",
+    "ROCKSDB_STATIC": "1",
+    "headers_sha256": "6970f49bbbfb89327b7edb6e312a3f093759b33728311006a22e8885ee955a1d",
+    "librocksdb_sha256": "e637ca1e5c7b73a5a1a8609f36ba4186d15b98d6e860c2cbeb3506aa1afbe043"
+  },
+  "oracle_diagnostics": {
+    "control_results_replaced": false,
+    "f32_domain_check": "passed all 10 operations; no replacement controls",
+    "original_equality_check": "failed; saved scalar/vector values equal expected in Python"
+  },
+  "performance_qualified": false,
+  "purpose": "development; qualification blocked",
+  "raw_root": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-admission-20261114-v1",
+  "recording_campaign": {
+    "all_recording_controls_passed": false,
+    "campaign_manifest_sha256": "f2e604fa29ca5483f4b93a912351ed7b59cafe7e4a2ddc216d756fbf2407c742",
+    "cells_observed": 18,
+    "cells_required": 18,
+    "elapsed_s": 74.07204474997707,
+    "performance_qualified": false,
+    "protocol_unchanged": true,
+    "scripts_unchanged": true,
+    "status": "complete",
+    "stop_reason": null
+  },
+  "recording_controls": {
+    "baseline-rocksdb-plain-contention-report": {
+      "development_only": true,
+      "elapsed_s": 1.0468826669966802,
+      "executable_sha256": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 24095,
+      "operations": 109,
+      "performance_qualified": false,
+      "plan_sha256": "bcffd0885df9788efee46e21daf4e95894400c1ee3b32e6738f02588923eb7a1",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "baseline-rocksdb-plain-read-report": {
+      "development_only": true,
+      "elapsed_s": 8.363339124945924,
+      "estimates": {
+        "0.5": {
+          "conservative_upper95": 1.008210512487558,
+          "ratio": 0.9951889516635279,
+          "upper95": {
+            "block10": 1.0076335877862594,
+            "conditional_iid": 1.008210512487558
+          }
+        },
+        "0.99": {
+          "conservative_upper95": 1.816758246910339,
+          "ratio": 1.711443928680267,
+          "upper95": {
+            "block10": 1.816758246910339,
+            "conditional_iid": 1.8096906012842966
+          }
+        }
+      },
+      "executable_sha256": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "limitation": "Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.",
+      "missing": 0,
+      "operations": 20404,
+      "pairs": 100,
+      "per_writer": {
+        "1": {
+          "False": {
+            "p50_ns": 199125,
+            "p99_ns": 226417
+          },
+          "True": {
+            "p50_ns": 198167,
+            "p99_ns": 387500
+          }
+        }
+      },
+      "performance_qualified": false,
+      "plan_sha256": "039ae072bcd91fcefab5aa69b6988546a0ef1412fc8f71598d73864eee2ccc64",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": true,
+      "statistic": "complete round makespan",
+      "status": "complete",
+      "unexpected": 0,
+      "workers": 1,
+      "writer_finish_rank_changes": 0,
+      "writer_pairs": 100
+    },
+    "baseline-rocksdb-plain-single-report": {
+      "development_only": true,
+      "elapsed_s": 1.0466135839233175,
+      "executable_sha256": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 21098,
+      "operations": 106,
+      "performance_qualified": false,
+      "plan_sha256": "1939b26d22c73bfd8942dbbd44b6a80c042e643161b15595f54ce2a5c58aafeb",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "baseline-sqlite-plain-contention-report": {
+      "development_only": true,
+      "elapsed_s": 1.0502876250538975,
+      "executable_sha256": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 24095,
+      "operations": 109,
+      "performance_qualified": false,
+      "plan_sha256": "f570219d5fa77a663968e5de8d643a0d2d80bd4b68c2d19120e6a4a775a85179",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "baseline-sqlite-plain-read-report": {
+      "development_only": true,
+      "elapsed_s": 8.387913209036924,
+      "estimates": {
+        "0.5": {
+          "conservative_upper95": 1.0148520868275845,
+          "ratio": 1.0040664291872021,
+          "upper95": {
+            "block10": 1.0118698948875655,
+            "conditional_iid": 1.0148520868275845
+          }
+        },
+        "0.99": {
+          "conservative_upper95": 2.0804173255052953,
+          "ratio": 0.5584214433518555,
+          "upper95": {
+            "block10": 2.0804173255052953,
+            "conditional_iid": 1.729032258064516
+          }
+        }
+      },
+      "executable_sha256": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "limitation": "Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.",
+      "missing": 0,
+      "operations": 20404,
+      "pairs": 100,
+      "per_writer": {
+        "1": {
+          "False": {
+            "p50_ns": 122958,
+            "p99_ns": 405459
+          },
+          "True": {
+            "p50_ns": 123458,
+            "p99_ns": 226417
+          }
+        }
+      },
+      "performance_qualified": false,
+      "plan_sha256": "28946a33b3d2f4d24b7fde9e35efda28991d8472ca348843131452886b0a38c6",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": true,
+      "statistic": "complete round makespan",
+      "status": "complete",
+      "unexpected": 0,
+      "workers": 1,
+      "writer_finish_rank_changes": 0,
+      "writer_pairs": 100
+    },
+    "baseline-sqlite-plain-single-report": {
+      "development_only": true,
+      "elapsed_s": 1.0391251670662314,
+      "executable_sha256": "caa00cd969863494da4c80166149881778c84e7d6f67175308c18ffd6f4fcc46",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 21098,
+      "operations": 106,
+      "performance_qualified": false,
+      "plan_sha256": "7e9801a9c18608ab2ee1aa25255b92583c84169120f8832edca064b8d497da5b",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-rocksdb-plain-contention-report": {
+      "development_only": true,
+      "elapsed_s": 1.0474394590128213,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 24095,
+      "operations": 109,
+      "performance_qualified": false,
+      "plan_sha256": "bcffd0885df9788efee46e21daf4e95894400c1ee3b32e6738f02588923eb7a1",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-rocksdb-plain-read-report": {
+      "development_only": true,
+      "elapsed_s": 5.226293790969066,
+      "estimates": {
+        "0.5": {
+          "conservative_upper95": 1.0052018440069774,
+          "ratio": 0.9948171206225681,
+          "upper95": {
+            "block10": 1.0025941747572815,
+            "conditional_iid": 1.0052018440069774
+          }
+        },
+        "0.99": {
+          "conservative_upper95": 2.5807560137457046,
+          "ratio": 1.3679122362083809,
+          "upper95": {
+            "block10": 2.0188172043010755,
+            "conditional_iid": 2.5807560137457046
+          }
+        }
+      },
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "limitation": "Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.",
+      "missing": 0,
+      "operations": 20404,
+      "pairs": 100,
+      "per_writer": {
+        "1": {
+          "False": {
+            "p50_ns": 64250,
+            "p99_ns": 85958
+          },
+          "True": {
+            "p50_ns": 63917,
+            "p99_ns": 117583
+          }
+        }
+      },
+      "performance_qualified": false,
+      "plan_sha256": "039ae072bcd91fcefab5aa69b6988546a0ef1412fc8f71598d73864eee2ccc64",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": true,
+      "statistic": "complete round makespan",
+      "status": "complete",
+      "unexpected": 0,
+      "workers": 1,
+      "writer_finish_rank_changes": 0,
+      "writer_pairs": 100
+    },
+    "candidate-rocksdb-plain-single-report": {
+      "development_only": true,
+      "elapsed_s": 1.046955208061263,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 21098,
+      "operations": 106,
+      "performance_qualified": false,
+      "plan_sha256": "1939b26d22c73bfd8942dbbd44b6a80c042e643161b15595f54ce2a5c58aafeb",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-rocksdb-txtime-contention-report": {
+      "development_only": true,
+      "elapsed_s": 1.0383196250768378,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 24895,
+      "operations": 109,
+      "performance_qualified": false,
+      "plan_sha256": "8c0449874c555e9186bb622b2ea963166899c07161bdf1739554ec406e54272a",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-rocksdb-txtime-read-report": {
+      "development_only": true,
+      "elapsed_s": 15.68876225000713,
+      "estimates": {
+        "0.5": {
+          "conservative_upper95": 1.0048040455120102,
+          "ratio": 0.9983251633166585,
+          "upper95": {
+            "block10": 1.0021812708518627,
+            "conditional_iid": 1.0048040455120102
+          }
+        },
+        "0.99": {
+          "conservative_upper95": 1.5255129273948662,
+          "ratio": 1.3441501664368538,
+          "upper95": {
+            "block10": 1.4565005820602719,
+            "conditional_iid": 1.5255129273948662
+          }
+        }
+      },
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "limitation": "Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.",
+      "missing": 0,
+      "operations": 20404,
+      "pairs": 100,
+      "per_writer": {
+        "1": {
+          "False": {
+            "p50_ns": 497959,
+            "p99_ns": 586709
+          },
+          "True": {
+            "p50_ns": 497125,
+            "p99_ns": 788625
+          }
+        }
+      },
+      "performance_qualified": false,
+      "plan_sha256": "906d787184fe4b46ae384bdac68c28761aa2a242c808fb7e5cb1f68fd0bc24de",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": true,
+      "statistic": "complete round makespan",
+      "status": "complete",
+      "unexpected": 0,
+      "workers": 1,
+      "writer_finish_rank_changes": 0,
+      "writer_pairs": 100
+    },
+    "candidate-rocksdb-txtime-single-report": {
+      "development_only": true,
+      "elapsed_s": 1.0379284579539672,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 21298,
+      "operations": 106,
+      "performance_qualified": false,
+      "plan_sha256": "7ccdbdf0585277eb2d758697a3f239041003f9af0382f6046156721ccd4182ca",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-sqlite-plain-contention-report": {
+      "development_only": true,
+      "elapsed_s": 1.05377791589126,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 24095,
+      "operations": 109,
+      "performance_qualified": false,
+      "plan_sha256": "f570219d5fa77a663968e5de8d643a0d2d80bd4b68c2d19120e6a4a775a85179",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-sqlite-plain-read-report": {
+      "development_only": true,
+      "elapsed_s": 4.19475104205776,
+      "estimates": {
+        "0.5": {
+          "conservative_upper95": 1.0165345701170603,
+          "ratio": 1.0052981393061657,
+          "upper95": {
+            "block10": 1.0165345701170603,
+            "conditional_iid": 1.0152425456163774
+          }
+        },
+        "0.99": {
+          "conservative_upper95": 1.2645748647236466,
+          "ratio": 0.5920250509434688,
+          "upper95": {
+            "block10": 1.22600007976708,
+            "conditional_iid": 1.2645748647236466
+          }
+        }
+      },
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "limitation": "Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.",
+      "missing": 0,
+      "operations": 20404,
+      "pairs": 100,
+      "per_writer": {
+        "1": {
+          "False": {
+            "p50_ns": 63041,
+            "p99_ns": 234083
+          },
+          "True": {
+            "p50_ns": 63375,
+            "p99_ns": 138583
+          }
+        }
+      },
+      "performance_qualified": false,
+      "plan_sha256": "28946a33b3d2f4d24b7fde9e35efda28991d8472ca348843131452886b0a38c6",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": true,
+      "statistic": "complete round makespan",
+      "status": "complete",
+      "unexpected": 0,
+      "workers": 1,
+      "writer_finish_rank_changes": 0,
+      "writer_pairs": 100
+    },
+    "candidate-sqlite-plain-single-report": {
+      "development_only": true,
+      "elapsed_s": 1.045948417042382,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 21098,
+      "operations": 106,
+      "performance_qualified": false,
+      "plan_sha256": "7e9801a9c18608ab2ee1aa25255b92583c84169120f8832edca064b8d497da5b",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-sqlite-txtime-contention-report": {
+      "development_only": true,
+      "elapsed_s": 1.0414701249683276,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 24895,
+      "operations": 109,
+      "performance_qualified": false,
+      "plan_sha256": "ec29221cb4667250cace4dfa4aa1f00e9bb0feac7e38355b3241a5ea6fe88694",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    },
+    "candidate-sqlite-txtime-read-report": {
+      "development_only": true,
+      "elapsed_s": 9.409527208073996,
+      "estimates": {
+        "0.5": {
+          "conservative_upper95": 1.003959188366385,
+          "ratio": 0.9956467661691543,
+          "upper95": {
+            "block10": 1.0029054726368158,
+            "conditional_iid": 1.003959188366385
+          }
+        },
+        "0.99": {
+          "conservative_upper95": 1.294204347826087,
+          "ratio": 0.8542459798852208,
+          "upper95": {
+            "block10": 1.294204347826087,
+            "conditional_iid": 1.294204347826087
+          }
+        }
+      },
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "limitation": "Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.",
+      "missing": 0,
+      "operations": 20404,
+      "pairs": 100,
+      "per_writer": {
+        "1": {
+          "False": {
+            "p50_ns": 201000,
+            "p99_ns": 281584
+          },
+          "True": {
+            "p50_ns": 200125,
+            "p99_ns": 240542
+          }
+        }
+      },
+      "performance_qualified": false,
+      "plan_sha256": "367978c65f5270222177d6d7e13e6dd57aff678e294f4b31b1b8a4b08e6856fa",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": true,
+      "statistic": "complete round makespan",
+      "status": "complete",
+      "unexpected": 0,
+      "workers": 1,
+      "writer_finish_rank_changes": 0,
+      "writer_pairs": 100
+    },
+    "candidate-sqlite-txtime-single-report": {
+      "development_only": true,
+      "elapsed_s": 1.0468279590131715,
+      "executable_sha256": "29093e662068aa4b921713c48cd0381a1f44d3a19733447041fedcfd2354993f",
+      "freeze_control_passed": false,
+      "frozen_binary_matches": true,
+      "frozen_plan_matches": true,
+      "missing": 21298,
+      "operations": 106,
+      "performance_qualified": false,
+      "plan_sha256": "153ca019895b25f290f2fe70786cd57e99749f2a81a359b5b56441795bfec167",
+      "provenance_valid": true,
+      "report_sha256": "c038c4819143fc52b02b14b2efa16d54cbc783b8cc49639302d5c370dc03a4b9",
+      "resource_limits_valid": true,
+      "snapshots_match": false,
+      "status": "incomplete",
+      "unexpected": 0
+    }
+  },
+  "validation": {
+    "debug_only_test_excluded": 1,
+    "governed_passed": 31,
+    "production_rocksdb_columnar_without_test_hooks": "passed",
+    "python_controls_passed": 5,
+    "python_timing_passed": 12,
+    "release_library_passed": 421,
+    "strict_clippy": "passed",
+    "txtime_concurrency_passed": 11
+  }
+}

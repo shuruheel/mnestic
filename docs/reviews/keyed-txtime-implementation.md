@@ -31,9 +31,9 @@ Evidence is retained in the workspace artifact directory
 `benchmark-artifacts/keyed-txtime-admission-20261114-v1`.
 
 The [measurement amendment](../plans/keyed-txtime-measurement-amendment.md) and
-replacement overhead controls passed independent source review. Development
-execution, recording-cost acceptance and full performance qualification are
-separate gates; this correctness evidence does not establish merge readiness.
+replacement overhead controls passed independent source review. The two sustained-writer
+development runs completed. The 18-control recording campaign failed acceptance;
+qualification and merge remain blocked. See the [admission and control results](keyed-txtime-admission.md).
 
 ## Scope
 

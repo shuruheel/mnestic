@@ -59,6 +59,9 @@ provenance and licensing.
   resource logs and fail-closed reports support later qualification; no release
   performance acceptance is claimed. See
   [harness evidence](docs/reviews/keyed-txtime-timing-harness.md).
+- Sustained-writer development checks now complete after the admission fix.
+  The replacement recording-cost campaign failed its gate; qualification and
+  merge remain blocked. [Results](docs/reviews/keyed-txtime-admission.md).
 
 ## 0.19.3 — 2026-11-14
 

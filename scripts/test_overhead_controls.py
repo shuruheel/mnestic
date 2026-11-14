@@ -99,6 +99,11 @@ class ControlsTests(unittest.TestCase):
                 self.assertEqual(row[2:],initial[row[0]][2:])
                 self.assertNotEqual(row[1],initial[row[0]][1])
             self.assertEqual(len(set(targets)),4)
+            for i,op in enumerate(round_['workers']):
+                current=round_['verify'][i*5]
+                self.assertIn('emb == vec($expected_vector)',current['script'])
+                self.assertEqual(current['params']['expected_vector'],op['params']['r'][0][2])
+                self.assertEqual(current['expected_rows'][0],op['params']['r'][0][:2]+[op['params']['r'][0][3],True])
 
 
 if __name__=='__main__': unittest.main()

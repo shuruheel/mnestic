@@ -1,5 +1,11 @@
 # Keyed access and TxTime search: measurement protocol
 
+Current status (November 14): the [reviewed revision-2 amendment](keyed-txtime-measurement-amendment.md)
+changes the baseline and disclosed C2/recording-control definitions. Its first
+recording campaign failed acceptance; [results and blockers](../reviews/keyed-txtime-admission.md)
+are preserved. Qualification remains disabled. The revision-1 contract below
+is retained as the original protocol; no old result is retrospectively accepted.
+
 Prepared November 14, 2026 for draft PR #81. Status: independently reviewed design;
 **qualifying execution is not yet enabled or performance-qualified**. See the
 [review record](../reviews/keyed-txtime-measurement-protocol.md). The harness,

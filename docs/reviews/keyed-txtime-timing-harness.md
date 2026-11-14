@@ -196,3 +196,10 @@ freezing the qualification campaign; no overhead is subtracted from results.
 Independent implementation review closed the snapshot, oracle, postprocessing,
 provenance and budget findings. The complete K1-K4/P1/T1/T2/C1/C2/H1 campaign
 implementation and qualification remain prerequisites to merge acceptance.
+
+The [November 14 admission/control results](keyed-txtime-admission.md) record two
+successful sustained-writer development runs and a failed 18-control recording
+campaign. Six read controls fail the tail uncertainty bound; twelve mutation
+controls expose a JSON-number oracle defect. The corrected F32-domain oracle
+passes a separate correctness diagnostic. The frozen campaign is not rerun or
+retroactively accepted, and qualifying execution remains disabled.

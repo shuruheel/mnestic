@@ -5,7 +5,6 @@ from collections import Counter
 import json
 from pathlib import Path
 import random
-import struct
 import csv
 import time
 import timing_harness as harness
@@ -33,8 +32,12 @@ def fixture(backend, temporal, kind):
                 operation = harness.op('update', '?[cid,text,emb,kind] <- $r :put chunk {cid=>text,emb,kind}',
                                        params={'r': [row]}, phases=['commit']+(['tt_commit_section'] if temporal else []))
                 verify.extend([
-                    harness.op('current', '?[cid,text,emb,kind] := *chunk{cid,text,emb,kind}, cid=$id',
-                               params={'id':row[0]}, rows=[[row[0],row[1],[struct.unpack('f',struct.pack('f',v))[0] for v in row[2]],row[3]]], immutable=True),
+                    # Compare the vector in its declared F32 domain. JSON's
+                    # decimal parsing can perturb an exactly widened F32 by
+                    # one F64 ULP; that is not a stored-vector difference.
+                    harness.op('current', '?[cid,text,kind,same_vector] := *chunk{cid,text,emb,kind}, cid=$id, same_vector = (emb == vec($expected_vector))',
+                               params={'id':row[0],'expected_vector':row[2]},
+                               rows=[[row[0],row[1],row[3],True]], immutable=True),
                     harness.op('fresh', '?[cid] := ~chunk:fts{cid | query:$q,k:100}',
                                params={'q':row[1]}, rows=[[row[0]]], immutable=True),
                     harness.op('stale', '?[cid] := ~chunk:fts{cid | query:$q,k:100}',
