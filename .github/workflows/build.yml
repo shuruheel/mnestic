@@ -34,7 +34,7 @@ jobs:
       # job above compiles them to zero tests. They must be named explicitly here
       # or they silently never run.
       - name: Test (test-hooks suites)
-        run: cargo test -p mnestic --features test-hooks --test commit_fence --test callback_commit_contract --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --verbose
+        run: cargo test -p mnestic --features test-hooks --test commit_fence --test callback_commit_contract --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --test keyed_access --verbose
       - name: Test (columnar import contract)
         run: cargo test -p mnestic --features columnar-io,test-hooks --test columnar_import --verbose
 
@@ -142,7 +142,7 @@ jobs:
       - name: Test (graph-projection interleaving)
         run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test graph_projection_interleaving --verbose
       - name: Test (governed read and write transactions)
-        run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --verbose
+        run: cargo test -p mnestic --features storage-rocksdb,test-hooks --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --test keyed_access --verbose
       - name: Test (HNSW mutation repair, reconciliation and rebuild)
         run: >
           cargo test -p mnestic --features storage-rocksdb,test-hooks

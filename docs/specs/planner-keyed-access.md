@@ -115,6 +115,25 @@ aliases, use a candidate as another candidate's producer, or enumerate subsets
 when a group is rejected. Retain every original equality, including conflicting
 ones. Rejection leaves the baseline compilation of that atom intact.
 
+**Implementation review fences (November 13).** Non-numeric does not imply
+byte-key compatibility: vector equality equates signed zero and NaN variants,
+while vector keys retain their raw bits. D1 accepts only recursively compatible
+constant values; D3 requires recursively compatible declared types. New D2
+noncontiguous seeks require compatible primary-key types. Vectors, JSON and
+unconstrained `Any` types cannot establish this proof; preserve baseline access.
+Existing contiguous-prefix access is unchanged.
+
+Local binding is also declined when the compiled body contains a volatile
+expression, or when a later residual can fail or otherwise cannot be proven
+safe to skip on nonmatching rows. The initial safe set is literal/bound-value
+unification, successfully folded deterministic constants, and simple equality
+predicates over literals/bindings. New D2 noncontiguous seeks require total
+right-side filters from the same narrow equality set. Determinism alone does
+not suffice: moving an assertion before an empty lookup can turn success into
+an error, and a point lookup can skip an error on an unselected right row.
+These fences preserve evaluation count/location and errors; they intentionally
+leave richer expression shapes on their existing plans.
+
 **D1a — Guard the actual access, including secondary indexes.** Before adding
 bindings, derive the target atom's baseline and candidate physical access with
 the same selection logic that compilation uses (`choose_index`, its mapper and

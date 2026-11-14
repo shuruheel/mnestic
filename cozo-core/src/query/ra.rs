@@ -2581,12 +2581,12 @@ impl InnerJoin {
                 }
             }
             RelAlgebra::Stored(r) => {
-                use crate::query::keyed_access::{classify, is_plain, StoredAccess};
+                use crate::query::keyed_access::{stored_access, StoredAccess};
                 let (_, positions) = self.joiner.join_indices(
                     &self.left.bindings_after_eliminate(),
                     &self.right.bindings_after_eliminate(),
                 ).unwrap();
-                match classify(&positions, r.storage.metadata.keys.len(), keyed_access && is_plain(&r.storage)) {
+                match stored_access(&r.storage, &positions, &r.filters, keyed_access) {
                     StoredAccess::Point => "stored_point_join",
                     StoredAccess::Prefix => "stored_prefix_join",
                     StoredAccess::Materialized => "stored_mat_join",
@@ -2687,9 +2687,8 @@ impl InnerJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if crate::query::keyed_access::classify(
-                    &join_indices.1, r.storage.metadata.keys.len(),
-                    tx.keyed_access && crate::query::keyed_access::is_plain(&r.storage),
+                if crate::query::keyed_access::stored_access(
+                    &r.storage, &join_indices.1, &r.filters, tx.keyed_access,
                 ) != crate::query::keyed_access::StoredAccess::Materialized {
                     r.prefix_join(
                         tx,
