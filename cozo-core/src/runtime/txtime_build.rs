@@ -56,11 +56,21 @@ fn relation_write<'a>(
     lock: &'a crossbeam::sync::ShardedLock<()>,
     poison: &Poison,
 ) -> Result<crossbeam::sync::ShardedLockWriteGuard<'a, ()>> {
+    #[cfg(feature = "test-hooks")]
+    let admission = crate::measurement::Span::new("relation_write_admission");
     loop {
         poison.check()?;
         match lock.try_write() {
-            Ok(guard) => return Ok(guard),
-            Err(TryLockError::Poisoned(error)) => return Ok(error.into_inner()),
+            Ok(guard) => {
+                #[cfg(feature = "test-hooks")]
+                admission.finish();
+                return Ok(guard);
+            }
+            Err(TryLockError::Poisoned(error)) => {
+                #[cfg(feature = "test-hooks")]
+                admission.finish();
+                return Ok(error.into_inner());
+            }
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
         }
     }
@@ -321,6 +331,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             return Ok(Some(result));
         }
 
+        #[cfg(feature = "test-hooks")]
+        let reservation_span = crate::measurement::Span::new("build_reservation");
         // Durable reservation only; no public index name exists yet.
         let (original, build) = {
             let _relation = relation_write(&locks[0], &poison)?;
@@ -334,6 +346,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             self.commit_tx_with_test_hook(&mut tx)?;
             (current, build)
         };
+        #[cfg(feature = "test-hooks")]
+        reservation_span.finish();
         let mut publication_attempted = false;
         let outcome = (|| {
             // Pin the actual read snapshot and registration in one commit gap.
@@ -568,5 +582,32 @@ impl<'s, S: Storage<'s>> Db<S> {
                 "Retry maintenance after resolving the storage error".to_string(),
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "test-hooks"))]
+mod admission_measurement_tests {
+    use super::*;
+    use crate::measurement::capture;
+
+    #[test]
+    fn admission_timeout_and_later_success_are_distinguishable() {
+        let lock = crossbeam::sync::ShardedLock::new(());
+        let reader = lock.read().unwrap();
+        let poison = Poison {
+            deadline: Some(Instant::now() + Duration::from_millis(15)),
+            ..Default::default()
+        };
+        let (result, trace) = capture(1, true, || relation_write(&lock, &poison).map(drop));
+        assert!(result.is_err());
+        assert_eq!(trace.events.len(), 1);
+        assert_eq!(trace.events[0].phase, "relation_write_admission");
+        assert!(!trace.events[0].completed);
+        // A polling exclusive waiter did not stop new shared admission.
+        assert!(lock.try_read().is_ok());
+        drop(reader);
+        let (result, trace) = capture(2, true, || relation_write(&lock, &Poison::default()).map(drop));
+        result.unwrap();
+        assert!(trace.events[0].completed);
     }
 }

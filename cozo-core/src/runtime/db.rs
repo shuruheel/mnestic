@@ -2196,7 +2196,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
         let write_lock = self.obtain_relation_locks(write_lock_names.iter());
         let _write_lock_guards = if is_write {
-            Some(write_lock[0].read().unwrap())
+            #[cfg(feature = "test-hooks")]
+            let admission = crate::measurement::Span::new("relation_read_admission");
+            let guard = write_lock[0].read().unwrap();
+            #[cfg(feature = "test-hooks")]
+            admission.finish();
+            Some(guard)
         } else {
             None
         };

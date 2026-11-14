@@ -84,6 +84,8 @@ enum Step {
         interval_ms: u64,
         max_attempts_per_writer: usize,
         max_seconds: u64,
+        #[serde(default)]
+        diagnostic_drain_after_ms: Option<u64>,
     },
 }
 
@@ -243,6 +245,8 @@ fn validate_trace(t: &Trace) -> bool {
                 && e.end_ns <= t.end_ns
                 && e.acquired_ns
                     .is_none_or(|a| e.start_ns <= a && a <= e.end_ns)
+                && e.release_begin_ns
+                    .is_none_or(|r| e.acquired_ns.is_some_and(|a| a <= r && r <= e.end_ns))
         })
 }
 
@@ -308,6 +312,7 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
                 interval_ms,
                 max_attempts_per_writer,
                 max_seconds,
+                diagnostic_drain_after_ms,
             } => {
                 ensure!(
                     plan.backend == "rocksdb",
@@ -325,6 +330,11 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
                         && *max_seconds <= 900,
                     "invalid build budget"
                 );
+                ensure!(
+                    diagnostic_drain_after_ms.is_none_or(|ms| ms > 0 && ms < *max_seconds * 1000),
+                    "invalid diagnostic drain time"
+                );
+                let started = Instant::now();
                 let done = AtomicBool::new(false);
                 let abort = AtomicBool::new(false);
                 let deadline = Instant::now() + Duration::from_secs(*max_seconds);
@@ -339,7 +349,15 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
                         scope.spawn(move || -> Result<()> {
                             let interval = Duration::from_millis(*interval_ms);
                             let mut scheduled = Instant::now();
+                            let mut drained = false;
                             for i in 0..*max_attempts_per_writer {
+                                if i > 0 && !drained && diagnostic_drain_after_ms.is_some_and(|ms| started.elapsed() >= Duration::from_millis(ms)) {
+                                    drained = true;
+                                    append(&mut context.out, &json!({"kind":"diagnostic_writer_drain","writer":context.writer,"at_ns":now_ns()}))?;
+                                    while !done.load(Ordering::Acquire) && !abort.load(Ordering::Acquire) && Instant::now() < deadline {
+                                        std::thread::sleep(Duration::from_millis(1));
+                                    }
+                                }
                                 let final_commit = done.load(Ordering::Acquire);
                                 if abort.load(Ordering::Acquire) || Instant::now() >= deadline { miette::bail!("build writer aborted/budget exhausted"); }
                                 let result = context.run(db, &ops[i % ops.len()], timeout.min(deadline.saturating_duration_since(Instant::now())));

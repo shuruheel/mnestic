@@ -20,8 +20,9 @@ manifest and inferential analysis are separate prerequisites.
 - `commit` surrounds the existing transaction commit funnel. `tt_commit_section`
   captures first acquisition attempt, successful acquisition if any, and release.
   Failed acquisition records its elapsed wait and null acquisition/hold fields.
-  The release clock is sampled immediately after unlocking: hold duration is an
-  observed upper bound that can include post-unlock scheduling delay.
+  The release clocks bracket unlocking: `release_begin_ns` precedes unlock and
+  `end_ns` follows it. Hold duration remains an observed upper bound; positive
+  overlap coverage uses only the conservative pre-unlock endpoint.
 - `tt_ddl_section` and `build_registration`, `build_backfill`, `build_catchup`,
   `build_publication` distinguish DDL phases. SQLite/mem backfill remains inside
   their existing single-writer section; detached catch-up is RocksDB-specific.
@@ -130,8 +131,10 @@ On November 14, 2026:
   observations remain in the incomplete report. A **separate diagnostic** at
   1,000 ms cadence completed and captured all build phases; it does not replace
   the failed run or change the qualifying cadence.
-- HNSW-create completed with writer overlap during backfill/publication, but no
-  registration overlap. The lower-load FTS diagnostic has no writer overlap in any
+- HNSW-create completed with writer overlap during backfill and the publication
+  phase envelope, but none during the acquired publication TT section or
+  registration. The [diagnostic investigation](keyed-txtime-diagnostics.md)
+  corrects the older report's publication-coverage interpretation. The lower-load FTS diagnostic has no writer overlap in any
   phase. Neither establishes the qualifying C2 coverage gate.
 
 The 100-pair on/off diagnostics produced p50 ratios of 1.0010/1.0005 for
@@ -166,3 +169,9 @@ hooks, schedules and timing semantics are unchanged. The original executable
 hashes and per-file build hashes are retained rather than attributing those runs
 to an unbuilt final commit. The final results review independently verified all
 1,068 indexed hashes and approved the bounded observations above.
+
+Subsequent [diagnostic findings](keyed-txtime-diagnostics.md) identify relation
+admission starvation and confounding in the contention overhead fixture. The
+reporter now requires confirmed-held section overlap, and the original evidence
+is preserved unchanged. Original validation counts above describe that earlier
+binary; diagnostic validation is recorded separately.

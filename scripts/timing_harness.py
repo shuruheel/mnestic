@@ -166,9 +166,12 @@ def build(source, target, output):
     source, target, output = map(lambda p: Path(p).resolve(), (source,target,output))
     output.mkdir()
     before = source_snapshot(source)
+    (output/'source-before.json').write_text(json.dumps(before,sort_keys=True,indent=2))
     env = os.environ.copy()
     env.update(CARGO_TARGET_DIR=str(target), CARGO_PROFILE_RELEASE_DEBUG='0', CARGO_INCREMENTAL='0')
-    command = ['cargo','build','-p','mnestic','--features','storage-rocksdb,test-hooks',
+    if env.get('ROCKSDB_LIB_DIR') and not (Path(env['ROCKSDB_LIB_DIR'])/'librocksdb.a').is_file():
+        raise ValueError('native RocksDB archive is missing; refusing a build with incomplete provenance')
+    command = ['cargo','build','--locked','-p','mnestic','--features','storage-rocksdb,test-hooks',
                '--example','keyed_txtime_timing','--release','-j','2']
     started = time.time()
     with (output/'build.log').open('x') as log:
@@ -185,8 +188,10 @@ def build(source, target, output):
     if code:
         raise RuntimeError(f'build failed: {code}; see {output}/build.log')
     after = source_snapshot(source)
+    (output/'source-after.json').write_text(json.dumps(after,sort_keys=True,indent=2))
     if before != after:
-        raise RuntimeError('source changed during build; artifact is not accepted')
+        changes = [name for name in before['files'].keys() | after['files'].keys() if before['files'].get(name) != after['files'].get(name)]
+        raise RuntimeError(f'source changed during build; artifact is not accepted: {changes}; compare saved source snapshots')
     binary = output/'keyed_txtime_timing'
     shutil.copy2(target/'release/examples/keyed_txtime_timing',binary)
     native = {}
@@ -349,9 +354,23 @@ def report(directory):
                 continue
             waits = [e for r in records if r['cell'] == record['cell'] and r.get('timing')
                      for e in r['timing']['events'] if e['phase'] == 'tt_commit_section']
-            count = sum(w['start_ns'] <= phase['end_ns'] and (w['acquired_ns'] if w['acquired_ns'] is not None else w['end_ns']) >= phase['start_ns'] for w in waits)
+            intervals = [(w['start_ns'],w['acquired_ns'] if w['acquired_ns'] is not None else w['end_ns']) for w in waits]
+            count = sum(a < b and phase['start_ns'] < phase['end_ns'] and a < phase['end_ns'] and b > phase['start_ns'] for a,b in intervals)
+            sections = [(max(s['acquired_ns'],phase['start_ns']), min(s['end_ns'],phase['end_ns']))
+                        for s in record['timing']['events'] if s['phase']=='tt_ddl_section'
+                        and s['acquired_ns'] is not None and s['acquired_ns'] < phase['end_ns'] and s['end_ns'] > phase['start_ns']]
+            guaranteed = [(max(s['acquired_ns'],phase['start_ns']),min(s['release_begin_ns'],phase['end_ns']))
+                          for s in record['timing']['events'] if s['phase']=='tt_ddl_section' and s['acquired_ns'] is not None
+                          and s.get('release_begin_ns') is not None and s['acquired_ns'] < phase['end_ns'] and s['release_begin_ns'] > phase['start_ns']]
+            critical = sum(a < b and any(start < end and a < end and b > start for start,end in guaranteed) for a,b in intervals)
+            potential = sum(a < b and any(start < end and a < end and b > start for start,end in sections) for a,b in intervals)
+            requires_section = phase['phase'] in ['build_registration','build_catchup','build_publication']
             key = f"{record['cell']}/{record['operation_id']}/{phase['phase']}"
-            phases[key] = dict(writer_attempts_overlapping=count,covered=count > 0)
+            phases[key] = dict(writer_attempts_overlapping=count,
+                               acquired_section_overlaps=critical if guaranteed else None,
+                               potential_section_overlaps=potential if sections else None,
+                               coverage_basis='acquired_tt_section' if requires_section else 'phase_envelope',
+                               covered=(bool(guaranteed) and critical > 0) if requires_section else count > 0)
     return dict(status='complete' if complete else 'incomplete',development_only=True,operations=len(records),
                 missing_operations=sum(missing.values()),unexpected_operations=sum(unexpected.values()),duplicate_operation_ids=duplicates,
                 errors=sum(r['status'] != 'ok' for r in records),oracle_or_trace_failures=len(failed),malformed=malformed,build_schedule_failures=build_schedule_failures,

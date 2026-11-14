@@ -38,6 +38,8 @@ pub struct Event {
     pub phase: &'static str,
     pub start_ns: u64,
     pub acquired_ns: Option<u64>,
+    /// Last timestamp known to precede unlocking; absent for non-lock spans.
+    pub release_begin_ns: Option<u64>,
     pub end_ns: u64,
     /// Span completed successfully, or lock was acquired and then released.
     /// A released lock does not imply the enclosing transaction committed.
@@ -133,6 +135,7 @@ impl Span {
                 phase,
                 start_ns: now_ns(),
                 acquired_ns: None,
+                release_begin_ns: None,
                 end_ns: 0,
                 completed: false,
             }),
@@ -171,8 +174,10 @@ pub(crate) struct SectionGuard<'a> {
 }
 impl Drop for SectionGuard<'_> {
     fn drop(&mut self) {
+        let release_begin = self.span.event.as_ref().map(|_| now_ns());
         drop(self.guard.take());
         if let Some(mut e) = self.span.event.take() {
+            e.release_begin_ns = release_begin;
             e.end_ns = now_ns();
             e.completed = true;
             record(e);
