@@ -552,7 +552,7 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
                                 std::thread::sleep(scheduled.saturating_duration_since(Instant::now()));
                             }
                             abort.store(true, Ordering::Release);
-                            miette::bail!("build writer attempt budget exhausted")
+                            Err(miette::miette!("build writer attempt budget exhausted"))
                         })
                     }).collect();
                     drop(ready_tx);
