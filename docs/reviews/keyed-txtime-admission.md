@@ -45,9 +45,10 @@ supervisor cap. Neither run uses a writer-drain intervention.
 
 All planned operations, oracles and traces passed. Each report's one error is
 the expected historical-search rejection. Independent results review accepted
-completion with continuing arrivals in these fixtures. Registration/catch-up
-still lack naturally overlapping writer calls, and publication has no confirmed
-TT-wait intersection. These runs do not qualify C2 or establish a general wait
+completion with continuing arrivals in these fixtures. FTS registration and
+catch-up each overlap three writer public calls; HNSW registration has none and
+catch-up has four. None of those phases overlaps a TT-wait interval. Publication in both runs
+has no confirmed TT-wait intersection. These runs do not qualify C2 or establish a general wait
 bound. One-second resource samples stayed within limits; the short runs cannot
 establish actual memory peaks.
 
