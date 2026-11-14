@@ -6,7 +6,7 @@ import json
 from pathlib import Path
 import random
 import csv
-import time
+import gzip
 import timing_harness as harness
 from analyze_timing_diagnostics import quantile
 
@@ -55,9 +55,23 @@ def fixture(backend, temporal, kind):
                 steps=[],verify=[],overhead_control=dict(warmup=warmup,rounds=rounds))
 
 
-def report(directory):
+def jsonl_records(directory, include_snapshots=False):
+    for path in sorted(Path(directory).iterdir()):
+        if not (path.name.endswith('.jsonl') or path.name.endswith('.jsonl.gz')):
+            continue
+        if not include_snapshots and path.name.startswith('snapshots.jsonl'):
+            continue
+        opener = gzip.open if path.name.endswith('.gz') else open
+        with opener(path, 'rt') as source:
+            for line in source:
+                yield json.loads(line)
+
+
+def report(directory, estimates=True):
     directory=Path(directory)
-    required=[directory/'plan.json',directory/'summary.json',directory/'snapshots.jsonl',directory.with_suffix('.completion.json'), directory/'manifest.json',directory.with_suffix('.supervisor.json'),directory.with_suffix('.resources.csv')]
+    snapshot_path=directory/'snapshots.jsonl'
+    if not snapshot_path.exists(): snapshot_path=directory/'snapshots.jsonl.gz'
+    required=[directory/'plan.json',directory/'summary.json',snapshot_path,directory.with_suffix('.completion.json'), directory/'manifest.json',directory.with_suffix('.supervisor.json'),directory.with_suffix('.resources.csv')]
     if not all(p.exists() for p in required):
         return dict(status='incomplete',reason='missing evidence',freeze_control_passed=False)
     plan=json.loads(required[0].read_text());control=plan['overhead_control']
@@ -79,10 +93,10 @@ def report(directory):
         and limits.get('min_free_mib',0)>=2048 and bool(resources)
         and all(float(r['rss_kib'])<=4096*1024 and float(r['free_mib'])>=2048 for r in resources))
     summary=json.loads(required[1].read_text()); completion=json.loads(required[3].read_text())
-    snapshots=[json.loads(line) for line in required[2].read_text().splitlines()]
-    rows=[json.loads(line) for p in directory.glob('*.jsonl') if p.name!='snapshots.jsonl'
-          for line in p.read_text().splitlines()]
-    rows=[r for r in rows if 'timing' in r]
+    opener=gzip.open if snapshot_path.name.endswith('.gz') else open
+    with opener(snapshot_path,'rt') as source:
+        snapshots=[json.loads(line) for line in source]
+    rows=[r for r in jsonl_records(directory) if 'timing' in r]
     width=len(control['rounds'][0]['workers'])
     expected=Counter(('setup',0,o['id']) for o in plan['setup'])
     for pair,round_ in enumerate(control['rounds']):
@@ -126,7 +140,7 @@ def report(directory):
                 snapshots_match=snapshots_ok,provenance_valid=provenance_ok,resource_limits_valid=resources_ok,
                 elapsed_s=completion.get('elapsed_s'),plan_sha256=plan_hash,executable_sha256=built.get('executable_sha256'),
                 report_sha256=harness.digest(Path(__file__).read_bytes()),freeze_control_passed=False,performance_qualified=False)
-    if not valid: return result
+    if not valid or not estimates: return result
     on=[]; off=[]
     worker_durations={w:{label:[] for label in ["True","False"]} for w in range(1,width+1)}
     rank_changes=0

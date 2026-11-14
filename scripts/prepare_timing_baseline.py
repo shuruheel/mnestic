@@ -30,7 +30,7 @@ def prepare(destination, evidence):
     if evidence.exists():
         raise ValueError('evidence file already exists')
     files = {}
-    for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']:
+    for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs', 'cozo-core/examples/keyed_txtime/inputs.rs']:
         files[name] = (source/name).read_text()
     # The baseline has no optimizer toggle. Refuse a toggle request rather than
     # silently label an identical run candidate-on/off. Timing code stays shared.
@@ -66,7 +66,7 @@ def prepare(destination, evidence):
         path.write_text(text)
     hashes = {name:hashlib.sha256(text.encode()).hexdigest() for name,text in files.items()}
     patch = git('diff', '--binary')
-    for name in ['cozo-core/src/measurement.rs', 'cozo-core/examples/keyed_txtime_timing.rs', 'cozo-core/examples/keyed_txtime/overhead.rs']:
+    for name in ['cozo-core/src/measurement.rs', 'cozo-core/examples/keyed_txtime_timing.rs', 'cozo-core/examples/keyed_txtime/overhead.rs', 'cozo-core/examples/keyed_txtime/inputs.rs']:
         addition = f'diff --git a/{name} b/{name}\nnew file mode 100644\n'
         addition += ''.join(difflib.unified_diff([], files[name].splitlines(keepends=True), fromfile='/dev/null', tofile='b/'+name))
         patch += addition.encode()

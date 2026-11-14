@@ -35,6 +35,10 @@ jobs:
       # or they silently never run.
       - name: Test (test-hooks suites)
         run: cargo test -p mnestic --features test-hooks --test commit_fence --test callback_commit_contract --test governed_transaction --test fts_transaction_stats --test fts_governed_stats --test keyed_access --test txtime_search_indexes --test txtime_index_concurrency --verbose
+      - name: Test (timing runner input and barrier contracts)
+        run: cargo test -p mnestic --features test-hooks --example keyed_txtime_timing --verbose
+      - name: Test (timing evidence and control orchestration)
+        run: python3 -m unittest discover -s scripts -p 'test_*timing*.py' -v && python3 -m unittest discover -s scripts -p 'test_*controls.py' -v && python3 -m unittest discover -s scripts -p test_recording_phase3.py -v
       - name: Test (columnar import contract)
         run: cargo test -p mnestic --features columnar-io,test-hooks --test columnar_import --verbose
 
@@ -198,5 +202,7 @@ jobs:
       # ~178 mostly-upstream files is deferred to a dedicated pass.
       - name: Clippy (all targets)
         run: cargo clippy -p mnestic --all-targets -- -D warnings
+      - name: Clippy (timing runner)
+        run: cargo clippy -p mnestic --features test-hooks --example keyed_txtime_timing -- -D warnings
       - name: Clippy (columnar feature)
         run: cargo clippy -p mnestic --features columnar-io,test-hooks --test columnar_import -- -D warnings

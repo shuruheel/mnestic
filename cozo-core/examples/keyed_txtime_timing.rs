@@ -5,7 +5,7 @@
 
 //! Development/validation runner for the reviewed keyed/TxTime timing protocol.
 //! Input is a frozen JSON operation schedule, output is append-only raw JSONL.
-//! Qualification is deliberately rejected until campaign manifests are reviewed.
+//! Qualification requires a frozen campaign bound to passing recording controls.
 use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
@@ -15,6 +15,8 @@ use std::sync::{
     mpsc, Arc, Barrier,
 };
 use std::time::{Duration, Instant};
+#[path = "keyed_txtime/inputs.rs"]
+mod inputs;
 #[path = "keyed_txtime/overhead.rs"]
 mod overhead;
 
@@ -55,6 +57,16 @@ struct Operation {
     #[serde(default)]
     params: BTreeMap<String, Value>,
     #[serde(default)]
+    params_file: Option<inputs::Input>,
+    #[serde(default)]
+    expected_rows_file: Option<inputs::Input>,
+    #[serde(default)]
+    params_from: BTreeMap<String, String>,
+    #[serde(default)]
+    capture: Option<CaptureValue>,
+    #[serde(default)]
+    timeout_seconds: Option<u64>,
+    #[serde(default)]
     batch: bool,
     #[serde(default)]
     immutable: bool,
@@ -67,11 +79,20 @@ struct Operation {
     #[serde(default)]
     expected_row_count: Option<usize>,
     #[serde(default)]
+    project_row_count: bool,
+    #[serde(default)]
     save_rows: bool,
     #[serde(default)]
     expected_error: Option<String>,
     #[serde(default)]
     phases: Vec<String>,
+}
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CaptureValue {
+    name: String,
+    column: String,
+    row: usize,
 }
 #[derive(Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
@@ -119,6 +140,7 @@ struct Context {
     writer: usize,
     counter: u64,
     out: BufWriter<File>,
+    bindings: BTreeMap<String, Value>,
 }
 impl Context {
     fn new(dir: &Path, cell: &str, writer: usize) -> Result<Self> {
@@ -130,6 +152,7 @@ impl Context {
             "invalid cell name"
         );
         Ok(Self {
+            bindings: BTreeMap::new(),
             cell: cell.into(),
             writer,
             counter: NEXT_CONTEXT.fetch_add(1, Ordering::Relaxed) << 32,
@@ -146,12 +169,53 @@ impl Context {
         timeout: Duration,
         boundary: Option<&Barrier>,
     ) -> Result<()> {
-        // Decode parameters and initialize capture storage outside run_script timing.
-        let params = op
-            .params
-            .iter()
-            .map(|(k, v)| (k.clone(), DataValue::from(v.clone())))
-            .collect();
+        // Every worker reaches both barriers even when input preparation fails.
+        let prepared = (|| -> Result<_> {
+            // Decode parameters and initialize capture storage outside run_script timing.
+            ensure!(
+                op.expected_rows_file.is_none() || op.expected_rows.is_none(),
+                "inline/file row oracle is exclusive"
+            );
+            let mut json_params: BTreeMap<String, Value> = match &op.params_file {
+                Some(input) => serde_json::from_value(input.read()?).into_diagnostic()?,
+                None => BTreeMap::new(),
+            };
+            for (key, value) in &op.params {
+                ensure!(
+                    json_params.insert(key.clone(), value.clone()).is_none(),
+                    "inline parameter overwrites file input"
+                );
+            }
+            for (param, binding) in &op.params_from {
+                ensure!(
+                    !json_params.contains_key(param),
+                    "bound parameter overwrites literal input"
+                );
+                json_params.insert(
+                    param.clone(),
+                    self.bindings
+                        .get(binding)
+                        .ok_or_else(|| miette::miette!("missing captured parameter {binding}"))?
+                        .clone(),
+                );
+            }
+            let expected_rows = match &op.expected_rows_file {
+                Some(input) => Some(input.read()?),
+                None => op.expected_rows.clone(),
+            };
+            let timeout = match op.timeout_seconds {
+                Some(seconds) => {
+                    ensure!((1..=900).contains(&seconds), "invalid operation timeout");
+                    Duration::from_secs(seconds).min(timeout)
+                }
+                None => timeout,
+            };
+            let params = json_params
+                .iter()
+                .map(|(k, v)| (k.clone(), DataValue::from(v.clone())))
+                .collect::<BTreeMap<String, DataValue>>();
+            Ok((params, json_params, expected_rows, timeout))
+        })();
         let id = self.counter;
         self.counter += 1;
         let mutability = if op.immutable {
@@ -162,6 +226,20 @@ impl Context {
         if let Some(boundary) = boundary {
             boundary.wait();
         }
+        let (params, json_params, expected_rows, timeout) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                if let Some(boundary) = boundary {
+                    boundary.wait();
+                }
+                append(
+                    &mut self.out,
+                    &json!({"cell":self.cell,"writer":self.writer,"input_id":op.id,
+                    "operation_id":id,"status":"input_error","error":format!("{error:?}"),"timing":null}),
+                )?;
+                return Err(error);
+            }
+        };
         let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             capture(id, !op.disabled, || {
                 if op.batch {
@@ -194,9 +272,40 @@ impl Context {
                 miette::bail!("engine panic in {}", op.id);
             }
         };
-        let (rows, error) = match result {
-            Ok(rows) => (Some(rows.into_json()["rows"].clone()), None),
-            Err(e) => (None, Some(format!("{e:?}"))),
+        let mut engine_row_count = None;
+        let (rows, error, captured, capture_error) = match result {
+            Ok(rows) => {
+                engine_row_count = Some(rows.rows.len());
+                // H1's physical-version count must not JSON-expand every vector.
+                // The engine still constructs the full NamedRows inside capture.
+                let data = if op.project_row_count {
+                    json!({"headers":["count"],"rows":[[rows.rows.len()]]})
+                } else {
+                    rows.into_json()
+                };
+                let captured = op.capture.as_ref().and_then(|binding| {
+                    let column = data["headers"]
+                        .as_array()?
+                        .iter()
+                        .position(|h| h == &binding.column)?;
+                    Some((
+                        binding.name.clone(),
+                        data["rows"].get(binding.row)?.get(column)?.clone(),
+                    ))
+                });
+                let capture_error = if op.capture.is_some() && captured.is_none() {
+                    Some("capture column or row missing")
+                } else if captured
+                    .as_ref()
+                    .is_some_and(|(name, _)| self.bindings.contains_key(name))
+                {
+                    Some("capture name reused")
+                } else {
+                    None
+                };
+                (Some(data["rows"].clone()), None, captured, capture_error)
+            }
+            Err(e) => (None, Some(format!("{e:?}")), None, None),
         };
         let row_bytes = rows
             .as_ref()
@@ -210,8 +319,7 @@ impl Context {
                         .and_then(Value::as_array)
                         .is_some_and(|rows| rows.len() == n)
                 })
-                && op
-                    .expected_rows
+                && expected_rows
                     .as_ref()
                     .is_none_or(|expected| rows.as_ref() == Some(expected))
         };
@@ -250,18 +358,32 @@ impl Context {
                 "cell":self.cell,"writer":self.writer,"input_id":op.id,"operation_id":id,"warmup":op.warmup,
                 "status":if error.is_some() {"error"} else {"ok"},"error":error,
                 "oracle_ok":oracle,"trace_valid":trace_valid,"row_count":rows.as_ref().and_then(Value::as_array).map(Vec::len),
+                "engine_row_count":engine_row_count,"project_row_count":op.project_row_count,
                 "output_sha256":row_bytes.as_deref().map(hash),"expected_error":op.expected_error,
-            "output_rows": if op.save_rows { rows.as_ref() } else { None },
+                "resolved_params_sha256":hash(&serde_json::to_vec(&json_params).into_diagnostic()?),"captured":captured,"capture_error":capture_error,
+            "output_rows": if op.save_rows || !oracle || capture_error.is_some() { rows.as_ref() } else { None },
                 "execution_ns":execution_ns,"end_to_end_ns":trace.end_ns-trace.start_ns,
                 "wait_ns":wait_ns,"hold_ns":hold_ns,"timing":trace
             }),
         )?;
+        ensure!(
+            capture_error.is_none(),
+            "operation {} failed capture: {:?}",
+            op.id,
+            capture_error
+        );
         ensure!(oracle, "operation {} failed its result/error oracle", op.id);
         ensure!(
             trace_valid,
             "operation {} has invalid, missing or overflowing trace",
             op.id
         );
+        if let Some((name, value)) = captured {
+            ensure!(
+                self.bindings.insert(name, value).is_none(),
+                "capture name reused"
+            );
+        }
         Ok(())
     }
 }
@@ -290,12 +412,30 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
     let timeout = Duration::from_secs(30);
     let mut setup = Context::new(dir, "setup", 0)?;
     for op in &plan.setup {
-        setup.run(&db, op, timeout)?;
+        let ddl = [
+            "::fts create ",
+            "::hnsw create ",
+            "::lsh create ",
+            "::reindex ",
+        ]
+        .iter()
+        .any(|prefix| op.script.trim_start().starts_with(prefix));
+        setup.run(
+            &db,
+            op,
+            if ddl {
+                Duration::from_secs(900)
+            } else {
+                timeout
+            },
+        )?;
     }
+    let bindings = setup.bindings.clone();
     for step in &plan.steps {
         match step {
             Step::Serial { cell, operations } => {
                 let mut context = Context::new(dir, cell, 0)?;
+                context.bindings = bindings.clone();
                 for op in operations {
                     context.run(&db, op, timeout)?;
                 }
@@ -310,7 +450,11 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
                 std::thread::scope(|scope| -> Result<()> {
                     // Open all outputs before spawning, so I/O failure cannot strand a barrier.
                     let contexts = (0..workers.len())
-                        .map(|w| Context::new(dir, cell, w + 1))
+                        .map(|w| {
+                            let mut context = Context::new(dir, cell, w + 1)?;
+                            context.bindings = bindings.clone();
+                            Ok(context)
+                        })
                         .collect::<Result<Vec<_>>>()?;
                     let handles: Vec<_> = workers
                         .iter()
@@ -371,9 +515,14 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
                 let abort = AtomicBool::new(false);
                 let deadline = Instant::now() + Duration::from_secs(*max_seconds);
                 let mut ddl_context = Context::new(dir, cell, 0)?;
+                ddl_context.bindings = bindings.clone();
                 std::thread::scope(|scope| -> Result<()> {
                     let contexts = (0..4)
-                        .map(|w| Context::new(dir, cell, w + 1))
+                        .map(|w| {
+                            let mut context = Context::new(dir, cell, w + 1)?;
+                            context.bindings = bindings.clone();
+                            Ok(context)
+                        })
                         .collect::<Result<Vec<_>>>()?;
                     let (ready_tx, ready_rx) = mpsc::channel();
                     let handles: Vec<_> = workers.iter().zip(contexts).map(|(ops,mut context)| {
@@ -433,6 +582,7 @@ fn run(plan: &Plan, dir: &Path) -> Result<()> {
         }
     }
     let mut verify = Context::new(dir, "verify", 0)?;
+    verify.bindings = bindings;
     for op in &plan.verify {
         verify.run(&db, op, timeout)?;
     }
@@ -458,7 +608,9 @@ fn main() -> Result<()> {
     );
     let bytes = fs::read(&args[1]).into_diagnostic()?;
     let plan: Plan = serde_json::from_slice(&bytes).into_diagnostic()?;
-    ensure!(plan.version == 1 && plan.purpose == "development" && plan.seed == 99, "only development seed 99 is enabled; qualifying execution needs a reviewed campaign manifest");
+    let executable = std::env::current_exe().into_diagnostic()?;
+    let executable_hash = hash(&fs::read(&executable).into_diagnostic()?);
+    let authorization = inputs::authorize(&plan, &bytes, &executable_hash)?;
     ensure!(
         ["mem", "sqlite", "rocksdb"].contains(&plan.backend.as_str()),
         "unsupported backend"
@@ -466,7 +618,6 @@ fn main() -> Result<()> {
     let dir = PathBuf::from(&args[2]);
     fs::create_dir(&dir).into_diagnostic()?;
     fs::write(dir.join("plan.json"), &bytes).into_diagnostic()?;
-    let executable = std::env::current_exe().into_diagnostic()?;
     let mut previous = now_ns();
     let mut clock_step = u64::MAX;
     for _ in 0..1000 {
@@ -479,16 +630,135 @@ fn main() -> Result<()> {
     let mut manifest = file(&dir.join("manifest.json"))?;
     append(
         &mut manifest,
-        &json!({"version":1,"purpose":"development","seed":99,"backend":plan.backend,
-        "plan_sha256":hash(&bytes),"executable":executable,"executable_sha256":hash(&fs::read(&executable).into_diagnostic()?),
-        "source_identity":"record build command and source patch in validation evidence; not a qualifying manifest",
+        &json!({"version":1,"purpose":plan.purpose,"seed":plan.seed,"backend":plan.backend,
+        "plan_sha256":hash(&bytes),"executable":executable,"executable_sha256":executable_hash,
+        "authorization":authorization,
         "debug_assertions":cfg!(debug_assertions),"clock_min_observed_step_ns":if clock_step == u64::MAX { None } else { Some(clock_step) },"unix_start_seconds":std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).into_diagnostic()?.as_secs()}),
     )?;
     let result = run(&plan, &dir);
     let mut summary = file(&dir.join("summary.json"))?;
     append(
         &mut summary,
-        &json!({"development_conformance":result.is_ok(),"performance_qualified":false,"error":result.as_ref().err().map(|e|format!("{e:?}"))}),
+        &json!({"development_conformance":plan.purpose == "development" && result.is_ok(),"execution_complete":result.is_ok(),"performance_qualified":false,"error":result.as_ref().err().map(|e|format!("{e:?}"))}),
     )?;
     result
+}
+
+#[cfg(test)]
+mod runner_tests {
+    use super::*;
+
+    fn operation(value: Value) -> Operation {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn external_parameters_merge_without_overwrite_and_capture_is_reusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("params.json");
+        let bytes = br#"{"value":42}"#;
+        fs::write(&path, bytes).unwrap();
+        let db = DbInstance::new("mem", "", "{}").unwrap();
+        let mut context = Context::new(dir.path(), "input", 0).unwrap();
+        let op = operation(
+            json!({"id":"load","script":"?[id,value] <- [[$id,$value]]", "params":{"id":"a"},
+            "params_file":{"path":path,"sha256":hash(bytes)},"expected_rows":[["a",42]],
+            "capture":{"name":"saved","column":"value","row":0}}),
+        );
+        context.run(&db, &op, Duration::from_secs(1)).unwrap();
+        let reuse = operation(
+            json!({"id":"reuse","script":"?[value] <- [[$x]]", "params_from":{"x":"saved"},"expected_rows":[[42]]}),
+        );
+        context.run(&db, &reuse, Duration::from_secs(1)).unwrap();
+        let duplicate = operation(
+            json!({"id":"duplicate","script":"?[x] <- [[$value]]","params":{"value":7},
+            "params_file":{"path":path,"sha256":hash(bytes)}}),
+        );
+        assert!(context
+            .run(&db, &duplicate, Duration::from_secs(1))
+            .is_err());
+        fs::write(&path, br#"{"value":43}"#).unwrap();
+        assert!(context.run(&db, &op, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn failed_capture_retains_trace_and_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbInstance::new("mem", "", "{}").unwrap();
+        let mut context = Context::new(dir.path(), "capture", 0).unwrap();
+        let op = operation(
+            json!({"id":"bad","script":"?[value] <- [[42]]", "capture":{"name":"x","column":"missing","row":0}}),
+        );
+        assert!(context.run(&db, &op, Duration::from_secs(1)).is_err());
+        let row: Value = serde_json::from_str(
+            fs::read_to_string(dir.path().join("capture-0.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(row["capture_error"], "capture column or row missing");
+        assert_eq!(row["output_rows"], json!([[42]]));
+        assert!(row["timing"].is_object());
+        assert!(context.bindings.is_empty());
+    }
+
+    #[test]
+    fn explicit_cardinality_projection_preserves_engine_count() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbInstance::new("mem", "", "{}").unwrap();
+        let mut context = Context::new(dir.path(), "count", 0).unwrap();
+        let op = operation(json!({"id":"count","script":"?[x] <- [[1],[2],[3]]",
+            "project_row_count":true,"save_rows":true,"expected_rows":[[3]]}));
+        context.run(&db, &op, Duration::from_secs(1)).unwrap();
+        let row: Value = serde_json::from_str(
+            fs::read_to_string(dir.path().join("count-0.jsonl"))
+                .unwrap()
+                .trim(),
+        )
+        .unwrap();
+        assert_eq!(row["engine_row_count"], 3);
+        assert_eq!(row["row_count"], 1);
+        assert_eq!(row["output_rows"], json!([[3]]));
+        assert!(row["project_row_count"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn one_invalid_input_does_not_strand_four_worker_barriers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Arc::new(DbInstance::new("mem", "", "{}").unwrap());
+        let barrier = Arc::new(Barrier::new(4));
+        let (send, recv) = mpsc::channel();
+        let mut threads = Vec::new();
+        for writer in 0..4 {
+            let db = db.clone();
+            let barrier = barrier.clone();
+            let send = send.clone();
+            let path = dir.path().to_path_buf();
+            threads.push(std::thread::spawn(move || {
+                let mut context = Context::new(&path, "barrier", writer).unwrap();
+                let mut value = json!({"id":"read","script":"?[x] <- [[1]]","expected_rows":[[1]]});
+                if writer == 0 {
+                    value["params_file"] =
+                        json!({"path":path.join("missing.json"),"sha256":"missing"});
+                }
+                let result = context.run_synchronized(
+                    &db,
+                    &operation(value),
+                    Duration::from_secs(1),
+                    Some(&barrier),
+                );
+                send.send((writer, result.is_ok())).unwrap();
+            }));
+        }
+        drop(send);
+        for _ in 0..4 {
+            let (writer, ok) = recv
+                .recv_timeout(Duration::from_secs(3))
+                .expect("every worker exits its barriers");
+            assert_eq!(ok, writer != 0);
+        }
+        for worker in threads {
+            worker.join().unwrap();
+        }
+    }
 }

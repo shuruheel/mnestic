@@ -212,7 +212,7 @@ def build(source, target, output, jobs=2):
     return evidence
 
 
-def supervise(binary, plan_path, output, build_manifest, timeout, max_rss, min_free):
+def supervise(binary, plan_path, output, build_manifest, timeout, max_rss, min_free, host_monitor=None):
     binary, plan_path, output = map(lambda p: Path(p).resolve(), (binary, plan_path, output))
     if output.exists():
         raise ValueError('output directory must not exist')
@@ -248,6 +248,8 @@ def supervise(binary, plan_path, output, build_manifest, timeout, max_rss, min_f
                 swap = subprocess.check_output(['vm_stat'], text=True) if sys.platform == 'darwin' else Path('/proc/vmstat').read_text()
                 writer.writerow([elapsed,rss,free,json.dumps(busy),json.dumps(swap)])
                 resources.flush()
+                if host_monitor is not None:
+                    reason = host_monitor.observe(table, ids, swap)
                 if elapsed > timeout: reason = 'wall_timeout'
                 elif rss > max_rss*1024: reason = 'rss_limit'
                 elif free < min_free: reason = 'disk_limit'
