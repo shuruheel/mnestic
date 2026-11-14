@@ -100,7 +100,32 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.19.2
+## New in 0.19.3
+
+**Full-text search no longer rescans its index when writes overlap.** BM25 needs
+each index's document and token totals. They lived only in memory, so a search
+after opening a database, or one whose snapshot overlapped a write commit,
+rescanned every posting of the index. On RocksDB at 40,000 documents such a
+search took 1,168 ms at the median against 122 ms warm; the scan grows with the
+index.
+
+- `db.enable_persisted_fts_stats()` (RocksDB) stores the totals inside each
+  index as a base record plus one delta record per write transaction. Writers
+  never contend on them. A read-only search sums them for its snapshot: exact,
+  and no scan.
+- `db.seed_fts_stats()` computes the base once without pausing writers;
+  `db.fold_fts_stats(min_deltas)` folds deltas into the base (call it
+  periodically); `db.verify_fts_stats()` and `db.repair_fts_stats()` check and
+  correct them against a scan.
+- Records are trusted only if nothing else wrote to the store since the last
+  clean close, compared through RocksDB's sequence number. After a crash, a
+  restore, or a write by an engine without this feature, they are ignored until
+  reseeded. Off unless enabled.
+
+Also new: governed transactions from Python (see the PyPI readme). No storage
+version change; `mnestic-rocks` moves to 0.1.13.
+
+## From 0.19.2
 
 **Faster writes, complete filtered search, no ANN-orphaned rows.** Measured at
 40,000 rows (dim 384) against 0.19.0 on SQLite:

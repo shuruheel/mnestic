@@ -5,6 +5,13 @@ provenance and licensing.
 
 ## Unreleased
 
+## 0.19.3 — 2026-11-14
+
+Two additions, both opt-in: persisted BM25 corpus totals on RocksDB, and
+governed transactions from Python. No storage version change; existing files
+keep working. `mnestic-rocks` moves to 0.1.13 for one new bridge function
+(`RocksDb::latest_sequence_number`).
+
 ### Added — persisted BM25 corpus totals (opt-in, RocksDB)
 
 - A full-text search needs each index's document and token totals. They lived
