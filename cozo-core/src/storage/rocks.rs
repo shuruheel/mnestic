@@ -259,6 +259,47 @@ impl RocksDbStorage {
 }
 
 impl Db<RocksDbStorage> {
+    /// Turn on persisted BM25 corpus totals (mnestic fork, opt-in; see
+    /// `fts/persist.rs`). Call right after opening, before other work.
+    ///
+    /// The records written by an earlier run are trusted only if nothing has
+    /// written to the store since that run's clean close: the marker written
+    /// at close must equal RocksDB's latest sequence number now. Otherwise a
+    /// new epoch makes every existing record invisible, and indexes stay
+    /// unseeded (searches behave as without this feature) until
+    /// [`Db::seed_fts_stats`] runs.
+    pub fn enable_persisted_fts_stats(&self) -> Result<crate::fts::persist::FtsStatsOpen> {
+        use crate::fts::persist::{decode_marker, encode_marker, marker_key, FtsStatsOpen};
+        let current = self.db.db.latest_sequence_number();
+        let marker = {
+            let tx = self.db.transact(false)?;
+            tx.get(&marker_key(), false)?.and_then(|v| decode_marker(&v))
+        };
+        let (epoch, outcome) = match marker {
+            Some((seq, epoch)) if seq == current => (epoch, FtsStatsOpen::Trusted),
+            _ => (rand::random::<u64>(), FtsStatsOpen::Reset),
+        };
+        let storage = self.db.clone();
+        self.fts_persist.enable(
+            epoch,
+            Box::new(move |epoch| {
+                // The marker records the sequence number its own write will
+                // produce. If that prediction is wrong, the next open sees a
+                // mismatch and resets, which is safe.
+                let predicted = storage.db.latest_sequence_number().wrapping_add(1);
+                let write = || -> Result<()> {
+                    let mut tx = storage.transact(true)?;
+                    tx.put(&marker_key(), &encode_marker(predicted, epoch))?;
+                    tx.commit()
+                };
+                if let Err(error) = write() {
+                    log::warn!("fts.persisted_stats_marker: could not write the close marker: {error}");
+                }
+            }),
+        );
+        Ok(outcome)
+    }
+
     /// Per-instance RocksDB memory property reads (mnestic fork,
     /// docs/specs/cross-instance-memory.md §5). See [`RocksMemoryStats`].
     pub fn rocksdb_memory_stats(&self) -> RocksMemoryStats {

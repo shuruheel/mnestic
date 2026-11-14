@@ -146,6 +146,7 @@ pub(crate) mod fts;
 /// counter, for scan-count regression tests (the NEAR double-scan class is
 /// invisible in results). Hidden from docs; no stability guarantee.
 #[doc(hidden)]
+pub use fts::persist::{FtsStatsCheck, FtsStatsOpen};
 pub use fts::{FTS_BASE_ROW_FETCHES, FTS_DOC_STATS_SCANS, FTS_LITERAL_SCANS};
 pub mod parse;
 pub(crate) mod query;
@@ -295,6 +296,40 @@ impl DbInstance {
         match self {
             DbInstance::RocksDb(db) => db.rocksdb_memory_stats(),
             _ => RocksMemoryStats::default(),
+        }
+    }
+
+    /// Dispatcher method. See [crate::Db::enable_persisted_fts_stats]; other
+    /// backends return [`FtsStatsOpen::Unsupported`].
+    pub fn enable_persisted_fts_stats(&self) -> Result<FtsStatsOpen> {
+        match self {
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.enable_persisted_fts_stats(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(FtsStatsOpen::Unsupported),
+        }
+    }
+
+    /// Dispatcher method. See [crate::Db::seed_fts_stats].
+    pub fn seed_fts_stats(&self) -> Result<usize> {
+        match self {
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.seed_fts_stats(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(0),
+        }
+    }
+
+    /// Dispatcher method. See [crate::Db::verify_fts_stats].
+    pub fn verify_fts_stats(&self) -> Result<Vec<FtsStatsCheck>> {
+        match self {
+            DbInstance::Mem(db) => db.verify_fts_stats(),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.verify_fts_stats(),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.verify_fts_stats(),
+            #[allow(unreachable_patterns)]
+            _ => Ok(Vec::new()),
         }
     }
 

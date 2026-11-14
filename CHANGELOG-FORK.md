@@ -5,6 +5,30 @@ provenance and licensing.
 
 ## Unreleased
 
+### Added — persisted BM25 corpus totals (opt-in, RocksDB)
+
+- A full-text search needs each index's document and token totals. They lived
+  only in memory, so a search after opening the database, or one whose
+  snapshot overlapped a write, scanned every posting of the index. On RocksDB
+  at 40,000 documents a search overlapping writes took about ten times its
+  warm time; the scan grows with the index.
+- `Db::enable_persisted_fts_stats` (and `DbInstance::enable_persisted_fts_stats`)
+  turns on persisted totals: a base record plus one delta record per write
+  transaction, stored inside each index's key range above its postings.
+  Writers write only their own delta, so they never contend. A read-only
+  search sums the base and the deltas in its snapshot, exact for that
+  snapshot, with no posting scan.
+- `Db::seed_fts_stats` computes the base by one scan in a read-only snapshot
+  and installs it in a short write transaction, without pausing writers.
+  `Db::verify_fts_stats` compares the persisted totals with a scan.
+- Records are trusted only if nothing wrote to the store since the last clean
+  close: the engine records RocksDB's sequence number at close and compares it
+  at the next enable. Otherwise, including after a crash, a restore, or a
+  write by an engine without this feature, the records are ignored until
+  reseeded. Index build and reindex also leave the index unseeded.
+- Off unless enabled; an unseeded index behaves exactly as before. No storage
+  version change. `mnestic-rocks` gains `RocksDb::latest_sequence_number`.
+
 ### Added — governed transactions from Python
 
 Spec: `docs/specs/python-governed-transactions.md`. Binding only; no engine

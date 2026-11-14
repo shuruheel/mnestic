@@ -42,6 +42,11 @@ pub struct SessionTx<'a> {
     /// totals over a newer committed corpus. Field order keeps the abort fence
     /// alive until store_tx is dropped, including failed commit and unwind.
     pub(crate) fts_stats: TxFtsStats,
+    /// Persisted corpus totals (opt-in): shared state and this transaction's
+    /// pending per-index change, written as one delta record at commit.
+    /// See `fts/persist.rs`.
+    pub(crate) fts_persist: Arc<crate::fts::persist::FtsPersist>,
+    pub(crate) fts_pending: crate::fts::persist::FtsPending,
     /// An interrupted graph mutation must never be committed by a legacy client.
     pub(crate) hnsw_mutations_incomplete: usize,
     /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
@@ -330,6 +335,7 @@ impl<'a> SessionTx<'a> {
             self.commit_tx_with_tt()?;
             return Ok(());
         }
+        self.write_fts_deltas()?;
         self.store_tx.commit()?;
         Ok(())
     }
@@ -393,6 +399,8 @@ impl<'a> SessionTx<'a> {
         // overlapping tt commits would otherwise abort the later one).
         self.store_tx
             .put_externally_serialized(&tt_hwm_key(), &tt.to_be_bytes())?;
+        // After stamping: stamped rows are the last posting writes.
+        self.write_fts_deltas()?;
         self.store_tx.commit()?;
         Ok(tt)
     }

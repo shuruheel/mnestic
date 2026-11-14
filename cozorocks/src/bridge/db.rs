@@ -387,6 +387,11 @@ impl RocksDb {
     /// Int-property read on the base DB (mnestic fork,
     /// docs/specs/cross-instance-memory.md §5). Errors with `kNotFound` when
     /// RocksDB does not recognise the property or has no value for it.
+    /// Sequence number of the most recent write to the store. Every write
+    /// advances it; background flush and compaction do not.
+    pub fn latest_sequence_number(&self) -> u64 {
+        self.inner.latest_sequence_number()
+    }
     fn int_property(&self, name: &str) -> Result<u64, RocksDbStatus> {
         let mut status = RocksDbStatus::default();
         let value = self.inner.get_int_property(name, &mut status);

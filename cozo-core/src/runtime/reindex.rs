@@ -90,6 +90,13 @@ impl SessionTx<'_> {
         let mut keys = TempCollector::default();
         for pair in self.store_tx.range_scan(&lower, &upper) {
             let (k, _) = pair?;
+            // Persisted-statistics records are not postings. Deleting another
+            // writer's just-committed delta would make this transaction
+            // conflict; the base is dropped separately and the next seed
+            // removes the deltas its scan includes.
+            if crate::fts::persist::is_record_key(idx_handle, &k) {
+                continue;
+            }
             keys.push(k);
         }
         for k in keys.into_iter() {
