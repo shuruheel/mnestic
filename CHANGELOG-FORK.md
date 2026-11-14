@@ -28,6 +28,12 @@ provenance and licensing.
   reseeded. Index build and reindex also leave the index unseeded.
 - Off unless enabled; an unseeded index behaves exactly as before. No storage
   version change. `mnestic-rocks` gains `RocksDb::latest_sequence_number`.
+- `Db::fold_fts_stats(min_deltas)` folds an index's delta records into its
+  base once it holds at least that many, keeping the totals read short. Call
+  it periodically; it never pauses writers and skips an index whose base
+  another fold or seed changed first. `Db::repair_fts_stats` reseeds any index
+  whose records disagree with a scan. `FtsStatsCheck` reports the number of
+  unfolded deltas.
 
 ### Added — governed transactions from Python
 
