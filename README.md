@@ -100,7 +100,22 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.19.3
+## New in 0.19.4
+
+**A full-text posting with no row no longer fails the search.** A search reads
+the row of every ranked hit, and a missing row raised `corrupted index`, so one
+stale posting failed every query that ranked it. The search now skips that hit,
+returns the next-best one in its place, and records an `fts.dangling_posting`
+warning (`::warnings`); `cozo::fts_dangling_postings_skipped()` returns the
+process-wide count.
+
+Such postings exist where a relation with only a full-text index was updated in
+place by a release through 0.12.0 and never rebuilt, or where rows were removed
+by bulk import. `::reindex <relation>` removes them.
+
+No storage-format change; `mnestic-rocks` stays 0.1.13.
+
+## From 0.19.3
 
 **Full-text search no longer rescans its index when writes overlap.** BM25 needs
 each index's document and token totals. They lived only in memory, so a search
