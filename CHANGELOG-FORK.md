@@ -5,6 +5,20 @@ provenance and licensing.
 
 ## Unreleased
 
+### Fixed
+
+- **The RocksDB backend builds with GCC 15 and later.** The vendored RocksDB
+  8.8 uses `uint64_t` in two headers that never include `<cstdint>`. Through
+  GCC 14 the standard library pulled it in indirectly; on GCC 15 and later
+  (Ubuntu 26.04, Fedora 42) the build stopped with `'uint64_t' has not been
+  declared`. The build script now includes `<cstdint>` ahead of every C++
+  translation unit on non-MSVC targets. `cozorocks/build.rs`.
+
+  **Release note for whoever cuts the next version:** this is a `cozorocks`
+  change, so it reaches crates.io only as `mnestic-rocks` 0.1.14 followed by a
+  `mnestic` release that pins it. Until then the published 0.19.4 does not
+  compile from source with `storage-rocksdb` on those systems.
+
 ### Changed
 
 - **A storage ID shared by more than one relation is reported through
