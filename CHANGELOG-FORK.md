@@ -5,6 +5,11 @@ provenance and licensing.
 
 ## Unreleased
 
+## 0.19.4 — 2026-11-15
+
+One fix: a full-text search no longer fails on a posting whose row is gone. No
+storage version change; `mnestic-rocks` stays 0.1.13.
+
 ### Fixed
 
 - **A full-text posting with no row no longer fails the search.** A search
