@@ -29,6 +29,13 @@ pub(crate) mod persist;
 pub(crate) mod stats;
 pub(crate) mod tokenizer;
 
+/// Process-wide count of full-text hits skipped because their base row no
+/// longer exists (dangling postings). A healthy index never moves it; a host
+/// can export it as a health metric. Read it with
+/// [`fts_dangling_postings_skipped`](crate::fts_dangling_postings_skipped).
+pub(crate) static FTS_DANGLING_POSTINGS_SKIPPED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 thread_local! {
     /// Per-thread count of FTS posting-range scans (`fts_search_literal`
     /// calls). One cell bump per *literal*, not per posting — negligible
