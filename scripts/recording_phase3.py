@@ -19,9 +19,9 @@ from analyze_timing_diagnostics import quantile
 BLOCKS = 10
 PAIRS = 100
 DRAWS = 10000
-# The source-driven replacement retains the original two-hour campaign cap.
-# Reserve 120s for the interrupted first attempt (113.329s through its stop record).
-PRIOR_ATTEMPT_SECONDS = 120
+# The user-authorized Nov15 attempt retains the original two-hour campaign cap.
+# Round up the prior campaign's accounted 421.341s, including the first 120s reserve.
+PRIOR_ATTEMPT_SECONDS = 422
 BUDGET = 7200 - PRIOR_ATTEMPT_SECONDS
 
 

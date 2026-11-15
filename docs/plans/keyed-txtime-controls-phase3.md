@@ -125,3 +125,27 @@ Reserve 120 seconds of the original two-hour campaign budget for the interrupted
 attempt (113.329 seconds from output-directory creation through the termination
 record). The replacement has at most 7,080 seconds for its preflights, execution,
 compression and analysis; record both elapsed and combined accounted time.
+
+## User-authorized November 15 attempt
+
+The user explicitly requested another attempt after the preceding campaigns
+ended before any benchmark block ran. The November 15 readiness check is
+read-only; it does not launch a campaign or generate qualifying inputs.
+
+Permit one new campaign, `keyed-txtime-phase3-20261115-v1/controls`, after fresh
+host admission and independent review. Reuse the unchanged November 14 v2 final
+executables, build manifests, shared export and accepted runtime-smoke evidence
+only after rechecking their frozen hashes. No rebuild or new runtime smoke is
+necessary while these identities remain identical. Freeze a new review manifest,
+plans, scripts, protocol and schedule; retain every earlier attempt as terminal
+and pool no observations.
+
+Reserve 422 seconds for prior campaign time: round up the preceding completion's
+421.341 accounted seconds, which already include the initial 120-second reserve.
+The new attempt has 6,778 seconds of the original 7,200-second total budget.
+The preparation-only readiness checks are recorded separately. Keep every sample
+size, estimator, threshold, host criterion, ordering and stop rule unchanged.
+Any failed host admission or invalid/measured block ends this attempt; there is
+no automatic retry. Full qualification remains conditional on all 180 blocks
+being complete and valid, all 18 aggregate controls passing the unchanged
+recording gates, and independent results review.
