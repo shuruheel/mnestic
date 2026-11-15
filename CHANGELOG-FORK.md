@@ -5,6 +5,23 @@ provenance and licensing.
 
 ## Unreleased
 
+### Fixed
+
+- **A full-text posting with no row no longer fails the search.** A search
+  reads the row of every ranked hit, and a missing row raised
+  `corrupted index`, so one stale posting failed every query that ranked it.
+  The search now skips the hit and returns the next-best one in its place.
+  Each search that skips a hit records an `fts.dangling_posting` warning
+  (`::warnings`), and `cozo::fts_dangling_postings_skipped()` returns the
+  process-wide count for a health metric. `fts/indexing.rs`; guarded by
+  `cozo-core/tests/fts_dangling_posting.rs`.
+
+  **Who has such postings.** A relation with only a full-text index that was
+  updated in place by a release through 0.12.0 and never rebuilt: the leaked
+  postings of a row's old text outlive the row once it is removed. A bulk-import
+  delete strands postings the same way. `::reindex <relation>` removes them;
+  the skip keeps searches working until it runs.
+
 ## 0.19.3 — 2026-11-14
 
 Two additions, both opt-in: persisted BM25 corpus totals on RocksDB, and
