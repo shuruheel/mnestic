@@ -19,6 +19,22 @@ provenance and licensing.
   `mnestic` release that pins it. Until then the published 0.19.4 does not
   compile from source with `storage-rocksdb` on those systems.
 
+### Changed
+
+- **A storage ID shared by more than one relation is reported through
+  `::warnings`.** The check at open already logged an error for each shared
+  ID. A host that embeds the engine and does not read its log never saw it: a
+  production deployment carried ten such stores for seven months. Each shared
+  ID now also records a `storage.relation_id_collision` warning, visible to
+  `::warnings` and `Db::recent_warnings` from the moment the store is opened.
+  The log line is unchanged. `runtime/db.rs`; guarded by
+  `a_shared_relation_id_is_reported_as_a_warning_at_open`.
+
+  **What a shared ID does.** The relations read and write one key range, so
+  each returns the others' rows, and removing any of them (`::remove`, an index
+  drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
+  a build before 0.13.0 (`f125fbd2`) can hold such IDs.
+
 ## 0.19.4 — 2026-11-15
 
 One fix: a full-text search no longer fails on a posting whose row is gone. No

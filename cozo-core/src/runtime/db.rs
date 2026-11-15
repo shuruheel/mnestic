@@ -750,6 +750,17 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
     }
 
+    /// Record one warning straight into the ring. For checks that run outside
+    /// a script (at open), where no later flush on the same thread is certain.
+    fn record_warning(&self, warning: QueryWarning) {
+        let mut ring = self.warnings.lock().unwrap();
+        let seq = self.warning_seq.fetch_add(1, Ordering::Relaxed);
+        ring.push_back((seq, warning));
+        while ring.len() > WARNING_RING_CAP {
+            ring.pop_front();
+        }
+    }
+
     /// Snapshot of the recent structured warnings ring, oldest first, as
     /// `(seq, warning)` — the Rust-side twin of the `::warnings` sysop
     /// (mnestic fork). `seq` is monotone per `Db`, so callers can remember the
@@ -2112,12 +2123,24 @@ impl<'s, S: Storage<'s>> Db<S> {
         self.relation_store_id
             .store(persisted.max(observed), Ordering::Release);
         for (id, names) in collisions {
+            let names = names.join(", ");
             log::error!(
-                "relation-id collision detected at open: id {id} is shared by {}; \
+                "relation-id collision detected at open: id {id} is shared by {names}; \
                  do NOT run ::repair_corrupt on these relations because it can delete valid rows; \
-                 restore the original backup into a fresh store with a fixed mnestic build",
-                names.join(", ")
+                 restore the original backup into a fresh store with a fixed mnestic build"
             );
+            // The log line alone went unread for seven months on a host that
+            // embeds the engine. `::warnings` is the surface a host can read.
+            self.record_warning(QueryWarning {
+                code: "storage.relation_id_collision",
+                message: format!(
+                    "storage id {id} is shared by relations {names}: each reads and writes the others' rows"
+                ),
+                hint: "do not run ::repair_corrupt, ::remove or an index drop on any of them \
+                       before each relation's own rows are copied out: removing one deletes \
+                       the key range they share"
+                    .to_string(),
+            });
         }
         // Seed the tt commit clock (mnestic fork, bitemporality step 2):
         // max(persisted high-water mark, wall clock).
