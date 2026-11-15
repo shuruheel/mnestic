@@ -437,3 +437,69 @@ fn consumer_lint_positive_fixtures_have_keyed_plans_with_declared_string_keys() 
         }
     });
 }
+
+fn neg_op<'a>(plan: &'a [BTreeMap<String, Value>]) -> &'a str {
+    ops(plan)
+        .into_iter()
+        .find(|op| op.starts_with("stored_neg_"))
+        .unwrap()
+}
+
+/// Stored negation on a full key plus a value column seeks the key and checks
+/// the value (MindGraph `not *node{uid: source, tombstone_at: 0.0}`), while a
+/// partial composite key and an `Any` key keep materializing.
+#[test]
+fn negated_full_key_plus_value_seeks_and_checks_every_pair() {
+    engines(|db| {
+        run(
+            db,
+            ":create node {uid:String => node_type:String, layer:String, tombstone_at:Float}",
+        );
+        run(
+            db,
+            "?[uid,node_type,layer,tombstone_at] <- [['a','Chunk','l',0.0],['b','Note','l',0.0],['c','Chunk','l',5.0]] :put node{uid=>node_type,layer,tombstone_at}",
+        );
+        let q = "?[s] := s in ['a','b','c','d'], not *node{uid: s, tombstone_at: 0.0}";
+        equivalent(db, q, json!([["c"], ["d"]]));
+        assert_eq!(neg_op(&plan(db, q, false)), "stored_neg_mat_join");
+        assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_point_join");
+
+        // Already a leading run today: unchanged execution, full-key label.
+        let q = "?[s] := s in ['a','b','c','d'], not *node{uid: s, node_type: 'Chunk'}";
+        equivalent(db, q, json!([["b"], ["d"]]));
+        assert_eq!(plan(db, q, false), plan(db, q, true));
+
+        // Mixed numeric variants: both arms compare the same values.
+        run(db, ":create m {k:String => n:Int, f:Float}");
+        run(db, "?[k,n,f] <- [['x',5,0.0]] :put m{k=>n,f}");
+        for q in [
+            "?[s] := s in ['x','y'], not *m{k: s, f: 0}",
+            "?[s] := s in ['x','y'], not *m{k: s, f: -0.0}",
+        ] {
+            db.set_keyed_access_for_tests(false);
+            let baseline = rows(db, q);
+            equivalent(db, q, baseline);
+        }
+
+        run(db, ":create c {a:String, b:String => v:String}");
+        run(
+            db,
+            "?[a,b,v] <- [['x','1','yes'],['x','2','no']] :put c{a,b=>v}",
+        );
+        // Full composite key plus value: point lookup with a residual check.
+        let q = "?[a,b] := a='x', b in ['1','2','3'], not *c{a, b, v: 'yes'}";
+        equivalent(db, q, json!([["x", "2"], ["x", "3"]]));
+        assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_point_join");
+        // Partial composite key plus value: never a seek on [a, v].
+        let q = "?[a] := a in ['x','y'], not *c{a, v: 'no'}";
+        equivalent(db, q, json!([["y"]]));
+        assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_mat_join");
+
+        // An untyped (Any) key gets no new seek-based equality.
+        run(db, ":create anyk {k => v}");
+        run(db, "?[k,v] <- [['x','yes']] :put anyk{k=>v}");
+        let q = "?[s] := s in ['x','y'], not *anyk{k: s, v: 'yes'}";
+        equivalent(db, q, json!([["y"]]));
+        assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_mat_join");
+    });
+}

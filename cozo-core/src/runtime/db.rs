@@ -2554,7 +2554,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                                         (t, json!(null), json!(seek_pairs), checked)
                                     }
                                     RelAlgebra::NegJoin(inner) => {
-                                        let t = inner.join_type();
+                                        let t = inner.join_type(self.enable_keyed_access.load(Ordering::Relaxed));
                                         let NegJoin {
                                             left,
                                             right,
