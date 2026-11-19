@@ -545,6 +545,8 @@ fn keyed_access_timing() {
             );
         }
         db.set_keyed_access_for_tests(true);
+    });
+}
 
 fn neg_op<'a>(plan: &'a [BTreeMap<String, Value>]) -> &'a str {
     ops(plan)
