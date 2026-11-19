@@ -65,9 +65,14 @@ fn contract(engine: &str) {
         run(&db, "?[count_unique(embedding)] := *vectors{embedding}"),
         vec![vec![cozo::DataValue::from(1)]]
     );
+    // The ordinary aggregate inserts its row before checking the limit, even
+    // for limit zero. Preserve that existing behavior, including through the
+    // filtered (ineligible) baseline, rather than imposing a new limit contract.
+    let limited = run(&db, "?[count(id)] := *vectors{id} :limit 0");
+    assert_eq!(limited, vec![vec![cozo::DataValue::from(255)]]);
     assert_eq!(
-        run(&db, "?[count(id)] := *vectors{id} :limit 0"),
-        Vec::<Vec<cozo::DataValue>>::new()
+        limited,
+        run(&db, "?[count(id)] := *vectors{id}, id >= 0 :limit 0")
     );
     assert!(db
         .run_script(
