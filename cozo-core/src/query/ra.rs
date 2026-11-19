@@ -52,7 +52,16 @@ impl RelAlgebra {
     /// No joins, filters, time travel, derived relations or expressions qualify.
     pub(crate) fn scalar_count_scan(&self) -> Option<&RelationHandle> {
         match self {
-            Self::Stored(scan) if scan.filters.is_empty() => Some(&scan.storage),
+            Self::Stored(scan)
+                if scan.filters.is_empty()
+                    && scan.storage.metadata.non_keys.len() == 1
+                    && matches!(
+                        scan.storage.metadata.non_keys[0].typing.coltype,
+                        crate::data::relation::ColType::Vec { .. }
+                    ) =>
+            {
+                Some(&scan.storage)
+            }
             Self::Reorder(reorder) => reorder.relation.scalar_count_scan(),
             Self::Join(join)
                 if join.joiner.left_keys.is_empty()
@@ -939,7 +948,10 @@ impl<I: Iterator<Item = Result<Tuple>>> Iterator for PoisonedIter<I> {
     }
 }
 
-fn poisoned<I: Iterator<Item = Result<Tuple>>>(inner: I, poison: Poison) -> PoisonedIter<I> {
+pub(crate) fn poisoned<I: Iterator<Item = Result<Tuple>>>(
+    inner: I,
+    poison: Poison,
+) -> PoisonedIter<I> {
     PoisonedIter {
         inner,
         poison,
@@ -2947,5 +2959,69 @@ mod tests {
             res,
             vec![vec![DataValue::from(1)], vec![DataValue::from(2)]]
         )
+    }
+}
+
+#[cfg(test)]
+mod scalar_count_detector_tests {
+    use super::*;
+
+    #[test]
+    fn scalar_count_selects_only_row_preserving_plain_scans() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        db.run_default(":create points {id: Int => value: <F32; 3>}")
+            .unwrap();
+        db.run_default(":create history {id: Int, at: Validity => value: <F32; 3>}")
+            .unwrap();
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let tx = inner.transact().unwrap();
+        let handle = tx.get_relation("points", false).unwrap();
+        let span = SourceSpan(0, 0);
+        let id = Symbol::new("id", span);
+        let value = Symbol::new("value", span);
+        let stored = || {
+            RelAlgebra::relation(
+                vec![id.clone(), value.clone()],
+                handle.clone(),
+                span,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        assert!(stored().scalar_count_scan().is_some());
+        let mut compiled_shape = RelAlgebra::unit(span).cartesian_join(stored(), span);
+        compiled_shape
+            .eliminate_temp_vars(&BTreeSet::from([id.clone()]))
+            .unwrap();
+        assert_eq!(compiled_shape.bindings_after_eliminate(), vec![id.clone()]);
+        assert!(compiled_shape.scalar_count_scan().is_some());
+        assert!(stored()
+            .reorder(vec![id.clone()])
+            .scalar_count_scan()
+            .is_some());
+        assert!(stored()
+            .cartesian_join(stored(), span)
+            .scalar_count_scan()
+            .is_none());
+        assert!(stored()
+            .filter(Expr::Const {
+                val: DataValue::Bool(true),
+                span
+            })
+            .unwrap()
+            .scalar_count_scan()
+            .is_none());
+        let temporal = RelAlgebra::relation(
+            vec![id, Symbol::new("at", span), value],
+            tx.get_relation("history", false).unwrap(),
+            span,
+            Some(ValidityTs(std::cmp::Reverse(150))),
+            None,
+        )
+        .unwrap();
+        assert!(temporal.scalar_count_scan().is_none());
     }
 }

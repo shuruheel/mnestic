@@ -29,6 +29,7 @@ use crate::parse::SourceSpan;
 use crate::query::compile::{
     AggrKind, CompiledProgram, CompiledRule, CompiledRuleSet, ContainedRuleMultiplicity,
 };
+use crate::query::ra::poisoned;
 use crate::runtime::db::{MemBudgetExceeded, Poison};
 use crate::runtime::temp_store::{EpochStore, MeetAggrStore, RegularTempStore, TempStore};
 use crate::runtime::transact::SessionTx;
@@ -627,14 +628,15 @@ impl<'a> SessionTx<'a> {
                 scalar_count
                     .then(|| rule.relation.scalar_count_scan())
                     .flatten()
+                    .filter(|scan| scan.supports_count_scan(self))
             {
                 let poison = poison.clone();
                 poison.check()?;
-                Box::new(scan.scan_for_count(self).map(move |row| {
-                    // Per-row checks retain kill, deadline and memory controls.
-                    poison.check()?;
-                    row.map(|()| vec![DataValue::Null])
-                }))
+                Box::new(poisoned(
+                    scan.scan_for_count(self)
+                        .map(|row| row.map(|()| vec![DataValue::Null])),
+                    poison,
+                ))
             } else {
                 rule.relation.iter(self, None, stores, poison.clone())?
             };

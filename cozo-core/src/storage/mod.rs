@@ -188,6 +188,11 @@ pub trait StoreTx<'s>: Sync {
         }))
     }
 
+    /// Whether this backend provides a specialized validated count iterator.
+    fn supports_count_scan(&self) -> bool {
+        false
+    }
+
     /// Enumerate validated rows for a scalar count, without exposing their values.
     /// Bounds and snapshot semantics match `range_scan_tuple`. Implementations
     /// must preserve value-decoding failures; a raw key count is not sufficient.

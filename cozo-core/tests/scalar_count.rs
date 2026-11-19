@@ -66,6 +66,42 @@ fn contract(engine: &str) {
             ScriptMutability::Immutable
         )
         .is_err());
+    run(
+        &db,
+        ":create nullable {id: Int => group_id: Int, value: Int?}",
+    );
+    run(&db, "?[id, group_id, value] <- [[1, 1, null], [2, 1, 9], [3, 2, null]] :put nullable {id => group_id, value}");
+    assert_eq!(
+        run(&db, "?[count(value)] := *nullable{value}"),
+        vec![vec![cozo::DataValue::from(3)]]
+    );
+    assert_eq!(
+        run(
+            &db,
+            "?[group_id, count(value)] := *nullable{group_id, value}"
+        ),
+        vec![
+            vec![cozo::DataValue::from(1), cozo::DataValue::from(2)],
+            vec![cozo::DataValue::from(2), cozo::DataValue::from(1)]
+        ]
+    );
+    assert_eq!(
+        run(&db, "?[count(x)] := *nullable{id}, x = id + 1"),
+        vec![vec![cozo::DataValue::from(3)]]
+    );
+    run(
+        &db,
+        ":create history {id: Int, at: Validity => value: <F32; 3>}",
+    );
+    run(&db, "?[id, at, value] <- [[1, [100, true], vec([1, 0, 0])], [1, [200, false], vec([1, 0, 0])]] :put history {id, at => value}");
+    assert_eq!(
+        run(&db, "?[count(id)] := *history{id @ 150}"),
+        vec![vec![cozo::DataValue::from(1)]]
+    );
+    assert_eq!(
+        run(&db, "?[count(id)] := *history{id @ 250}"),
+        vec![vec![cozo::DataValue::from(0)]]
+    );
     // A tiny request deadline still terminates a count through the usual error path.
     let err = db
         .run_script(

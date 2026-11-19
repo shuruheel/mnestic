@@ -13,7 +13,8 @@ remain exact. The API uses the ordinary `count` query without changes.
 A bare `StoreTx::range_count` is insufficient: it skips value decoding and its
 loop has no query poison. Neither stale cached counts nor estimates are allowed.
 This candidate instead specializes the input iterator of one scalar builtin
-`count` over a plain stored scan. No grouping, filter, actual join, expression,
+`count` over a plain stored scan whose sole non-key column has vector type.
+Only a backend declaring specialized support (currently RocksDB) opts in. No grouping, filter, actual join, expression,
 derived relation or time-resolved scan qualifies. Row-preserving reorder and
 unit-join wrappers are allowed. Other shapes retain the original evaluator.
 The ordinary aggregation still counts every body match, including equal/null
@@ -23,7 +24,8 @@ arguments, and owns empty results, limits, output and memory accounting.
 
 `StoreTx::range_scan_for_count` has the same bounds and transaction as tuple
 scanning and yields one success per validated row. Its default implementation
-fully decodes rows. RocksDB uses the existing pinned iterator and borrowed
+fully decodes rows; backends without specialized support retain the original
+aggregate input iterator. RocksDB uses the existing pinned iterator and borrowed
 key/value pair. It still decodes the key. A canonical value blob holding exactly
 one vector can be validated without allocation: exact MessagePack container and
 enum shape, F32/F64 tag, binary length, element-width divisibility and exact end
@@ -34,7 +36,8 @@ an unused payload, not ignoring corruption or estimating a count.
 
 No disk schema, bridge ABI, cache, counter or mutation path changes. The count
 uses the transaction's existing snapshot and sees its own writes where supported.
-Poison is checked before enumeration and after each iterator pull; native storage
+The existing poison wrapper and 4,096-pull cadence are retained, with an
+additional check before enumeration; native storage
 calls remain as interruptible as the existing iterator. This is not a new claim
 about cancelling an in-progress RocksDB call or a timed-out host worker.
 

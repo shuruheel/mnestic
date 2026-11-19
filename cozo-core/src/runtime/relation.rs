@@ -686,6 +686,10 @@ impl RelationHandle {
         }
     }
 
+    pub(crate) fn supports_count_scan(&self, tx: &SessionTx<'_>) -> bool {
+        !self.is_temp && tx.store_tx.supports_count_scan()
+    }
+
     pub(crate) fn scan_for_count<'a>(
         &self,
         tx: &'a SessionTx<'_>,

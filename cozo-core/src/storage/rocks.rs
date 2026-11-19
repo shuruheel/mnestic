@@ -571,6 +571,10 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         })
     }
 
+    fn supports_count_scan(&self) -> bool {
+        true
+    }
+
     fn range_scan_for_count<'a>(
         &'a self,
         lower: &[u8],
