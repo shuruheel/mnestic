@@ -53,6 +53,10 @@ jobs:
       - name: Test (sled)
         run: cargo test -p mnestic --features storage-sled --test backend_transaction_contract --verbose
       - name: Test (newrocksdb)
+        # librocksdb-sys 0.16's vendored headers omit cstdint. GCC 15 no
+        # longer supplies it transitively (cozorocks applies the same fix).
+        env:
+          CXXFLAGS: "-include cstdint"
         run: cargo test -p mnestic --features storage-new-rocksdb --test backend_transaction_contract --verbose
 
   # TiKV is the only distributed backend. A compile-only check cannot prove

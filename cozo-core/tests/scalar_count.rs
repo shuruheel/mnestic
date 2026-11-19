@@ -11,12 +11,22 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 const COUNT: &str = "?[count(id)] := *vectors{id}";
-const ENUMERATE: &str = "?[sum(one)] := *vectors{id}, one = 1";
+const ENUMERATE: &str = "?[id] := *vectors{id}";
 
 fn run(db: &DbInstance, query: &str) -> Vec<Vec<cozo::DataValue>> {
     db.run_script(query, BTreeMap::new(), ScriptMutability::Mutable)
         .unwrap()
         .rows
+}
+
+// Count returns Int; sum returns Float, including for an empty relation.
+// Enumerate distinct fixture keys instead, preserving exact count type checks.
+fn assert_enumerated_count(db: &DbInstance) {
+    let enumerated = i64::try_from(run(db, ENUMERATE).len()).unwrap();
+    assert_eq!(
+        run(db, COUNT),
+        vec![vec![cozo::DataValue::from(enumerated)]]
+    );
 }
 
 fn fixture(engine: &str) -> (tempfile::TempDir, DbInstance) {
@@ -28,11 +38,11 @@ fn fixture(engine: &str) -> (tempfile::TempDir, DbInstance) {
 
 fn contract(engine: &str) {
     let (_dir, db) = fixture(engine);
-    assert_eq!(run(&db, COUNT), run(&db, ENUMERATE));
+    assert_enumerated_count(&db);
     for n in [1, 17, 257] {
         run(&db, &format!("?[id, embedding] := id in range(0, {n}), embedding = vec([1.0, 0.0, -1.0]) :put vectors {{id => embedding}}"));
         assert_eq!(run(&db, COUNT), vec![vec![cozo::DataValue::from(n)]]);
-        assert_eq!(run(&db, COUNT), run(&db, ENUMERATE));
+        assert_enumerated_count(&db);
         // Projection multiplicity: every equal embedding is still counted.
         assert_eq!(
             run(&db, "?[count(embedding)] := *vectors{embedding}"),
@@ -41,7 +51,7 @@ fn contract(engine: &str) {
     }
     run(&db, "?[id] <- [[0], [1]] :rm vectors {id}");
     assert_eq!(run(&db, COUNT), vec![vec![cozo::DataValue::from(255)]]);
-    assert_eq!(run(&db, COUNT), run(&db, ENUMERATE));
+    assert_enumerated_count(&db);
     // Conditions and joined multiplicity must retain the ordinary evaluator.
     assert_eq!(
         run(&db, "?[count(id)] := *vectors{id}, id < 5"),
@@ -213,6 +223,6 @@ fn scalar_count_rocks_pinned_snapshot_and_reopen() {
     assert_eq!(run(&db, COUNT), vec![vec![cozo::DataValue::from(2)]]);
     drop(db);
     let db = DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "").unwrap();
-    assert_eq!(run(&db, COUNT), run(&db, ENUMERATE));
+    assert_enumerated_count(&db);
     assert_eq!(run(&db, COUNT), vec![vec![cozo::DataValue::from(2)]]);
 }
