@@ -40,7 +40,7 @@ fn contract(engine: &str) {
     let (_dir, db) = fixture(engine);
     assert_enumerated_count(&db);
     for n in [1, 17, 257] {
-        run(&db, &format!("?[id, embedding] := id in range(0, {n}), embedding = vec([1.0, 0.0, -1.0]) :put vectors {{id => embedding}}"));
+        run(&db, &format!("?[id, embedding] := id in int_range(0, {n}), embedding = vec([1.0, 0.0, -1.0]) :put vectors {{id => embedding}}"));
         assert_eq!(run(&db, COUNT), vec![vec![cozo::DataValue::from(n)]]);
         assert_enumerated_count(&db);
         // Projection multiplicity: every equal embedding is still counted.
