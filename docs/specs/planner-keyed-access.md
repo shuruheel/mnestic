@@ -1,10 +1,12 @@
 # Keyed access for equality filters and key-plus-value joins
 
-Status: **Implementation authorized and in qualification, November 13, 2026.**
-The owner requested a combined branch and PR with TxTime search indexes.
-Correctness and review evidence is recorded in
-[the implementation review](../reviews/keyed-txtime-implementation.md);
-performance acceptance remains pending. Original authoring passes (workspace
+Status: **Implemented; split from the combined branch on November 18, 2026.** This change
+now stands alone: the TxTime search indexes that shared mnestic PR #81 are a separate pull
+request stacked on this one. Correctness is covered by `cozo-core/tests/keyed_access.rs`
+(differential results and physical plans, under `test-hooks`). The three target shapes are
+timed by the ignored test `keyed_access_timing` in that file, run by hand in release mode;
+a full scan becoming a point lookup does not need the paired-control campaign written for
+the combined branch. Not approved for release until that timing is recorded. Passes (workspace
 `spec-authoring` method):
 
 | Pass | Date | Result |

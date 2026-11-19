@@ -437,3 +437,113 @@ fn consumer_lint_positive_fixtures_have_keyed_plans_with_declared_string_keys() 
         }
     });
 }
+
+/// Timing check for the three target shapes of the keyed-access spec (T1, T2, T3), with the
+/// optimization off and on. Not a correctness test and not part of the default run:
+///
+/// ```text
+/// cargo test --release -p mnestic --features test-hooks --test keyed_access -- \
+///     --ignored --nocapture keyed_access_timing
+/// ```
+///
+/// Add `storage-rocksdb` to the features to include RocksDB. `KEYED_ACCESS_BENCH_ROWS` sets the
+/// size of the `node` relation (default 50,000). The effect being checked is a full scan or a
+/// whole-relation materialization becoming a point lookup, so it grows with the relation; the
+/// test fails only if the optimized plan is slower than the baseline by more than half.
+#[test]
+#[ignore = "timing: run by hand in release mode"]
+fn keyed_access_timing() {
+    use std::time::Instant;
+
+    let n: usize = std::env::var("KEYED_ACCESS_BENCH_ROWS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50_000);
+    engines(|db| {
+        run(
+            db,
+            ":create node {uid: String => name: String, tombstone_reason: String}",
+        );
+        run(db, ":create link {src: String, dst: String}");
+        let hub = format!("u{:08}", 1);
+        for start in (0..n).step_by(5_000) {
+            let end = (start + 5_000).min(n);
+            let nodes: Vec<String> = (start..end)
+                .map(|i| {
+                    let reason = if i % 100 == 0 { "deleted" } else { "" };
+                    format!("['u{i:08}','n{i}','{reason}']")
+                })
+                .collect();
+            run(
+                db,
+                &format!(
+                    "?[uid,name,tombstone_reason] <- [{}] :put node{{uid=>name,tombstone_reason}}",
+                    nodes.join(",")
+                ),
+            );
+        }
+        // Forty links out of one node, some of them to tombstoned nodes.
+        let links: Vec<String> = (0..40)
+            .map(|i| format!("['{hub}','u{:08}']", (i * 25) % n))
+            .collect();
+        run(
+            db,
+            &format!("?[src,dst] <- [{}] :put link{{src,dst}}", links.join(",")),
+        );
+        let frontier: Vec<String> = (0..20).map(|i| format!("['u{:08}']", (i * 997) % n)).collect();
+        let shapes = [
+            (
+                "T1 trailing unification",
+                format!("?[name] := *node{{uid, name}}, uid = 'u{:08}'", n / 2),
+            ),
+            (
+                "T2 key plus non-adjacent value",
+                format!(
+                    "?[t] := *link{{src: '{hub}', dst: t}}, *node{{uid: t, tombstone_reason: 'deleted'}}"
+                ),
+            ),
+            (
+                "T3 equality with a rule-bound variable",
+                format!(
+                    "f[x] <- [{}] ?[n] := f[x], *node{{uid: u, name: n}}, u == x",
+                    frontier.join(",")
+                ),
+            ),
+        ];
+        for (label, query) in shapes {
+            let mut medians = [0f64; 2];
+            let mut results = Vec::new();
+            for (slot, enabled) in [(0usize, false), (1usize, true)] {
+                db.set_keyed_access_for_tests(enabled);
+                results.push(rows(db, &query));
+                let mut samples: Vec<f64> = (0..15)
+                    .map(|_| {
+                        let started = Instant::now();
+                        let _ = rows(db, &query);
+                        started.elapsed().as_secs_f64() * 1e3
+                    })
+                    .collect();
+                samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                medians[slot] = samples[samples.len() / 2];
+            }
+            let mut baseline = results[0].as_array().unwrap().clone();
+            let mut optimized = results[1].as_array().unwrap().clone();
+            baseline.sort_by_key(|v| v.to_string());
+            optimized.sort_by_key(|v| v.to_string());
+            assert_eq!(baseline, optimized, "{label}: results differ");
+            println!(
+                "keyed_access_timing rows={n} {label}: off {:.3} ms, on {:.3} ms, ratio {:.1}x",
+                medians[0],
+                medians[1],
+                medians[0] / medians[1].max(1e-6)
+            );
+            assert!(
+                medians[1] <= medians[0] * 1.5 + 0.05,
+                "{label}: optimized plan is slower ({:.3} ms against {:.3} ms)",
+                medians[1],
+                medians[0]
+            );
+        }
+        db.set_keyed_access_for_tests(true);
+    });
+}
