@@ -605,11 +605,19 @@ fn negated_full_key_plus_value_seeks_and_checks_every_pair() {
         equivalent(db, q, json!([["y"]]));
         assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_mat_join");
 
-        // An untyped (Any) key gets no new seek-based equality.
-        run(db, ":create anyk {k => v}");
-        run(db, "?[k,v] <- [['x','yes']] :put anyk{k=>v}");
+        // An untyped (Any) key gets no new seek-based equality: with a value
+        // column that is not adjacent to the key, the join stays materialized.
+        run(db, ":create anyk {k => w, v}");
+        run(db, "?[k,w,v] <- [['x','-','yes']] :put anyk{k=>w,v}");
         let q = "?[s] := s in ['x','y'], not *anyk{k: s, v: 'yes'}";
         equivalent(db, q, json!([["y"]]));
         assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_mat_join");
+        // A key plus the adjacent value column was a leading-run seek before
+        // this change and still is; only its label names the full key.
+        run(db, ":create anyadj {k => v}");
+        run(db, "?[k,v] <- [['x','yes']] :put anyadj{k=>v}");
+        let q = "?[s] := s in ['x','y'], not *anyadj{k: s, v: 'yes'}";
+        equivalent(db, q, json!([["y"]]));
+        assert_eq!(neg_op(&plan(db, q, true)), "stored_neg_point_join");
     });
 }
