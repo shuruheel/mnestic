@@ -24,6 +24,7 @@ fn main() {
     } else {
         builder.flag(cxx_standard());
         builder.define("HAVE_UINT128_EXTENSION", Some("1"));
+        force_include_cstdint(&mut builder);
         builder.flag("-Wsign-compare");
         builder.flag("-Wshadow");
         builder.flag("-Wno-unused-parameter");
@@ -305,6 +306,7 @@ fn build_rocksdb() {
         config.flag(cxx_standard());
         // matches the flags in CMakeLists.txt from rocksdb
         config.define("HAVE_UINT128_EXTENSION", Some("1"));
+        force_include_cstdint(&mut config);
         config.flag("-Wsign-compare");
         config.flag("-Wshadow");
         config.flag("-Wno-unused-parameter");
@@ -325,6 +327,15 @@ fn build_rocksdb() {
     config.cpp(true);
     config.flag_if_supported("-std=c++17");
     config.compile("librocksdb.a");
+}
+
+/// RocksDB 8.8 uses fixed-width integer types in headers that never include
+/// `<cstdint>` (`db/blob/blob_file_meta.h`, `rocksdb/trace_record.h`).
+/// libstdc++ through GCC 14 pulled the header in indirectly; GCC 15 does not,
+/// and the build stops with `'uint64_t' has not been declared`. Including it
+/// ahead of every translation unit is harmless where it was already present.
+fn force_include_cstdint(build: &mut cc::Build) {
+    build.flag("-include").flag("cstdint");
 }
 
 fn try_to_find_and_link_lib(lib_name: &str) -> bool {

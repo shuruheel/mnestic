@@ -667,17 +667,31 @@ impl<'a> SessionTx<'a> {
             .into_iter()
             .collect();
         result.sort_by_key(|(_, hit)| Reverse(OrderedFloat(hit.score)));
-        if config.filter.is_none() {
-            result.truncate(config.k);
-        }
 
-        let mut ret = Vec::with_capacity(config.k);
+        // The ranked list is not cut to `k` before the base rows are read: a
+        // hit can be dropped below (dangling posting, or the filter), and the
+        // next-best hit must then take its place. The loop stops at `k` rows,
+        // so a healthy index still reads exactly `k` base rows.
+        let mut ret = Vec::with_capacity(config.k.min(result.len()));
+        let mut dangling = 0u64;
         for (found_key, hit) in result {
+            if ret.len() >= config.k {
+                break;
+            }
             crate::fts::FTS_BASE_ROW_FETCHES.with(|count| count.set(count.get() + 1));
-            let mut cand_tuple = config
-                .base_handle
-                .get_current(self, &found_key)?
-                .ok_or_else(|| miette!("corrupted index"))?;
+            // A posting whose base row is gone (0.19.4). Postings written by
+            // releases through 0.12.0 could outlive their row: an in-place
+            // `:put` on a relation with only an FTS index left the old terms'
+            // postings behind, and a later `:rm` removed only the current
+            // terms'. A bulk-import delete strands postings the same way. This
+            // used to fail the whole search with "corrupted index", so one
+            // stale posting took out every query that ranked it. The row does
+            // not exist, so it cannot be a result: skip it, count it, and say
+            // so once per search. `::reindex` removes the postings.
+            let Some(mut cand_tuple) = config.base_handle.get_current(self, &found_key)? else {
+                dangling += 1;
+                continue;
+            };
 
             if config.bind_score.is_some() {
                 cand_tuple.push(DataValue::from(hit.score));
@@ -706,9 +720,26 @@ impl<'a> SessionTx<'a> {
             }
 
             ret.push(cand_tuple);
-            if ret.len() >= config.k {
-                break;
-            }
+        }
+        if dangling > 0 {
+            crate::fts::FTS_DANGLING_POSTINGS_SKIPPED
+                .fetch_add(dangling, std::sync::atomic::Ordering::Relaxed);
+            crate::runtime::diagnostics::emit(
+                "fts.dangling_posting",
+                format!(
+                    "full-text index '{}:{}' ranked {} document(s) that have no row in '{}'; \
+                     they were skipped",
+                    config.base_handle.name,
+                    config.manifest.index_name,
+                    dangling,
+                    config.base_handle.name
+                ),
+                format!(
+                    "the index holds postings for rows that no longer exist; rebuild it \
+                     with `::reindex {}`",
+                    config.base_handle.name
+                ),
+            );
         }
         Ok(ret)
     }

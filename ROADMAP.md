@@ -64,6 +64,9 @@ release/issue descriptions retain their September 6 reconciliation date.
   full-text searches no longer rescan the index after opening or while writes
   commit). `mnestic-rocks` moves to 0.1.13. Numbers are in the
   [0.19.3 changelog](CHANGELOG-FORK.md).
+- `mnestic` 0.19.4 (November 15, 2026) is a fix release: a full-text search
+  skips a posting whose row is gone instead of failing with `corrupted index`,
+  and reports it through `::warnings`. `::reindex` removes such postings.
 
 ### Selected next — owner decision, November 13, 2026
 

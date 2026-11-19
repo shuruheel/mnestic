@@ -150,7 +150,16 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.19.3
+## New in 0.19.4
+
+- **A full-text posting with no row no longer fails the search.** The search
+  skips the hit instead of raising `corrupted index` and records an
+  `fts.dangling_posting` warning (`::warnings`). `::reindex <relation>` removes
+  such postings.
+
+No storage version change.
+
+## From 0.19.3
 
 - **Governed transactions** (`db.governed_transact`, `db.run_governed`,
   `MnesticError.maybe_committed`): one deadline per transaction, a bounded wait

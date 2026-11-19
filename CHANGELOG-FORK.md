@@ -5,6 +5,36 @@ provenance and licensing.
 
 ## Unreleased
 
+### Fixed
+
+- **The RocksDB backend builds with GCC 15 and later.** The vendored RocksDB
+  8.8 uses `uint64_t` in two headers that never include `<cstdint>`. Through
+  GCC 14 the standard library pulled it in indirectly; on GCC 15 and later
+  (Ubuntu 26.04, Fedora 42) the build stopped with `'uint64_t' has not been
+  declared`. The build script now includes `<cstdint>` ahead of every C++
+  translation unit on non-MSVC targets. `cozorocks/build.rs`.
+
+  **Release note for whoever cuts the next version:** this is a `cozorocks`
+  change, so it reaches crates.io only as `mnestic-rocks` 0.1.14 followed by a
+  `mnestic` release that pins it. Until then the published 0.19.4 does not
+  compile from source with `storage-rocksdb` on those systems.
+
+### Changed
+
+- **A storage ID shared by more than one relation is reported through
+  `::warnings`.** The check at open already logged an error for each shared
+  ID. A host that embeds the engine and does not read its log never saw it: a
+  production deployment carried ten such stores for seven months. Each shared
+  ID now also records a `storage.relation_id_collision` warning, visible to
+  `::warnings` and `Db::recent_warnings` from the moment the store is opened.
+  The log line is unchanged. `runtime/db.rs`; guarded by
+  `a_shared_relation_id_is_reported_as_a_warning_at_open`.
+
+  **What a shared ID does.** The relations read and write one key range, so
+  each returns the others' rows, and removing any of them (`::remove`, an index
+  drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
+  a build before 0.13.0 (`f125fbd2`) can hold such IDs.
+
 ### Added — current-belief search on transaction-time relations
 
 - FTS, HNSW and LSH indexes can be created on tt-only relations. Index identity
@@ -62,6 +92,28 @@ provenance and licensing.
 - Sustained-writer development checks now complete after the admission fix.
   The replacement recording-cost campaign failed its gate; qualification and
   merge remain blocked. [Results](docs/reviews/keyed-txtime-admission.md).
+
+## 0.19.4 — 2026-11-15
+
+One fix: a full-text search no longer fails on a posting whose row is gone. No
+storage version change; `mnestic-rocks` stays 0.1.13.
+
+### Fixed
+
+- **A full-text posting with no row no longer fails the search.** A search
+  reads the row of every ranked hit, and a missing row raised
+  `corrupted index`, so one stale posting failed every query that ranked it.
+  The search now skips the hit and returns the next-best one in its place.
+  Each search that skips a hit records an `fts.dangling_posting` warning
+  (`::warnings`), and `cozo::fts_dangling_postings_skipped()` returns the
+  process-wide count for a health metric. `fts/indexing.rs`; guarded by
+  `cozo-core/tests/fts_dangling_posting.rs`.
+
+  **Who has such postings.** A relation with only a full-text index that was
+  updated in place by a release through 0.12.0 and never rebuilt: the leaked
+  postings of a row's old text outlive the row once it is removed. A bulk-import
+  delete strands postings the same way. `::reindex <relation>` removes them;
+  the skip keeps searches working until it runs.
 
 ## 0.19.3 — 2026-11-14
 

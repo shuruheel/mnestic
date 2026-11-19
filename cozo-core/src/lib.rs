@@ -148,6 +148,15 @@ pub(crate) mod fts;
 #[doc(hidden)]
 pub use fts::persist::{FtsStatsCheck, FtsStatsOpen};
 pub use fts::{FTS_BASE_ROW_FETCHES, FTS_DOC_STATS_SCANS, FTS_LITERAL_SCANS};
+
+/// Full-text hits skipped since the process started because the row they
+/// pointed to no longer exists (dangling postings). A healthy index never
+/// moves this; a host can export it as a health metric. Each search that skips
+/// a hit also records an `fts.dangling_posting` warning (`::warnings`), whose
+/// hint names the `::reindex` that removes the postings.
+pub fn fts_dangling_postings_skipped() -> u64 {
+    fts::FTS_DANGLING_POSTINGS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub mod parse;
 pub(crate) mod query;
 pub(crate) mod runtime;

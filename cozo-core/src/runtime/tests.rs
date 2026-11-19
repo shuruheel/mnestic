@@ -57,6 +57,73 @@ fn stale_db_handle_does_not_reuse_relation_id() {
 }
 
 #[test]
+fn a_shared_relation_id_is_reported_as_a_warning_at_open() {
+    use crate::data::tuple::TupleT;
+    use crate::runtime::relation::RelationId;
+    use rmp_serde::Serializer;
+    use serde::Serialize;
+
+    let storage = MemStorage::default();
+    let db = Db::new(storage.clone()).unwrap();
+    db.initialize().unwrap();
+    for script in [
+        ":create first {k: Int => v: String}",
+        ":create second {k: Int => v: String}",
+    ] {
+        db.run_script(script, BTreeMap::new(), ScriptMutability::Mutable)
+            .unwrap();
+    }
+    assert!(
+        db.recent_warnings().is_empty(),
+        "{:?}",
+        db.recent_warnings()
+    );
+
+    // Give `second` the storage id `first` already uses: the state a store
+    // restored by a build before 0.13.0 can be left in.
+    {
+        let mut tx = db.transact_write().unwrap();
+        let first = tx.get_relation("first", false).unwrap();
+        let mut second = tx.get_relation("second", false).unwrap();
+        second.id = first.id;
+        let key = vec![DataValue::Str(second.name.clone())].encode_as_key(RelationId::SYSTEM);
+        let mut value = vec![];
+        second
+            .serialize(&mut Serializer::new(&mut value).with_struct_map())
+            .unwrap();
+        tx.store_tx.put(&key, &value).unwrap();
+        tx.commit_tx().unwrap();
+    }
+
+    let reopened = Db::new(storage).unwrap();
+    reopened.initialize().unwrap();
+    let warnings = reopened.recent_warnings();
+    let found: Vec<_> = warnings
+        .iter()
+        .filter(|(_, warning)| warning.code == "storage.relation_id_collision")
+        .collect();
+    assert_eq!(found.len(), 1, "{warnings:?}");
+    assert!(
+        found[0].1.message.contains("first, second"),
+        "{}",
+        found[0].1.message
+    );
+    assert!(found[0].1.hint.contains("::repair_corrupt"));
+
+    // The same warning through the script surface every binding can reach.
+    let listed = reopened
+        .run_script("::warnings", BTreeMap::new(), ScriptMutability::Immutable)
+        .unwrap();
+    assert!(
+        listed.rows.iter().any(|row| row
+            .iter()
+            .any(|value| value.get_str() == Some("storage.relation_id_collision"))),
+        "{:?}",
+        listed.rows
+    );
+}
+
+#[test]
 fn test_limit_offset() {
     let db = DbInstance::default();
     let res = db
