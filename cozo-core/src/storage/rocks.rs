@@ -571,6 +571,30 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         })
     }
 
+    fn range_scan_for_count<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Box<dyn Iterator<Item = Result<()>> + 'a>
+    where
+        's: 'a,
+    {
+        let mut inner = self.iter_builder().upper_bound(upper).start();
+        inner.seek(lower);
+        let mut scan = RocksDbIterator {
+            inner,
+            started: false,
+            upper_bound: upper.to_vec(),
+        };
+        Box::new(std::iter::from_fn(move || match scan.next_pair() {
+            Ok(Some((key, value))) => {
+                Some(crate::runtime::relation::validate_count_row(key, value))
+            }
+            Ok(None) => None,
+            Err(error) => Some(Err(error)),
+        }))
+    }
+
     fn range_skip_scan_tuple<'a>(
         &'a self,
         lower: &[u8],
@@ -659,23 +683,23 @@ pub(crate) struct RocksDbIterator {
 
 impl RocksDbIterator {
     #[inline]
-    fn next_inner(&mut self) -> Result<Option<Tuple>> {
+    fn next_pair(&mut self) -> Result<Option<(&[u8], &[u8])>> {
         if self.started {
             self.inner.next()
         } else {
             self.started = true;
         }
-        Ok(match self.inner.pair()? {
-            None => None,
-            Some((k_slice, v_slice)) => {
-                if self.upper_bound.as_slice() <= k_slice {
-                    None
-                } else {
-                    // upper bound is exclusive
-                    Some(try_decode_tuple_from_kv(k_slice, v_slice, None)?)
-                }
-            }
-        })
+        Ok(self
+            .inner
+            .pair()?
+            .filter(|(key, _)| *key < self.upper_bound.as_slice()))
+    }
+
+    #[inline]
+    fn next_inner(&mut self) -> Result<Option<Tuple>> {
+        self.next_pair()?
+            .map(|(key, value)| try_decode_tuple_from_kv(key, value, None))
+            .transpose()
     }
 }
 

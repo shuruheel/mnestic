@@ -15,6 +15,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_BUILD_JOBS: 2
 
 jobs:
   test:
@@ -134,6 +135,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build with RocksDB backend
         run: cargo build -p mnestic --features storage-rocksdb --verbose
+      - name: Test (validated scalar counts)
+        run: |
+          cargo test -j 2 -p mnestic --features storage-rocksdb --lib scalar_count
+          cargo test -j 2 -p mnestic --features storage-rocksdb --test scalar_count
       # The graph-projection freshness protocol has race windows that mem and
       # sqlite cannot reach: both pin a read transaction by holding a store-wide
       # read guard, so no writer can run alongside a long-lived reader. RocksDB

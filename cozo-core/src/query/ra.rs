@@ -48,6 +48,24 @@ pub(crate) enum RelAlgebra {
 }
 
 impl RelAlgebra {
+    /// Only row-preserving wrappers around one plain, unfiltered stored scan.
+    /// No joins, filters, time travel, derived relations or expressions qualify.
+    pub(crate) fn scalar_count_scan(&self) -> Option<&RelationHandle> {
+        match self {
+            Self::Stored(scan) if scan.filters.is_empty() => Some(&scan.storage),
+            Self::Reorder(reorder) => reorder.relation.scalar_count_scan(),
+            Self::Join(join)
+                if join.joiner.left_keys.is_empty()
+                    && join.joiner.right_keys.is_empty()
+                    && matches!(&join.left, Self::Fixed(unit)
+                    if unit.bindings.is_empty() && unit.data.len() == 1 && unit.data[0].is_empty()) =>
+            {
+                join.right.scalar_count_scan()
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn span(&self) -> SourceSpan {
         match self {
             RelAlgebra::Fixed(i) => i.span,

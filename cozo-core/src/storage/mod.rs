@@ -188,6 +188,24 @@ pub trait StoreTx<'s>: Sync {
         }))
     }
 
+    /// Enumerate validated rows for a scalar count, without exposing their values.
+    /// Bounds and snapshot semantics match `range_scan_tuple`. Implementations
+    /// must preserve value-decoding failures; a raw key count is not sufficient.
+    /// The caller remains responsible for cancellation between iterator pulls.
+    fn range_scan_for_count<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Box<dyn Iterator<Item = Result<()>> + 'a>
+    where
+        's: 'a,
+    {
+        Box::new(
+            self.range_scan_tuple(lower, upper)
+                .map(|row| row.map(|_| ())),
+        )
+    }
+
     /// Scan on a range with a certain validity.
     ///
     /// `lower` is inclusive whereas `upper` is exclusive.

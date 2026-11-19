@@ -616,7 +616,29 @@ impl<'a> SessionTx<'a> {
                 .filter_map(|(i, a)| a.as_ref().map(|aggr| (i, aggr.clone())))
                 .collect_vec();
 
-            for item_res in rule.relation.iter(self, None, stores, poison.clone())? {
+            // Count ignores its argument, but not body multiplicity or errors.
+            // Retain the normal aggregate/limit/output path; only its input
+            // iterator can specialize a plain stored scan. Other shapes fall back.
+            let scalar_count = rule.aggr.len() == 1
+                && rule.aggr[0].as_ref().is_some_and(|(aggr, args)| {
+                    aggr.name == crate::data::aggr::count_aggr_name() && args.is_empty()
+                });
+            let input: Box<dyn Iterator<Item = Result<Tuple>> + '_> = if let Some(scan) =
+                scalar_count
+                    .then(|| rule.relation.scalar_count_scan())
+                    .flatten()
+            {
+                let poison = poison.clone();
+                poison.check()?;
+                Box::new(scan.scan_for_count(self).map(move |row| {
+                    // Per-row checks retain kill, deadline and memory controls.
+                    poison.check()?;
+                    row.map(|()| vec![DataValue::Null])
+                }))
+            } else {
+                rule.relation.iter(self, None, stores, poison.clone())?
+            };
+            for item_res in input {
                 let item = item_res?;
                 trace!("item for {:?}.{}: {:?} at {}", rule_symb, rule_n, item, 0);
 
