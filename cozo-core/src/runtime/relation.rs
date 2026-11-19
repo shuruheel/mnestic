@@ -2346,15 +2346,28 @@ mod scalar_count_validation_tests {
     }
 
     fn same_validation(key: &[u8], blob: &[u8]) {
-        let normal = try_decode_tuple_from_kv(key, blob, None).map(|_| ());
-        let counted = validate_count_row(key, blob);
-        assert_eq!(normal.is_ok(), counted.is_ok(), "{blob:?}");
-        if let (Err(a), Err(b)) = (normal, counted) {
-            assert_eq!(
-                a.code().map(|c| c.to_string()),
-                b.code().map(|c| c.to_string())
-            );
-            assert_eq!(a.to_string(), b.to_string());
+        // The existing decoder panics on reserved Regex values. Preserve and
+        // compare that existing failure too; do not silently skip fuzz inputs.
+        let normal =
+            std::panic::catch_unwind(|| try_decode_tuple_from_kv(key, blob, None).map(|_| ()));
+        let counted = std::panic::catch_unwind(|| validate_count_row(key, blob));
+        match (normal, counted) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.is_ok(), b.is_ok(), "{blob:?}");
+                if let (Err(a), Err(b)) = (a, b) {
+                    assert_eq!(
+                        a.code().map(|c| c.to_string()),
+                        b.code().map(|c| c.to_string())
+                    );
+                    assert_eq!(a.to_string(), b.to_string());
+                }
+            }
+            (Err(a), Err(b)) => {
+                assert!(!canonical_vector_payload(blob));
+                assert_eq!(a.downcast_ref::<&str>(), b.downcast_ref::<&str>());
+                assert_eq!(a.downcast_ref::<String>(), b.downcast_ref::<String>());
+            }
+            _ => panic!("count decoder changed panic behavior for {blob:?}"),
         }
     }
 

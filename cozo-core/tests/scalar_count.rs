@@ -102,6 +102,22 @@ fn contract(engine: &str) {
         run(&db, "?[count(id)] := *history{id @ 250}"),
         vec![vec![cozo::DataValue::from(0)]]
     );
+    assert_eq!(
+        run(&db, "?[count(x)] := *vectors{id}, x = id + 1"),
+        run(&db, COUNT)
+    );
+    let grouped = run(&db, "?[id, count(embedding)] := *vectors{id, embedding}");
+    assert_eq!(grouped.len(), 255);
+    assert!(grouped.iter().all(|row| row[1].get_int() == Some(1)));
+    run(
+        &db,
+        ":create optional_vectors {id: Int => embedding: <F32; 3>?}",
+    );
+    run(&db, "?[id, embedding] <- [[1, null], [2, vec([1, 0, 0])]] :put optional_vectors {id => embedding}");
+    assert_eq!(
+        run(&db, "?[count(embedding)] := *optional_vectors{embedding}"),
+        vec![vec![cozo::DataValue::from(2)]]
+    );
     // A tiny request deadline still terminates a count through the usual error path.
     let err = db
         .run_script(

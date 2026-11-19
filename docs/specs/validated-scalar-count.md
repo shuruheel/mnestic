@@ -48,7 +48,9 @@ mutation, equal values, filters, joins, distinct aggregates, limits, missing
 relations, deadlines, rollback, concurrent RocksDB snapshot readers and reopen.
 Codec tests exercise F32/F64 and all binary-length classes, exhaustive one-byte
 mutations and truncations of a canonical fixture, comparing success and error
-text/code against the existing decoder. RocksDB corruption must remain a query
+text/code against the existing decoder. The differential test also compares
+existing panic outcomes (reserved Regex representations); this optimization
+does not change that decoder behavior. RocksDB corruption must remain a query
 error. Hosted default and RocksDB jobs run these checks; no local native build.
 
 A result does not yet establish speed or API non-regression. Before performance

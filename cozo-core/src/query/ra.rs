@@ -951,7 +951,7 @@ impl<I: Iterator<Item = Result<Tuple>>> Iterator for PoisonedIter<I> {
 pub(crate) fn poisoned<I: Iterator<Item = Result<Tuple>>>(
     inner: I,
     poison: Poison,
-) -> PoisonedIter<I> {
+) -> impl Iterator<Item = Result<Tuple>> {
     PoisonedIter {
         inner,
         poison,
