@@ -1342,6 +1342,7 @@ pub(crate) fn execute_hybrid_native<'s, S: Storage<'s>>(
             bind_vector: None,
             radius: None,
             filter: None,
+            tx_valid_at: None,
             span: SourceSpan(0, 0),
         };
         Some((qvec, cfg))
@@ -1432,7 +1433,7 @@ pub(crate) fn execute_hybrid_native<'s, S: Storage<'s>>(
         let res = (|| {
             poison.check()?;
             let mut stack = Vec::new();
-            let rows = tx.hnsw_knn(vec_plan.0.clone(), &vec_plan.1, &None, &mut stack)?;
+            let rows = tx.hnsw_knn(vec_plan.0.clone(), &vec_plan.1, &None, &mut stack, &poison)?;
             let mut out = Vec::with_capacity(rows.len());
             for row in rows {
                 let id = row[id_col_idx].clone();

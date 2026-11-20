@@ -29,8 +29,38 @@ pub(crate) struct TouchedRelation {
     pub(crate) old: BTreeMap<Vec<u8>, (Tuple, Option<Tuple>)>,
 }
 
+pub(crate) const AS_OF_SCAN_MAX_ROWS_DEFAULT: usize = 200_000;
+
+#[cfg(test)]
+thread_local! {
+    static AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+pub(crate) fn as_of_scan_max_rows() -> usize {
+    #[cfg(test)]
+    {
+        let ov = AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE.with(std::cell::Cell::get);
+        if ov > 0 {
+            return ov;
+        }
+    }
+    AS_OF_SCAN_MAX_ROWS_DEFAULT
+}
+
+pub(crate) fn as_of_scan_limit_error(rel_name: &str, limit: usize) -> miette::Report {
+    #[derive(Debug, Error, Diagnostic)]
+    #[error("historical as-of scan on transaction-time relation '{0}' exceeded the {1}-row bound")]
+    #[diagnostic(
+        code(query::as_of_scan_limit),
+        help("bind the primary key prefix or reduce the scanned range")
+    )]
+    struct AsOfScanLimit(String, usize);
+    AsOfScanLimit(rel_name.to_string(), limit).into()
+}
+
 pub(crate) fn has_search_indexes(handle: &RelationHandle) -> bool {
-    !handle.fts_indices.is_empty()
+    !handle.indices.is_empty()
+        || !handle.fts_indices.is_empty()
         || !handle.hnsw_indices.is_empty()
         || !handle.lsh_indices.is_empty()
 }
@@ -170,6 +200,33 @@ impl SessionTx<'_> {
             let hashes = self.make_lsh_hash_perms(handle);
             let filters = Self::make_hnsw_filters(handle)?;
             let mut stack = Vec::new();
+            for (idx_handle, extraction_indices) in handle.indices.values() {
+                for (old, new) in &changes {
+                    let old_extracted = old.map(|row| {
+                        extraction_indices
+                            .iter()
+                            .map(|&i| row[i].clone())
+                            .collect::<Vec<_>>()
+                    });
+                    let new_extracted = new.as_ref().map(|row| {
+                        extraction_indices
+                            .iter()
+                            .map(|&i| row[i].clone())
+                            .collect::<Vec<_>>()
+                    });
+                    if old_extracted == new_extracted {
+                        continue;
+                    }
+                    if let Some(old_vals) = old_extracted {
+                        let key = idx_handle.encode_key_for_store(&old_vals, Default::default())?;
+                        self.store_tx.del(&key)?;
+                    }
+                    if let Some(new_vals) = new_extracted {
+                        let key = idx_handle.encode_key_for_store(&new_vals, Default::default())?;
+                        self.store_tx.put(&key, &[])?;
+                    }
+                }
+            }
             for (name, (index, manifest)) in &handle.hnsw_indices {
                 let filter = filters.get(name);
                 let mut removed = Vec::new();
@@ -232,6 +289,44 @@ impl SessionTx<'_> {
                 &hashes,
                 &mut stack,
             )?;
+        }
+        Ok(())
+    }
+
+    /// Maintain B-tree secondary current-belief indexes for explicit `(old, new)`
+    /// row pairs without reading the base table (used by commit-section
+    /// maintenance, unlocked catch-up rounds, and shadow maintenance).
+    pub(crate) fn maintain_tt_btree_pairs(
+        &mut self,
+        handle: &RelationHandle,
+        changes: &[(Option<&Tuple>, Option<&Tuple>)],
+    ) -> Result<()> {
+        for (idx_handle, extraction_indices) in handle.indices.values() {
+            for (old, new) in changes {
+                let old_extracted = old.map(|row| {
+                    extraction_indices
+                        .iter()
+                        .map(|&i| row[i].clone())
+                        .collect::<Vec<_>>()
+                });
+                let new_extracted = new.map(|row| {
+                    extraction_indices
+                        .iter()
+                        .map(|&i| row[i].clone())
+                        .collect::<Vec<_>>()
+                });
+                if old_extracted == new_extracted {
+                    continue;
+                }
+                if let Some(old_vals) = old_extracted {
+                    let key = idx_handle.encode_key_for_store(&old_vals, Default::default())?;
+                    self.store_tx.del(&key)?;
+                }
+                if let Some(new_vals) = new_extracted {
+                    let key = idx_handle.encode_key_for_store(&new_vals, Default::default())?;
+                    self.store_tx.put(&key, &[])?;
+                }
+            }
         }
         Ok(())
     }
@@ -489,20 +584,28 @@ impl SessionTx<'_> {
                 }
             }
         }
-        if !handle.fts_indices.is_empty() || !handle.lsh_indices.is_empty() {
-            let processors = self.make_fts_lsh_processors(handle)?;
-            let hashes = self.make_lsh_hash_perms(handle);
-            let fts_lsh_pairs: Vec<(Option<&Tuple>, Option<&Tuple>)> = pairs
+        if !handle.indices.is_empty()
+            || !handle.fts_indices.is_empty()
+            || !handle.lsh_indices.is_empty()
+        {
+            let non_hnsw_pairs: Vec<(Option<&Tuple>, Option<&Tuple>)> = pairs
                 .iter()
                 .map(|(old, new)| (old.as_ref(), new.as_ref()))
                 .collect();
-            self.maintain_tt_fts_lsh_pairs(
-                handle,
-                &fts_lsh_pairs,
-                &processors,
-                &hashes,
-                &mut stack,
-            )?;
+            if !handle.indices.is_empty() {
+                self.maintain_tt_btree_pairs(handle, &non_hnsw_pairs)?;
+            }
+            if !handle.fts_indices.is_empty() || !handle.lsh_indices.is_empty() {
+                let processors = self.make_fts_lsh_processors(handle)?;
+                let hashes = self.make_lsh_hash_perms(handle);
+                self.maintain_tt_fts_lsh_pairs(
+                    handle,
+                    &non_hnsw_pairs,
+                    &processors,
+                    &hashes,
+                    &mut stack,
+                )?;
+            }
         }
         Ok(())
     }
@@ -940,6 +1043,100 @@ mod tests {
                 .rows
                 .len(),
             1
+        );
+    }
+
+    #[test]
+    fn as_of_scan_limit_fails_closed_for_base_and_vector_scans() {
+        struct ResetGuard;
+        impl Drop for ResetGuard {
+            fn drop(&mut self) {
+                AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE.with(|c| c.set(0));
+            }
+        }
+        let _reset = ResetGuard;
+        AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE.with(|c| c.set(3));
+
+        let db = DbInstance::new("mem", "", "{}").unwrap();
+        db.run_default(":create item {id:String, tt:TxTime => tag:String, emb:<F32; 2>}")
+            .unwrap();
+        db.run_default(
+            "::hnsw create item:vec {dim:2, m:8, dtype:F32, fields:[emb], distance:L2, ef_construction:16}",
+        )
+        .unwrap();
+        db.run_default("::index create item:by_tag {tag}").unwrap();
+        db.run_default(
+            "?[id, tag, emb] <- [['a','t',vec([1,0])],['b','t',vec([2,0])],['c','t',vec([3,0])],['d','t',vec([4,0])]] :put item {id => tag, emb}",
+        )
+        .unwrap();
+        let tt = db
+            .run_default("?[max(t)] := *item{tt}, t = to_int(tt)")
+            .unwrap()
+            .rows[0][0]
+            .get_int()
+            .unwrap();
+
+        // Current read through B-tree index succeeds (not a historical base scan).
+        assert_eq!(
+            db.run_default("?[id] := tag = 't', *item{id, tag}")
+                .unwrap()
+                .rows
+                .len(),
+            4
+        );
+
+        // Historical secondary-key base scan exceeds the 3-row cap -> query::as_of_scan_limit.
+        let base_err = db
+            .run_default(&format!("?[id] := tag = 't', *item{{id, tag}} :as_of {tt}"))
+            .unwrap_err();
+        assert!(
+            format!("{base_err:?}").contains("query::as_of_scan_limit"),
+            "expected as_of_scan_limit on base scan, got: {base_err:?}"
+        );
+
+        // Historical vector scan exceeds the 3-row cap -> query::as_of_scan_limit (never falls back to ANN).
+        let vec_err = db
+            .run_default(&format!(
+                "?[id] := ~item:vec{{id | query: vec([1,0]), k: 2, ef: 10}} :as_of {tt}"
+            ))
+            .unwrap_err();
+        assert!(
+            format!("{vec_err:?}").contains("query::as_of_scan_limit"),
+            "expected as_of_scan_limit on vector scan, got: {vec_err:?}"
+        );
+
+        // Historical fixed-rule base scan exceeds the 3-row cap -> query::as_of_scan_limit.
+        let fixed_err = db
+            .run_default(&format!(
+                "?[rank, id] <~ ReorderSort(*item[id, tt, tag, emb], out: [id]) :as_of {tt}"
+            ))
+            .unwrap_err();
+        assert!(
+            format!("{fixed_err:?}").contains("query::as_of_scan_limit"),
+            "expected as_of_scan_limit on fixed-rule scan, got: {fixed_err:?}"
+        );
+
+        // Historical prefix_join on a composite logical key also enforces query::as_of_scan_limit.
+        db.run_default(":create comp {tenant:String, id:String, tt:TxTime => tag:String}")
+            .unwrap();
+        db.run_default(
+            "?[tenant, id, tag] <- [['acme','1','a'],['acme','2','b'],['acme','3','c'],['acme','4','d']] :put comp {tenant, id => tag}",
+        )
+        .unwrap();
+        let comp_tt = db
+            .run_default("?[max(t)] := *comp{tt}, t = to_int(tt)")
+            .unwrap()
+            .rows[0][0]
+            .get_int()
+            .unwrap();
+        let prefix_err = db
+            .run_default(&format!(
+                "?[id] := tenant = 'acme', *comp{{tenant, id, tag}}, tag == 'd' :as_of {comp_tt}"
+            ))
+            .unwrap_err();
+        assert!(
+            format!("{prefix_err:?}").contains("query::as_of_scan_limit"),
+            "expected as_of_scan_limit on historical prefix_join, got: {prefix_err:?}"
         );
     }
 }

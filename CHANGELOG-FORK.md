@@ -35,6 +35,24 @@ provenance and licensing.
   drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
   a build before 0.13.0 (`f125fbd2`) can hold such IDs.
 
+### Added — as-of vector search and B-tree secondary indexes on transaction-time relations (EA4 Batch 4.1)
+
+- `:as_of` vector search on tt-only relations executes a bounded exact scan over
+  historical beliefs (up to 200,000 rows; exceeding fails closed with
+  `query::as_of_scan_limit`, never falling back to the current HNSW graph),
+  respecting index filters, query filters, `radius`, `::history_gc` floor, and
+  query deadlines/cancellation. `::explain` labels it `hnsw_history_scan`.
+  Historical FTS/LSH and direct index atoms remain rejected with
+  `search::as_of_unsupported`.
+- `::index create` / `::index drop` are now supported on tt-only relations.
+  Index keys omit `tt` (naming `tt` fails with `eval::txtime_index_column`),
+  maintain current asserted beliefs atomically inside the `tt_commit_lock`
+  section, build off-lock on RocksDB, and move with `::rename`. Current reads
+  use secondary indexes; historical (`:as_of` / `@ (tt: ...)`) reads bypass
+  indexes, show history scan labels in `::explain`, and fail closed past the
+  200,000-row scan bound (`query::as_of_scan_limit`) across base scans,
+  prefix joins, negations, and fixed-rule inputs.
+
 ### Added — current-belief search on transaction-time relations
 
 - FTS, HNSW and LSH indexes can be created on tt-only relations. Index identity

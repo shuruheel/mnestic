@@ -609,7 +609,7 @@ impl RelationHandle {
     /// After `::history_gc`, an as-of read below the persisted floor would
     /// silently return a post-hoc reconstruction as if it were the historical
     /// belief — error instead (mnestic fork, bitemporality step 5).
-    fn check_tt_gc_floor(&self, tt: Option<ValidityTs>, span: SourceSpan) -> Result<()> {
+    pub(crate) fn check_tt_gc_floor(&self, tt: Option<ValidityTs>, span: SourceSpan) -> Result<()> {
         if let (Some(t), Some(floor)) = (tt, self.tt_gc_floor) {
             if t.0 .0 < floor {
                 #[derive(Debug, Error, Diagnostic)]
@@ -2003,7 +2003,9 @@ impl<'a> SessionTx<'a> {
                 rel_handle.access_level
             ));
         }
-        Self::reject_txtime_relation(&rel_handle, "::index create")?;
+        if !self.preparing_tt_index || !rel_handle.is_tt_only() {
+            Self::reject_txtime_relation(&rel_handle, "::index create")?;
+        }
 
         // Check if index already exists
         if rel_handle.has_index(&idx_name.name) {
@@ -2012,6 +2014,11 @@ impl<'a> SessionTx<'a> {
                 rel_name.name.to_string()
             ));
         }
+
+        crate::runtime::txtime_index::reject_tt_index_columns(
+            &rel_handle,
+            cols.iter().map(|c| c.name.to_string()),
+        )?;
 
         // Build column definitions
         let mut col_defs = vec![];
@@ -2040,7 +2047,8 @@ impl<'a> SessionTx<'a> {
             ));
         }
 
-        'outer: for key in rel_handle.metadata.keys.iter() {
+        let logical_key_len = rel_handle.index_key_len();
+        'outer: for key in rel_handle.metadata.keys[..logical_key_len].iter() {
             for col in cols.iter() {
                 if col.name == key.name {
                     continue 'outer;
@@ -2070,7 +2078,8 @@ impl<'a> SessionTx<'a> {
             span: Default::default(),
         };
 
-        let idx_handle = self.create_relation(idx_handle)?;
+        let idx_handle =
+            self.create_relation_with_visibility(idx_handle, !self.preparing_tt_index)?;
 
         // populate index
         let extraction_indices = idx_handle
@@ -2091,6 +2100,14 @@ impl<'a> SessionTx<'a> {
                 unreachable!()
             })
             .collect_vec();
+
+        if self.preparing_tt_index {
+            rel_handle
+                .indices
+                .insert(idx_name.name.clone(), (idx_handle, extraction_indices));
+            self.prepared_tt_index = Some(rel_handle);
+            return Ok(());
+        }
 
         // A corrupt/truncated stored tuple (e.g. from an interrupted write)
         // must degrade to "left out of this index" with a loud error — not
@@ -2257,7 +2274,11 @@ impl<'a> SessionTx<'a> {
             // The public catalog and embedded handles must move together. The
             // standalone metadata wrapper already locked both sets of names.
             let prefix = format!("{}:", old.name);
-            for index in rel.fts_indices.values_mut().map(|(i, _)| i)
+            for index in rel
+                .indices
+                .values_mut()
+                .map(|(i, _)| i)
+                .chain(rel.fts_indices.values_mut().map(|(i, _)| i))
                 .chain(rel.hnsw_indices.values_mut().map(|(i, _)| i))
                 .chain(rel.lsh_indices.values_mut().flat_map(|(i, j, _)| [i, j]))
             {

@@ -142,7 +142,6 @@ fn historical_search_and_tt_index_inputs_are_rejected() {
         create_indexes(db);
         for q in [
             "?[id] := ~doc:text{id | query:'alpha',k:10} :as_of 1",
-            "?[id] := ~doc:vec{id | query:vec([0,0]),k:10,ef:20} :as_of 1",
             "?[id] := ~doc:similar{id | query:'alpha',k:10} :as_of 1",
             "?[word] := *doc:text{word} :as_of 1",
             "?[rank,word] <~ ReorderSort(*doc:text[word,src_id,offset_from,offset_to,position,total_length], out:[word]) :as_of 1",
@@ -150,35 +149,32 @@ fn historical_search_and_tt_index_inputs_are_rejected() {
             let error = db.run_script(q,BTreeMap::new(),ScriptMutability::Mutable).unwrap_err();
             assert!(format!("{error:?}").contains("search::as_of_unsupported"),"{q}: {error:?}");
         }
+        // Batch 2: as-of vector search runs a bounded exact scan instead of returning as_of_unsupported.
+        let as_of_vec = run(db, "?[id] := ~doc:vec{id | query:vec([0,0]),k:10,ef:20} :as_of 1");
+        assert!(as_of_vec.rows.is_empty());
         for q in [
             "::fts create doc:bad {extractor:to_string(tt),tokenizer:Simple}",
             "::lsh create doc:bad {extractor:to_string(tt),tokenizer:Simple,n_perm:64,target_threshold:0.4,n_gram:1}",
             "::hnsw create doc:bad {fields:[tt],dim:2,m:8,dtype:F32,distance:L2,ef_construction:50}",
             "::hnsw create doc:bad {fields:[v],dim:2,m:8,dtype:F32,distance:L2,ef_construction:50,filter:tt==tt}",
+            "::index create doc:bad {tt}",
         ] {
             let error = db.run_script(q,BTreeMap::new(),ScriptMutability::Mutable).unwrap_err();
             assert!(format!("{error:?}").contains("eval::txtime_index_column"),"{q}: {error:?}");
         }
-        let error = db
-            .run_script(
-                "::index create doc:secondary {body}",
-                BTreeMap::new(),
-                ScriptMutability::Mutable,
-            )
-            .unwrap_err();
-        assert!(format!("{error:?}").contains("eval::txtime_unsupported_op"));
         run(
             db,
             ":create bt {id:String,vt:Validity,tt:TxTime => body:String}",
         );
-        let error = db
-            .run_script(
-                "::fts create bt:bad {extractor:body,tokenizer:Simple}",
-                BTreeMap::new(),
-                ScriptMutability::Mutable,
-            )
-            .unwrap_err();
-        assert!(format!("{error:?}").contains("eval::txtime_unsupported_op"));
+        for q in [
+            "::fts create bt:bad {extractor:body,tokenizer:Simple}",
+            "::index create bt:bad {body}",
+        ] {
+            let error = db
+                .run_script(q, BTreeMap::new(), ScriptMutability::Mutable)
+                .unwrap_err();
+            assert!(format!("{error:?}").contains("eval::txtime_unsupported_op"), "{q}: {error:?}");
+        }
     });
 }
 
