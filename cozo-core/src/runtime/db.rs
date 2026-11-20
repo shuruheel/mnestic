@@ -2586,6 +2586,16 @@ impl<'s, S: Storage<'s>> Db<S> {
             }));
         }
 
+        // mnestic fork (E8): surface full-scan joins on bound non-key /
+        // unindexed columns in `::explain` alongside `factorize_advisory`.
+        let keyed_access = self.enable_keyed_access.load(Ordering::Relaxed);
+        for adv in collect_missing_index_advisories(strata, keyed_access) {
+            ret.push(json!({
+                OP: "missing_index_advisory",
+                FILTERS: format!("{} — {}", adv.message, adv.hint),
+            }));
+        }
+
         let rows = ret
             .into_iter()
             .map(|m| {
@@ -3785,6 +3795,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         let (stratified_program, store_lifetimes) = normalized_program.into_stratified_program()?;
         let program = stratified_program.magic_sets_rewrite(tx)?;
         let compiled = tx.stratified_magic_compile(program)?;
+        for adv in collect_missing_index_advisories(&compiled, tx.keyed_access) {
+            crate::runtime::diagnostics::emit("query.missing_index", adv.message, adv.hint);
+        }
 
         // poison terminates queries early: on `::kill` (its flag) or when the
         // effective wall-clock deadline passes (mnestic fork, query budget).
@@ -4627,6 +4640,209 @@ impl Poison {
             mem,
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct MissingIndexAdvisory {
+    message: String,
+    hint: String,
+}
+
+fn stored_handle_of(ra: &RelAlgebra) -> Option<&RelationHandle> {
+    match ra {
+        RelAlgebra::Stored(r) => Some(&r.storage),
+        RelAlgebra::StoredWithValidity(r) => Some(&r.storage),
+        RelAlgebra::StoredBitemporal(r) => Some(&r.storage),
+        _ => None,
+    }
+}
+
+fn col_name_at(handle: &RelationHandle, pos: usize) -> Option<&str> {
+    if pos < handle.metadata.keys.len() {
+        Some(handle.metadata.keys[pos].name.as_str())
+    } else {
+        handle
+            .metadata
+            .non_keys
+            .get(pos - handle.metadata.keys.len())
+            .map(|c| c.name.as_str())
+    }
+}
+
+fn is_temporal_col(handle: &RelationHandle, pos: usize) -> bool {
+    handle.metadata.keys.get(pos).is_some_and(|k| {
+        matches!(
+            k.typing.coltype,
+            crate::data::relation::ColType::Validity | crate::data::relation::ColType::TxTime
+        )
+    })
+}
+
+fn build_missing_index_advisory(
+    rule_name: &str,
+    op: &str,
+    handle: &RelationHandle,
+    positions: &[usize],
+) -> Option<MissingIndexAdvisory> {
+    if handle.is_temp || handle.name.starts_with('_') || handle.name.contains(':') {
+        return None;
+    }
+    let mut bound_cols: Vec<String> = Vec::new();
+    for &pos in positions {
+        if let Some(name) = col_name_at(handle, pos) {
+            if !bound_cols.iter().any(|c| c == name) {
+                bound_cols.push(name.to_string());
+            }
+        }
+    }
+    if bound_cols.is_empty() {
+        return None;
+    }
+    let message = format!(
+        "missing index on relation '{}' for bound column(s) [{}] in rule '{}': \
+         falling back to full-relation scan ({})",
+        handle.name,
+        bound_cols.join(", "),
+        rule_name,
+        op
+    );
+    let binds_temporal = positions.iter().any(|&p| is_temporal_col(handle, p));
+    let hint = if handle.has_txtime() {
+        "bind a leading primary-key prefix (secondary indexes are not yet supported on TxTime relations)".to_string()
+    } else if positions.contains(&0) || binds_temporal {
+        "bind a contiguous leading primary-key prefix or filter after a keyed lookup \
+         (a secondary index is not selected when primary-key column 0 or a temporal column is bound)"
+            .to_string()
+    } else {
+        let mut suggested_cols = bound_cols.clone();
+        for key in &handle.metadata.keys {
+            if matches!(
+                key.typing.coltype,
+                crate::data::relation::ColType::Validity | crate::data::relation::ColType::TxTime
+            ) {
+                continue;
+            }
+            if !suggested_cols.iter().any(|c| c == key.name.as_str()) {
+                suggested_cols.push(key.name.to_string());
+            }
+        }
+        let idx_name = format!("by_{}", bound_cols.join("_"));
+        format!(
+            "create a secondary index covering the lookup, e.g. `::index create {}:{} {{{}}}`",
+            handle.name,
+            idx_name,
+            suggested_cols.join(", ")
+        )
+    };
+    Some(MissingIndexAdvisory { message, hint })
+}
+
+/// Detect joins against stored relations that bind column(s) not covered by any
+/// primary-key prefix or secondary index, causing a silent full-relation scan
+/// (`stored_mat_join` / `stored_neg_mat_join` / `stored_bt_mat_join` /
+/// `stored_vld_neg_mat_join` / `stored_bt_neg_mat_join`) (E8).
+fn collect_missing_index_advisories(
+    strata: &[CompiledProgram],
+    keyed_access: bool,
+) -> Vec<MissingIndexAdvisory> {
+    let mut seen: BTreeSet<(String, String, Vec<usize>)> = BTreeSet::new();
+    let mut out = Vec::new();
+    for p in strata {
+        for (rule_name, v) in p {
+            let CompiledRuleSet::Rules(rules) = v else {
+                continue;
+            };
+            let rule_label = rule_name.to_string();
+            for CompiledRule { relation, .. } in rules {
+                let mut stack = vec![relation];
+                while let Some(rel) = stack.pop() {
+                    match rel {
+                        RelAlgebra::Join(inner) => {
+                            if inner.left.is_unit() {
+                                stack.push(&inner.right);
+                                continue;
+                            }
+                            stack.push(&inner.left);
+                            stack.push(&inner.right);
+                            if inner.joiner.right_keys.is_empty() {
+                                continue;
+                            }
+                            let op = inner.join_type(keyed_access);
+                            if matches!(op, "stored_mat_join" | "stored_bt_mat_join") {
+                                if let Some(handle) = stored_handle_of(&inner.right) {
+                                    if let Ok((_, positions)) = inner.joiner.join_indices(
+                                        &inner.left.bindings_after_eliminate(),
+                                        &inner.right.bindings_after_eliminate(),
+                                    ) {
+                                        let key = (
+                                            rule_label.clone(),
+                                            handle.name.to_string(),
+                                            positions.clone(),
+                                        );
+                                        if seen.insert(key) {
+                                            if let Some(adv) = build_missing_index_advisory(
+                                                &rule_label,
+                                                op,
+                                                handle,
+                                                &positions,
+                                            ) {
+                                                out.push(adv);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        RelAlgebra::NegJoin(inner) => {
+                            stack.push(&inner.left);
+                            stack.push(&inner.right);
+                            if inner.joiner.right_keys.is_empty() {
+                                continue;
+                            }
+                            let op = inner.join_type(keyed_access);
+                            if matches!(
+                                op,
+                                "stored_neg_mat_join"
+                                    | "stored_vld_neg_mat_join"
+                                    | "stored_bt_neg_mat_join"
+                            ) {
+                                if let Some(handle) = stored_handle_of(&inner.right) {
+                                    if let Ok((_, positions)) = inner.joiner.join_indices(
+                                        &inner.left.bindings_after_eliminate(),
+                                        &inner.right.bindings_after_eliminate(),
+                                    ) {
+                                        let key = (
+                                            rule_label.clone(),
+                                            handle.name.to_string(),
+                                            positions.clone(),
+                                        );
+                                        if seen.insert(key) {
+                                            if let Some(adv) = build_missing_index_advisory(
+                                                &rule_label,
+                                                op,
+                                                handle,
+                                                &positions,
+                                            ) {
+                                                out.push(adv);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        RelAlgebra::Reorder(r) => stack.push(&r.relation),
+                        RelAlgebra::Filter(f) => stack.push(&f.parent),
+                        RelAlgebra::Unification(u) => stack.push(&u.parent),
+                        RelAlgebra::HnswSearch(s) => stack.push(&s.parent),
+                        RelAlgebra::FtsSearch(s) => stack.push(&s.parent),
+                        RelAlgebra::LshSearch(s) => stack.push(&s.parent),
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 pub(crate) fn seconds_since_the_epoch() -> Result<f64> {

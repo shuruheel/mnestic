@@ -150,3 +150,118 @@ fn rust_accessor_matches_sysop() {
         via_sysop.rows.last().unwrap()[1].get_str().unwrap()
     );
 }
+
+#[test]
+fn missing_index_surfaced_in_explain_and_warnings_and_clears_when_indexed() {
+    let (_d, db) = db();
+    run(&db, ":create edge { src: String, dst: String }");
+    run(
+        &db,
+        "?[src, dst] <- [['e1', 'e2'], ['e3', 'e2']] :put edge { src, dst }",
+    );
+    run(&db, "::warnings clear");
+
+    // Binding the non-leading key column `dst` without a reverse index forces a
+    // full-relation scan (`stored_mat_join`).
+    let q = "?[src] := dst = 'e2', *edge{ src, dst }";
+    let plan = run(&db, &format!("::explain {{ {q} }}"));
+    let has_advisory = plan.rows.iter().any(|row| {
+        row[4].get_str() == Some("missing_index_advisory")
+            && row[7]
+                .get_str()
+                .is_some_and(|s| s.contains("edge") && s.contains("dst") && s.contains("::index create"))
+    });
+    assert!(
+        has_advisory,
+        "expected missing_index_advisory in ::explain, got: {:?}",
+        plan.rows
+    );
+
+    // Executing the query records `query.missing_index` in `::warnings`.
+    let rows = run(&db, q);
+    assert_eq!(rows.rows.len(), 2);
+    let w = run(&db, "::warnings");
+    assert!(
+        codes(&w).iter().any(|c| c == "query.missing_index"),
+        "expected query.missing_index in {w:?}"
+    );
+    let hint = w
+        .rows
+        .iter()
+        .find(|r| r[1].get_str() == Some("query.missing_index"))
+        .unwrap()[3]
+        .get_str()
+        .unwrap();
+    assert!(
+        hint.contains("::index create edge:by_dst"),
+        "hint should suggest the missing index: {hint}"
+    );
+
+    // Creating the reverse index eliminates both the explain advisory and warning.
+    run(&db, "::index create edge:by_dst { dst, src }");
+    run(&db, "::warnings clear");
+    let plan_after = run(&db, &format!("::explain {{ {q} }}"));
+    assert!(
+        !plan_after
+            .rows
+            .iter()
+            .any(|row| row[4].get_str() == Some("missing_index_advisory")),
+        "advisory should disappear once indexed: {:?}",
+        plan_after.rows
+    );
+    let rows_after = run(&db, q);
+    assert_eq!(rows_after.rows.len(), 2);
+    let w_after = run(&db, "::warnings");
+    assert!(
+        !codes(&w_after).iter().any(|c| c == "query.missing_index"),
+        "warning should not fire once indexed: {w_after:?}"
+    );
+}
+
+#[test]
+fn missing_index_covers_neg_join_and_avoids_broken_hint_on_txtime() {
+    let (_d, db) = db();
+    run(&db, ":create edge { src: String, dst: String }");
+    run(
+        &db,
+        ":create bt { k: String, vt: Validity, tx: TxTime => v: String }",
+    );
+    run(&db, "?[src, dst] <- [['a', 'b']] :put edge { src, dst }");
+    run(
+        &db,
+        "?[k, vt, v] <- [['k1', 'ASSERT', 'v1']] :put bt { k, vt => v }",
+    );
+
+    // Negated join on unindexed `dst` surfaces advisory + actionable hint.
+    let neg_q = "?[x] := x = 'b', not *edge{ dst: x }";
+    let neg_plan = run(&db, &format!("::explain {{ {neg_q} }}"));
+    assert!(
+        neg_plan.rows.iter().any(|r| {
+            r[4].get_str() == Some("missing_index_advisory")
+                && r[7].get_str().is_some_and(|s| {
+                    s.contains("stored_neg_mat_join") && s.contains("::index create edge:by_dst")
+                })
+        }),
+        "expected missing_index_advisory on negated full scan: {:?}",
+        neg_plan.rows
+    );
+
+    // Bitemporal (`TxTime`) full scan surfaces advisory without suggesting `::index create`.
+    let bt_q = "?[k] := v = 'v1', *bt{ k, v @ 'NOW' }";
+    let bt_plan = run(&db, &format!("::explain {{ {bt_q} }}"));
+    let bt_adv = bt_plan
+        .rows
+        .iter()
+        .find(|r| r[4].get_str() == Some("missing_index_advisory"))
+        .and_then(|r| r[7].get_str())
+        .unwrap_or_else(|| {
+            panic!(
+                "expected missing_index_advisory for TxTime scan: {:?}",
+                bt_plan.rows
+            )
+        });
+    assert!(
+        !bt_adv.contains("::index create"),
+        "TxTime advisory must not suggest unsupported ::index create: {bt_adv}"
+    );
+}
