@@ -41,9 +41,22 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-use miette::{ensure, Result};
+use miette::{bail, ensure, Result};
+use ndarray::Array1;
+use ordered_float::OrderedFloat;
 
-use crate::data::value::DataValue;
+use crate::data::program::{FtsScoreKind, FtsSearch, HnswSearch};
+use crate::data::relation::ColType;
+use crate::data::symb::Symbol;
+use crate::data::value::{DataValue, Vector};
+use crate::fts::indexing::FtsCache;
+use crate::parse::SourceSpan;
+use crate::runtime::db::{Db, Poison};
+use crate::runtime::diagnostics::{self, QueryWarning};
+use crate::runtime::relation::{AccessLevel, InsufficientAccessLevel, RelationHandle};
+use crate::runtime::transact::SessionTx;
+use crate::storage::Storage;
+use crate::NamedRows;
 
 /// Diversity-aware rerank applied after fusion (Maximal Marginal Relevance).
 #[derive(Clone, Debug)]
@@ -198,6 +211,22 @@ pub struct GraphLeg {
     /// `"ok == 1"`. **Spliced verbatim — not sanitized.** `None` with a
     /// `gate_relation` = bare row-presence admits.
     pub admit: Option<String>,
+    /// Optional bridge/mapping relation resolving reached graph nodes
+    /// (including `seeds` at hop 0) to target item ids (e.g. an entity→chunk
+    /// `mention` relation). When set, intermediate graph nodes never enter
+    /// fusion — only mapped target ids do, scored by the minimum hop/cost of
+    /// any linking node.
+    pub target_relation: Option<String>,
+    /// Column in [`GraphLeg::target_relation`] matching traversed graph nodes.
+    /// Required iff `target_relation` is `Some`.
+    pub target_node_col: Option<String>,
+    /// Column in [`GraphLeg::target_relation`] holding the target item id.
+    /// Required iff `target_relation` is `Some`.
+    pub target_id_col: Option<String>,
+    /// Optional per-leg candidate cap (must be `>= 1`), matching `vector_k`
+    /// and `fts_k`. Truncates the leg's ranked list ordered by ascending
+    /// distance/cost then ascending item id before RRF fusion.
+    pub limit: Option<usize>,
 }
 
 impl Default for GraphLeg {
@@ -218,6 +247,10 @@ impl Default for GraphLeg {
             gate_relation: None,
             gate_cols: Vec::new(),
             admit: None,
+            target_relation: None,
+            target_node_col: None,
+            target_id_col: None,
+            limit: None,
         }
     }
 }
@@ -401,6 +434,33 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
             g.max_hops >= 1,
             "hybrid_search: graph_legs.max_hops must be >= 1"
         );
+        if let Some(lim) = g.limit {
+            ensure!(
+                lim >= 1,
+                "hybrid_search: graph_legs.limit must be >= 1"
+            );
+        }
+        match &g.target_relation {
+            Some(tr) => {
+                validate_ident(tr, "graph_legs.target_relation")?;
+                let nc = g.target_node_col.as_deref().unwrap_or("");
+                ensure!(
+                    !nc.is_empty(),
+                    "hybrid_search: graph_legs.target_relation needs target_node_col"
+                );
+                validate_ident(nc, "graph_legs.target_node_col")?;
+                let ic = g.target_id_col.as_deref().unwrap_or("");
+                ensure!(
+                    !ic.is_empty(),
+                    "hybrid_search: graph_legs.target_relation needs target_id_col"
+                );
+                validate_ident(ic, "graph_legs.target_id_col")?;
+            }
+            None => ensure!(
+                g.target_node_col.is_none() && g.target_id_col.is_none(),
+                "hybrid_search: target_node_col/target_id_col need a target_relation"
+            ),
+        }
         if g.max_nodes.is_none() {
             // Recursive mode: budgeted-only fields set here would be silently
             // meaningless — reject them loudly instead.
@@ -644,33 +704,59 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
                 writeln!(s, "hg{i}_seed[__s] := __s = ${pname}").unwrap();
                 params.insert(pname, seed.clone());
             }
-            // Hop 1: direct neighbours of the seeds.
-            writeln!(
-                s,
-                "hg{i}_reach[__to, min(__d)] := hg{i}_seed[__s], *{er}{{ {fc}: __s, {tc}: __to }}, __d = 1.0"
-            )
-            .unwrap();
-            if g.undirected {
-                writeln!(
-                    s,
-                    "hg{i}_reach[__to, min(__d)] := hg{i}_seed[__s], *{er}{{ {fc}: __to, {tc}: __s }}, __d = 1.0"
-                )
-                .unwrap();
-            }
-            // Hop n+1: expand only from nodes whose shortest distance is below the
-            // hop bound, so the recursion is capped at `max_hops`.
             let bound = fmt_f64(g.max_hops as f64);
-            writeln!(
-                s,
-                "hg{i}_reach[__to, min(__d)] := hg{i}_reach[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __mid, {tc}: __to }}, __d = __pd + 1.0"
-            )
-            .unwrap();
-            if g.undirected {
+            if let Some(tr) = &g.target_relation {
+                let nc = g.target_node_col.as_deref().unwrap();
+                let ic = g.target_id_col.as_deref().unwrap();
+                // Target-mapped mode: traverse graph nodes including seeds at
+                // distance 0.0, then map reached nodes to target item ids via
+                // `target_relation`, taking minimum hop per target item.
+                writeln!(s, "hg{i}_node[__n, min(__d)] := hg{i}_seed[__n], __d = 0.0").unwrap();
                 writeln!(
                     s,
-                    "hg{i}_reach[__to, min(__d)] := hg{i}_reach[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __to, {tc}: __mid }}, __d = __pd + 1.0"
+                    "hg{i}_node[__to, min(__d)] := hg{i}_node[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __mid, {tc}: __to }}, __d = __pd + 1.0"
                 )
                 .unwrap();
+                if g.undirected {
+                    writeln!(
+                        s,
+                        "hg{i}_node[__to, min(__d)] := hg{i}_node[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __to, {tc}: __mid }}, __d = __pd + 1.0"
+                    )
+                    .unwrap();
+                }
+                writeln!(
+                    s,
+                    "hg{i}_reach[id, min(__d)] := hg{i}_node[__n, __d], *{tr}{{ {nc}: __n, {ic}: id }}"
+                )
+                .unwrap();
+            } else {
+                // Hop 1: direct neighbours of the seeds.
+                writeln!(
+                    s,
+                    "hg{i}_reach[__to, min(__d)] := hg{i}_seed[__s], *{er}{{ {fc}: __s, {tc}: __to }}, __d = 1.0"
+                )
+                .unwrap();
+                if g.undirected {
+                    writeln!(
+                        s,
+                        "hg{i}_reach[__to, min(__d)] := hg{i}_seed[__s], *{er}{{ {fc}: __to, {tc}: __s }}, __d = 1.0"
+                    )
+                    .unwrap();
+                }
+                // Hop n+1: expand only from nodes whose shortest distance is below the
+                // hop bound, so the recursion is capped at `max_hops`.
+                writeln!(
+                    s,
+                    "hg{i}_reach[__to, min(__d)] := hg{i}_reach[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __mid, {tc}: __to }}, __d = __pd + 1.0"
+                )
+                .unwrap();
+                if g.undirected {
+                    writeln!(
+                        s,
+                        "hg{i}_reach[__to, min(__d)] := hg{i}_reach[__mid, __pd], __pd < {bound}, *{er}{{ {fc}: __to, {tc}: __mid }}, __d = __pd + 1.0"
+                    )
+                    .unwrap();
+                }
             }
         }
     }
@@ -704,13 +790,98 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         // the other legs' higher-is-better orientation; RRF only uses the
         // within-list rank.
         if g.max_nodes.is_some() {
-            // `__d > 0` excludes the seed roots from the fusion contribution:
-            // the seeds are the other legs' own candidates, and re-emitting
-            // them would double-count identity rather than measure proximity
-            // (the recursive mode's `not hg{i}_seed[id]`, expressed on depth).
+            if let Some(tr) = &g.target_relation {
+                let nc = g.target_node_col.as_deref().unwrap();
+                let ic = g.target_id_col.as_deref().unwrap();
+                writeln!(
+                    s,
+                    "hg{i}_mapped[id, min(__c)] := hg{i}_bt[__n, __c, _, _], *{tr}{{ {nc}: __n, {ic}: id }}"
+                )
+                .unwrap();
+                if let Some(lim) = g.limit {
+                    writeln!(
+                        s,
+                        "hg{i}_top[_, id, __c] <~ ReorderSort(hg{i}_mapped[id, __c], out: [id, __c], sort_by: [__c, id], take: {lim})"
+                    )
+                    .unwrap();
+                    writeln!(
+                        s,
+                        "combined[__lid, id, score] := hg{i}_top[_, id, __c], score = -__c, __lid = '{label}'",
+                        label = g.label,
+                    )
+                    .unwrap();
+                } else {
+                    writeln!(
+                        s,
+                        "combined[__lid, id, score] := hg{i}_mapped[id, __c], score = -__c, __lid = '{label}'",
+                        label = g.label,
+                    )
+                    .unwrap();
+                }
+            } else if let Some(lim) = g.limit {
+                writeln!(
+                    s,
+                    "hg{i}_cand[id, __c] := hg{i}_bt[id, __c, _, __d], __d > 0"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "hg{i}_top[_, id, __c] <~ ReorderSort(hg{i}_cand[id, __c], out: [id, __c], sort_by: [__c, id], take: {lim})"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "combined[__lid, id, score] := hg{i}_top[_, id, __c], score = -__c, __lid = '{label}'",
+                    label = g.label,
+                )
+                .unwrap();
+            } else {
+                // `__d > 0` excludes the seed roots from the fusion contribution:
+                // the seeds are the other legs' own candidates, and re-emitting
+                // them would double-count identity rather than measure proximity
+                // (the recursive mode's `not hg{i}_seed[id]`, expressed on depth).
+                writeln!(
+                    s,
+                    "combined[__lid, id, score] := hg{i}_bt[id, __c, _, __d], __d > 0, score = -__c, __lid = '{label}'",
+                    label = g.label,
+                )
+                .unwrap();
+            }
+        } else if g.target_relation.is_some() {
+            if let Some(lim) = g.limit {
+                writeln!(
+                    s,
+                    "hg{i}_top[_, id, __gd] <~ ReorderSort(hg{i}_reach[id, __gd], out: [id, __gd], sort_by: [__gd, id], take: {lim})"
+                )
+                .unwrap();
+                writeln!(
+                    s,
+                    "combined[__lid, id, score] := hg{i}_top[_, id, __gd], score = -__gd, __lid = '{label}'",
+                    label = g.label,
+                )
+                .unwrap();
+            } else {
+                writeln!(
+                    s,
+                    "combined[__lid, id, score] := hg{i}_reach[id, __gd], score = -__gd, __lid = '{label}'",
+                    label = g.label,
+                )
+                .unwrap();
+            }
+        } else if let Some(lim) = g.limit {
             writeln!(
                 s,
-                "combined[__lid, id, score] := hg{i}_bt[id, __c, _, __d], __d > 0, score = -__c, __lid = '{label}'",
+                "hg{i}_cand[id, __gd] := hg{i}_reach[id, __gd], not hg{i}_seed[id]"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "hg{i}_top[_, id, __gd] <~ ReorderSort(hg{i}_cand[id, __gd], out: [id, __gd], sort_by: [__gd, id], take: {lim})"
+            )
+            .unwrap();
+            writeln!(
+                s,
+                "combined[__lid, id, score] := hg{i}_top[_, id, __gd], score = -__gd, __lid = '{label}'",
                 label = g.label,
             )
             .unwrap();
@@ -738,7 +909,7 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
         .graph_legs
         .iter()
         .enumerate()
-        .filter(|(_, g)| g.max_nodes.is_some())
+        .filter(|(_, g)| g.max_nodes.is_some() && g.target_relation.is_none())
         .map(|(i, g)| (i, g.label.as_str()))
         .collect();
     let witness_head = !budgeted_labels.is_empty() && q.detailed;
@@ -851,6 +1022,643 @@ pub fn build_hybrid_query(q: &HybridSearch) -> Result<(String, BTreeMap<String, 
     }
 
     Ok((s, params))
+}
+
+fn is_temporal_relation(handle: &RelationHandle) -> bool {
+    handle
+        .metadata
+        .keys
+        .iter()
+        .any(|c| matches!(c.typing.coltype, ColType::TxTime | ColType::Validity))
+}
+
+fn find_column_index(handle: &RelationHandle, col: &str) -> Result<usize> {
+    if let Some(pos) = handle
+        .metadata
+        .keys
+        .iter()
+        .position(|c| c.name.as_str() == col)
+    {
+        return Ok(pos);
+    }
+    if let Some(pos) = handle
+        .metadata
+        .non_keys
+        .iter()
+        .position(|c| c.name.as_str() == col)
+    {
+        return Ok(handle.metadata.keys.len() + pos);
+    }
+    bail!(
+        "hybrid_search: column '{}' not found in relation '{}'",
+        col,
+        handle.name
+    )
+}
+
+enum EdgeLookupPlan {
+    /// Prefix scan on `handle` (either the base relation when `match_col == 0`
+    /// or a covering secondary index whose first key column is `match_col`),
+    /// reading the output column at `out_pos`.
+    Prefix {
+        handle: RelationHandle,
+        out_pos: usize,
+    },
+    /// Full scan fallback when no index leads with `match_col`.
+    FullScan {
+        handle: RelationHandle,
+        match_col: usize,
+        out_col: usize,
+    },
+}
+
+fn build_lookup_plan(
+    tx: &SessionTx<'_>,
+    handle: &RelationHandle,
+    match_col: usize,
+    out_col: usize,
+) -> Result<EdgeLookupPlan> {
+    if match_col == 0 {
+        return Ok(EdgeLookupPlan::Prefix {
+            handle: handle.clone(),
+            out_pos: out_col,
+        });
+    }
+    for (idx_handle, col_order) in handle.indices.values() {
+        if col_order.first() == Some(&match_col) {
+            if let Some(out_pos) = col_order.iter().position(|&c| c == out_col) {
+                if tx.effective_read_access_level(idx_handle)? >= AccessLevel::ReadOnly {
+                    return Ok(EdgeLookupPlan::Prefix {
+                        handle: idx_handle.clone(),
+                        out_pos,
+                    });
+                }
+            }
+        }
+    }
+    Ok(EdgeLookupPlan::FullScan {
+        handle: handle.clone(),
+        match_col,
+        out_col,
+    })
+}
+
+fn expand_neighbors(
+    tx: &SessionTx<'_>,
+    plan: &EdgeLookupPlan,
+    frontier: &[DataValue],
+    frontier_set: &BTreeSet<DataValue>,
+    poison: &Poison,
+    mut on_neighbor: impl FnMut(DataValue),
+) -> Result<()> {
+    match plan {
+        EdgeLookupPlan::Prefix { handle, out_pos } => {
+            let mut prefix = Vec::with_capacity(1);
+            for u in frontier {
+                poison.check()?;
+                prefix.clear();
+                prefix.push(u.clone());
+                for row in handle.scan_prefix(tx, &prefix) {
+                    let mut row = row?;
+                    if *out_pos < row.len() {
+                        on_neighbor(row.swap_remove(*out_pos));
+                    }
+                }
+            }
+        }
+        EdgeLookupPlan::FullScan {
+            handle,
+            match_col,
+            out_col,
+        } => {
+            for row in handle.scan_all(tx) {
+                poison.check()?;
+                let mut row = row?;
+                if *match_col < row.len()
+                    && *out_col < row.len()
+                    && frontier_set.contains(&row[*match_col])
+                {
+                    on_neighbor(row.swap_remove(*out_col));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct PreparedGraphLeg {
+    label: String,
+    seeds: Vec<DataValue>,
+    max_hops: usize,
+    forward: EdgeLookupPlan,
+    reverse: Option<EdgeLookupPlan>,
+    target: Option<EdgeLookupPlan>,
+    limit: Option<usize>,
+}
+
+fn run_graph_leg(
+    tx: &SessionTx<'_>,
+    leg: &PreparedGraphLeg,
+    poison: &Poison,
+) -> Result<Vec<(DataValue, DataValue)>> {
+    let mut visited: BTreeMap<DataValue, usize> = BTreeMap::new();
+    let mut frontier: Vec<DataValue> = Vec::with_capacity(leg.seeds.len());
+    for seed in &leg.seeds {
+        if visited.insert(seed.clone(), 0).is_none() {
+            frontier.push(seed.clone());
+        }
+    }
+    for hop in 1..=leg.max_hops {
+        if frontier.is_empty() {
+            break;
+        }
+        poison.check()?;
+        let need_set = matches!(leg.forward, EdgeLookupPlan::FullScan { .. })
+            || matches!(leg.reverse, Some(EdgeLookupPlan::FullScan { .. }));
+        let frontier_set: BTreeSet<DataValue> = if need_set {
+            frontier.iter().cloned().collect()
+        } else {
+            BTreeSet::new()
+        };
+        let mut next_frontier = Vec::new();
+        expand_neighbors(tx, &leg.forward, &frontier, &frontier_set, poison, |v| {
+            if !visited.contains_key(&v) {
+                visited.insert(v.clone(), hop);
+                next_frontier.push(v);
+            }
+        })?;
+        if let Some(rev) = &leg.reverse {
+            expand_neighbors(tx, rev, &frontier, &frontier_set, poison, |v| {
+                if !visited.contains_key(&v) {
+                    visited.insert(v.clone(), hop);
+                    next_frontier.push(v);
+                }
+            })?;
+        }
+        frontier = next_frontier;
+    }
+
+    let mut ranked: Vec<(DataValue, DataValue)> = if let Some(target_plan) = &leg.target {
+        let mut target_dist: BTreeMap<DataValue, usize> = BTreeMap::new();
+        match target_plan {
+            EdgeLookupPlan::Prefix { handle, out_pos } => {
+                let mut prefix = Vec::with_capacity(1);
+                for (node, &hop) in &visited {
+                    poison.check()?;
+                    prefix.clear();
+                    prefix.push(node.clone());
+                    for row in handle.scan_prefix(tx, &prefix) {
+                        let mut row = row?;
+                        if *out_pos < row.len() {
+                            let tid = row.swap_remove(*out_pos);
+                            target_dist
+                                .entry(tid)
+                                .and_modify(|d| {
+                                    if hop < *d {
+                                        *d = hop;
+                                    }
+                                })
+                                .or_insert(hop);
+                        }
+                    }
+                }
+            }
+            EdgeLookupPlan::FullScan {
+                handle,
+                match_col,
+                out_col,
+            } => {
+                for row in handle.scan_all(tx) {
+                    poison.check()?;
+                    let mut row = row?;
+                    if *match_col < row.len() && *out_col < row.len() {
+                        if let Some(&hop) = visited.get(&row[*match_col]) {
+                            let tid = row.swap_remove(*out_col);
+                            target_dist
+                                .entry(tid)
+                                .and_modify(|d| {
+                                    if hop < *d {
+                                        *d = hop;
+                                    }
+                                })
+                                .or_insert(hop);
+                        }
+                    }
+                }
+            }
+        }
+        target_dist
+            .into_iter()
+            .map(|(id, hop)| (id, DataValue::from(-(hop as f64))))
+            .collect()
+    } else {
+        visited
+            .into_iter()
+            .filter(|(_, hop)| *hop > 0)
+            .map(|(id, hop)| (id, DataValue::from(-(hop as f64))))
+            .collect()
+    };
+
+    if let Some(lim) = leg.limit {
+        // `ranked` already comes out of a BTreeMap (ascending `id`), so a
+        // stable descending sort on `score` (= `-hop`) breaks ties by
+        // ascending `id`, matching `ReorderSort(..., sort_by: [__gd, id])`.
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        ranked.truncate(lim);
+    }
+    Ok(ranked)
+}
+
+type LegOutput = Result<(String, Vec<(DataValue, DataValue)>, Vec<QueryWarning>)>;
+
+/// Direct native fast path for [`Db::hybrid_search`]: runs independent legs
+/// (HNSW, FTS, recursive graph legs) on one shared read-only snapshot — in
+/// parallel under `rayon` — and fuses them directly with exact RRF math,
+/// avoiding per-query CozoScript parsing, Datalog compilation, and serial
+/// leg evaluation.
+///
+/// Returns `Ok(None)` when the query uses `extra_lists`, `mmr`, budgeted
+/// graph legs (`max_nodes`), or temporal relations, letting the caller fall
+/// back cleanly to `build_hybrid_query` + `run_script`.
+pub(crate) fn execute_hybrid_native<'s, S: Storage<'s>>(
+    db: &'s Db<S>,
+    q: &HybridSearch,
+) -> Result<Option<NamedRows>> {
+    // Run the exact same validation contract as `build_hybrid_query`.
+    let _ = build_hybrid_query(q)?;
+
+    if !q.extra_lists.is_empty()
+        || q.mmr.is_some()
+        || q.graph_legs.iter().any(|g| g.max_nodes.is_some())
+    {
+        return Ok(None);
+    }
+
+    let poison = Poison {
+        deadline: db.effective_outer_deadline(None),
+        ..Default::default()
+    };
+    poison.check()?;
+
+    let tx = db.transact()?;
+    let base_handle = tx.get_relation_for_read(&q.relation, "hybrid_search")?;
+    if is_temporal_relation(&base_handle) {
+        return Ok(None);
+    }
+    let id_col_idx = find_column_index(&base_handle, &q.id_col)?;
+
+    let vec_plan = if let Some(vidx) = &q.vector_index {
+        let (idx_handle, manifest) = base_handle
+            .hnsw_indices
+            .get(vidx.as_str())
+            .ok_or_else(|| {
+                miette::miette!("HNSW index '{}:{}' not found", q.relation, vidx)
+            })?
+            .clone();
+        let access = tx.effective_read_access_level(&idx_handle)?;
+        if access < AccessLevel::ReadOnly {
+            bail!(InsufficientAccessLevel(
+                idx_handle.name.to_string(),
+                "hybrid_search".to_string(),
+                access
+            ));
+        }
+        let qvec = if q.vector_f64 {
+            Vector::F64(Array1::from_iter(q.query_vector.iter().map(|&f| f as f64)))
+        } else {
+            Vector::F32(Array1::from_vec(q.query_vector.clone()))
+        };
+        let cfg = HnswSearch {
+            base_handle: base_handle.clone(),
+            idx_handle,
+            manifest,
+            bindings: Vec::new(),
+            k: q.vector_k,
+            ef: q.ef,
+            query: Symbol::new("__qv", SourceSpan(0, 0)),
+            bind_field: None,
+            bind_field_idx: None,
+            bind_distance: Some(Symbol::new("__dist", SourceSpan(0, 0))),
+            bind_vector: None,
+            radius: None,
+            filter: None,
+            span: SourceSpan(0, 0),
+        };
+        Some((qvec, cfg))
+    } else {
+        None
+    };
+
+    let fts_plan = if let Some(fidx) = &q.fts_index {
+        let (idx_handle, manifest) = base_handle
+            .fts_indices
+            .get(fidx.as_str())
+            .ok_or_else(|| {
+                miette::miette!("FTS index '{}:{}' not found", q.relation, fidx)
+            })?
+            .clone();
+        let access = tx.effective_read_access_level(&idx_handle)?;
+        if access < AccessLevel::ReadOnly {
+            bail!(InsufficientAccessLevel(
+                idx_handle.name.to_string(),
+                "hybrid_search".to_string(),
+                access
+            ));
+        }
+        let tokenizer = tx.tokenizers.get(
+            &idx_handle.name,
+            &manifest.tokenizer,
+            &manifest.filters,
+        )?;
+        let cfg = FtsSearch {
+            base_handle: base_handle.clone(),
+            idx_handle,
+            manifest,
+            bindings: Vec::new(),
+            k: q.fts_k,
+            k1: 1.2,
+            b: 0.75,
+            query: Symbol::new("__qt", SourceSpan(0, 0)),
+            score_kind: FtsScoreKind::Bm25,
+            bind_score: Some(Symbol::new("score", SourceSpan(0, 0))),
+            bind_spans: None,
+            candidates: None,
+            filter: None,
+            span: SourceSpan(0, 0),
+        };
+        Some((cfg, tokenizer))
+    } else {
+        None
+    };
+
+    let mut graph_plans = Vec::with_capacity(q.graph_legs.len());
+    for g in &q.graph_legs {
+        let edge_handle = tx.get_relation_for_read(&g.edge_relation, "hybrid_search")?;
+        if is_temporal_relation(&edge_handle) {
+            return Ok(None);
+        }
+        let from_col = find_column_index(&edge_handle, &g.from_col)?;
+        let to_col = find_column_index(&edge_handle, &g.to_col)?;
+        let forward = build_lookup_plan(&tx, &edge_handle, from_col, to_col)?;
+        let reverse = if g.undirected {
+            Some(build_lookup_plan(&tx, &edge_handle, to_col, from_col)?)
+        } else {
+            None
+        };
+        let target = if let Some(tr) = &g.target_relation {
+            let target_handle = tx.get_relation_for_read(tr, "hybrid_search")?;
+            if is_temporal_relation(&target_handle) {
+                return Ok(None);
+            }
+            let nc = find_column_index(&target_handle, g.target_node_col.as_deref().unwrap())?;
+            let ic = find_column_index(&target_handle, g.target_id_col.as_deref().unwrap())?;
+            Some(build_lookup_plan(&tx, &target_handle, nc, ic)?)
+        } else {
+            None
+        };
+        graph_plans.push(PreparedGraphLeg {
+            label: g.label.clone(),
+            seeds: g.seeds.clone(),
+            max_hops: g.max_hops,
+            forward,
+            reverse,
+            target,
+            limit: g.limit,
+        });
+    }
+
+    let run_vec = |vec_plan: &(Vector, HnswSearch)| -> LegOutput {
+        let _ = diagnostics::drain();
+        let res = (|| {
+            poison.check()?;
+            let mut stack = Vec::new();
+            let rows = tx.hnsw_knn(vec_plan.0.clone(), &vec_plan.1, &None, &mut stack)?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id = row[id_col_idx].clone();
+                let dist = row
+                    .last()
+                    .and_then(|v| v.get_float())
+                    .ok_or_else(|| miette::miette!("hybrid_search: missing HNSW distance"))?;
+                out.push((id, DataValue::from(-dist)));
+            }
+            Ok(out)
+        })();
+        let warns = diagnostics::drain();
+        res.map(|items| ("semantic".to_string(), items, warns))
+    };
+
+    let run_fts = |fts_plan: &(FtsSearch, std::sync::Arc<crate::fts::tokenizer::TextAnalyzer>)| -> LegOutput {
+        let _ = diagnostics::drain();
+        let res = (|| {
+            poison.check()?;
+            let mut stack = Vec::new();
+            let mut cache = FtsCache::default();
+            let rows = tx.fts_search(
+                &q.query_text,
+                &fts_plan.0,
+                &None,
+                &fts_plan.1,
+                &mut stack,
+                &mut cache,
+            )?;
+            let mut out = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id = row[id_col_idx].clone();
+                let score = row
+                    .last()
+                    .cloned()
+                    .ok_or_else(|| miette::miette!("hybrid_search: missing FTS score"))?;
+                out.push((id, score));
+            }
+            Ok(out)
+        })();
+        let warns = diagnostics::drain();
+        res.map(|items| ("text".to_string(), items, warns))
+    };
+
+    let run_graph = |plan: &PreparedGraphLeg| -> LegOutput {
+        let _ = diagnostics::drain();
+        let res = run_graph_leg(&tx, plan, &poison);
+        let warns = diagnostics::drain();
+        res.map(|items| (plan.label.clone(), items, warns))
+    };
+
+    let total_legs =
+        usize::from(vec_plan.is_some()) + usize::from(fts_plan.is_some()) + graph_plans.len();
+
+    let mut leg_results: Vec<LegOutput> = Vec::with_capacity(total_legs);
+
+    #[cfg(feature = "rayon")]
+    {
+        if total_legs > 1 {
+            let mut vec_out: Option<LegOutput> = None;
+            let mut fts_out: Option<LegOutput> = None;
+            let mut graph_outs: Vec<Option<LegOutput>> =
+                (0..graph_plans.len()).map(|_| None).collect();
+            rayon::scope(|s| {
+                if let Some(vp) = &vec_plan {
+                    let slot = &mut vec_out;
+                    s.spawn(move |_| {
+                        *slot = Some(run_vec(vp));
+                    });
+                }
+                if let Some(fp) = &fts_plan {
+                    let slot = &mut fts_out;
+                    s.spawn(move |_| {
+                        *slot = Some(run_fts(fp));
+                    });
+                }
+                for (plan, slot) in graph_plans.iter().zip(graph_outs.iter_mut()) {
+                    s.spawn(move |_| {
+                        *slot = Some(run_graph(plan));
+                    });
+                }
+            });
+            if let Some(r) = vec_out {
+                leg_results.push(r);
+            }
+            if let Some(r) = fts_out {
+                leg_results.push(r);
+            }
+            for r in graph_outs.into_iter().flatten() {
+                leg_results.push(r);
+            }
+        } else {
+            if let Some(vp) = &vec_plan {
+                leg_results.push(run_vec(vp));
+            }
+            if let Some(fp) = &fts_plan {
+                leg_results.push(run_fts(fp));
+            }
+            for plan in &graph_plans {
+                leg_results.push(run_graph(plan));
+            }
+        }
+    }
+
+    #[cfg(not(feature = "rayon"))]
+    {
+        if let Some(vp) = &vec_plan {
+            leg_results.push(run_vec(vp));
+        }
+        if let Some(fp) = &fts_plan {
+            leg_results.push(run_fts(fp));
+        }
+        for plan in &graph_plans {
+            leg_results.push(run_graph(plan));
+        }
+    }
+
+    drop(tx);
+
+    // Flush any warnings captured on worker threads before returning errors or results.
+    let mut lists: Vec<(String, Vec<(DataValue, DataValue)>)> = Vec::with_capacity(leg_results.len());
+    let mut first_err: Option<miette::Report> = None;
+    for res in leg_results {
+        match res {
+            Ok((label, items, warns)) => {
+                for w in warns {
+                    db.record_warning(w);
+                }
+                lists.push((label, items));
+            }
+            Err(err) => {
+                if first_err.is_none() {
+                    first_err = Some(err);
+                }
+            }
+        }
+    }
+    db.flush_warnings();
+    if let Some(err) = first_err {
+        return Err(err);
+    }
+
+    // Exact Reciprocal Rank Fusion matching `ReciprocalRankFusion` (fixed_rule/utilities/rrf.rs).
+    let rrf_k = q.rrf_k.max(0.0);
+    let mut fused: BTreeMap<DataValue, f64> = BTreeMap::new();
+    let mut contribs: BTreeMap<DataValue, Vec<(String, f64, DataValue)>> = BTreeMap::new();
+    for (list_id, entries) in lists {
+        let mut best: BTreeMap<DataValue, DataValue> = BTreeMap::new();
+        for (item, score) in entries {
+            if let Some(f) = score.get_float() {
+                if !f.is_finite() {
+                    bail!("ReciprocalRankFusion: score (column 3) must be finite, got {f}");
+                }
+            }
+            match best.get_mut(&item) {
+                Some(cur) => {
+                    if score > *cur {
+                        *cur = score;
+                    }
+                }
+                None => {
+                    best.insert(item, score);
+                }
+            }
+        }
+        let mut ranked: Vec<(DataValue, DataValue)> = best.into_iter().collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1));
+        for (idx, (item, score)) in ranked.into_iter().enumerate() {
+            let rank = (idx + 1) as f64;
+            *fused.entry(item.clone()).or_insert(0.0) += 1.0 / (rrf_k + rank);
+            if q.detailed {
+                contribs
+                    .entry(item)
+                    .or_default()
+                    .push((list_id.clone(), rank, score));
+            }
+        }
+    }
+
+    let mut ordered: Vec<(DataValue, f64)> = fused.into_iter().collect();
+    ordered.sort_by(|a, b| {
+        OrderedFloat(b.1)
+            .cmp(&OrderedFloat(a.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    if q.detailed {
+        let cap = q.limit.saturating_mul(total_legs);
+        let mut rows = Vec::with_capacity(cap.min(ordered.len().saturating_mul(total_legs)));
+        for (item, score) in ordered {
+            let mut item_contribs = contribs.remove(&item).unwrap_or_default();
+            item_contribs.sort_by(|a, b| a.0.cmp(&b.0));
+            for (list_id, leg_rank, leg_score) in item_contribs {
+                if rows.len() >= cap {
+                    break;
+                }
+                rows.push(vec![
+                    item.clone(),
+                    DataValue::from(score),
+                    DataValue::from(list_id),
+                    DataValue::from(leg_rank),
+                    leg_score,
+                ]);
+            }
+            if rows.len() >= cap {
+                break;
+            }
+        }
+        Ok(Some(NamedRows::new(
+            vec![
+                "id".into(),
+                "score".into(),
+                "list_id".into(),
+                "leg_rank".into(),
+                "leg_score".into(),
+            ],
+            rows,
+        )))
+    } else {
+        ordered.truncate(q.limit);
+        let rows = ordered
+            .into_iter()
+            .map(|(id, score)| vec![id, DataValue::from(score)])
+            .collect();
+        Ok(Some(NamedRows::new(vec!["id".into(), "score".into()], rows)))
+    }
 }
 
 #[cfg(test)]
@@ -1119,6 +1927,38 @@ mod tests {
             ..Default::default()
         }))
         .contains("seeds is empty"));
+        // limit=0 rejected
+        assert!(err(&leg(GraphLeg {
+            edge_relation: "edges".into(),
+            seeds: vec![DataValue::from("n1")],
+            limit: Some(0),
+            ..Default::default()
+        }))
+        .contains("limit must be >= 1"));
+        // target_relation requires both target_node_col and target_id_col
+        assert!(err(&leg(GraphLeg {
+            edge_relation: "edges".into(),
+            seeds: vec![DataValue::from("n1")],
+            target_relation: Some("mention".into()),
+            ..Default::default()
+        }))
+        .contains("target_node_col"));
+        assert!(err(&leg(GraphLeg {
+            edge_relation: "edges".into(),
+            seeds: vec![DataValue::from("n1")],
+            target_relation: Some("mention".into()),
+            target_node_col: Some("eid".into()),
+            ..Default::default()
+        }))
+        .contains("target_id_col"));
+        // target_node_col/target_id_col without target_relation rejected
+        assert!(err(&leg(GraphLeg {
+            edge_relation: "edges".into(),
+            seeds: vec![DataValue::from("n1")],
+            target_node_col: Some("eid".into()),
+            ..Default::default()
+        }))
+        .contains("need a target_relation"));
 
         #[cfg(feature = "graph-algo")]
         {
