@@ -1809,7 +1809,17 @@ impl StoredRA {
             left_to_prefix_indices.push(left_join_indices[*idx]);
         }
 
-        if join_is_prefix(&right_join_indices) {
+        // Seek on the leading run and check every pair on each found row. The
+        // shared keyed-access rule also allows a full key plus value columns
+        // (`not *node{uid, tombstone_at: 0.0}`); `scan_prefix` truncates the
+        // seek to the key, so a full key is a single-row lookup.
+        if crate::query::keyed_access::stored_access(
+            &self.storage,
+            &right_join_indices,
+            &self.filters,
+            tx.keyed_access,
+        ) != crate::query::keyed_access::StoredAccess::Materialized
+        {
             Ok(Box::new(
                 left_iter
                     .map_ok(move |tuple| -> Result<Option<Tuple>> {
@@ -2383,7 +2393,7 @@ impl NegJoin {
         Ok(())
     }
 
-    pub(crate) fn join_type(&self) -> &str {
+    pub(crate) fn join_type(&self, keyed_access: bool) -> &str {
         match &self.right {
             RelAlgebra::TempStore(_) => {
                 let join_indices = self
@@ -2399,18 +2409,19 @@ impl NegJoin {
                     "mem_neg_mat_join"
                 }
             }
-            RelAlgebra::Stored(_) => {
-                let join_indices = self
+            RelAlgebra::Stored(r) => {
+                use crate::query::keyed_access::{stored_access, StoredAccess};
+                let (_, positions) = self
                     .joiner
                     .join_indices(
                         &self.left.bindings_after_eliminate(),
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_is_prefix(&join_indices.1) {
-                    "stored_neg_prefix_join"
-                } else {
-                    "stored_neg_mat_join"
+                match stored_access(&r.storage, &positions, &r.filters, keyed_access) {
+                    StoredAccess::Point => "stored_neg_point_join",
+                    StoredAccess::Prefix => "stored_neg_prefix_join",
+                    StoredAccess::Materialized => "stored_neg_mat_join",
                 }
             }
             RelAlgebra::StoredWithValidity(_) => {
