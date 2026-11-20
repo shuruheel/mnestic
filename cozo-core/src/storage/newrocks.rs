@@ -97,6 +97,10 @@ impl<'s> Storage<'s> for NewRocksDbStorage {
         "rocksdb"
     }
 
+    fn supports_concurrent_writers(&self) -> bool {
+        true
+    }
+
     fn transact(&'s self, write: bool) -> Result<Self::Tx> {
         // mnestic fork (0.12.1): a writing transaction takes a snapshot, so
         // conflict validation at commit is against the state the transaction

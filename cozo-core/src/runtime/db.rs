@@ -475,7 +475,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         payloads: Receiver<TransactionPayload>,
         results: Sender<Result<NamedRows>>,
     ) {
-        let mut admission_pinned = !self.db.supports_sst_ingest();
+        let mut admission_pinned = !self.db.supports_concurrent_writers();
         let mut writer_admission = match self.admit_writer(is_write && admission_pinned, &Poison::default()) {
             Ok(guard) => guard,
             Err(error) => { let _ = results.send(Err(error)); return; }
@@ -893,7 +893,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         worker: &crate::GovernedTransactionWorker,
     ) -> Result<()> {
         worker.poison.check()?;
-        let mut admission_pinned = !self.db.supports_sst_ingest();
+        let mut admission_pinned = !self.db.supports_concurrent_writers();
         let mut writer_admission = self.admit_writer(worker.write && admission_pinned, &worker.poison)?;
         let mut tx = if worker.write {
             self.transact_write()?
@@ -2164,7 +2164,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         if !write { return Ok(None); }
         #[cfg(feature = "test-hooks")]
         let admission = crate::measurement::Span::new("transaction_admission");
-        let guard = if self.db.supports_sst_ingest() {
+        let guard = if self.db.supports_concurrent_writers() {
             self.writer_admission.read_with_poison(poison)?
         } else {
             self.writer_admission.write_with_poison(poison)?
@@ -2174,11 +2174,12 @@ impl<'s, S: Storage<'s>> Db<S> {
         Ok(Some(guard))
     }
 
-    // Non-Rocks standalone operations already hold the single-writer gate.
-    // Rocks builders hold this only while obtaining their relation guards,
-    // never throughout backfill or the subsequent storage/TT critical section.
+    // Single-writer backends already hold the exclusive writer gate on
+    // standalone operations. Multi-writer backends hold this only while
+    // obtaining their relation guards, never throughout backfill or the
+    // subsequent storage/TT critical section.
     pub(crate) fn admit_relation_maintenance(&self, poison: &Poison) -> Result<Option<crate::runtime::relation_lock::RelationGuard<'_>>> {
-        if self.db.supports_sst_ingest() {
+        if self.db.supports_concurrent_writers() {
             #[cfg(feature = "test-hooks")]
             let admission = crate::measurement::Span::new("maintenance_admission");
             let guard = self.writer_admission.write_with_poison(poison)?;
@@ -3841,7 +3842,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             _ => {}
         }
         let writer_poison = Poison { deadline: outer_deadline, ..Default::default() };
-        let mut writer_admission = if self.db.supports_sst_ingest() { None }
+        let mut writer_admission = if self.db.supports_concurrent_writers() { None }
             else { self.admit_writer(!read_only, &writer_poison)? };
         if let Some(rows) = self.run_tt_index_op(&op, read_only, outer_deadline)? { return Ok(rows); }
         if let Some(rows) = self.run_tt_metadata_op(&op, read_only, outer_deadline)? { return Ok(rows); }
@@ -3881,7 +3882,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
             _ => false,
         };
-        if self.db.supports_sst_ingest() && !read_only {
+        if self.db.supports_concurrent_writers() && !read_only {
             writer_admission = if exclusive { self.admit_relation_maintenance(&writer_poison)? }
                 else { self.admit_writer(true, &writer_poison)? };
         }
@@ -3891,7 +3892,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             if exclusive { lock.write_with_poison(&admission_poison) }
             else { lock.read_with_poison(&admission_poison) }
         }).collect::<Result<Vec<_>>>()?;
-        if exclusive && self.db.supports_sst_ingest() { drop(writer_admission.take()); }
+        if exclusive && self.db.supports_concurrent_writers() { drop(writer_admission.take()); }
         let mut tx = if read_only {
             self.transact()?
         } else {

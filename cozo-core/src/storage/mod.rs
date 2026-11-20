@@ -56,6 +56,18 @@ pub trait Storage<'s>: Send + Sync + Clone {
         false
     }
 
+    /// Whether [`transact(true)`](Self::transact) allows multiple write
+    /// transactions to run concurrently without holding a store-wide exclusive
+    /// write lock. Backends that take a process-wide write lock for the entire
+    /// transaction (`mem`, `sqlite`) return `false` (the conservative default)
+    /// so writer admission serializes writers before they acquire relation
+    /// locks; multi-writer backends (`rocksdb`, `newrocksdb`, `sled`, `tikv`)
+    /// return `true` so writers take shared admission and only exclusive
+    /// maintenance drains them. (mnestic fork)
+    fn supports_concurrent_writers(&self) -> bool {
+        false
+    }
+
     /// Request that write transactions **fsync on commit** from now on (or stop
     /// doing so, with `false`). Returns `true` iff this backend honors the
     /// knob; the default implementation is a no-op returning `false`, so

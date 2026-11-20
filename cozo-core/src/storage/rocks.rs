@@ -357,6 +357,10 @@ impl Storage<'_> for RocksDbStorage {
         true
     }
 
+    fn supports_concurrent_writers(&self) -> bool {
+        true
+    }
+
     fn ingest_sorted<'a>(
         &'a self,
         entries: Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>,
