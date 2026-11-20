@@ -1,0 +1,117 @@
+{
+  "status": "host_preflight_blocked",
+  "performance_qualified": false,
+  "first_attempt": {
+    "artifact_root": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-phase3-20261114-v1",
+    "candidate_source": "2e6e4f8686cabd042d08b647bd7e7e5adf88e8b9",
+    "engine_source": "0cedce380a40280e27899b316968c48eff9afca5",
+    "baseline_source": "272c7b7196de9acd8d4aa66ec3e6e2f10f0057ea",
+    "builds": {
+      "candidate": {
+        "build_manifest_sha256": "33a92ca5b31d592e958dfeeb8cc47bc469a99a8c130c8ef766302cb481343cd9",
+        "executable_sha256": "1a28ebff66e7d9ec20243e65a2550925e582ab7b86b9c9a7a7b7f42b7ef39984"
+      },
+      "baseline": {
+        "build_manifest_sha256": "49747159497f178990f18196e6703ee2a2b3cd7f95a94c4de4d083c6b888648d",
+        "executable_sha256": "f2c4d2deb863e57eefaca85aede6d1c42e2b3250b5201cf1c479ac0052bf8c17"
+      }
+    },
+    "artifacts": {
+      "review-manifest.json": "72ab264b1e6de0b882a663df14dd4f71d04ee0fb344544fa6932137b7d274d6b",
+      "baseline-export.json": "a849384b95cb830af651b53d78d39dc1af104b86b7534c6163b557d0d765167c",
+      "baseline-export.patch": "9c11f677fe6f098ade4a9cd79c84f8256bd5b03bc83a34c6bf46b3b6ea115461",
+      "source-review-closure.json": "6d9632f510b136f121d042b180a5118645c4b0a71f77b2b0a831de79fcb5e7c3",
+      "runner-unit-tests-cardinality.log": "e8aa05d0343b3d75d15c7e974b3287bbaf3d2d197e264a82f496c3aea17145ea",
+      "runner-clippy.log": "cd021c74c66a60fb981cf66cdac07c7cd274a1d480b3f9c5ac8a4a1a058c7e36",
+      "python-phase3-provenance-tests.log": "a2770fe07bdbd3094acaf07c45a8fc8c422be97f1c278d4f707f7dc7ed580403",
+      "python-timing-tests.log": "73b2804c3624d19c8b330f45caf3a5dae09382cae81eab7dc5552c2962949cb4",
+      "python-original-controls-final.log": "d8381143c890cc7898aad0dfd760553517baf7baca13c3e195f0075553fe395b",
+      "final-smokes/completion.json": "1834da958690a28b24be2a22883388e4cb6b5b064a3a0e524fb34088f0153767",
+      "final-smokes-v2/completion.json": "9d7e4b683312a7832f1c0670c368135edf340718ae065d3aa86525a09ac5f1b3",
+      "snapshot-smokes/completion.json": "324ff00cd6d2df31629999288de0748c22528fb77002b9527cc44becae676729",
+      "controls/operator-stop.json": "e42ed44ee97546aadfb06e878eb40533befad1b73a091721a8eaf3d72fc51b59",
+      "controls/operator-stop-clarification.json": "eb6a27c3b22e70227f39f43ab3e9112d7ee218355f1acd9a16832a6db7c24350",
+      "controls/campaign-manifest.json": "181ad0ff998c3f2f26b8f763d1ebeaa5915bae9287ec50055c5d99b7176e0f16"
+    },
+    "source_review_passed": true,
+    "final_binary_readiness_passed": true,
+    "performance_qualified": false
+  },
+  "amended_attempt": {
+    "artifact_root": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-phase3-20261114-v2",
+    "candidate_source": "be394ba46624bfc6e6712803e7e6006f3fa3d799",
+    "controller_commit": "0e76f06fbc446985c388ab82e30691208f45f434",
+    "builds": {
+      "candidate": {
+        "build_manifest_sha256": "740555aaf220c68de3c5440ff66625442fd9fe1a7f328171d650d251ffa5d5d6",
+        "executable_sha256": "cb16af86ba89e114f1cf92d4628fef394a15f4239426a6294bc48ba45869603c"
+      },
+      "baseline": {
+        "build_manifest_sha256": "e0d515a46fe63d826fd35dab0192a8a37ea399fc16b9cb8b8110aeb4f3f1e70d",
+        "executable_sha256": "7dddcd960c46464004a80fdec8be6d85bee8893d3782d0b199ce563f528552ec"
+      }
+    },
+    "artifacts": {
+      "review-manifest.json": "ce76ddb5bb08ed1cb18bbfab2dcbf0f14d89023bf0e89b1eaf1b7b354cf430e6",
+      "baseline-export.json": "74781d2a36622c007ce33f91685ef6671cb881614b93cfe4a4937bec61746af8",
+      "baseline-export.patch": "5900eb4916bbe970dd0564e9fa08dc9e0247195f57a4ddd39c81640915301c97",
+      "source-review-closure.json": "ea94b05310125eec62195d21546165902c402819b3962feabf93959e5c5679d7",
+      "python-phase3-amendment-tests.log": "5282c6e95622a531efff6255bd017632a5eb1f36b0a6aa44a11eaf954bffe94e",
+      "candidate-build/build.json": "740555aaf220c68de3c5440ff66625442fd9fe1a7f328171d650d251ffa5d5d6",
+      "candidate-build/source-before.json": "6cc2516a7c58ee83dc6d6f4603a1d7b5e85c864cb9db8b2b09b83f76d006eff8",
+      "candidate-build/source-after.json": "6cc2516a7c58ee83dc6d6f4603a1d7b5e85c864cb9db8b2b09b83f76d006eff8",
+      "baseline-build/build.json": "e0d515a46fe63d826fd35dab0192a8a37ea399fc16b9cb8b8110aeb4f3f1e70d",
+      "baseline-build/source-before.json": "0d232f858c73af427c1bb7c65e610ccb8819ac9e75b4beddf2541193a05ac22f",
+      "baseline-build/source-after.json": "0d232f858c73af427c1bb7c65e610ccb8819ac9e75b4beddf2541193a05ac22f",
+      "final-smokes-v2/completion.json": "eea81261ecc6c429c2abdd4079abb9cfb3906cb414d0aaee5c2be3df62e8da55",
+      "snapshot-smokes/completion.json": "58f380ea70b046f4dd7af95e279ededb7b6066546342c052b264ae7b8b111d35",
+      "controls/campaign-manifest.json": "0603b22109f8b7977b3a86608797c539abb4d828186fedf8a7b35f748cd3ec18",
+      "controls/campaign-completion.json": "bc81e1e5015a22081368d06dc91434047bbe5c216f883459b1f62fd51b8fa3d0",
+      "controls/host-summary.json": "34a612fac3bbe4324c1769cf9d5d244d997bdea28b24a33846b931d529f03338",
+      "controls/baseline-sqlite-plain-read-block-00.preflight.jsonl": "aa53f40cc0cefcf4904059e87c11aaac277746a6e12630777dbb1a172fe8fe0f",
+      "controls/baseline-sqlite-plain-read-block-00.preflight-result.json": "eb5c943e7e01932dd50b19a8aef96d794254b3c9b3eab11e07fbc605234c10d0",
+      "admission-review.json": "d12799d3149945e9bcefc1646b4f3a614c91d8a7dadb4d6d3a1c0ca128192cec"
+    },
+    "completion": {
+      "accounted_elapsed_s": 421.3407951659756,
+      "all_recording_controls_passed": false,
+      "campaign_manifest_sha256": "0603b22109f8b7977b3a86608797c539abb4d828186fedf8a7b35f748cd3ec18",
+      "completed_blocks": 0,
+      "elapsed_s": 301.3407951659756,
+      "performance_qualified": false,
+      "phase": 3,
+      "prior_attempt_budget_seconds": 120,
+      "required_blocks": 180,
+      "scripts_and_protocol_unchanged": true,
+      "status": "incomplete",
+      "stop_reason": {
+        "block": 0,
+        "cell": "baseline-sqlite-plain-read",
+        "detail": {
+          "elapsed_s": 300.0101568340324,
+          "eligible": false,
+          "reason": "disk_limit"
+        },
+        "reason": "host_preflight"
+      },
+      "version": 1
+    },
+    "host_summary": {
+      "samples": 278,
+      "observed_sample_span_s": 299.41436974995304,
+      "reasons": {
+        "disk_limit": 278
+      },
+      "free_mib_min": 1518.27734375,
+      "free_mib_max": 1664.68359375,
+      "free_mib_final": 1642.0,
+      "swapouts_delta": 0,
+      "max_quiet_elapsed_s": 0,
+      "observations_with_busy_processes": 278,
+      "observations_with_native_processes": 11,
+      "observations_with_power_failure": 0
+    },
+    "final_binary_readiness_passed": true,
+    "admission_review_passed": true
+  }
+}

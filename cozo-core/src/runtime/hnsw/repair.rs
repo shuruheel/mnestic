@@ -415,12 +415,9 @@ impl SessionTx<'_> {
         rows: &[&Tuple],
     ) -> Result<()> {
         self.hnsw_mutations_incomplete += 1;
-        let mut cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
+        let mut cache = VectorCache::new(manifest.distance);
         for row in rows {
-            let key = row[..orig.metadata.keys.len()].to_vec();
+            let key = row[..orig.index_key_len()].to_vec();
             for &field in &manifest.vec_fields {
                 match &row[field] {
                     DataValue::Vec(v) => {
@@ -702,7 +699,7 @@ impl SessionTx<'_> {
         layer: i64,
         orig: &RelationHandle,
         table: &RelationHandle,
-        cache: &mut VectorCache,
+        cache: &mut VectorCache<'_, '_>,
     ) -> Result<usize> {
         let mut rows_left = usize::MAX;
         let incident = match self.repair_neighbours_with_budget(table, layer, node, &mut rows_left)
@@ -850,7 +847,7 @@ impl SessionTx<'_> {
         manifest: &HnswIndexManifest,
         orig: &RelationHandle,
         table: &RelationHandle,
-        cache: &mut VectorCache,
+        cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let incident = self.repair_neighbours(table, layer, node)?;
         if incident.len() > MAX_NEIGHBOURS {
@@ -1247,10 +1244,7 @@ mod tests {
         let DataValue::Vec(v) = &row[1] else {
             unreachable!()
         };
-        let mut cache = VectorCache {
-            cache: Default::default(),
-            distance: manifest.distance,
-        };
+        let mut cache = VectorCache::new(manifest.distance);
         tx.hnsw_put_vector(&row, v, 1, -1, &manifest, &orig, &table, &mut cache)
             .unwrap();
         for id in 0..6 {
@@ -1386,10 +1380,7 @@ mod tests {
             }
         }
         manifest.m_max0 = 2;
-        let mut cache = VectorCache {
-            cache: Default::default(),
-            distance: manifest.distance,
-        };
+        let mut cache = VectorCache::new(manifest.distance);
         tx.hnsw_remove_vec(
             &[DataValue::from(0)],
             1,

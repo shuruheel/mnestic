@@ -35,6 +35,24 @@ provenance and licensing.
   drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
   a build before 0.13.0 (`f125fbd2`) can hold such IDs.
 
+### Added — current-belief search on transaction-time relations
+
+- FTS, HNSW and LSH indexes can be created on tt-only relations. Index identity
+  uses logical keys; corrections, retractions, imports and evictions maintain
+  the current belief atomically with the base rows. Historical base reads
+  remain available; historical search fails with `search::as_of_unsupported`.
+- RocksDB builds and rebuilds use private generations, a pinned snapshot and a
+  bounded touched-key log; publication catches up concurrent commits before
+  attaching the generation. Mem and SQLite use their existing single-writer
+  transaction model. Failed rebuilds preserve the attached generation.
+- TxTime index/catalog DDL must be standalone. The tt column cannot appear in
+  indexed fields, extractors or filters. Eviction of an indexed relation is
+  limited to 1,000 logical keys per command. Bitemporal search and B-tree
+  indexes remain deferred.
+- Qualification is in progress: correctness coverage is recorded in the two
+  `txtime_*` integration suites; the specification's performance release gates
+  must pass before release acceptance.
+
 ### Changed — HNSW & FTS query latency (E6, E7) and missing-index diagnostic (E8)
 
 - **Lazy error-key formatting on value-blob decoding (`runtime/relation.rs`).**
@@ -95,7 +113,33 @@ provenance and licensing.
   residual equality checks in `filters/expr`.
 - Differential coverage is in `tests/keyed_access.rs` under `test-hooks`;
   existing planner and recursive-workload shape baselines remain unchanged.
-  Performance qualification and RocksDB validation are still pending.
+  Memory, SQLite and RocksDB differential checks pass. Performance
+  qualification remains pending; see
+  [implementation evidence](docs/reviews/keyed-txtime-implementation.md).
+
+### Fixed — maintenance admission under sustained writes
+
+- Queue maintenance fairly and cancel expired admission requests without
+  stranding later work. Resolve multiple relation guards in canonical order.
+- Drain native-lock-owning writers before maintenance takes relation guards;
+  release global admission before maintenance storage work. Buffered TT-only
+  multi-transactions retain their ability to span index attachment and rebuild.
+- Regression coverage includes governed writers, index publication, eviction,
+  caller deadlines and cancellation. Performance qualification remains pending.
+
+### Added — internal keyed/TxTime timing harness
+
+- `test-hooks` instrumentation records compile-excluded execution, commits,
+  direct TxTime section waits/holds and detached index-build phases. A bounded
+  thread-local trace preserves errors and reports overflow.
+- A development-only runner validates a batched T2 comparator, concurrent
+  writers, build phase coverage and recording overhead. Source/binary manifests,
+  resource logs and fail-closed reports support later qualification; no release
+  performance acceptance is claimed. See
+  [harness evidence](docs/reviews/keyed-txtime-timing-harness.md).
+- Sustained-writer development checks now complete after the admission fix.
+  The replacement recording-cost campaign failed its gate; qualification and
+  merge remain blocked. [Results](docs/reviews/keyed-txtime-admission.md).
 
 ## 0.19.4 — 2026-11-15
 

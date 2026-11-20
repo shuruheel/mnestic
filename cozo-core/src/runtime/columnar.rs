@@ -358,9 +358,14 @@ impl<'s, S: Storage<'s>> Db<S> {
             .into());
         }
 
+        let admission_poison = crate::runtime::db::Poison { deadline, ..Default::default() };
+        let _writer_admission = self.admit_writer(true, &admission_poison).or_else(|error| { check_deadline(deadline)?; Err(error) })?;
         let relation_name = SmartString::from(relation);
         let locks = self.obtain_relation_locks(std::iter::once(&relation_name));
-        let _guards = locks.iter().map(|lock| lock.read().unwrap()).collect_vec();
+        let _guards = locks.iter().map(|lock| lock.read_with_poison(&admission_poison)
+            .map_err(|error| if deadline.is_some_and(|d| Instant::now() >= d) {
+                ColumnarError::Timeout.into()
+            } else { error })).collect::<Result<Vec<_>>>()?;
         let mut tx = self.transact_write()?;
         let handle = tx.get_relation(relation, false)?;
 

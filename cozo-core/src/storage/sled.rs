@@ -48,6 +48,10 @@ impl Storage<'_> for SledStorage {
         "sled"
     }
 
+    fn supports_concurrent_writers(&self) -> bool {
+        true
+    }
+
     fn transact(&self, _write: bool) -> Result<Self::Tx> {
         Ok(SledTx {
             db: self.db.clone(),

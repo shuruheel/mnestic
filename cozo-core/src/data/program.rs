@@ -1028,9 +1028,27 @@ fn apply_as_of_default(
             .map(|h| h.has_txtime())
             .unwrap_or(false)
     }
-    fn walk(atom: &mut InputAtom, t: ValidityTs, tx: &SessionTx<'_>, applied: &mut bool) {
+    fn unsupported(name: &str) -> miette::Report {
+        #[derive(Debug, Error, Diagnostic)]
+        #[error("historical search on transaction-time index {0} is not supported")]
+        #[diagnostic(code(search::as_of_unsupported))]
+        struct HistoricalSearchUnsupported(String);
+        HistoricalSearchUnsupported(name.to_string()).into()
+    }
+    fn reject_index(name: &Symbol, tx: &SessionTx<'_>, applied: &mut bool) -> Result<()> {
+        if let Some((base, _)) = name.name.split_once(':') {
+            if tx.get_relation(base, false).is_ok_and(|h| h.has_txtime())
+                && tx.get_relation(name, false).is_ok() {
+                *applied = true;
+                return Err(unsupported(&name.name));
+            }
+        }
+        Ok(())
+    }
+    fn walk(atom: &mut InputAtom, t: ValidityTs, tx: &SessionTx<'_>, applied: &mut bool) -> Result<()> {
         match atom {
             InputAtom::Relation { inner } => {
+                reject_index(&inner.name, tx, applied)?;
                 if is_tt_stamped(&inner.name, tx) {
                     *applied = true;
                     if inner.tx_valid_at.is_none() {
@@ -1039,6 +1057,7 @@ fn apply_as_of_default(
                 }
             }
             InputAtom::NamedFieldRelation { inner } => {
+                reject_index(&inner.name, tx, applied)?;
                 if is_tt_stamped(&inner.name, tx) {
                     *applied = true;
                     if inner.tx_valid_at.is_none() {
@@ -1046,23 +1065,27 @@ fn apply_as_of_default(
                     }
                 }
             }
-            InputAtom::Negation { inner, .. } => walk(inner, t, tx, applied),
+            InputAtom::Negation { inner, .. } => walk(inner, t, tx, applied)?,
             InputAtom::Conjunction { inner, .. } | InputAtom::Disjunction { inner, .. } => {
                 for a in inner {
-                    walk(a, t, tx, applied);
+                    walk(a, t, tx, applied)?;
                 }
             }
-            InputAtom::Rule { .. }
-            | InputAtom::Predicate { .. }
-            | InputAtom::Unification { .. }
-            | InputAtom::Search { .. } => {}
+            InputAtom::Search { inner } => {
+                if is_tt_stamped(&inner.relation, tx) {
+                    *applied = true;
+                    return Err(unsupported(&inner.relation.name));
+                }
+            }
+            InputAtom::Rule { .. } | InputAtom::Predicate { .. } | InputAtom::Unification { .. } => {}
         }
+        Ok(())
     }
     match rules_or_fixed {
         InputInlineRulesOrFixed::Rules { rules } => {
             for rule in rules {
                 for atom in rule.body.iter_mut() {
-                    walk(atom, t, tx, applied);
+                    walk(atom, t, tx, applied)?;
                 }
             }
         }
@@ -1075,6 +1098,7 @@ fn apply_as_of_default(
                     | FixedRuleArg::NamedStored {
                         name, tx_valid_at, ..
                     } => {
+                        reject_index(name, tx, applied)?;
                         if is_tt_stamped(name, tx) {
                             *applied = true;
                             if tx_valid_at.is_none() {

@@ -61,6 +61,10 @@ impl Storage<'_> for TiKvStorage {
         "tikv"
     }
 
+    fn supports_concurrent_writers(&self) -> bool {
+        true
+    }
+
     fn transact(&self, _write: bool) -> Result<Self::Tx> {
         let tx = if self.optimistic {
             RT.block_on(self.client.begin_optimistic())

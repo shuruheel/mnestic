@@ -864,7 +864,7 @@ impl<'a> SessionTx<'a> {
                 slice.iter().map(|(k, _)| k.as_slice()).collect();
             crate::fts::FTS_BASE_ROW_FETCHES
                 .with(|count| count.set(count.get() + need as u64));
-            let base_rows = config.base_handle.get_batch(self, &key_slices)?;
+            let base_rows = config.base_handle.get_current_batch(self, &key_slices)?;
             for ((_, hit), row_opt) in slice.iter().zip(base_rows) {
                 let Some(mut cand_tuple) = row_opt else {
                     dangling += 1;
@@ -1009,9 +1009,9 @@ impl<'a> SessionTx<'a> {
             collector.insert(text);
             count += 1;
         }
-        let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
+        let mut key = Vec::with_capacity(1 + rel_handle.index_key_len());
         key.push(DataValue::Bot);
-        for k in &tuple[..rel_handle.metadata.keys.len()] {
+        for k in &tuple[..rel_handle.index_key_len()] {
             key.push(k.clone());
         }
         // Maintain doc stats only if this document is actually indexed (probe
@@ -1090,9 +1090,9 @@ pub(crate) fn encode_fts_rows_for_tuple(
         position.push(DataValue::from(token.position as i64));
         count += 1;
     }
-    let mut key = Vec::with_capacity(1 + rel_handle.metadata.keys.len());
+    let mut key = Vec::with_capacity(1 + rel_handle.index_key_len());
     key.push(DataValue::Bot);
-    for k in &tuple[..rel_handle.metadata.keys.len()] {
+    for k in &tuple[..rel_handle.index_key_len()] {
         key.push(k.clone());
     }
     let mut val = vec![

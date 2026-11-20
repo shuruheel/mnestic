@@ -1,0 +1,360 @@
+{
+  "purpose": "development diagnostic",
+  "performance_qualified": false,
+  "raw_root": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-diagnostics-20261114-v1",
+  "artifact_index_sha256": "76da66b94401963fb12aa1ec2c750febb1a10a2b5794a1d241d4cb26b288f33d",
+  "indexed_artifacts": 58,
+  "source_head": "dbc3a608f848f426616843114bdfb11f829855e8",
+  "source_patch_sha256": "ec306824a525cec8839c0ca479891119a9ca5af20cb968121465849465bbc5cc",
+  "executable_sha256": "a15ca0e79a021411a6aa2f637bcbb68d45623787770342bbfc3c419d3281c16d",
+  "native": {
+    "ROCKSDB_LIB_DIR": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-diagnostics-20261114-v1/native",
+    "ROCKSDB_INCLUDE_DIR": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-diagnostics-20261114-v1/native/include",
+    "ROCKSDB_STATIC": "1",
+    "librocksdb_sha256": "e637ca1e5c7b73a5a1a8609f36ba4186d15b98d6e860c2cbeb3506aa1afbe043",
+    "headers_sha256": "6970f49bbbfb89327b7edb6e312a3f093759b33728311006a22e8885ee955a1d"
+  },
+  "validation": {
+    "rust_measurement_tests_passed": 6,
+    "python_tests_passed": 11,
+    "strict_clippy": "passed",
+    "rocksdb_without_test_hooks": "passed",
+    "format_and_diff_checks": "passed"
+  },
+  "independent_reviews": {
+    "contract": "Source review accepted diagnostic guard lifetimes, cfg exclusion and conservative pre-unlock timestamp.",
+    "experiment": "Independent review accepted protocol, reporting correction and raw-result claims. Background CPU limitation retained; qualification remains disabled."
+  },
+  "runs": {
+    "sustained": {
+      "plan_sha256": "5499bf0d78b6ec6093612022123c396c1af943bd0e1358fb2935b633d8f5438c",
+      "analysis": {
+        "cell": "build_fts",
+        "ddl_ns": 19931573000,
+        "ddl_shared_guard_covered_fraction": 1.0,
+        "ddl_status": "error",
+        "interpretation": "development diagnostic; phase envelopes are not acquired critical sections",
+        "phases": [
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 276,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": false,
+            "duration_ns": 19931434208,
+            "phase": "build_reservation",
+            "read_admission_envelope_overlaps": 272,
+            "scripts_inflight": 276
+          }
+        ],
+        "relation_write_waits": [
+          {
+            "completed": false,
+            "duration_ns": 19931394959,
+            "shared_guard_covered_fraction": 1.0,
+            "shared_guard_covered_ns": 19931394959
+          }
+        ],
+        "shared_guard_basis": "admission-end to commit-end when available; otherwise commit interval",
+        "writer_errors": 4,
+        "writer_operations": 280
+      },
+      "report": {
+        "status": "incomplete",
+        "development_only": true,
+        "operations": 284,
+        "missing_operations": 4,
+        "unexpected_operations": 0,
+        "duplicate_operation_ids": 0,
+        "errors": 5,
+        "oracle_or_trace_failures": 5,
+        "malformed": [],
+        "build_schedule_failures": [
+          "build_fts/1",
+          "build_fts/2",
+          "build_fts/3",
+          "build_fts/4"
+        ],
+        "overhead_pairs_observed": 0,
+        "overhead_pairs_valid": 0,
+        "overhead_estimate_valid": false,
+        "overhead_p50_ratio": null,
+        "overhead_median_paired_delta_ns": null,
+        "overhead_by_writer": {},
+        "phase_coverage": {
+          "build_fts/4294967296/build_reservation": {
+            "writer_attempts_overlapping": 276,
+            "acquired_section_overlaps": null,
+            "potential_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": true
+          }
+        },
+        "performance_qualified": false
+      },
+      "completion": {
+        "exit_code": 1,
+        "stop_reason": null,
+        "elapsed_s": 21.913327250047587,
+        "performance_qualified": false
+      }
+    },
+    "drained": {
+      "plan_sha256": "67ad3461ee553357c4b773f5acc727fcc59fa620e5e4444c6c1c690ddde9f87c",
+      "analysis": {
+        "cell": "build_fts",
+        "ddl_ns": 2091068750,
+        "ddl_shared_guard_covered_fraction": 0.9979982724145249,
+        "ddl_status": "ok",
+        "interpretation": "development diagnostic; phase envelopes are not acquired critical sections",
+        "phases": [
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 39,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": true,
+            "duration_ns": 2087600167,
+            "phase": "build_reservation",
+            "read_admission_envelope_overlaps": 37,
+            "scripts_inflight": 40
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 37333,
+            "phase": "build_registration",
+            "read_admission_envelope_overlaps": 0,
+            "scripts_inflight": 0
+          },
+          {
+            "acquired_tt_sections": 0,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": null,
+            "commit_wait_potential_section_overlaps": null,
+            "completed": true,
+            "duration_ns": 3223958,
+            "phase": "build_backfill",
+            "read_admission_envelope_overlaps": 0,
+            "scripts_inflight": 0
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 3375,
+            "phase": "build_catchup",
+            "read_admission_envelope_overlaps": 0,
+            "scripts_inflight": 0
+          },
+          {
+            "acquired_tt_sections": 1,
+            "commit_wait_envelope_overlaps": 0,
+            "commit_wait_guaranteed_section_overlaps": 0,
+            "commit_wait_potential_section_overlaps": 0,
+            "completed": true,
+            "duration_ns": 108166,
+            "phase": "build_publication",
+            "read_admission_envelope_overlaps": 0,
+            "scripts_inflight": 0
+          }
+        ],
+        "relation_write_waits": [
+          {
+            "completed": true,
+            "duration_ns": 2087487417,
+            "shared_guard_covered_fraction": 0.9996786605780053,
+            "shared_guard_covered_ns": 2086816625
+          },
+          {
+            "completed": true,
+            "duration_ns": 333,
+            "shared_guard_covered_fraction": 0.0,
+            "shared_guard_covered_ns": 0
+          }
+        ],
+        "shared_guard_basis": "admission-end to commit-end when available; otherwise commit interval",
+        "writer_errors": 0,
+        "writer_operations": 49
+      },
+      "report": {
+        "status": "complete",
+        "development_only": true,
+        "operations": 57,
+        "missing_operations": 0,
+        "unexpected_operations": 0,
+        "duplicate_operation_ids": 0,
+        "errors": 1,
+        "oracle_or_trace_failures": 0,
+        "malformed": [],
+        "build_schedule_failures": [],
+        "overhead_pairs_observed": 0,
+        "overhead_pairs_valid": 0,
+        "overhead_estimate_valid": false,
+        "overhead_p50_ratio": null,
+        "overhead_median_paired_delta_ns": null,
+        "overhead_by_writer": {},
+        "phase_coverage": {
+          "build_fts/4294967296/build_reservation": {
+            "writer_attempts_overlapping": 39,
+            "acquired_section_overlaps": null,
+            "potential_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": true
+          },
+          "build_fts/4294967296/build_registration": {
+            "writer_attempts_overlapping": 0,
+            "acquired_section_overlaps": 0,
+            "potential_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false
+          },
+          "build_fts/4294967296/build_backfill": {
+            "writer_attempts_overlapping": 0,
+            "acquired_section_overlaps": null,
+            "potential_section_overlaps": null,
+            "coverage_basis": "phase_envelope",
+            "covered": false
+          },
+          "build_fts/4294967296/build_catchup": {
+            "writer_attempts_overlapping": 0,
+            "acquired_section_overlaps": 0,
+            "potential_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false
+          },
+          "build_fts/4294967296/build_publication": {
+            "writer_attempts_overlapping": 0,
+            "acquired_section_overlaps": 0,
+            "potential_section_overlaps": 0,
+            "coverage_basis": "acquired_tt_section",
+            "covered": false
+          }
+        },
+        "performance_qualified": false
+      },
+      "completion": {
+        "exit_code": 0,
+        "stop_reason": null,
+        "elapsed_s": 3.1235038329614326,
+        "performance_qualified": false
+      }
+    }
+  },
+  "existing_data_reanalysis": {
+    "fts-starvation-reanalysis": {
+      "cell": "build_fts",
+      "ddl_ns": 59887736916,
+      "ddl_shared_guard_covered_fraction": 1.0,
+      "ddl_status": "error",
+      "interpretation": "development diagnostic; phase envelopes are not acquired critical sections",
+      "phases": [],
+      "relation_write_waits": [],
+      "shared_guard_basis": "admission-end to commit-end when available; otherwise commit interval",
+      "writer_errors": 4,
+      "writer_operations": 582
+    },
+    "hnsw-coverage-reanalysis": {
+      "cell": "build_hnsw",
+      "ddl_ns": 387854792,
+      "ddl_shared_guard_covered_fraction": 0.030859487227890173,
+      "ddl_status": "ok",
+      "interpretation": "development diagnostic; phase envelopes are not acquired critical sections",
+      "phases": [
+        {
+          "acquired_tt_sections": 1,
+          "commit_wait_envelope_overlaps": 0,
+          "commit_wait_guaranteed_section_overlaps": null,
+          "commit_wait_potential_section_overlaps": 0,
+          "completed": true,
+          "duration_ns": 13250,
+          "phase": "build_registration",
+          "read_admission_envelope_overlaps": 0,
+          "scripts_inflight": 0
+        },
+        {
+          "acquired_tt_sections": 0,
+          "commit_wait_envelope_overlaps": 8,
+          "commit_wait_guaranteed_section_overlaps": null,
+          "commit_wait_potential_section_overlaps": null,
+          "completed": true,
+          "duration_ns": 16212417,
+          "phase": "build_backfill",
+          "read_admission_envelope_overlaps": 0,
+          "scripts_inflight": 8
+        },
+        {
+          "acquired_tt_sections": 1,
+          "commit_wait_envelope_overlaps": 0,
+          "commit_wait_guaranteed_section_overlaps": null,
+          "commit_wait_potential_section_overlaps": 0,
+          "completed": true,
+          "duration_ns": 359838958,
+          "phase": "build_catchup",
+          "read_admission_envelope_overlaps": 0,
+          "scripts_inflight": 4
+        },
+        {
+          "acquired_tt_sections": 1,
+          "commit_wait_envelope_overlaps": 1,
+          "commit_wait_guaranteed_section_overlaps": null,
+          "commit_wait_potential_section_overlaps": 0,
+          "completed": true,
+          "duration_ns": 371404250,
+          "phase": "build_publication",
+          "read_admission_envelope_overlaps": 0,
+          "scripts_inflight": 5
+        }
+      ],
+      "relation_write_waits": [],
+      "shared_guard_basis": "admission-end to commit-end when available; otherwise commit interval",
+      "writer_errors": 0,
+      "writer_operations": 20
+    },
+    "overhead-reanalysis": {
+      "bootstrap": {
+        "draws": 10000,
+        "paired_round_block_size": 10,
+        "seed": 20261114
+      },
+      "estimates": {
+        "0.5": {
+          "off_ns": 382924875,
+          "on_ns": 413836250,
+          "percentile_95_interval": [
+            0.9612839382469828,
+            1.1384462467435221
+          ],
+          "ratio": 1.0807243849070918
+        },
+        "0.99": {
+          "off_ns": 806769708,
+          "on_ns": 781552458,
+          "percentile_95_interval": [
+            0.9507863505527722,
+            1.073562328811424
+          ],
+          "ratio": 0.968742938970138
+        }
+      },
+      "limitation": "Exploratory single-trajectory analysis; mutations and index histories differ between conditions. Not an isolated instrumentation-cost estimate.",
+      "pairs": 100,
+      "quantiles": "nearest rank",
+      "round_statistic": "max(end_ns)-min(start_ns), all four writers",
+      "rounds_with_rank_changes": 99,
+      "writer_finish_rank_changes": 316,
+      "writer_pairs": 400
+    }
+  },
+  "limitations": [
+    "Single development fixture; no release acceptance or production starvation fix.",
+    "Native archive compiled at -O0; both cells used the same binary.",
+    "Background fileproviderd exceeded 100% CPU in 12/21 sustained and 1/3 drained samples.",
+    "Old overhead arms used different mutations and evolving state; reanalysis cannot isolate instrumentation cost."
+  ]
+}

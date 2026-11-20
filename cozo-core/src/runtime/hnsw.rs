@@ -94,12 +94,54 @@ mod distance_order_tests {
     }
 }
 
-struct VectorCache {
-    cache: FxHashMap<CompoundKey, Vector>,
-    distance: HnswDistance,
+pub(crate) struct VectorCache<'r, 's> {
+    pub(crate) cache: FxHashMap<CompoundKey, Vector>,
+    pub(crate) distance: HnswDistance,
+    pub(crate) base_tx: Option<&'r SessionTx<'s>>,
 }
 
-impl VectorCache {
+impl VectorCache<'static, 'static> {
+    pub(crate) fn new(distance: HnswDistance) -> Self {
+        Self {
+            cache: FxHashMap::default(),
+            distance,
+            base_tx: None,
+        }
+    }
+}
+
+impl<'r, 's> VectorCache<'r, 's> {
+    pub(crate) fn with_base_tx(distance: HnswDistance, base_tx: &'r SessionTx<'s>) -> Self {
+        Self {
+            cache: FxHashMap::default(),
+            distance,
+            base_tx: Some(base_tx),
+        }
+    }
+    pub(crate) fn seed_row(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig: &RelationHandle,
+        row: &Tuple,
+    ) {
+        let key = row[..orig.index_key_len()].to_vec();
+        for &field in &manifest.vec_fields {
+            match &row[field] {
+                DataValue::Vec(v) => {
+                    self.cache.insert((key.clone(), field, -1), v.clone());
+                }
+                DataValue::List(values) => {
+                    for (sub, value) in values.iter().enumerate() {
+                        if let DataValue::Vec(v) = value {
+                            self.cache
+                                .insert((key.clone(), field, sub as i32), v.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     fn insert(&mut self, k: CompoundKey, v: Vector) {
         self.cache.insert(k, v);
     }
@@ -250,7 +292,11 @@ impl VectorCache {
         tx: &SessionTx<'_>,
     ) -> Result<()> {
         if !self.cache.contains_key(key) {
-            match handle.get(tx, &key.0)? {
+            let found = match self.base_tx {
+                Some(base_tx) => handle.get_current(base_tx, &key.0)?,
+                None => handle.get_current(tx, &key.0)?,
+            };
+            match found {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
                 None => bail!("Cannot find compound key for HNSW: {:?}", key),
             }
@@ -279,7 +325,10 @@ impl VectorCache {
             return self.ensure_key(missing[0], handle, tx);
         }
         let key_slices: Vec<&[DataValue]> = missing.iter().map(|k| k.0.as_slice()).collect();
-        let tuples = handle.get_batch(tx, &key_slices)?;
+        let tuples = match self.base_tx {
+            Some(base_tx) => handle.get_current_batch(base_tx, &key_slices)?,
+            None => handle.get_current_batch(tx, &key_slices)?,
+        };
         for (key, tuple) in missing.iter().zip(tuples) {
             match tuple {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
@@ -364,9 +413,9 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
-        let tuple_key = &tuple[..orig_table.metadata.keys.len()];
+        let tuple_key = &tuple[..orig_table.index_key_len()];
         let inserted_key = (tuple_key.to_vec(), idx, subidx);
         vec_cache.insert(inserted_key.clone(), q.clone());
         let hash = q.get_hash();
@@ -399,9 +448,9 @@ impl<'a> SessionTx<'a> {
             let ep = ep?;
             // bottom level since we are going up
             let bottom_level = ep[0].get_int().unwrap();
-            let ep_t_key = ep[1..orig_table.metadata.keys.len() + 1].to_vec();
-            let ep_idx = ep[orig_table.metadata.keys.len() + 1].get_int().unwrap() as usize;
-            let ep_subidx = ep[orig_table.metadata.keys.len() + 2].get_int().unwrap() as i32;
+            let ep_t_key = ep[1..orig_table.index_key_len() + 1].to_vec();
+            let ep_idx = ep[orig_table.index_key_len() + 1].get_int().unwrap() as usize;
+            let ep_subidx = ep[orig_table.index_key_len() + 2].get_int().unwrap() as i32;
             let ep_key = (ep_t_key, ep_idx, ep_subidx);
             vec_cache.ensure_key(&ep_key, orig_table, self)?;
             let ep_distance = vec_cache.v_dist(q, &ep_key);
@@ -433,7 +482,7 @@ impl<'a> SessionTx<'a> {
                     vec_cache,
                 )?;
             }
-            let mut self_tuple_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+            let mut self_tuple_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
             self_tuple_key.push(DataValue::from(0));
             for _ in 0..2 {
                 self_tuple_key.extend_from_slice(tuple_key);
@@ -483,7 +532,7 @@ impl<'a> SessionTx<'a> {
 
                 // add bidirectional links
                 for (neighbour, Reverse(OrderedFloat(dist))) in neighbours.iter() {
-                    let mut out_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                    let mut out_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                     let out_val = vec![
                         DataValue::from(*dist),
                         DataValue::Null,
@@ -502,7 +551,7 @@ impl<'a> SessionTx<'a> {
                         idx_table.encode_val_only_for_store(&out_val, Default::default())?;
                     self.idx_put(idx_table, &out_key_bytes, &out_val_bytes)?;
 
-                    let mut in_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                    let mut in_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                     let in_val = vec![
                         DataValue::from(*dist),
                         DataValue::Null,
@@ -530,7 +579,7 @@ impl<'a> SessionTx<'a> {
                 for (neighbour, _) in neighbours.iter() {
                     // shrink links if necessary
                     let mut target_self_key =
-                        Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                        Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                     target_self_key.push(DataValue::from(current_level));
                     for _ in 0..2 {
                         target_self_key.extend_from_slice(&neighbour.0);
@@ -627,7 +676,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         idx_table: &RelationHandle,
         orig_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<(usize, bool)> {
         vec_cache.ensure_key(target_key, orig_table, self)?;
         let vec = vec_cache.get_key(target_key).clone();
@@ -701,7 +750,7 @@ impl<'a> SessionTx<'a> {
         let kept_inserted = new_candidate_set.contains(inserted);
         for (new, Reverse(OrderedFloat(new_dist))) in new_candidates {
             if !old_candidate_set.contains(&new) {
-                let mut new_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                let mut new_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                 let new_val = vec![
                     DataValue::from(new_dist),
                     DataValue::Null,
@@ -722,7 +771,7 @@ impl<'a> SessionTx<'a> {
         }
         for (old, OrderedFloat(old_dist)) in candidates {
             if !new_candidate_set.contains(&old) {
-                let mut old_key = Vec::with_capacity(orig_table.metadata.keys.len() * 2 + 5);
+                let mut old_key = Vec::with_capacity(orig_table.index_key_len() * 2 + 5);
                 old_key.push(DataValue::from(level));
                 old_key.extend_from_slice(&target_key.0);
                 old_key.push(DataValue::from(target_key.1 as i64));
@@ -768,7 +817,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         idx_table: &RelationHandle,
         orig_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>> {
         let mut candidates = PriorityQueue::new();
         // Simple non-heuristic selection
@@ -836,7 +885,7 @@ impl<'a> SessionTx<'a> {
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
         found_nn: &mut PriorityQueue<CompoundKey, OrderedFloat<f64>>,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let q_norm_sq = match vec_cache.distance {
             HnswDistance::Cosine => match q {
@@ -1027,7 +1076,7 @@ impl<'a> SessionTx<'a> {
         let mut target_key = vec![DataValue::Null];
         let mut canary_key = vec![DataValue::from(1)];
         for _ in 0..2 {
-            for i in 0..orig_table.metadata.keys.len() {
+            for i in 0..orig_table.index_key_len() {
                 target_key.push(tuple.get(i).unwrap().clone());
                 canary_key.push(DataValue::Null);
             }
@@ -1074,12 +1123,8 @@ impl<'a> SessionTx<'a> {
         // Steady-state path (single upsert): a fresh per-call cache, because a
         // batch can update a vector that is also some other row's neighbour, and
         // a cache shared across the batch could then serve a stale vector.
-        let mut vec_cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
-        self.hnsw_mutations_incomplete += 1;
-        let result = self.hnsw_put_inner(
+        let mut vec_cache = VectorCache::new(manifest.distance);
+        self.hnsw_put_with_cache(
             manifest,
             orig_table,
             idx_table,
@@ -1087,6 +1132,45 @@ impl<'a> SessionTx<'a> {
             stack,
             tuple,
             &mut vec_cache,
+        )
+    }
+
+    pub(crate) fn hnsw_put_with_cache(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        filter: Option<&Vec<Bytecode>>,
+        stack: &mut Vec<DataValue>,
+        tuple: &[DataValue],
+        vec_cache: &mut VectorCache<'_, '_>,
+    ) -> Result<bool> {
+        self.hnsw_mutations_incomplete += 1;
+        let result = self.hnsw_put_inner(
+            manifest, orig_table, idx_table, filter, stack, tuple, vec_cache,
+        );
+        if result.is_ok() {
+            self.hnsw_mutations_incomplete -= 1;
+        }
+        result
+    }
+
+    pub(crate) fn hnsw_remove_with_cache(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        tuple: &[DataValue],
+        vec_cache: &mut VectorCache<'_, '_>,
+    ) -> Result<()> {
+        self.hnsw_mutations_incomplete += 1;
+        let result = self.hnsw_remove_except(
+            manifest,
+            orig_table,
+            idx_table,
+            tuple,
+            &FxHashSet::default(),
+            vec_cache,
         );
         if result.is_ok() {
             self.hnsw_mutations_incomplete -= 1;
@@ -1111,7 +1195,7 @@ impl<'a> SessionTx<'a> {
     ) -> Result<()> {
         use crate::runtime::hnsw_build::{build_threads, FlatHnswBuilder, NodeMeta};
 
-        let key_len = orig_table.metadata.keys.len();
+        let key_len = orig_table.index_key_len();
         let mut builder = FlatHnswBuilder::new(manifest);
         let mut stack = vec![];
         for tuple in tuples {
@@ -1251,7 +1335,7 @@ impl<'a> SessionTx<'a> {
         filter: Option<&Vec<Bytecode>>,
         stack: &mut Vec<DataValue>,
         tuple: &[DataValue],
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<bool> {
         if let Some(code) = filter {
             if !eval_bytecode_pred(code, tuple, stack, Default::default())? {
@@ -1294,10 +1378,7 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         tuple: &[DataValue],
     ) -> Result<()> {
-        let mut cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
+        let mut cache = VectorCache::new(manifest.distance);
         self.hnsw_mutations_incomplete += 1;
         let result = self.hnsw_remove_except(
             manifest,
@@ -1320,15 +1401,15 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         tuple: &[DataValue],
         keep: &FxHashSet<(usize, i32)>,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let mut prefix = vec![DataValue::from(0)];
-        prefix.extend_from_slice(&tuple[0..orig_table.metadata.keys.len()]);
+        prefix.extend_from_slice(&tuple[0..orig_table.index_key_len()]);
         let candidates: FxHashSet<_> = idx_table
             .scan_prefix(self, &prefix)
             .map(|t| {
                 let t = t?;
-                let key_len = orig_table.metadata.keys.len();
+                let key_len = orig_table.index_key_len();
                 if t.len() < key_len + 3 {
                     bail!(
                         "corrupt HNSW self-row: expected at least {} fields, got {}",
@@ -1363,7 +1444,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let compound_key = (tuple_key.to_vec(), idx, subidx);
         // Go down the layers and remove all the links
@@ -1485,7 +1566,7 @@ impl<'a> SessionTx<'a> {
                 .next();
             let mut canary_key = vec![DataValue::from(1)];
             for _ in 0..2 {
-                for _ in 0..orig_table.metadata.keys.len() {
+                for _ in 0..orig_table.index_key_len() {
                     canary_key.push(DataValue::Null);
                 }
                 canary_key.push(DataValue::Null);
@@ -1531,10 +1612,7 @@ impl<'a> SessionTx<'a> {
             (Vector::F64(v), VecElementType::F32) => Vector::F32(v.mapv(|x| x as f32)),
         };
 
-        let mut vec_cache = VectorCache {
-            cache: Default::default(),
-            distance: config.manifest.distance,
-        };
+        let mut vec_cache = VectorCache::new(config.manifest.distance);
 
         let ep_res = config
             .idx_handle
@@ -1548,15 +1626,15 @@ impl<'a> SessionTx<'a> {
         if let Some(ep) = ep_res {
             let ep = ep?;
             let bottom_level = ep[0].get_int().unwrap();
-            let ep_idx = match ep[config.base_handle.metadata.keys.len() + 1].get_int() {
+            let ep_idx = match ep[config.base_handle.index_key_len() + 1].get_int() {
                 Some(x) => x as usize,
                 None => {
                     // this occurs if the index is empty
                     return Ok(vec![]);
                 }
             };
-            let ep_t_key = ep[1..config.base_handle.metadata.keys.len() + 1].to_vec();
-            let ep_subidx = ep[config.base_handle.metadata.keys.len() + 2]
+            let ep_t_key = ep[1..config.base_handle.index_key_len() + 1].to_vec();
+            let ep_subidx = ep[config.base_handle.index_key_len() + 2]
                 .get_int()
                 .unwrap() as i32;
             let ep_key = (ep_t_key, ep_idx, ep_subidx);
@@ -1608,7 +1686,7 @@ impl<'a> SessionTx<'a> {
 
             let key_slices: Vec<&[DataValue]> =
                 selected.iter().map(|(k, _)| k.0.as_slice()).collect();
-            let base_rows = config.base_handle.get_batch(self, &key_slices)?;
+            let base_rows = config.base_handle.get_current_batch(self, &key_slices)?;
 
             let mut ret = Vec::with_capacity(config.k.min(selected.len()));
             for ((cand_key, distance), base_row) in selected.into_iter().zip(base_rows) {
@@ -1658,7 +1736,7 @@ impl<'a> SessionTx<'a> {
         config: &HnswSearch,
         filter_bytecode: &Option<(Vec<Bytecode>, SourceSpan)>,
         stack: &mut Vec<DataValue>,
-        vec_cache: &VectorCache,
+        vec_cache: &VectorCache<'_, '_>,
     ) -> Result<Option<Vec<Tuple>>> {
         let index_filter = match &config.manifest.index_filter {
             Some(f_code) => {
@@ -1674,8 +1752,8 @@ impl<'a> SessionTx<'a> {
         };
         type Ranked = (OrderedFloat<f64>, Tuple, usize, i32);
         let mut best: std::collections::BinaryHeap<(Ranked, Tuple)> = Default::default();
-        let n_keys = config.base_handle.metadata.keys.len();
-        for (scanned, row) in config.base_handle.scan_all(self).enumerate() {
+        let n_keys = config.base_handle.index_key_len();
+        for (scanned, row) in config.base_handle.scan_current(self).enumerate() {
             if scanned >= FILTERED_EXACT_MAX_ROWS {
                 crate::runtime::diagnostics::emit(
                     "hnsw.filtered_incomplete",
@@ -1902,10 +1980,7 @@ mod tests {
 
     #[test]
     fn cosine_f32_self_distance_is_zero_and_symmetric() {
-        let vc = VectorCache {
-            cache: Default::default(),
-            distance: HnswDistance::Cosine,
-        };
+        let vc = VectorCache::new(HnswDistance::Cosine);
         let v1 = Vector::F32(Array1::from_vec(
             (0..384).map(|i| ((i as f32) * 0.137).sin() + 0.01).collect(),
         ));

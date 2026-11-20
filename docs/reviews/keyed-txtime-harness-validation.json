@@ -1,0 +1,491 @@
+{
+  "artifact_index_sha256": "aca69541edfa2d8248d54ba949eabf45b256073ba47314ff1d415ab10ffdd12e",
+  "artifact_root": "/Users/shuruheel/Code/mindgraph/benchmark-artifacts/keyed-txtime-harness-20261114-v1",
+  "baseline_build": "093e6f3bcbe359f436ae8f4de2dd30a30c911b3cd8d7cd294ad64072bea125f9",
+  "candidate_build": "6c6cb055d08b9f2729235de04ebb55e04018a5d639d011c53a9025aaee6f26cc",
+  "check_logs": {
+    "validation-clippy.log": "e7fd1ab2d6b5863381a72f4af2ec38b05d36472fab59d23cb089fd5e34bb3b1f",
+    "validation-engine-tests.log": "72dc395549e1f4bdaaf46e671d4e1b6cc3affabceeb02e52282a97ec3eee1ab5",
+    "validation-feature-off.log": "14492c9e0ef15500ec79d8ac86d5f91d93d15ef330129f56c8e471e8f5d30e69",
+    "validation-regressions.log": "0fffc189d47a836407a5c594310bc77855b82e461431d4918cd8070219ea3c46"
+  },
+  "purpose": "development conformance only",
+  "runs": {
+    "baseline-rocksdb-keyed": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 2,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 209,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 1.0024943937278226,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": 0.0,
+      "overhead_p50_ratio": 1.0024943937278226,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "baseline-rocksdb-plain": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 0,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 40,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "baseline-sqlite-keyed": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 2,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 209,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 0.986412167362738,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": -896.5,
+      "overhead_p50_ratio": 0.986412167362738,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "baseline-sqlite-plain": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 0,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 40,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-build-fts": {
+      "build_schedule_failures": [
+        "build_fts/1",
+        "build_fts/2",
+        "build_fts/3",
+        "build_fts/4"
+      ],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 5,
+      "malformed": [],
+      "missing_operations": 4,
+      "operations": 586,
+      "oracle_or_trace_failures": 5,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "incomplete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-build-fts-low-load": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 16,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {
+        "build_fts/4294967296/build_backfill": {
+          "covered": false,
+          "writer_attempts_overlapping": 0
+        },
+        "build_fts/4294967296/build_catchup": {
+          "covered": false,
+          "writer_attempts_overlapping": 0
+        },
+        "build_fts/4294967296/build_publication": {
+          "covered": false,
+          "writer_attempts_overlapping": 0
+        },
+        "build_fts/4294967296/build_registration": {
+          "covered": false,
+          "writer_attempts_overlapping": 0
+        }
+      },
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-build-hnsw": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 28,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {
+        "build_hnsw/4294967296/build_backfill": {
+          "covered": true,
+          "writer_attempts_overlapping": 8
+        },
+        "build_hnsw/4294967296/build_catchup": {
+          "covered": false,
+          "writer_attempts_overlapping": 0
+        },
+        "build_hnsw/4294967296/build_publication": {
+          "covered": true,
+          "writer_attempts_overlapping": 1
+        },
+        "build_hnsw/4294967296/build_registration": {
+          "covered": false,
+          "writer_attempts_overlapping": 0
+        }
+      },
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-concurrent": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 138,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-keyed": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 2,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 209,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 1.000498952200379,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": 62.0,
+      "overhead_p50_ratio": 1.000498952200379,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-keyed-off": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 2,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 209,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 0.9974128341372451,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": 813.0,
+      "overhead_p50_ratio": 0.9974128341372451,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-overhead-contention": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 808,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "1": {
+          "p50_ratio": 0.9426743409484609,
+          "pairs": 100
+        },
+        "2": {
+          "p50_ratio": 1.220018824599533,
+          "pairs": 100
+        },
+        "3": {
+          "p50_ratio": 1.1329255459626635,
+          "pairs": 100
+        },
+        "4": {
+          "p50_ratio": 0.9401270902465226,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": -6381978.5,
+      "overhead_p50_ratio": 1.0182109018233305,
+      "overhead_pairs_observed": 400,
+      "overhead_pairs_valid": 400,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-overhead-tt": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 208,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 0.9856339815016679,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": 962562.5,
+      "overhead_p50_ratio": 0.9856339815016679,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-plain": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 0,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 40,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "rocksdb-txtime": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 42,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "sqlite-keyed": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 2,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 209,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 1.0010060606060607,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": -1.0,
+      "overhead_p50_ratio": 1.0010060606060607,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "sqlite-keyed-off": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 2,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 209,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 1.0002271752950531,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": 395.0,
+      "overhead_p50_ratio": 1.0002271752950531,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "sqlite-overhead-tt": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 208,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {
+        "0": {
+          "p50_ratio": 1.0265286948752195,
+          "pairs": 100
+        }
+      },
+      "overhead_estimate_valid": true,
+      "overhead_median_paired_delta_ns": 311604.0,
+      "overhead_p50_ratio": 1.0265286948752195,
+      "overhead_pairs_observed": 100,
+      "overhead_pairs_valid": 100,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "sqlite-plain": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 0,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 40,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    },
+    "sqlite-txtime": {
+      "build_schedule_failures": [],
+      "development_only": true,
+      "duplicate_operation_ids": 0,
+      "errors": 1,
+      "malformed": [],
+      "missing_operations": 0,
+      "operations": 42,
+      "oracle_or_trace_failures": 0,
+      "overhead_by_writer": {},
+      "overhead_estimate_valid": false,
+      "overhead_median_paired_delta_ns": null,
+      "overhead_p50_ratio": null,
+      "overhead_pairs_observed": 0,
+      "overhead_pairs_valid": 0,
+      "performance_qualified": false,
+      "phase_coverage": {},
+      "status": "complete",
+      "unexpected_operations": 0
+    }
+  }
+}

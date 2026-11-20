@@ -160,6 +160,8 @@ pub fn fts_dangling_postings_skipped() -> u64 {
 pub mod parse;
 pub(crate) mod query;
 pub(crate) mod runtime;
+#[cfg(feature = "test-hooks")]
+pub mod measurement;
 pub(crate) mod storage;
 pub(crate) mod utils;
 
