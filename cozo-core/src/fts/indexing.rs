@@ -90,6 +90,67 @@ struct LiteralStats {
     doc_len: u32,
 }
 
+/// Exact MessagePack prefix for `DataValue::Num(Num::Int(_))`:
+/// `fixmap(1) "Num" fixmap(1) "Int"`.
+const MSGPACK_NUM_INT_PREFIX: &[u8; 10] = b"\x81\xa3Num\x81\xa3Int";
+/// Exact MessagePack prefix for `DataValue::List(_)`: `fixmap(1) "List"`.
+const MSGPACK_LIST_PREFIX: &[u8; 6] = b"\x81\xa4List";
+
+/// Iteratively validate and skip a `DataValue::List` of `DataValue::Num(Num::Int(_))`
+/// values without allocating or recursing, returning its element count.
+/// Returns `None` on any unexpected encoding so the caller falls back to
+/// `try_decode_val_only` and preserves exact corruption diagnostics.
+fn skip_fts_int_list(rd: &mut &[u8]) -> Option<usize> {
+    if rd.len() < MSGPACK_LIST_PREFIX.len() || &rd[..MSGPACK_LIST_PREFIX.len()] != MSGPACK_LIST_PREFIX
+    {
+        return None;
+    }
+    *rd = &rd[MSGPACK_LIST_PREFIX.len()..];
+    let len = rmp::decode::read_array_len(rd).ok()? as usize;
+    for _ in 0..len {
+        if rd.len() < MSGPACK_NUM_INT_PREFIX.len()
+            || &rd[..MSGPACK_NUM_INT_PREFIX.len()] != MSGPACK_NUM_INT_PREFIX
+        {
+            return None;
+        }
+        *rd = &rd[MSGPACK_NUM_INT_PREFIX.len()..];
+        let _: i64 = rmp::decode::read_int(rd).ok()?;
+    }
+    Some(len)
+}
+
+/// Fast zero-allocation, non-recursive decoder for `(tf, doc_len)` from an FTS
+/// posting value blob (`[List(froms), List(tos), List(positions), Num(Int(total_length))]`)
+/// used when the query needs neither token positions nor `bind_spans` (E7).
+/// Validates the exact `DataValue` schema of all four elements and returns `None`
+/// on any unexpected encoding so the caller falls back to `try_decode_val_only`
+/// and preserves exact corruption diagnostics.
+fn decode_fts_posting_tf_doc_len(vvec: &[u8]) -> Option<(usize, u32)> {
+    const ENCODED_KEY_MIN_LEN: usize = 8;
+    let mut rd = vvec.get(ENCODED_KEY_MIN_LEN..)?;
+    if rmp::decode::read_array_len(&mut rd).ok()? != 4 {
+        return None;
+    }
+    let tf = skip_fts_int_list(&mut rd)?;
+    let tos_len = skip_fts_int_list(&mut rd)?;
+    let pos_len = skip_fts_int_list(&mut rd)?;
+    if tos_len != tf || pos_len != tf {
+        return None;
+    }
+    if rd.len() < MSGPACK_NUM_INT_PREFIX.len()
+        || &rd[..MSGPACK_NUM_INT_PREFIX.len()] != MSGPACK_NUM_INT_PREFIX
+    {
+        return None;
+    }
+    rd = &rd[MSGPACK_NUM_INT_PREFIX.len()..];
+    let total_length: i64 = rmp::decode::read_int(&mut rd).ok()?;
+    if !rd.is_empty() {
+        return None;
+    }
+    let doc_len = u32::try_from(total_length).ok()?;
+    Some((tf, doc_len))
+}
+
 impl<'a> SessionTx<'a> {
     /// Reserved key under which the 0.8.3 design stored a durable corpus
     /// doc-stats counter. `DataValue::Bot` is the top key sentinel, so it sits
@@ -215,6 +276,68 @@ impl<'a> SessionTx<'a> {
         Ok(())
     }
 
+    /// Fast literal posting scan for non-position / non-span queries (E7):
+    /// reads only `(doc_key, tf, doc_len)` without decoding or allocating
+    /// `PositionInfo` arrays.
+    fn fts_search_literal_counts(
+        &self,
+        literal: &FtsLiteral,
+        idx_handle: &RelationHandle,
+        candidates: Option<&FxHashSet<Tuple>>,
+    ) -> Result<(Vec<(Tuple, usize, u32)>, usize)> {
+        crate::fts::FTS_LITERAL_SCANS.with(|c| c.set(c.get() + 1));
+        let start_key_str = &literal.value as &str;
+        let start_key = vec![DataValue::Str(SmartString::from(start_key_str))];
+        let mut end_key_str = literal.value.clone();
+        end_key_str.push(LARGEST_UTF_CHAR);
+        let end_key = vec![DataValue::Str(end_key_str)];
+        let start_key_bytes = idx_handle.encode_partial_key_for_store(&start_key);
+        let end_key_bytes = idx_handle.encode_partial_key_for_store(&end_key);
+        let mut results = vec![];
+        let mut global_doc_frequency = 0;
+        let key_arity = idx_handle.metadata.keys.len();
+        for item in self.store_tx.range_scan(&start_key_bytes, &end_key_bytes) {
+            let (kvec, vvec) = item?;
+            let mut key_tuple = decode_tuple_from_key(&kvec, key_arity);
+            let found_str_key = key_tuple[0].get_str().unwrap();
+            if literal.is_prefix {
+                if !found_str_key.starts_with(start_key_str) {
+                    break;
+                }
+            } else if found_str_key != start_key_str {
+                break;
+            }
+
+            global_doc_frequency += 1;
+            let found_key = key_tuple.split_off(1);
+            if candidates.is_some_and(|allowed| !allowed.contains(&found_key)) {
+                continue;
+            }
+
+            let (tf, doc_len) = match decode_fts_posting_tf_doc_len(&vvec) {
+                Some(pair) => pair,
+                None => {
+                    let vals = try_decode_val_only(&kvec, &vvec)?;
+                    let froms = vals
+                        .first()
+                        .and_then(DataValue::get_slice)
+                        .ok_or_else(|| {
+                            miette!("corrupt FTS posting value: missing start offsets")
+                        })?;
+                    let total_length = vals
+                        .get(3)
+                        .and_then(DataValue::get_int)
+                        .ok_or_else(|| {
+                            miette!("corrupt FTS posting value: missing document length")
+                        })?;
+                    (froms.len(), total_length as u32)
+                }
+            };
+            results.push((found_key, tf, doc_len));
+        }
+        Ok((results, global_doc_frequency))
+    }
+
     fn fts_search_literal(
         &self,
         literal: &FtsLiteral,
@@ -305,6 +428,27 @@ impl<'a> SessionTx<'a> {
         Ok(match ast {
             FtsExpr::Literal(l) => {
                 let mut res = FxHashMap::default();
+                if !want_spans {
+                    let (found_docs, global_doc_frequency) = self.fts_search_literal_counts(
+                        l,
+                        &config.idx_handle,
+                        config.candidates.as_deref(),
+                    )?;
+                    res.reserve(found_docs.len());
+                    for (key, tf, doc_len) in found_docs {
+                        let score = Self::fts_compute_score(
+                            tf,
+                            global_doc_frequency,
+                            n,
+                            doc_len,
+                            avgdl,
+                            l.booster.0,
+                            config,
+                        );
+                        res.insert(key, DocHit { score, spans: vec![] });
+                    }
+                    return Ok(res);
+                }
                 let (found_docs, global_doc_frequency) =
                     self.fts_search_literal(l, &config.idx_handle, config.candidates.as_deref())?;
                 for el in found_docs {
@@ -317,11 +461,7 @@ impl<'a> SessionTx<'a> {
                         l.booster.0,
                         config,
                     );
-                    let spans = if want_spans {
-                        el.position_info.iter().map(|p| (p.from, p.to)).collect()
-                    } else {
-                        vec![]
-                    };
+                    let spans = el.position_info.iter().map(|p| (p.from, p.to)).collect();
                     res.insert(el.key, DocHit { score, spans });
                 }
                 res
@@ -444,6 +584,47 @@ impl<'a> SessionTx<'a> {
                 let sum_terms = config.score_kind == FtsScoreKind::Bm25;
                 let mut res: FxHashMap<Tuple, DocHit> = FxHashMap::default();
                 for nxt in ls {
+                    // Direct accumulation for plain non-prefix literals when spans are not
+                    // requested: avoids building and merging a per-term intermediate FxHashMap
+                    // (E7). Prefix literals can emit multiple postings for the same document and
+                    // must keep per-literal overwrite semantics via `fts_search_impl`.
+                    if !want_spans {
+                        if let FtsExpr::Literal(l) = nxt {
+                            if !l.is_prefix {
+                                let (found_docs, global_doc_frequency) = self
+                                    .fts_search_literal_counts(
+                                        l,
+                                        &config.idx_handle,
+                                        config.candidates.as_deref(),
+                                    )?;
+                                res.reserve(found_docs.len());
+                                for (key, tf, doc_len) in found_docs {
+                                    let score = Self::fts_compute_score(
+                                        tf,
+                                        global_doc_frequency,
+                                        n,
+                                        doc_len,
+                                        avgdl,
+                                        l.booster.0,
+                                        config,
+                                    );
+                                    match res.get_mut(&key) {
+                                        Some(old_v) => {
+                                            old_v.score = if sum_terms {
+                                                old_v.score + score
+                                            } else {
+                                                old_v.score.max(score)
+                                            };
+                                        }
+                                        None => {
+                                            res.insert(key, DocHit { score, spans: vec![] });
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     let nxt_res = self.fts_search_impl(nxt, config, n, avgdl)?;
                     for (k, v) in nxt_res {
                         if let Some(old_v) = res.get_mut(&k) {
@@ -670,56 +851,55 @@ impl<'a> SessionTx<'a> {
 
         // The ranked list is not cut to `k` before the base rows are read: a
         // hit can be dropped below (dangling posting, or the filter), and the
-        // next-best hit must then take its place. The loop stops at `k` rows,
-        // so a healthy index still reads exactly `k` base rows.
+        // next-best hit must then take its place. Fetch in batches of the
+        // remaining needed rows so a healthy index still reads exactly `k` base
+        // rows, using one `multi_get` instead of `k` serial point gets (E7).
         let mut ret = Vec::with_capacity(config.k.min(result.len()));
         let mut dangling = 0u64;
-        for (found_key, hit) in result {
-            if ret.len() >= config.k {
-                break;
-            }
-            crate::fts::FTS_BASE_ROW_FETCHES.with(|count| count.set(count.get() + 1));
-            // A posting whose base row is gone (0.19.4). Postings written by
-            // releases through 0.12.0 could outlive their row: an in-place
-            // `:put` on a relation with only an FTS index left the old terms'
-            // postings behind, and a later `:rm` removed only the current
-            // terms'. A bulk-import delete strands postings the same way. This
-            // used to fail the whole search with "corrupted index", so one
-            // stale posting took out every query that ranked it. The row does
-            // not exist, so it cannot be a result: skip it, count it, and say
-            // so once per search. `::reindex` removes the postings.
-            let Some(mut cand_tuple) = config.base_handle.get_current(self, &found_key)? else {
-                dangling += 1;
-                continue;
-            };
-
-            if config.bind_score.is_some() {
-                cand_tuple.push(DataValue::from(hit.score));
-            }
-            if config.bind_spans.is_some() {
-                let mut spans = hit.spans;
-                spans.sort_unstable();
-                spans.dedup();
-                cand_tuple.push(DataValue::List(
-                    spans
-                        .into_iter()
-                        .map(|(f, t)| {
-                            DataValue::List(vec![
-                                DataValue::from(f as i64),
-                                DataValue::from(t as i64),
-                            ])
-                        })
-                        .collect(),
-                ));
-            }
-
-            if let Some((code, span)) = filter_code {
-                if !eval_bytecode_pred(code, &cand_tuple, stack, *span)? {
+        let mut idx = 0usize;
+        while ret.len() < config.k && idx < result.len() {
+            let need = (config.k - ret.len()).min(result.len() - idx);
+            let slice = &result[idx..idx + need];
+            let key_slices: Vec<&[DataValue]> =
+                slice.iter().map(|(k, _)| k.as_slice()).collect();
+            crate::fts::FTS_BASE_ROW_FETCHES
+                .with(|count| count.set(count.get() + need as u64));
+            let base_rows = config.base_handle.get_current_batch(self, &key_slices)?;
+            for ((_, hit), row_opt) in slice.iter().zip(base_rows) {
+                let Some(mut cand_tuple) = row_opt else {
+                    dangling += 1;
                     continue;
-                }
-            }
+                };
 
-            ret.push(cand_tuple);
+                if config.bind_score.is_some() {
+                    cand_tuple.push(DataValue::from(hit.score));
+                }
+                if config.bind_spans.is_some() {
+                    let mut spans = hit.spans.clone();
+                    spans.sort_unstable();
+                    spans.dedup();
+                    cand_tuple.push(DataValue::List(
+                        spans
+                            .into_iter()
+                            .map(|(f, t)| {
+                                DataValue::List(vec![
+                                    DataValue::from(f as i64),
+                                    DataValue::from(t as i64),
+                                ])
+                            })
+                            .collect(),
+                    ));
+                }
+
+                if let Some((code, span)) = filter_code {
+                    if !eval_bytecode_pred(code, &cand_tuple, stack, *span)? {
+                        continue;
+                    }
+                }
+
+                ret.push(cand_tuple);
+            }
+            idx += need;
         }
         if dangling > 0 {
             crate::fts::FTS_DANGLING_POSTINGS_SKIPPED
@@ -932,4 +1112,63 @@ pub(crate) fn encode_fts_rows_for_tuple(
         rows.push((key_bytes, val_bytes));
     }
     Ok((rows, count))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_fts_posting_tf_doc_len;
+    use crate::data::value::DataValue;
+
+    fn encode_blob(vals: &[DataValue]) -> Vec<u8> {
+        let mut out = vec![0u8; 8];
+        rmp_serde::encode::write(&mut out, vals).unwrap();
+        out
+    }
+
+    #[test]
+    fn decode_fts_posting_fast_path_accepts_valid_and_rejects_corrupt() {
+        let valid = encode_blob(&[
+            DataValue::List(vec![DataValue::from(0), DataValue::from(12)]),
+            DataValue::List(vec![DataValue::from(5), DataValue::from(17)]),
+            DataValue::List(vec![DataValue::from(0), DataValue::from(3)]),
+            DataValue::from(42),
+        ]);
+        assert_eq!(decode_fts_posting_tf_doc_len(&valid), Some((2, 42)));
+
+        // Deeply nested corrupt MessagePack must not stack overflow.
+        let mut nested = vec![0u8; 8];
+        nested.extend(std::iter::repeat_n(0x91u8, 10_000));
+        assert_eq!(decode_fts_posting_tf_doc_len(&nested), None);
+
+        // Non-integer element inside `froms` list must fall back.
+        let bad_elem = encode_blob(&[
+            DataValue::List(vec![DataValue::from("not_an_int")]),
+            DataValue::List(vec![DataValue::from(5)]),
+            DataValue::List(vec![DataValue::from(0)]),
+            DataValue::from(10),
+        ]);
+        assert_eq!(decode_fts_posting_tf_doc_len(&bad_elem), None);
+
+        // Mismatched `froms`/`tos`/`positions` lengths must fall back.
+        let mismatched = encode_blob(&[
+            DataValue::List(vec![DataValue::from(0), DataValue::from(5)]),
+            DataValue::List(vec![DataValue::from(4)]),
+            DataValue::List(vec![DataValue::from(0), DataValue::from(1)]),
+            DataValue::from(10),
+        ]);
+        assert_eq!(decode_fts_posting_tf_doc_len(&mismatched), None);
+
+        // Negative doc length or trailing bytes must fall back.
+        let neg_len = encode_blob(&[
+            DataValue::List(vec![DataValue::from(0)]),
+            DataValue::List(vec![DataValue::from(4)]),
+            DataValue::List(vec![DataValue::from(0)]),
+            DataValue::from(-1),
+        ]);
+        assert_eq!(decode_fts_posting_tf_doc_len(&neg_len), None);
+
+        let mut trailing = valid.clone();
+        trailing.push(0x00);
+        assert_eq!(decode_fts_posting_tf_doc_len(&trailing), None);
+    }
 }

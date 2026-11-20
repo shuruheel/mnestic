@@ -236,3 +236,36 @@ fn prefix_candidates_updates_deletes_and_reopen() {
     assert_eq!(ids(&db, "CHA*"), vec![1]);
     assert!(ids(&db, "DI*").is_empty());
 }
+
+#[test]
+fn prefix_or_query_scores_match_with_and_without_bind_spans() {
+    let (_dir, db) = setup(
+        "Simple",
+        "Lowercase",
+        "[1, 'foobar foobaz alpha'], [2, 'foobar beta'], [3, 'gamma delta']",
+    );
+    for score_kind in ["bm25", "tf_idf"] {
+        let without_spans = db
+            .run_script(
+                &format!(
+                    "?[id, s] := ~doc:idx{{id | query: 'foo* OR beta', k: 10, bind_score: s, score_kind: '{score_kind}'}} :order -s, id"
+                ),
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        let with_spans = db
+            .run_script(
+                &format!(
+                    "?[id, s] := ~doc:idx{{id | query: 'foo* OR beta', k: 10, bind_score: s, bind_spans: _sp, score_kind: '{score_kind}'}} :order -s, id"
+                ),
+                BTreeMap::new(),
+                ScriptMutability::Immutable,
+            )
+            .unwrap();
+        assert_eq!(
+            without_spans.rows, with_spans.rows,
+            "score_kind={score_kind}: bind_spans must not change scores or ranking on prefix OR"
+        );
+    }
+}

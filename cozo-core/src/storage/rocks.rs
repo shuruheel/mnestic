@@ -143,12 +143,20 @@ fn prepare_db_builder(path: &Path) -> Result<DbBuilder> {
         ""
     };
 
-    Ok(builder
+    let mut builder = builder
         .create_if_missing(is_new)
         .use_capped_prefix_extractor(true, KEY_PREFIX_LEN)
         .use_bloom_filter(true, 9.9, true)
         .path(store_path)
-        .options_path(options_path))
+        .options_path(options_path);
+    // Default lazy 128 MiB block cache cap when the caller supplies no options
+    // file (overridden automatically when opening under a shared memory
+    // envelope). RocksDB's tiny built-in default cache caused SST Bloom filter
+    // blocks to evict and re-checksum on every HNSW prefix seek (E6).
+    if options_path.is_empty() {
+        builder.opts.block_cache_size = 128 << 20;
+    }
+    Ok(builder)
 }
 
 /// Typed conflict error for the process-default shared memory envelope
