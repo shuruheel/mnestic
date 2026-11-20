@@ -201,12 +201,25 @@ def build(source, target, output, jobs=2):
         native[key] = env.get(key)
     if env.get('ROCKSDB_LIB_DIR'):
         native['librocksdb_sha256'] = digest((Path(env['ROCKSDB_LIB_DIR'])/'librocksdb.a').read_bytes())
+    else:
+        built_archives = sorted((target/'release/build').glob('mnestic-rocks-*/out/librocksdb*.a'))
+        if built_archives:
+            native['built_librocksdb_path'] = str(built_archives[0])
+            native['librocksdb_sha256'] = digest(built_archives[0].read_bytes())
     if env.get('ROCKSDB_INCLUDE_DIR'):
         root = Path(env['ROCKSDB_INCLUDE_DIR'])
         native['headers_sha256'] = digest(json.dumps({str(p.relative_to(root)):digest(p.read_bytes()) for p in sorted(root.rglob('*.h'))},sort_keys=True).encode())
+    host_info = {'uname': subprocess.check_output(['uname', '-a'], text=True).strip()}
+    if sys.platform == 'linux':
+        cpuinfo = Path('/proc/cpuinfo').read_text() if Path('/proc/cpuinfo').is_file() else ''
+        models = sorted({line.split(':', 1)[1].strip() for line in cpuinfo.splitlines() if line.startswith('model name')})
+        host_info['cpu_models'] = models
+        host_info['cpu_count'] = os.cpu_count()
+        meminfo = Path('/proc/meminfo').read_text() if Path('/proc/meminfo').is_file() else ''
+        host_info['mem_total'] = next((line.strip() for line in meminfo.splitlines() if line.startswith('MemTotal:')), None)
     evidence = dict(source=before, executable_sha256=digest(binary.read_bytes()), executable=str(binary),
                     command=command, environment={k:env.get(k) for k in ['CARGO_TARGET_DIR','CARGO_PROFILE_RELEASE_DEBUG','CARGO_INCREMENTAL','RUSTFLAGS']},
-                    native=native, rustc=subprocess.check_output(['rustc','-Vv'],text=True),
+                    native=native, host=host_info, rustc=subprocess.check_output(['rustc','-Vv'],text=True),
                     started_unix=started,finished_unix=time.time(),purpose='development')
     (output/'build.json').write_text(json.dumps(evidence,indent=2))
     return evidence
@@ -220,11 +233,13 @@ def supervise(binary, plan_path, output, build_manifest, timeout, max_rss, min_f
     built = json.loads(build_bytes)
     if digest(binary.read_bytes()) != built['executable_sha256']:
         raise ValueError('binary does not match build manifest')
+    plan_bytes = plan_path.read_bytes()
+    plan_purpose = json.loads(plan_bytes).get('purpose', 'development')
     provenance = output.with_suffix('.supervisor.json')
     resource_path = output.with_suffix('.resources.csv')
     stdout_path = output.with_suffix('.stdout.log')
-    evidence = dict(purpose='development', build_manifest=built, build_manifest_sha256=digest(build_bytes),
-                    binary_sha256=digest(binary.read_bytes()), plan_sha256=digest(plan_path.read_bytes()),
+    evidence = dict(purpose=plan_purpose, build_manifest=built, build_manifest_sha256=digest(build_bytes),
+                    binary_sha256=digest(binary.read_bytes()), plan_sha256=digest(plan_bytes),
                     supervisor_sha256=digest(Path(__file__).read_bytes()),
                     environment={k: os.environ.get(k) for k in ['RAYON_NUM_THREADS','OMP_NUM_THREADS','OPENBLAS_NUM_THREADS']},
                     limits=dict(seconds=timeout, rss_mib=max_rss, min_free_mib=min_free),

@@ -57,6 +57,7 @@ class PhaseTests(unittest.TestCase):
                                   ('swapouts',11,'swapout_change')]:
             self.assertEqual(host.invalid(dict(valid,**{key:value}),10),reason)
         self.assertEqual(host.swapouts('Swapouts: 123.\n'),123)
+        self.assertEqual(host.swapouts('nr_free_pages 100\npswpout 42\n'),42)
         with self.assertRaises(ValueError): host.swapouts('no counter')
 
     def fake_builds(self, root):
@@ -65,7 +66,7 @@ class PhaseTests(unittest.TestCase):
             path=root/arm;path.mkdir();(path/'keyed_txtime_timing').write_bytes(arm.encode())
             info=dict(executable_sha256=phase.file_hash(path/'keyed_txtime_timing'),native={},rustc='same',
                       environment={'CARGO_TARGET_DIR':str(path/'target'),'RUSTFLAGS':None},
-                      source=dict(head='272c7b7196de9acd8d4aa66ec3e6e2f10f0057ea' if arm=='baseline' else 'candidate',files={
+                      source=dict(head=phase.BASELINE_HEAD if arm=='baseline' else 'candidate',files={
                           name:'same' for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime/inputs.rs',
                                                   'cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']}))
             (path/'build.json').write_text(json.dumps(info))

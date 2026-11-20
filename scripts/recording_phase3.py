@@ -19,10 +19,10 @@ from analyze_timing_diagnostics import quantile
 BLOCKS = 10
 PAIRS = 100
 DRAWS = 10000
-# The user-authorized Nov15 attempt retains the original two-hour campaign cap.
-# Round up the prior campaign's accounted 421.341s, including the first 120s reserve.
-PRIOR_ATTEMPT_SECONDS = 422
+# Fresh Linux Fly dedicated-VM campaign (ea3-fly-linux-amendment.md); no prior observations pooled.
+PRIOR_ATTEMPT_SECONDS = 0
 BUDGET = 7200 - PRIOR_ATTEMPT_SECONDS
+BASELINE_HEAD = '94595f8e9b57941fcd3827aba78d0f8e61843dda'
 
 
 def save(path, value):
@@ -147,16 +147,16 @@ def validate_review(builds, review):
             raise ValueError('build differs from reviewed artifact: '+arm)
         if expected['source'] != item['build']['source']:
             raise ValueError('source differs from reviewed artifact: '+arm)
-    for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime/inputs.rs']:
+    # All four shared measurement/runner files must be byte-identical across candidate and baseline.
+    for name in ['cozo-core/src/measurement.rs','cozo-core/examples/keyed_txtime/inputs.rs',
+                 'cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']:
         if builds['candidate']['build']['source']['files'].get(name) != builds['baseline']['build']['source']['files'].get(name):
-            raise ValueError('shared measurement/input source differs: '+name)
-    # The reviewed baseline export changes only the two absent optimizer-toggle
-    # calls in runner/helper; both exact hashes must match the accepted patch.
+            raise ValueError('shared measurement/runner source differs: '+name)
     for name in ['cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']:
         for arm,item in builds.items():
             if review['shared_runner'][name][arm] != item['build']['source']['files'][name]:
                 raise ValueError('shared runner differs from reviewed export')
-    if builds['baseline']['build']['source']['head'] != '272c7b7196de9acd8d4aa66ec3e6e2f10f0057ea':
+    if builds['baseline']['build']['source']['head'] != BASELINE_HEAD:
         raise ValueError('baseline differs from protocol')
 
 
@@ -168,7 +168,7 @@ def run(candidate, baseline, output, review_manifest):
     os.environ.update(environment)
     scripts = [Path(__file__),Path(host.__file__),Path(controls.__file__),Path(harness.__file__),
                Path(__file__).with_name('analyze_timing_diagnostics.py')]
-    protocol = Path(__file__).resolve().parents[1]/'docs/plans/keyed-txtime-controls-phase3.md'
+    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-fly-linux-amendment.md'
     builds = {}
     for arm,path in [('candidate',candidate),('baseline',baseline)]:
         info = json.loads((path/'build.json').read_text())
