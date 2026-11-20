@@ -19,7 +19,7 @@ env:
 jobs:
   test:
     name: test (mnestic, default/sqlite features)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -48,7 +48,7 @@ jobs:
   # and a backend nobody builds in CI is a backend nobody notices breaking.
   secondary-backends:
     name: test (sled + newrocksdb transaction contract)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -63,7 +63,7 @@ jobs:
   # this job boots real PD/TiKV servers and exercises that boundary directly.
   tikv:
     name: test (TiKV multi-client relation IDs)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
@@ -129,7 +129,7 @@ jobs:
 
   rocksdb:
     name: build (storage-rocksdb, C++ bridge)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
         with:
@@ -177,7 +177,7 @@ jobs:
   # error (design §a0, 0.14.0).
   minimal:
     name: test (minimal features, no graph-algo)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -187,7 +187,7 @@ jobs:
 
   clippy:
     name: clippy (blocking, -D warnings)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
