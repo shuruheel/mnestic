@@ -104,13 +104,54 @@ impl VectorCache {
         self.cache.insert(k, v);
     }
     fn dist(&self, v1: &Vector, v2: &Vector) -> f64 {
+        let q_norm_sq = match self.distance {
+            HnswDistance::Cosine => match v1 {
+                Vector::F32(a) => a
+                    .as_slice()
+                    .map(|s| s.iter().map(|&x| (x as f64) * (x as f64)).sum())
+                    .unwrap_or_else(|| a.dot(a) as f64),
+                Vector::F64(a) => a
+                    .as_slice()
+                    .map(|s| s.iter().map(|&x| x * x).sum())
+                    .unwrap_or_else(|| a.dot(a)),
+            },
+            _ => 0.0,
+        };
+        self.dist_with_norm(v1, q_norm_sq, v2)
+    }
+    #[inline]
+    fn dist_with_norm(&self, v1: &Vector, v1_norm_sq: f64, v2: &Vector) -> f64 {
         match self.distance {
             HnswDistance::L2 => match (v1, v2) {
                 (Vector::F32(a), Vector::F32(b)) => {
+                    if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                        if sa.len() == sb.len() {
+                            return sa
+                                .iter()
+                                .zip(sb.iter())
+                                .map(|(&x, &y)| {
+                                    let d = x - y;
+                                    d * d
+                                })
+                                .sum::<f32>() as f64;
+                        }
+                    }
                     let diff = a - b;
                     diff.dot(&diff) as f64
                 }
                 (Vector::F64(a), Vector::F64(b)) => {
+                    if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                        if sa.len() == sb.len() {
+                            return sa
+                                .iter()
+                                .zip(sb.iter())
+                                .map(|(&x, &y)| {
+                                    let d = x - y;
+                                    d * d
+                                })
+                                .sum();
+                        }
+                    }
                     let diff = a - b;
                     diff.dot(&diff)
                 }
@@ -118,16 +159,38 @@ impl VectorCache {
             },
             HnswDistance::Cosine => match (v1, v2) {
                 (Vector::F32(a), Vector::F32(b)) => {
-                    let a_norm = a.dot(a) as f64;
+                    if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                        if sa.len() == sb.len() {
+                            let mut dot = 0.0f64;
+                            let mut b_norm = 0.0f64;
+                            for (&x, &y) in sa.iter().zip(sb.iter()) {
+                                let xf = x as f64;
+                                let yf = y as f64;
+                                dot += xf * yf;
+                                b_norm += yf * yf;
+                            }
+                            return cosine_distance(v1_norm_sq, b_norm, dot);
+                        }
+                    }
                     let b_norm = b.dot(b) as f64;
                     let dot = a.dot(b) as f64;
-                    cosine_distance(a_norm, b_norm, dot)
+                    cosine_distance(v1_norm_sq, b_norm, dot)
                 }
                 (Vector::F64(a), Vector::F64(b)) => {
-                    let a_norm = a.dot(a);
+                    if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                        if sa.len() == sb.len() {
+                            let mut dot = 0.0f64;
+                            let mut b_norm = 0.0f64;
+                            for (&x, &y) in sa.iter().zip(sb.iter()) {
+                                dot += x * y;
+                                b_norm += y * y;
+                            }
+                            return cosine_distance(v1_norm_sq, b_norm, dot);
+                        }
+                    }
                     let b_norm = b.dot(b);
                     let dot = a.dot(b);
-                    cosine_distance(a_norm, b_norm, dot)
+                    cosine_distance(v1_norm_sq, b_norm, dot)
                 }
                 _ => panic!(
                     "Cannot compute cosine distance between {:?} and {:?}",
@@ -136,11 +199,27 @@ impl VectorCache {
             },
             HnswDistance::InnerProduct => match (v1, v2) {
                 (Vector::F32(a), Vector::F32(b)) => {
-                    let dot = a.dot(b);
+                    let dot = if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                        if sa.len() == sb.len() {
+                            sa.iter().zip(sb.iter()).map(|(&x, &y)| x * y).sum::<f32>()
+                        } else {
+                            a.dot(b)
+                        }
+                    } else {
+                        a.dot(b)
+                    };
                     1. - dot as f64
                 }
                 (Vector::F64(a), Vector::F64(b)) => {
-                    let dot = a.dot(b);
+                    let dot = if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                        if sa.len() == sb.len() {
+                            sa.iter().zip(sb.iter()).map(|(&x, &y)| x * y).sum::<f64>()
+                        } else {
+                            a.dot(b)
+                        }
+                    } else {
+                        a.dot(b)
+                    };
                     1. - dot
                 }
                 _ => panic!("Cannot compute inner product between {:?} and {:?}", v1, v2),
@@ -150,6 +229,11 @@ impl VectorCache {
     fn v_dist(&self, v: &Vector, key: &CompoundKey) -> f64 {
         let v2 = self.cache.get(key).unwrap();
         self.dist(v, v2)
+    }
+    #[inline]
+    fn v_dist_with_norm(&self, v: &Vector, v_norm_sq: f64, key: &CompoundKey) -> f64 {
+        let v2 = self.cache.get(key).unwrap();
+        self.dist_with_norm(v, v_norm_sq, v2)
     }
     fn k_dist(&self, k1: &CompoundKey, k2: &CompoundKey) -> f64 {
         let v1 = self.cache.get(k1).unwrap();
@@ -754,6 +838,19 @@ impl<'a> SessionTx<'a> {
         found_nn: &mut PriorityQueue<CompoundKey, OrderedFloat<f64>>,
         vec_cache: &mut VectorCache,
     ) -> Result<()> {
+        let q_norm_sq = match vec_cache.distance {
+            HnswDistance::Cosine => match q {
+                Vector::F32(a) => a
+                    .as_slice()
+                    .map(|s| s.iter().map(|&x| (x as f64) * (x as f64)).sum())
+                    .unwrap_or_else(|| a.dot(a) as f64),
+                Vector::F64(a) => a
+                    .as_slice()
+                    .map(|s| s.iter().map(|&x| x * x).sum())
+                    .unwrap_or_else(|| a.dot(a)),
+            },
+            _ => 0.0,
+        };
         let mut visited: FxHashSet<CompoundKey> = FxHashSet::default();
         // min queue
         let mut candidates: PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>> =
@@ -772,16 +869,14 @@ impl<'a> SessionTx<'a> {
             // Fetch all unvisited neighbours' vectors in one batched read
             // (mnestic fork): on the snapshot read path this is one RocksDB
             // MultiGet instead of a serial point get per neighbour.
-            let unvisited: Vec<CompoundKey> = self
-                .hnsw_get_neighbours(&candidate, cur_level, idx_table, false)?
-                .filter_map(|(k, _)| if visited.contains(&k) { None } else { Some(k) })
-                .collect();
+            let unvisited =
+                self.hnsw_get_unvisited_neighbours(&candidate, cur_level, idx_table, &visited)?;
             vec_cache.ensure_keys(&unvisited, orig_table, self)?;
             for neighbour_key in unvisited {
                 if visited.contains(&neighbour_key) {
                     continue;
                 }
-                let neighbour_dist = vec_cache.v_dist(q, &neighbour_key);
+                let neighbour_dist = vec_cache.v_dist_with_norm(q, q_norm_sq, &neighbour_key);
                 let (_, OrderedFloat(candidate_furthest_dist)) = found_nn.peek().unwrap();
                 if found_nn.len() < ef
                     || distance_is_closer(neighbour_dist, *candidate_furthest_dist)
@@ -797,6 +892,77 @@ impl<'a> SessionTx<'a> {
         }
 
         Ok(())
+    }
+
+    /// Fast neighbour-key scan for `hnsw_search_level` (E6): scans raw KV
+    /// entries, validates the exact 42-byte MessagePack layout of standard HNSW
+    /// edge values (`[Num(Float(_)), Null, Bool(is_deleted)]`) without
+    /// allocating, and filters self-edges and already-visited neighbours inline.
+    /// Any row that does not match the exact edge layout (self-rows carrying a
+    /// vector hash, or any corrupt/truncated/colliding blob) falls back to
+    /// `try_decode_val_only` so corruption errors remain unchanged.
+    fn hnsw_get_unvisited_neighbours(
+        &self,
+        cand_key: &CompoundKey,
+        level: i64,
+        idx_handle: &RelationHandle,
+        visited: &FxHashSet<CompoundKey>,
+    ) -> Result<Vec<CompoundKey>> {
+        let key_len = cand_key.0.len();
+        let key_arity = 2 * key_len + 5;
+        let mut start_tuple = Vec::with_capacity(key_len + 3);
+        start_tuple.push(DataValue::from(level));
+        start_tuple.extend_from_slice(&cand_key.0);
+        start_tuple.push(DataValue::from(cand_key.1 as i64));
+        start_tuple.push(DataValue::from(cand_key.2 as i64));
+
+        let mut out = Vec::new();
+        for res in idx_handle.scan_prefix_raw(self, &start_tuple) {
+            let (kvec, vvec) = res?;
+            let is_deleted = match hnsw_edge_is_deleted_fast(&vvec) {
+                Some(b) => b,
+                None => {
+                    let vals = try_decode_val_only(&kvec, &vvec)?;
+                    if vals.len() < 3 {
+                        bail!(
+                            "corrupt HNSW edge row: expected at least {} fields, got {}",
+                            2 * key_len + 8,
+                            key_arity + vals.len()
+                        );
+                    }
+                    vals[2].get_bool().ok_or_else(|| {
+                        miette!("corrupt HNSW edge row: deletion marker is not boolean")
+                    })?
+                }
+            };
+            if is_deleted {
+                continue;
+            }
+            let tuple = crate::data::tuple::decode_tuple_from_key(&kvec, key_arity);
+            if tuple.len() < key_arity {
+                bail!(
+                    "corrupt HNSW edge row: expected at least {} key fields, got {}",
+                    key_arity,
+                    tuple.len()
+                );
+            }
+            let key_idx = tuple[2 * key_len + 3].get_int().ok_or_else(|| {
+                miette!("corrupt HNSW edge row: vector index is not an integer")
+            })? as usize;
+            let key_subidx = tuple[2 * key_len + 4].get_int().ok_or_else(|| {
+                miette!("corrupt HNSW edge row: vector sub-index is not an integer")
+            })? as i32;
+            let dst_slice = &tuple[key_len + 3..2 * key_len + 3];
+            if dst_slice == cand_key.0.as_slice() && key_idx == cand_key.1 && key_subidx == cand_key.2
+            {
+                continue;
+            }
+            let neighbour_key = (dst_slice.to_vec(), key_idx, key_subidx);
+            if !visited.contains(&neighbour_key) {
+                out.push(neighbour_key);
+            }
+        }
+        Ok(out)
     }
     fn hnsw_get_neighbours<'b>(
         &'b self,
@@ -1428,19 +1594,25 @@ impl<'a> SessionTx<'a> {
                 }
             }
 
-            let mut ret = vec![];
-
+            let mut selected: Vec<(CompoundKey, f64)> = Vec::with_capacity(found_nn.len());
             while let Some((cand_key, OrderedFloat(distance))) = found_nn.pop() {
                 if let Some(r) = config.radius {
                     if distance > r {
                         continue;
                     }
                 }
+                selected.push((cand_key, distance));
+            }
+            // Ascending distance order before batch fetching base rows.
+            selected.reverse();
 
-                let base_row = config
-                    .base_handle
-                    .get(self, &cand_key.0)?
-                    .ok_or_else(|| miette!("corrupted index"))?;
+            let key_slices: Vec<&[DataValue]> =
+                selected.iter().map(|(k, _)| k.0.as_slice()).collect();
+            let base_rows = config.base_handle.get_batch(self, &key_slices)?;
+
+            let mut ret = Vec::with_capacity(config.k.min(selected.len()));
+            for ((cand_key, distance), base_row) in selected.into_iter().zip(base_rows) {
+                let base_row = base_row.ok_or_else(|| miette!("corrupted index"))?;
                 let cand_tuple = Self::hnsw_result_tuple(config, base_row, &cand_key, distance)?;
 
                 if let Some((code, span)) = filter_bytecode {
@@ -1450,9 +1622,10 @@ impl<'a> SessionTx<'a> {
                 }
 
                 ret.push(cand_tuple);
+                if ret.len() >= config.k {
+                    break;
+                }
             }
-            ret.reverse();
-            ret.truncate(config.k);
 
             // Filtered completeness (0.19.2). The graph search visits about `ef`
             // vertices nearest the query regardless of the filter. If at least k
@@ -1629,11 +1802,46 @@ impl<'a> SessionTx<'a> {
     }
 }
 
+/// Fast zero-allocation validator for standard 42-byte HNSW edge value blobs
+/// (`[DataValue::Num(Num::Float(dist)), DataValue::Null, DataValue::Bool(is_deleted)]`
+/// prefixed with the 8-byte `RelationId` header). Returns `Some(is_deleted)` only
+/// when every structural byte matches; self-edges (which store a vector hash
+/// instead of `Null`) and any corrupt/truncated/colliding blobs return `None` so
+/// the caller falls back to `try_decode_val_only`.
+#[inline]
+fn hnsw_edge_is_deleted_fast(vvec: &[u8]) -> Option<bool> {
+    // Bytes 0..8: 8-byte RelationId header.
+    // Bytes 8..22: fixarray(3) + fixmap(1) "Num" + fixmap(1) "Float" + f64(0xcb).
+    const EDGE_PREFIX: [u8; 14] = [
+        0x93, 0x81, 0xa3, b'N', b'u', b'm', 0x81, 0xa5, b'F', b'l', b'o', b'a', b't', 0xcb,
+    ];
+    // Bytes 22..30: 8-byte IEEE 754 f64 distance.
+    // Bytes 30..35: fixstr(4) "Null" (DataValue::Null).
+    const EDGE_NULL: [u8; 5] = [0xa4, b'N', b'u', b'l', b'l'];
+    // Bytes 35..42: fixmap(1) "Bool" + false(0xc2)/true(0xc3).
+    const BOOL_FALSE_TAIL: [u8; 7] = [0x81, 0xa4, b'B', b'o', b'o', b'l', 0xc2];
+    const BOOL_TRUE_TAIL: [u8; 7] = [0x81, 0xa4, b'B', b'o', b'o', b'l', 0xc3];
+
+    if vvec.len() != 42 || vvec[8..22] != EDGE_PREFIX || vvec[30..35] != EDGE_NULL {
+        return None;
+    }
+    if vvec[35..42] == BOOL_FALSE_TAIL {
+        Some(false)
+    } else if vvec[35..42] == BOOL_TRUE_TAIL {
+        Some(true)
+    } else {
+        None
+    }
+}
+
 /// Base rows an exact filtered rescan may read before giving up (0.19.2).
 const FILTERED_EXACT_MAX_ROWS: usize = 200_000;
 
 #[cfg(test)]
 mod tests {
+    use super::{hnsw_edge_is_deleted_fast, HnswDistance, VectorCache};
+    use crate::data::value::{DataValue, Vector};
+    use ndarray::Array1;
     use rand::Rng;
     use std::collections::BTreeMap;
 
@@ -1651,5 +1859,64 @@ mod tests {
             collected.entry(level).and_modify(|x| *x += 1).or_insert(1);
         }
         println!("{:?}", collected);
+    }
+
+    #[test]
+    fn hnsw_edge_fast_path_matches_wire_format_and_rejects_corrupt_blobs() {
+        let encode = |vals: &[DataValue]| -> Vec<u8> {
+            let mut out = vec![0u8; 8];
+            rmp_serde::encode::write(&mut out, vals).unwrap();
+            out
+        };
+        let live = encode(&[DataValue::from(0.25f64), DataValue::Null, DataValue::from(false)]);
+        assert_eq!(live.len(), 42);
+        assert_eq!(hnsw_edge_is_deleted_fast(&live), Some(false));
+
+        let deleted = encode(&[DataValue::from(1.75f64), DataValue::Null, DataValue::from(true)]);
+        assert_eq!(deleted.len(), 42);
+        assert_eq!(hnsw_edge_is_deleted_fast(&deleted), Some(true));
+
+        // Self-edge carries Bytes(hash) instead of Null -> falls back.
+        let self_edge = encode(&[
+            DataValue::from(16.0f64),
+            DataValue::Bytes(vec![1, 2, 3, 4]),
+            DataValue::from(false),
+        ]);
+        assert_eq!(hnsw_edge_is_deleted_fast(&self_edge), None);
+
+        // Truncated 7-byte blob ending in BOOL_FALSE_TAIL -> must fall back.
+        assert_eq!(
+            hnsw_edge_is_deleted_fast(&[0x81, 0xa4, b'B', b'o', b'o', b'l', 0xc2]),
+            None
+        );
+
+        // Wrong arity ending in Bool(false) -> must fall back.
+        let short_arity = encode(&[DataValue::from(false)]);
+        assert_eq!(hnsw_edge_is_deleted_fast(&short_arity), None);
+
+        // Bit-flipped distance header -> must fall back.
+        let mut flipped = live.clone();
+        flipped[8] ^= 0x01;
+        assert_eq!(hnsw_edge_is_deleted_fast(&flipped), None);
+    }
+
+    #[test]
+    fn cosine_f32_self_distance_is_zero_and_symmetric() {
+        let vc = VectorCache {
+            cache: Default::default(),
+            distance: HnswDistance::Cosine,
+        };
+        let v1 = Vector::F32(Array1::from_vec(
+            (0..384).map(|i| ((i as f32) * 0.137).sin() + 0.01).collect(),
+        ));
+        let v2 = Vector::F32(Array1::from_vec(
+            (0..384).map(|i| ((i as f32) * 0.293).cos() - 0.02).collect(),
+        ));
+        let self_d = vc.dist(&v1, &v1);
+        assert_eq!(self_d, 0.0, "cosine self-distance must be exact 0.0");
+        let d12 = vc.dist(&v1, &v2);
+        let d21 = vc.dist(&v2, &v1);
+        assert_eq!(d12, d21, "cosine distance must be symmetric");
+        assert!((0.0..=2.0).contains(&d12));
     }
 }

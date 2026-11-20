@@ -35,6 +35,34 @@ provenance and licensing.
   drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
   a build before 0.13.0 (`f125fbd2`) can hold such IDs.
 
+### Changed — HNSW & FTS query latency (E6, E7) and missing-index diagnostic (E8)
+
+- **Lazy error-key formatting on value-blob decoding (`runtime/relation.rs`).**
+  `decode_val_blob` previously formatted the key bytes to hex (`encoded_key_label`)
+  or `Debug` (`format!("tuple {key:?}")`) eagerly on every successful row decode.
+  Making key formatting lazy removes 43.5% of sampled FTS query CPU and 5.5% of
+  HNSW query CPU across every storage read.
+- **HNSW query path optimizations (`runtime/hnsw.rs`, `storage/rocks.rs`, E6).**
+  Sets a lazy 128 MiB default RocksDB block cache cap when no `options` file is
+  supplied (keeping SST Bloom filter blocks resident instead of re-reading and
+  re-checksumming them on every HNSW prefix seek — 37.3% of sampled HNSW CPU),
+  adds a raw-KV `hnsw_get_unvisited_neighbours` fast path that skips decoding
+  unused edge distance/hash payloads, precomputes query norm squared with
+  single-pass slice distance kernels, and batches final top-`k` base-row fetches
+  via `get_batch`.
+- **FTS query path optimizations (`fts/indexing.rs`, E7).** Adds a zero-allocation
+  MessagePack `(tf, doc_len)` posting fast path for non-position / non-span
+  queries, folds `FtsExpr::Or` literal terms directly into one score map without
+  per-term intermediate maps or `PositionInfo` allocations, and batches top-`k`
+  base-row fetches via `get_batch` while preserving dangling-posting skips and
+  warnings.
+- **Missing-index diagnostic (`runtime/db.rs`, E8).** Joins against non-temporary
+  stored relations that bind columns not covered by any primary-key prefix or
+  secondary index (`stored_mat_join` / `stored_neg_mat_join` / `stored_bt_mat_join`)
+  now surface a `missing_index_advisory` row in `::explain` and emit a structured
+  `query.missing_index` warning (`log::warn!` + `::warnings` / `Db::recent_warnings`)
+  suggesting the `::index create` command.
+
 ### Changed — planner keyed access
 
 - Eligible trailing equalities now bind immediately before their stored-relation

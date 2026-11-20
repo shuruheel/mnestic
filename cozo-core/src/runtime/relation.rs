@@ -788,6 +788,24 @@ impl RelationHandle {
         }
     }
 
+    pub(crate) fn scan_prefix_raw<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+        prefix: &Tuple,
+    ) -> Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a> {
+        let mut lower = prefix.clone();
+        lower.truncate(self.metadata.keys.len());
+        let mut upper = lower.clone();
+        upper.push(DataValue::Bot);
+        let prefix_encoded = lower.encode_as_key(self.id);
+        let upper_encoded = upper.encode_as_key(self.id);
+        if self.is_temp {
+            tx.temp_store_tx.range_scan(&prefix_encoded, &upper_encoded)
+        } else {
+            tx.store_tx.range_scan(&prefix_encoded, &upper_encoded)
+        }
+    }
+
     /// Two-level bitemporal scans (mnestic fork, step 4b): whole relation.
     pub(crate) fn bitemporal_scan_all<'a>(
         &self,
@@ -899,19 +917,20 @@ struct CorruptValueBlob {
     reason: String,
 }
 
-fn decode_val_blob(val: &[u8], key: String) -> Result<Vec<DataValue>> {
-    let encoded = val
-        .get(ENCODED_KEY_MIN_LEN..)
-        .ok_or_else(|| CorruptValueBlob {
-            key: key.clone(),
+fn decode_val_blob(val: &[u8], key: impl FnOnce() -> String) -> Result<Vec<DataValue>> {
+    let Some(encoded) = val.get(ENCODED_KEY_MIN_LEN..) else {
+        return Err(CorruptValueBlob {
+            key: key(),
             reason: format!(
                 "value is {} bytes; expected at least {ENCODED_KEY_MIN_LEN}",
                 val.len()
             ),
-        })?;
+        }
+        .into());
+    };
     rmp_serde::from_slice(encoded).map_err(|error| {
         CorruptValueBlob {
-            key,
+            key: key(),
             reason: error.to_string(),
         }
         .into()
@@ -919,7 +938,13 @@ fn decode_val_blob(val: &[u8], key: String) -> Result<Vec<DataValue>> {
 }
 
 fn encoded_key_label(key: &[u8]) -> String {
-    key.iter().map(|byte| format!("{byte:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(key.len() * 2);
+    for &b in key {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// Decode tuple from key-value pairs. Used for customizing storage
@@ -942,7 +967,7 @@ pub fn extend_tuple_from_v(key: &mut Tuple, val: &[u8]) {
 
 pub(crate) fn try_extend_tuple_from_v(key: &mut Tuple, val: &[u8]) -> Result<()> {
     if !val.is_empty() {
-        let vals = decode_val_blob(val, format!("tuple {key:?}"))?;
+        let vals = decode_val_blob(val, || format!("tuple {key:?}"))?;
         key.extend(vals);
     }
     Ok(())
@@ -952,7 +977,7 @@ pub(crate) fn try_decode_val_only(key: &[u8], val: &[u8]) -> Result<Tuple> {
     if val.is_empty() {
         Ok(Vec::new())
     } else {
-        decode_val_blob(val, encoded_key_label(key))
+        decode_val_blob(val, || encoded_key_label(key))
     }
 }
 
