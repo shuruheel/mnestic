@@ -94,12 +94,54 @@ mod distance_order_tests {
     }
 }
 
-struct VectorCache {
-    cache: FxHashMap<CompoundKey, Vector>,
-    distance: HnswDistance,
+pub(crate) struct VectorCache<'r, 's> {
+    pub(crate) cache: FxHashMap<CompoundKey, Vector>,
+    pub(crate) distance: HnswDistance,
+    pub(crate) base_tx: Option<&'r SessionTx<'s>>,
 }
 
-impl VectorCache {
+impl VectorCache<'static, 'static> {
+    pub(crate) fn new(distance: HnswDistance) -> Self {
+        Self {
+            cache: FxHashMap::default(),
+            distance,
+            base_tx: None,
+        }
+    }
+}
+
+impl<'r, 's> VectorCache<'r, 's> {
+    pub(crate) fn with_base_tx(distance: HnswDistance, base_tx: &'r SessionTx<'s>) -> Self {
+        Self {
+            cache: FxHashMap::default(),
+            distance,
+            base_tx: Some(base_tx),
+        }
+    }
+    pub(crate) fn seed_row(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig: &RelationHandle,
+        row: &Tuple,
+    ) {
+        let key = row[..orig.index_key_len()].to_vec();
+        for &field in &manifest.vec_fields {
+            match &row[field] {
+                DataValue::Vec(v) => {
+                    self.cache.insert((key.clone(), field, -1), v.clone());
+                }
+                DataValue::List(values) => {
+                    for (sub, value) in values.iter().enumerate() {
+                        if let DataValue::Vec(v) = value {
+                            self.cache
+                                .insert((key.clone(), field, sub as i32), v.clone());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     fn insert(&mut self, k: CompoundKey, v: Vector) {
         self.cache.insert(k, v);
     }
@@ -250,7 +292,11 @@ impl VectorCache {
         tx: &SessionTx<'_>,
     ) -> Result<()> {
         if !self.cache.contains_key(key) {
-            match handle.get_current(tx, &key.0)? {
+            let found = match self.base_tx {
+                Some(base_tx) => handle.get_current(base_tx, &key.0)?,
+                None => handle.get_current(tx, &key.0)?,
+            };
+            match found {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
                 None => bail!("Cannot find compound key for HNSW: {:?}", key),
             }
@@ -279,7 +325,10 @@ impl VectorCache {
             return self.ensure_key(missing[0], handle, tx);
         }
         let key_slices: Vec<&[DataValue]> = missing.iter().map(|k| k.0.as_slice()).collect();
-        let tuples = handle.get_current_batch(tx, &key_slices)?;
+        let tuples = match self.base_tx {
+            Some(base_tx) => handle.get_current_batch(base_tx, &key_slices)?,
+            None => handle.get_current_batch(tx, &key_slices)?,
+        };
         for (key, tuple) in missing.iter().zip(tuples) {
             match tuple {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
@@ -364,7 +413,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let tuple_key = &tuple[..orig_table.index_key_len()];
         let inserted_key = (tuple_key.to_vec(), idx, subidx);
@@ -627,7 +676,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         idx_table: &RelationHandle,
         orig_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<(usize, bool)> {
         vec_cache.ensure_key(target_key, orig_table, self)?;
         let vec = vec_cache.get_key(target_key).clone();
@@ -768,7 +817,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         idx_table: &RelationHandle,
         orig_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>> {
         let mut candidates = PriorityQueue::new();
         // Simple non-heuristic selection
@@ -836,7 +885,7 @@ impl<'a> SessionTx<'a> {
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
         found_nn: &mut PriorityQueue<CompoundKey, OrderedFloat<f64>>,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let q_norm_sq = match vec_cache.distance {
             HnswDistance::Cosine => match q {
@@ -1074,12 +1123,8 @@ impl<'a> SessionTx<'a> {
         // Steady-state path (single upsert): a fresh per-call cache, because a
         // batch can update a vector that is also some other row's neighbour, and
         // a cache shared across the batch could then serve a stale vector.
-        let mut vec_cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
-        self.hnsw_mutations_incomplete += 1;
-        let result = self.hnsw_put_inner(
+        let mut vec_cache = VectorCache::new(manifest.distance);
+        self.hnsw_put_with_cache(
             manifest,
             orig_table,
             idx_table,
@@ -1087,6 +1132,45 @@ impl<'a> SessionTx<'a> {
             stack,
             tuple,
             &mut vec_cache,
+        )
+    }
+
+    pub(crate) fn hnsw_put_with_cache(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        filter: Option<&Vec<Bytecode>>,
+        stack: &mut Vec<DataValue>,
+        tuple: &[DataValue],
+        vec_cache: &mut VectorCache<'_, '_>,
+    ) -> Result<bool> {
+        self.hnsw_mutations_incomplete += 1;
+        let result = self.hnsw_put_inner(
+            manifest, orig_table, idx_table, filter, stack, tuple, vec_cache,
+        );
+        if result.is_ok() {
+            self.hnsw_mutations_incomplete -= 1;
+        }
+        result
+    }
+
+    pub(crate) fn hnsw_remove_with_cache(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig_table: &RelationHandle,
+        idx_table: &RelationHandle,
+        tuple: &[DataValue],
+        vec_cache: &mut VectorCache<'_, '_>,
+    ) -> Result<()> {
+        self.hnsw_mutations_incomplete += 1;
+        let result = self.hnsw_remove_except(
+            manifest,
+            orig_table,
+            idx_table,
+            tuple,
+            &FxHashSet::default(),
+            vec_cache,
         );
         if result.is_ok() {
             self.hnsw_mutations_incomplete -= 1;
@@ -1251,7 +1335,7 @@ impl<'a> SessionTx<'a> {
         filter: Option<&Vec<Bytecode>>,
         stack: &mut Vec<DataValue>,
         tuple: &[DataValue],
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<bool> {
         if let Some(code) = filter {
             if !eval_bytecode_pred(code, tuple, stack, Default::default())? {
@@ -1294,10 +1378,7 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         tuple: &[DataValue],
     ) -> Result<()> {
-        let mut cache = VectorCache {
-            cache: FxHashMap::default(),
-            distance: manifest.distance,
-        };
+        let mut cache = VectorCache::new(manifest.distance);
         self.hnsw_mutations_incomplete += 1;
         let result = self.hnsw_remove_except(
             manifest,
@@ -1320,7 +1401,7 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         tuple: &[DataValue],
         keep: &FxHashSet<(usize, i32)>,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let mut prefix = vec![DataValue::from(0)];
         prefix.extend_from_slice(&tuple[0..orig_table.index_key_len()]);
@@ -1363,7 +1444,7 @@ impl<'a> SessionTx<'a> {
         manifest: &HnswIndexManifest,
         orig_table: &RelationHandle,
         idx_table: &RelationHandle,
-        vec_cache: &mut VectorCache,
+        vec_cache: &mut VectorCache<'_, '_>,
     ) -> Result<()> {
         let compound_key = (tuple_key.to_vec(), idx, subidx);
         // Go down the layers and remove all the links
@@ -1531,10 +1612,7 @@ impl<'a> SessionTx<'a> {
             (Vector::F64(v), VecElementType::F32) => Vector::F32(v.mapv(|x| x as f32)),
         };
 
-        let mut vec_cache = VectorCache {
-            cache: Default::default(),
-            distance: config.manifest.distance,
-        };
+        let mut vec_cache = VectorCache::new(config.manifest.distance);
 
         let ep_res = config
             .idx_handle
@@ -1658,7 +1736,7 @@ impl<'a> SessionTx<'a> {
         config: &HnswSearch,
         filter_bytecode: &Option<(Vec<Bytecode>, SourceSpan)>,
         stack: &mut Vec<DataValue>,
-        vec_cache: &VectorCache,
+        vec_cache: &VectorCache<'_, '_>,
     ) -> Result<Option<Vec<Tuple>>> {
         let index_filter = match &config.manifest.index_filter {
             Some(f_code) => {
@@ -1902,10 +1980,7 @@ mod tests {
 
     #[test]
     fn cosine_f32_self_distance_is_zero_and_symmetric() {
-        let vc = VectorCache {
-            cache: Default::default(),
-            distance: HnswDistance::Cosine,
-        };
+        let vc = VectorCache::new(HnswDistance::Cosine);
         let v1 = Vector::F32(Array1::from_vec(
             (0..384).map(|i| ((i as f32) * 0.137).sin() + 0.01).collect(),
         ));

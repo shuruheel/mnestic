@@ -202,60 +202,98 @@ impl SessionTx<'_> {
                 if !removed.is_empty() {
                     self.hnsw_remove_snapshot_rows(manifest, handle, index, &removed)?;
                 }
-                for row in inserted {
-                    self.hnsw_put(manifest, handle, index, filter, &mut stack, row)?;
-                }
-            }
-            for (old, new) in &changes {
-                if let Some(new) = new {
-                    self.replace_in_fts(
-                        handle,
-                        &mut stack,
-                        &processors,
-                        old.map(|r| r.as_slice()),
-                        new,
-                    )?;
-                } else if let Some(old) = old {
-                    self.del_in_fts(handle, &mut stack, &processors, old)?;
-                }
-                for (name, (index, inverse, manifest)) in &handle.lsh_indices {
-                    let (tokenizer, extractor) = processors.get(name).unwrap();
-                    if let (Some(old), Some(new)) = (old, new) {
-                        let old_value = eval_bytecode(extractor, old, &mut stack)?;
-                        let new_value = eval_bytecode(extractor, new, &mut stack)?;
-                        // List element equality need not match hashing (JSON
-                        // signed zero is one example). Compare actual derived
-                        // signatures for lists; strings/null have exact identity.
-                        let unchanged = match (&old_value, &new_value) {
-                            (DataValue::Null, DataValue::Null) => true,
-                            (DataValue::Str(a), DataValue::Str(b)) => a == b,
-                            (DataValue::List(a), DataValue::List(b)) => {
-                                let perms = hashes.get(name).unwrap();
-                                HashValues::new(a.iter(), perms).0
-                                    == HashValues::new(b.iter(), perms).0
-                            }
-                            _ => false,
-                        };
-                        if unchanged {
-                            continue;
-                        }
-                    }
-                    if let Some(old) = old {
-                        self.del_lsh_index_item(old, None, index, inverse)?;
-                    }
-                    if let Some(new) = new {
-                        self.put_lsh_index_item(
-                            new,
-                            extractor,
-                            &mut stack,
-                            tokenizer,
+                if !inserted.is_empty() {
+                    let mut insert_cache = crate::runtime::hnsw::VectorCache::new(manifest.distance);
+                    for row in inserted {
+                        self.hnsw_put_with_cache(
+                            manifest,
                             handle,
                             index,
-                            inverse,
-                            manifest,
-                            hashes.get(name).unwrap(),
+                            filter,
+                            &mut stack,
+                            row,
+                            &mut insert_cache,
                         )?;
                     }
+                }
+            }
+            let fts_lsh_pairs: Vec<(Option<&Tuple>, Option<&Tuple>)> = changes
+                .iter()
+                .map(|(old, new)| (*old, new.as_ref()))
+                .collect();
+            self.maintain_tt_fts_lsh_pairs(
+                handle,
+                &fts_lsh_pairs,
+                &processors,
+                &hashes,
+                &mut stack,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Maintain FTS and LSH current-belief indexes for explicit `(old, new)` row
+    /// pairs without reading the base table (used by both commit-section
+    /// maintenance and unlocked catch-up rounds).
+    pub(crate) fn maintain_tt_fts_lsh_pairs(
+        &mut self,
+        handle: &RelationHandle,
+        changes: &[(Option<&Tuple>, Option<&Tuple>)],
+        processors: &std::collections::BTreeMap<
+            smartstring::SmartString<smartstring::LazyCompact>,
+            (
+                std::sync::Arc<crate::fts::tokenizer::TextAnalyzer>,
+                Vec<crate::data::expr::Bytecode>,
+            ),
+        >,
+        hashes: &std::collections::BTreeMap<
+            smartstring::SmartString<smartstring::LazyCompact>,
+            crate::runtime::minhash_lsh::HashPermutations,
+        >,
+        stack: &mut Vec<DataValue>,
+    ) -> Result<()> {
+        for (old, new) in changes {
+            if let Some(new) = new {
+                self.replace_in_fts(handle, stack, processors, old.map(|r| r.as_slice()), new)?;
+            } else if let Some(old) = old {
+                self.del_in_fts(handle, stack, processors, old)?;
+            }
+            for (name, (index, inverse, manifest)) in &handle.lsh_indices {
+                let (tokenizer, extractor) = processors.get(name).unwrap();
+                if let (Some(old), Some(new)) = (old, new) {
+                    let old_value = eval_bytecode(extractor, old, stack)?;
+                    let new_value = eval_bytecode(extractor, new, stack)?;
+                    // List element equality need not match hashing (JSON
+                    // signed zero is one example). Compare actual derived
+                    // signatures for lists; strings/null have exact identity.
+                    let unchanged = match (&old_value, &new_value) {
+                        (DataValue::Null, DataValue::Null) => true,
+                        (DataValue::Str(a), DataValue::Str(b)) => a == b,
+                        (DataValue::List(a), DataValue::List(b)) => {
+                            let perms = hashes.get(name).unwrap();
+                            HashValues::new(a.iter(), perms).0 == HashValues::new(b.iter(), perms).0
+                        }
+                        _ => false,
+                    };
+                    if unchanged {
+                        continue;
+                    }
+                }
+                if let Some(old) = old {
+                    self.del_lsh_index_item(old, None, index, inverse)?;
+                }
+                if let Some(new) = new {
+                    self.put_lsh_index_item(
+                        new,
+                        extractor,
+                        stack,
+                        tokenizer,
+                        handle,
+                        index,
+                        inverse,
+                        manifest,
+                        hashes.get(name).unwrap(),
+                    )?;
                 }
             }
         }
@@ -366,6 +404,24 @@ impl BuildRegistration {
             token
         };
         Self { shared, token }
+    }
+
+    /// Drain currently accumulated catch-up keys while keeping the registration
+    /// live for subsequent commits (used by unlocked catch-up rounds before
+    /// taking exclusive publication locks).
+    pub(crate) fn take_keys(&self) -> Result<Vec<Tuple>> {
+        let mut registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get_mut(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        log.bytes = 0;
+        Ok(std::mem::take(&mut log.keys).into_values().collect())
     }
 
     /// Called under the commit section immediately before publication.

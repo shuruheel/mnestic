@@ -378,12 +378,128 @@ impl<'s, S: Storage<'s>> Db<S> {
             drop(rows);
             #[cfg(feature = "test-hooks")]
             self.run_tt_index_build_fence("populated");
+            // Iterative unlocked catch-up rounds: advance the detached
+            // generation in small committed batches against pinned read
+            // snapshots before acquiring `relation_write` + `tt_commit_lock`.
+            // Keeps RocksDB `WriteBatchWithIndex` small (avoiding O(N^2) HNSW
+            // catch-up blowup) and shrinks the exclusive publication tail to a
+            // handful of keys.
+            const MAX_UNLOCKED_CATCHUP_ROUNDS: usize = 16;
+            const UNLOCKED_CATCHUP_STOP_KEYS: usize = 8;
+            const UNLOCKED_HNSW_MAX_BACKLOG: usize = 256;
+            const FINAL_LOCKED_MAX_KEYS: usize = 32;
+            let profile = std::env::var_os("MNESTIC_BUILD_PROFILE").is_some();
+            let mut snapshot = snapshot;
+            let mut prev_pending: Option<usize> = None;
+            for round in 0..MAX_UNLOCKED_CATCHUP_ROUNDS {
+                poison.check()?;
+                let (next_snapshot, pending) = {
+                    let _section = section(&self.tt_commit_lock, &poison)?;
+                    let peek_len = registration.keys()?.len();
+                    if peek_len == 0 {
+                        break;
+                    }
+                    // When building HNSW under heavy concurrent write load,
+                    // incremental RocksDB HNSW catch-up cannot outpace
+                    // unthrottled writers. Skip unlocked rounds when the HNSW
+                    // backlog already exceeds `UNLOCKED_HNSW_MAX_BACKLOG` so
+                    // backlog does not amplify before the chunked
+                    // `relation_write` drain (which still keeps `tt_commit_lock`
+                    // free for other relations).
+                    if !build.hnsw_indices.is_empty() && peek_len > UNLOCKED_HNSW_MAX_BACKLOG {
+                        if profile {
+                            eprintln!(
+                                "tt catchup round {round}: HNSW backlog {peek_len} > {UNLOCKED_HNSW_MAX_BACKLOG}, switching to chunked relation_write drain"
+                            );
+                        }
+                        break;
+                    }
+                    // Stop unlocked rounds BEFORE replaying if backlog did not
+                    // shrink by at least 25% since the previous round, so
+                    // faster writers never amplify the backlog.
+                    if prev_pending.is_some_and(|prev| peek_len * 4 >= prev * 3) {
+                        if profile {
+                            eprintln!(
+                                "tt catchup round {round}: non-shrinking ({peek_len} vs prev {:?}), switching to relation_write drain",
+                                prev_pending
+                            );
+                        }
+                        break;
+                    }
+                    let pending = registration.take_keys()?;
+                    let next_snapshot = self.transact()?;
+                    let current = next_snapshot.get_relation(name, false)?;
+                    validate(&original, &current, &build)?;
+                    (next_snapshot, pending)
+                };
+                let pending_len = pending.len();
+                let t_round = Instant::now();
+                count = self.replay_tt_catchup_unlocked(
+                    &original,
+                    &build,
+                    &snapshot,
+                    &next_snapshot,
+                    &pending,
+                    count,
+                    &poison,
+                )?;
+                if profile {
+                    eprintln!(
+                        "tt catchup round {round}: replayed {pending_len} keys in {:?}",
+                        t_round.elapsed()
+                    );
+                }
+                snapshot = next_snapshot;
+                if pending_len <= UNLOCKED_CATCHUP_STOP_KEYS {
+                    break;
+                }
+                prev_pending = Some(pending_len);
+            }
             {
                 #[cfg(feature = "test-hooks")]
                 let publication_span = crate::measurement::Span::new("build_publication");
                 let admission = self.admit_relation_maintenance(&poison)?;
-            let _relation = relation_write(&locks[0], &poison)?;
-            drop(admission);
+                let _relation = relation_write(&locks[0], &poison)?;
+                drop(admission);
+                // Ordinary writers to `name` are now paused by `_relation` while
+                // `tt_commit_lock` is still free. If unlocked catch-up did not
+                // converge (e.g. fast writers outpaced HNSW catch-up), drain the
+                // remaining backlog here in small committed chunks so the final
+                // single-tx `WriteBatchWithIndex` never goes quadratic and
+                // `tt_commit_lock` is held only for the tiny tail + publication.
+                let drain_batch = {
+                    let _section = section(&self.tt_commit_lock, &poison)?;
+                    let peek_len = registration.keys()?.len();
+                    if peek_len > FINAL_LOCKED_MAX_KEYS {
+                        let pending = registration.take_keys()?;
+                        let next_snapshot = self.transact()?;
+                        let current = next_snapshot.get_relation(name, false)?;
+                        validate(&original, &current, &build)?;
+                        Some((next_snapshot, pending))
+                    } else {
+                        None
+                    }
+                };
+                if let Some((next_snapshot, pending)) = drain_batch {
+                    let n = pending.len();
+                    let t_drain = Instant::now();
+                    count = self.replay_tt_catchup_unlocked(
+                        &original,
+                        &build,
+                        &snapshot,
+                        &next_snapshot,
+                        &pending,
+                        count,
+                        &poison,
+                    )?;
+                    if profile {
+                        eprintln!(
+                            "tt relation_write drain: replayed {n} keys in {:?}",
+                            t_drain.elapsed()
+                        );
+                    }
+                    snapshot = next_snapshot;
+                }
                 let mut tx = self.transact_write()?;
                 // Catalog lock before the commit section, never while owning it.
                 #[cfg(feature = "test-hooks")]
@@ -445,6 +561,173 @@ impl<'s, S: Storage<'s>> Db<S> {
                 Err(error)
             }
         }
+    }
+
+    /// Replay catch-up keys into a detached generation without holding
+    /// `relation_write` or `tt_commit_lock`, using small committed RocksDB
+    /// transactions and pinned read snapshots:
+    /// - Phase 1 (HNSW removals) reads neighbor vectors from `snapshot`, where
+    ///   every vertex still in `build` has its exact pre-round vector.
+    /// - Phase 2 (HNSW insertions) reads neighbor vectors from `next_snapshot`,
+    ///   where every surviving/inserted vertex has its exact post-round vector.
+    /// - FTS and LSH replay explicit `(old, new)` pairs in chunked transactions.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_tt_catchup_unlocked(
+        &'s self,
+        original: &RelationHandle,
+        build: &RelationHandle,
+        snapshot: &SessionTx<'_>,
+        next_snapshot: &SessionTx<'_>,
+        pending: &[Tuple],
+        mut count: usize,
+        poison: &Poison,
+    ) -> Result<usize> {
+        const HNSW_CATCHUP_CHUNK: usize = 32;
+        const FTS_LSH_CATCHUP_CHUNK: usize = 256;
+        const MAX_CACHE_VECTORS: usize = 50_000;
+
+        let mut pairs: Vec<(Option<Tuple>, Option<Tuple>)> = Vec::with_capacity(pending.len());
+        for key in pending {
+            poison.check()?;
+            let prior = original.get_current(snapshot, key)?;
+            let now = original.get_current(next_snapshot, key)?;
+            count = count + usize::from(now.is_some()) - usize::from(prior.is_some());
+            pairs.push((prior, now));
+        }
+
+        let filters = SessionTx::make_hnsw_filters(build)?;
+        let mut stack = Vec::new();
+        for (idx_name, (index, manifest)) in &build.hnsw_indices {
+            let filter = filters.get(idx_name);
+            let mut removed: Vec<&Tuple> = Vec::new();
+            let mut inserted: Vec<&Tuple> = Vec::new();
+            for (old, new) in &pairs {
+                let old_passes = match (old.as_ref(), filter) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(r), Some(code)) => crate::data::expr::eval_bytecode_pred(
+                        code,
+                        r,
+                        &mut stack,
+                        Default::default(),
+                    )?,
+                };
+                let new_passes = match (new.as_ref(), filter) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(r), Some(code)) => crate::data::expr::eval_bytecode_pred(
+                        code,
+                        r,
+                        &mut stack,
+                        Default::default(),
+                    )?,
+                };
+                if !old_passes && !new_passes {
+                    continue;
+                }
+                if old_passes && new_passes {
+                    if let (Some(o), Some(n)) = (old.as_ref(), new.as_ref()) {
+                        let same_vectors = manifest
+                            .vec_fields
+                            .iter()
+                            .all(|&i| o.get(i) == n.get(i));
+                        if same_vectors {
+                            continue;
+                        }
+                    }
+                }
+                if old_passes {
+                    removed.push(old.as_ref().unwrap());
+                }
+                if new_passes {
+                    inserted.push(new.as_ref().unwrap());
+                }
+            }
+
+            if !removed.is_empty() {
+                let t_rem = Instant::now();
+                let mut remove_cache =
+                    crate::runtime::hnsw::VectorCache::with_base_tx(manifest.distance, snapshot);
+                for chunk in removed.chunks(HNSW_CATCHUP_CHUNK) {
+                    poison.check()?;
+                    if remove_cache.cache.len() > MAX_CACHE_VECTORS {
+                        remove_cache.cache.clear();
+                    }
+                    for row in chunk {
+                        remove_cache.seed_row(manifest, build, row);
+                    }
+                    let mut tx = self.transact_write()?;
+                    for row in chunk {
+                        tx.hnsw_remove_with_cache(manifest, build, index, row, &mut remove_cache)?;
+                    }
+                    self.commit_tx_with_test_hook(&mut tx)?;
+                }
+                if std::env::var_os("MNESTIC_BUILD_PROFILE").is_some() {
+                    eprintln!(
+                        "  hnsw catchup remove: {} rows in {:?}",
+                        removed.len(),
+                        t_rem.elapsed()
+                    );
+                }
+            }
+
+            if !inserted.is_empty() {
+                let t_ins = Instant::now();
+                let mut insert_cache = crate::runtime::hnsw::VectorCache::with_base_tx(
+                    manifest.distance,
+                    next_snapshot,
+                );
+                for chunk in inserted.chunks(HNSW_CATCHUP_CHUNK) {
+                    poison.check()?;
+                    if insert_cache.cache.len() > MAX_CACHE_VECTORS {
+                        insert_cache.cache.clear();
+                    }
+                    let mut tx = self.transact_write()?;
+                    for row in chunk {
+                        tx.hnsw_put_with_cache(
+                            manifest,
+                            build,
+                            index,
+                            filter,
+                            &mut stack,
+                            row,
+                            &mut insert_cache,
+                        )?;
+                    }
+                    self.commit_tx_with_test_hook(&mut tx)?;
+                }
+                if std::env::var_os("MNESTIC_BUILD_PROFILE").is_some() {
+                    eprintln!(
+                        "  hnsw catchup insert: {} rows in {:?}",
+                        inserted.len(),
+                        t_ins.elapsed()
+                    );
+                }
+            }
+        }
+
+        if !build.fts_indices.is_empty() || !build.lsh_indices.is_empty() {
+            for chunk in pairs.chunks(FTS_LSH_CATCHUP_CHUNK) {
+                poison.check()?;
+                let mut tx = self.transact_write()?;
+                let processors = tx.make_fts_lsh_processors(build)?;
+                let hashes = tx.make_lsh_hash_perms(build);
+                let chunk_pairs: Vec<(Option<&Tuple>, Option<&Tuple>)> = chunk
+                    .iter()
+                    .map(|(old, new)| (old.as_ref(), new.as_ref()))
+                    .collect();
+                tx.maintain_tt_fts_lsh_pairs(
+                    build,
+                    &chunk_pairs,
+                    &processors,
+                    &hashes,
+                    &mut stack,
+                )?;
+                self.commit_tx_with_test_hook(&mut tx)?;
+            }
+        }
+
+        Ok(count)
     }
 
     /// Detached or retired ids only. After successful attachment a cleanup
