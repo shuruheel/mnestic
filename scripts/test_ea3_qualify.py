@@ -131,6 +131,7 @@ class Ea3QualifyTests(unittest.TestCase):
                     c2_workers_cids=[["c0"]] * 4,
                     c2_workers_kinds=[["note"]] * 4,
                     h1_bucket_ref=dummy_ref,
+                    all_cids_ref=dummy_ref,
                     h1_expected_by_bucket={str(k): [["c0"]] for k in range(100)},
                 )
             specs = qual.build_all_plans(metas, p / "plans")

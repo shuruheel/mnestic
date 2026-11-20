@@ -204,7 +204,6 @@ def build(source, target, output, jobs=2):
     else:
         built_archives = sorted((target/'release/build').glob('mnestic-rocks-*/out/librocksdb*.a'))
         if built_archives:
-            native['built_librocksdb_path'] = str(built_archives[0])
             native['librocksdb_sha256'] = digest(built_archives[0].read_bytes())
     if env.get('ROCKSDB_INCLUDE_DIR'):
         root = Path(env['ROCKSDB_INCLUDE_DIR'])

@@ -201,6 +201,7 @@ def generate_seed_inputs(bench_repo, seed, out_dir):
     # H1 bucket table (tiny ~1 MB instead of 3.7 GB of repeated vectors): maps each cid -> bucket 0..99.
     h1_buckets = [[w.chunks[idx].id, f"{pos % 100}"] for pos, idx in enumerate(order)]
     h1_bucket_ref = write_input(f"seed{seed}_h1_buckets.json", {"b": h1_buckets})
+    all_cids_ref = write_input(f"seed{seed}_all_cids.json", {"keys": [[cid] for cid in all_cids]})
     h1_expected_by_bucket = {str(k): [] for k in range(100)}
     for cid, b in h1_buckets:
         h1_expected_by_bucket[b].append([cid])
@@ -229,6 +230,7 @@ def generate_seed_inputs(bench_repo, seed, out_dir):
         c2_workers_cids=c2_workers,
         c2_workers_kinds=[[chunk_kind(cid) for cid in cids] for cids in c2_workers],
         h1_bucket_ref=h1_bucket_ref,
+        all_cids_ref=all_cids_ref,
         h1_expected_by_bucket=h1_expected_by_bucket,
         input_hashes=input_hashes,
     )
@@ -517,7 +519,7 @@ def build_all_plans(metas, plans_dir):
                     steps=[dict(mode="serial", cell="h1_history", operations=h1_ops)],
                     verify=[
                         harness.op("logical-count", "?[count(cid)] := *chunk{cid}", rows=[[40000]], immutable=True),
-                        harness.op("physical-count", "?[name, nrows] := ::relations, name == 'chunk'", rows=[["chunk", 200000]], save_rows=True, immutable=True),
+                        harness.op("physical-count", "::history chunk $keys", params_file=meta["all_cids_ref"], project_row_count=True, rows=[[200000]], save_rows=True, immutable=True),
                     ],
                 ),
                 report_only=True,
@@ -1251,6 +1253,9 @@ def run_qualification(candidate_dir, baseline_dir, controls_dir, bench_repo, out
                     )
                     reason = comp_cell.get("stop_reason")
                     if attempt == 1 and reason in ("competing_native_process", "swapout_change", "sustained_competing_cpu"):
+                        if run_out.exists():
+                            phase.archive(run_out)
+                            _cleanup_db(run_out)
                         contaminated_retries.append(dict(cell=name, reason=reason, attempt=attempt, path=str(att_dir)))
                         continue
                     if spec["report_only"]:
