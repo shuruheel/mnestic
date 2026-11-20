@@ -1062,7 +1062,14 @@ impl<'a> SessionTx<'a> {
             bail!("Cannot set triggers for temp store")
         }
         let mut original = self.get_relation(name, true)?;
-        Self::reject_txtime_relation(&original, "::set_triggers")?;
+        if original.has_txtime() {
+            if !original.is_tt_only() {
+                Self::reject_txtime_relation(&original, "::set_triggers")?;
+            }
+            if !replaces.is_empty() {
+                Self::reject_txtime_relation(&original, "::set_triggers on replace")?;
+            }
+        }
         if original.access_level < AccessLevel::Protected {
             bail!(InsufficientAccessLevel(
                 original.name.to_string(),

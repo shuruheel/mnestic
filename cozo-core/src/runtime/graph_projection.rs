@@ -954,7 +954,7 @@ impl ProjectionCache {
     }
 
     /// The `(generation, edges, nodes)` of a registered projection.
-    fn definition(
+    pub(crate) fn definition(
         &self,
         name: &str,
     ) -> Result<(
@@ -1413,13 +1413,22 @@ fn create_projection(
     nodes: Option<&str>,
 ) -> Result<()> {
     let edges_handle = resolve_source(tx, edges)?;
-    let arity = edges_handle.metadata.keys.len() + edges_handle.metadata.non_keys.len();
+    let arity = (edges_handle.metadata.keys.len() + edges_handle.metadata.non_keys.len())
+        .saturating_sub(usize::from(edges_handle.is_tt_only()));
     ensure!(
         arity >= 2,
         ProjectionEdgeArityError(edges.to_string(), arity)
     );
     if let Some(nodes) = nodes {
-        resolve_source(tx, nodes)?;
+        let nodes_handle = resolve_source(tx, nodes)?;
+        let node_arity = (nodes_handle.metadata.keys.len() + nodes_handle.metadata.non_keys.len())
+            .saturating_sub(usize::from(nodes_handle.is_tt_only()));
+        ensure!(
+            node_arity >= 1,
+            "node relation '{}' for graph projection must have at least 1 column (excluding TxTime), got {}",
+            nodes,
+            node_arity
+        );
     }
     tx.projections
         .create(name, edges.into(), nodes.map(|n| n.into()))
@@ -1458,30 +1467,12 @@ fn resolve_source(tx: &SessionTx<'_>, name: &str) -> Result<RelationHandle> {
     if handle.is_temp {
         bail!(ProjectionTempSourceError(name.to_string()));
     }
-    if handle.has_txtime() {
+    if handle.has_txtime() && !handle.is_tt_only() {
         bail!(ProjectionTxTimeSourceError(name.to_string()));
     }
     Ok(handle)
 }
 
-/// Obtain the `key` variant of projection `name` for this transaction: a cache
-/// hit, or a build. The whole freshness protocol lives here.
-///
-/// Three doors lead to an *ephemeral* build — one this transaction uses and
-/// nobody caches:
-///
-/// 1. **Own uncommitted writes.** A source is in this transaction's dirty set,
-///    so its snapshot differs from every other transaction's. (Marking happens
-///    at mutation-function entry, i.e. at statement time, so a later statement
-///    of the same imperative script sees the mark.)
-/// 2. **A source this transaction cannot vouch for.** `FRESH` fails: a commit
-///    landed after our watermark, or one is in flight. Note this is permanent
-///    for *us* — a commit's token is minted after it finishes, hence after any
-///    watermark captured before it, so an unfresh source never becomes fresh
-///    again at a fixed watermark. So we do not even queue behind the build
-///    slot: nothing we build could be published.
-/// 3. **The produce rule refuses at insert time**, or the entry does not fit
-///    under the ceiling.
 #[cfg(feature = "graph-algo")]
 pub(crate) fn graph_source(
     tx: &SessionTx<'_>,
@@ -1489,6 +1480,7 @@ pub(crate) fn graph_source(
     key: VariantKey,
     span: SourceSpan,
     poison: &Poison,
+    tt_as_of: Option<crate::data::value::ValidityTs>,
 ) -> Result<GraphSource> {
     let cache = &tx.projections;
     let (generation, edges_name, nodes_name) = cache.definition(name)?;
@@ -1502,8 +1494,34 @@ pub(crate) fn graph_source(
     let edges_id = edges_handle.id;
     let nodes_id = nodes_handle.as_ref().map(|h| h.id);
 
+    // EA4 Batch 4.2 (D4.2.3): historical `:as_of` over any tt-only source
+    // builds an ephemeral CSR at `tt_as_of` without reading or populating the
+    // current-belief cache (nor bumping `cache.build_count`).
+    if tt_as_of.is_some()
+        && (edges_handle.is_tt_only() || nodes_handle.as_ref().is_some_and(|h| h.is_tt_only()))
+    {
+        let variant = build_variant(
+            tx,
+            &edges_handle,
+            nodes_handle.as_ref(),
+            key,
+            span,
+            poison,
+            tt_as_of,
+        )?;
+        return Ok(Arc::new(variant));
+    }
+
     let build = || {
-        let variant = build_variant(tx, &edges_handle, nodes_handle.as_ref(), key, span, poison)?;
+        let variant = build_variant(
+            tx,
+            &edges_handle,
+            nodes_handle.as_ref(),
+            key,
+            span,
+            poison,
+            None,
+        )?;
         cache.build_count.fetch_add(1, Ordering::Relaxed);
         Ok(Arc::new(variant))
     };
@@ -1625,6 +1643,75 @@ fn slot_action(
     SlotAction::BuildAndPublish
 }
 
+#[cfg(feature = "graph-algo")]
+struct EphemeralMemCharge {
+    mem: Option<crate::runtime::db::MemBudget>,
+    charged: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[cfg(feature = "graph-algo")]
+impl Drop for EphemeralMemCharge {
+    fn drop(&mut self) {
+        if let Some(mem) = &self.mem {
+            let n = self.charged.swap(0, Ordering::Relaxed);
+            if n > 0 {
+                mem.debit(n);
+            }
+        }
+    }
+}
+
+#[cfg(feature = "graph-algo")]
+fn scan_projection_source<'a>(
+    tx: &'a SessionTx<'_>,
+    handle: &'a RelationHandle,
+    tt_as_of: Option<crate::data::value::ValidityTs>,
+    span: SourceSpan,
+    mem: Option<(
+        crate::runtime::db::MemBudget,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    )>,
+) -> Result<TupleIter<'a>> {
+    if !handle.is_tt_only() {
+        return Ok(Box::new(handle.scan_all(tx)));
+    }
+    let target_tt = tt_as_of.unwrap_or(crate::data::functions::MAX_VALIDITY_TS);
+    if tt_as_of.is_some() {
+        handle.check_tt_gc_floor(tt_as_of, span)?;
+    }
+    let kpos = handle.metadata.keys.len() - 1;
+    let strip_tt = move |res: Result<crate::data::tuple::Tuple>| {
+        res.map(|mut row| {
+            if kpos < row.len() {
+                row.remove(kpos);
+            }
+            row
+        })
+    };
+    if tt_as_of.is_some() {
+        let limit = crate::runtime::txtime_index::as_of_scan_max_rows();
+        let rel_name = handle.name.to_string();
+        let mut seen = 0usize;
+        Ok(Box::new(handle.skip_scan_all(tx, target_tt).map(move |r| {
+            seen += 1;
+            if seen > limit {
+                return Err(crate::runtime::txtime_index::as_of_scan_limit_error(
+                    &rel_name, limit,
+                ));
+            }
+            let row = strip_tt(r)?;
+            if let Some((budget, charged)) = &mem {
+                let bytes = crate::data::memsize::est_tuple_bytes(&row);
+                charged.fetch_add(bytes, Ordering::Relaxed);
+                budget.charge_checked(bytes)?;
+            }
+            Ok(row)
+        })))
+    } else {
+        Ok(Box::new(handle.skip_scan_all(tx, target_tt).map(strip_tt)))
+    }
+}
+
 /// Scan the sources through this transaction's snapshot and build the CSR.
 /// Weighted variants build permissively and record what they saw (§3.2.2).
 #[cfg(feature = "graph-algo")]
@@ -1635,11 +1722,28 @@ fn build_variant(
     key: VariantKey,
     span: SourceSpan,
     poison: &Poison,
+    tt_as_of: Option<crate::data::value::ValidityTs>,
 ) -> Result<ProjectionVariant> {
-    let edge_iter: TupleIter<'_> = Box::new(edges.scan_all(tx));
-    let node_iter: Option<TupleIter<'_>> = nodes.map(|n| Box::new(n.scan_all(tx)) as TupleIter<'_>);
+    let mem_guard = if tt_as_of.is_some() {
+        Some(EphemeralMemCharge {
+            mem: poison.mem.clone(),
+            charged: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        })
+    } else {
+        None
+    };
+    let mem_arg = || {
+        mem_guard
+            .as_ref()
+            .and_then(|g| g.mem.clone().map(|m| (m, g.charged.clone())))
+    };
+    let edge_iter: TupleIter<'_> = scan_projection_source(tx, edges, tt_as_of, span, mem_arg())?;
+    let node_iter: Option<TupleIter<'_>> = match nodes {
+        Some(n) => Some(scan_projection_source(tx, n, tt_as_of, span, mem_arg())?),
+        None => None,
+    };
 
-    Ok(if key.weighted {
+    let variant = if key.weighted {
         let (graph, indices, inv_indices, has_negative) = build_weighted_csr(
             edge_iter,
             node_iter,
@@ -1662,7 +1766,15 @@ fn build_variant(
         let (graph, indices, inv_indices) =
             build_unweighted_csr(edge_iter, node_iter, key.undirected, span, span, poison)?;
         ProjectionVariant::new(GraphVariant::Unweighted(graph), indices, inv_indices)
-    })
+    };
+    if let Some(guard) = &mem_guard {
+        if let Some(budget) = &guard.mem {
+            let csr_bytes = variant.est_bytes();
+            guard.charged.fetch_add(csr_bytes, Ordering::Relaxed);
+            budget.charge_checked(csr_bytes)?;
+        }
+    }
+    Ok(variant)
 }
 
 #[cfg(feature = "graph-algo")]
@@ -2458,7 +2570,7 @@ mod cache_tests {
         key: VariantKey,
     ) -> miette::Result<GraphSource> {
         let tx = db.transact()?;
-        graph_source(&tx, name, key, SourceSpan(0, 0), &Poison::default())
+        graph_source(&tx, name, key, SourceSpan(0, 0), &Poison::default(), None)
     }
 
     fn builds<S>(db: &Db<S>) -> u64 {
@@ -2557,33 +2669,113 @@ mod cache_tests {
         .unwrap();
         run(&db, ":create vt_knows {a: Int, b: Int, vt: Validity}").unwrap();
 
-        for source in ["tt_knows", "bi_knows"] {
-            let err = define(&db, "g", source, None).unwrap_err().to_string();
-            assert!(
-                err.contains("transaction-time"),
-                "a tt-stamped edges source must be rejected by name: {err}"
-            );
-            let err = define(&db, "g", "knows", Some(source))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                err.contains("transaction-time"),
-                "the nodes slot too: {err}"
-            );
-        }
+        // Bitemporal (vt, tt) relations stay rejected; tt-only relations are admitted (EA4 Batch 4.2).
+        define(&db, "tt_ok", "tt_knows", None).unwrap();
+        define(&db, "tt_nodes_ok", "knows", Some("tt_knows")).unwrap();
+
+        let err = define(&db, "g", "bi_knows", None).unwrap_err().to_string();
+        assert!(
+            err.contains("transaction-time"),
+            "a bitemporal edges source must be rejected by name: {err}"
+        );
+        let err = define(&db, "g", "knows", Some("bi_knows"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("transaction-time"),
+            "the nodes slot too: {err}"
+        );
 
         // Plain-Validity relations are fine: a selector-less scan returns
         // every version row on every engine path, so the projection matches
         // the positional form exactly.
         define(&db, "vt_ok", "vt_knows", None).unwrap();
 
-        // The guard runs at every use, not only at create: a tt relation
+        // The guard runs at every use, not only at create: a bitemporal relation
         // renamed into the source name after the fact errors loudly instead
         // of silently projecting history.
         define(&db, "g", "knows", None).unwrap();
-        run(&db, "::rename knows -> knows_real, tt_knows -> knows").unwrap();
+        run(&db, "::rename knows -> knows_real, bi_knows -> knows").unwrap();
         let err = fetch(&db, "g", DIRECTED).unwrap_err().to_string();
         assert!(err.contains("transaction-time"), "{err}");
+
+        // Effective arity excludes the engine `tt` column (Finding 5).
+        run(&db, ":create unary_tt {a: Int, tt: TxTime}").unwrap();
+        run(&db, ":create empty_tt {tt: TxTime}").unwrap();
+        assert!(
+            define(&db, "bad_edge", "unary_tt", None).is_err(),
+            "1-data-column tt-only edge relation must be rejected at ::graph create"
+        );
+        assert!(
+            define(&db, "bad_node", "tt_knows", Some("empty_tt")).is_err(),
+            "0-data-column tt-only node relation must be rejected at ::graph create"
+        );
+    }
+
+    #[test]
+    fn as_of_tt_projection_bypasses_and_preserves_cache_and_bounds() {
+        let db = new_cozo_mem().unwrap();
+        run(&db, ":create e_tt {a: String, b: String, tt: TxTime => w: Float}").unwrap();
+        run(&db, "::graph create g {edges: e_tt}").unwrap();
+        run(&db, "?[a, b, w] <- [['a', 'b', 1.0], ['b', 'c', 1.0]] :put e_tt {a, b => w}").unwrap();
+        let t1 = match &run(&db, "?[tt] := *e_tt{a: 'a', b: 'b', tt}").unwrap().rows[0][0] {
+            DataValue::Validity(v) => v.timestamp.0 .0,
+            other => panic!("expected validity, got {other:?}"),
+        };
+        run(&db, "?[a, b, w] <- [['a', 'c', 0.25]] :put e_tt {a, b => w}").unwrap();
+
+        // Warm current-belief cache
+        let cur = run(
+            &db,
+            "s[x] <- [['a']] d[x] <- [['c']] ?[s, d, cost, path] <~ ShortestPathDijkstra(s[], d[], graph: g)",
+        )
+        .unwrap();
+        assert_eq!(cur.rows[0][2], DataValue::from(0.25));
+        assert_eq!(builds(&db), 1);
+        assert_eq!(cached(&db), 1);
+
+        // Historical :as_of query (including non-literal const expression `concat('g', '')`)
+        // must NOT bump `builds(&db)` or alter `cached(&db)`.
+        let hist = run(
+            &db,
+            &format!(
+                "s[x] <- [['a']] d[x] <- [['c']] ?[s, d, cost, path] <~ ShortestPathDijkstra(s[], d[], graph: concat('g', '')) :as_of {t1}"
+            ),
+        )
+        .unwrap();
+        assert_eq!(hist.rows[0][2], DataValue::from(2.0));
+        assert_eq!(builds(&db), 1, ":as_of must not increment cache build_count");
+        assert_eq!(cached(&db), 1, ":as_of must not insert into or evict current cache");
+
+        // Tight :mem_limit trips MemBudget during ephemeral :as_of CSR build.
+        let mem_err = run(
+            &db,
+            &format!(
+                "s[x] <- [['a']] d[x] <- [['c']] ?[s, d, cost, path] <~ ShortestPathDijkstra(s[], d[], graph: g) :as_of {t1} :mem_limit 16"
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{mem_err:?}").contains("mem_limit")
+                || format!("{mem_err:?}").contains("memory"),
+            "expected memory limit error on ephemeral :as_of CSR build, got: {mem_err:?}"
+        );
+        assert_eq!(builds(&db), 1);
+        assert_eq!(cached(&db), 1);
+
+        // Row scan cap (`query::as_of_scan_limit`) enforced on ephemeral :as_of projection.
+        let _guard = crate::runtime::txtime_index::AsOfScanMaxRowsGuard::set(1);
+        let cap_err = run(
+            &db,
+            &format!(
+                "s[x] <- [['a']] d[x] <- [['c']] ?[s, d, cost, path] <~ ShortestPathDijkstra(s[], d[], graph: g) :as_of {t1}"
+            ),
+        )
+        .unwrap_err();
+        assert!(
+            format!("{cap_err:?}").contains("query::as_of_scan_limit"),
+            "expected query::as_of_scan_limit, got: {cap_err:?}"
+        );
     }
 
     #[test]
@@ -3233,7 +3425,7 @@ mod cache_tests {
             let mut tx = db.transact_write().unwrap();
             let handle = tx.get_relation("knows", false).unwrap();
             tx.mark_dirty(&handle);
-            let g = graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default()).unwrap();
+            let g = graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default(), None).unwrap();
             assert_eq!(builds(&db), before + 1, "the writer built its own graph");
             assert_eq!(counts(&g), (5, 4));
             assert_eq!(cached(&db), 1, "and published nothing of its own");
@@ -3262,7 +3454,7 @@ mod cache_tests {
             let mut tx = db.transact_write().unwrap();
             let handle = tx.get_relation("knows", false).unwrap();
             tx.mark_dirty(&handle);
-            let g = graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default()).unwrap();
+            let g = graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default(), None).unwrap();
             assert_eq!(builds(&db), before + 1, "the dirty transaction built");
             assert_eq!(counts(&g), (5, 4));
             assert_eq!(
@@ -3427,7 +3619,7 @@ mod cache_tests {
                 std::thread::spawn(move || {
                     barrier.wait();
                     let tx = db.transact().unwrap();
-                    graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default()).unwrap()
+                    graph_source(&tx, "g", DIRECTED, SourceSpan(0, 0), &Poison::default(), None).unwrap()
                 })
             })
             .collect();

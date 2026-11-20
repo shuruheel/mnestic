@@ -2366,7 +2366,7 @@ fn make_extractor(
     }
 }
 
-fn make_const_rule(
+pub(crate) fn make_const_rule(
     program: &mut InputProgram,
     rule_name: &str,
     bindings: Vec<Symbol>,
@@ -2395,6 +2395,7 @@ fn make_const_rule(
                 arity: bindings_arity,
                 span: Default::default(),
                 fixed_impl: Arc::new(Box::new(Constant)),
+                tx_valid_at: None,
             },
         },
     );

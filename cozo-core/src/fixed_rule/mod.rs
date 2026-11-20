@@ -591,7 +591,14 @@ impl<'a, 'b> FixedRulePayload<'a, 'b> {
                 span
             ));
         }
-        let source = graph_source(self.tx, &name, spec.key(), span, poison)?;
+        let source = graph_source(
+            self.tx,
+            &name,
+            spec.key(),
+            span,
+            poison,
+            self.manifest.tx_valid_at,
+        )?;
         if spec.strict_weights && source.has_negative() {
             bail!(ProjectionNegativeWeightError(
                 self.name().to_string(),

@@ -36,6 +36,30 @@ thread_local! {
     static AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[cfg(test)]
+pub(crate) struct AsOfScanMaxRowsGuard {
+    prev: usize,
+}
+
+#[cfg(test)]
+impl AsOfScanMaxRowsGuard {
+    pub(crate) fn set(limit: usize) -> Self {
+        let prev = AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE.with(|c| {
+            let p = c.get();
+            c.set(limit);
+            p
+        });
+        Self { prev }
+    }
+}
+
+#[cfg(test)]
+impl Drop for AsOfScanMaxRowsGuard {
+    fn drop(&mut self) {
+        AS_OF_SCAN_MAX_ROWS_TEST_OVERRIDE.with(|c| c.set(self.prev));
+    }
+}
+
 pub(crate) fn as_of_scan_max_rows() -> usize {
     #[cfg(test)]
     {
@@ -63,6 +87,18 @@ pub(crate) fn has_search_indexes(handle: &RelationHandle) -> bool {
         || !handle.fts_indices.is_empty()
         || !handle.hnsw_indices.is_empty()
         || !handle.lsh_indices.is_empty()
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("trigger on transaction-time relation '{0}' cannot write to a transaction-time relation")]
+#[diagnostic(
+    code(eval::txtime_trigger_nested_tt_write),
+    help("transaction-time triggers may only mutate plain derived relations")
+)]
+pub(crate) struct TxTimeTriggerNestedWrite(pub(crate) String);
+
+pub(crate) fn has_tt_triggers(handle: &RelationHandle) -> bool {
+    !handle.put_triggers.is_empty() || !handle.rm_triggers.is_empty()
 }
 
 pub(crate) fn check_evict_limit(handle: &RelationHandle, count: usize) -> Result<()> {
@@ -135,8 +171,9 @@ impl SessionTx<'_> {
             if !entry.handle.is_tt_only() {
                 continue;
             }
-            let need_old =
-                has_search_indexes(&entry.handle) || self.has_active_shadow(entry.handle.id.0);
+            let need_old = has_search_indexes(&entry.handle)
+                || has_tt_triggers(&entry.handle)
+                || self.has_active_shadow(entry.handle.id.0);
             for row in &write.rows {
                 let key = row[..entry.handle.index_key_len()].to_vec();
                 let encoded = key.encode_as_key(entry.handle.id);
@@ -156,8 +193,9 @@ impl SessionTx<'_> {
             let count = evict_counts.entry(entry.handle.id.0).or_default();
             *count += 1;
             check_evict_limit(&entry.handle, *count)?;
-            let need_old =
-                has_search_indexes(&entry.handle) || self.has_active_shadow(entry.handle.id.0);
+            let need_old = has_search_indexes(&entry.handle)
+                || has_tt_triggers(&entry.handle)
+                || self.has_active_shadow(entry.handle.id.0);
             let encoded = evict.logical_key.encode_as_key(entry.handle.id);
             if !entry.old.contains_key(&encoded) {
                 let old = if need_old {
@@ -169,6 +207,122 @@ impl SessionTx<'_> {
             }
         }
         Ok(touched)
+    }
+
+    /// Execute commit-section triggers for touched `tt-only` relations (EA4 Batch 4.2, D4.2.2).
+    /// Runs after base rows are stamped and attached indexes are updated, inside `tt_commit_lock`.
+    /// Forbids nested writes to any `TxTime` relation (`eval::txtime_trigger_nested_tt_write`).
+    pub(crate) fn fire_tt_triggers(
+        &mut self,
+        touched: &BTreeMap<u64, TouchedRelation>,
+        tt: i64,
+    ) -> Result<()> {
+        if self.suppress_tt_triggers {
+            return Ok(());
+        }
+        let Some(executor) = self.tt_trigger_executor else {
+            return Ok(());
+        };
+        let mut cleanups = Vec::new();
+        for entry in touched.values() {
+            let handle = &entry.handle;
+            if !handle.is_tt_only() || entry.old.is_empty() || !has_tt_triggers(handle) {
+                continue;
+            }
+            let mut put_new: Vec<DataValue> = Vec::new();
+            let mut put_old: Vec<DataValue> = Vec::new();
+            let mut rm_new: Vec<DataValue> = Vec::new();
+            let mut rm_old: Vec<DataValue> = Vec::new();
+            for (logical_key, old_opt) in entry.old.values() {
+                let new_opt = handle.get_current(self, logical_key)?;
+                match (old_opt, new_opt) {
+                    (old_row, Some(new_row)) => {
+                        // Guard against concurrent `::evict` + `:put` where an
+                        // evicted historical row leaves a newer concurrent belief
+                        // untouched (`old_row == Some(&new_row)`). A real `:put`
+                        // always stamps a fresh `tt`, so `new_row != old_row`.
+                        if old_row.as_ref() != Some(&new_row) {
+                            put_new.push(DataValue::List(new_row));
+                            if let Some(prev) = old_row {
+                                put_old.push(DataValue::List(prev.clone()));
+                            }
+                        }
+                    }
+                    (Some(prev), None) => {
+                        let mut k_with_tt = logical_key.clone();
+                        k_with_tt.push(DataValue::Validity(crate::data::value::Validity {
+                            timestamp: crate::data::value::ValidityTs(std::cmp::Reverse(tt)),
+                            is_assert: std::cmp::Reverse(false),
+                        }));
+                        rm_new.push(DataValue::List(k_with_tt));
+                        rm_old.push(DataValue::List(prev.clone()));
+                    }
+                    (None, None) => {}
+                }
+            }
+
+            let k_bindings: Vec<crate::data::symb::Symbol> = handle
+                .metadata
+                .keys
+                .iter()
+                .map(|k| crate::data::symb::Symbol::new(k.name.clone(), Default::default()))
+                .collect();
+            let mut kv_bindings = k_bindings.clone();
+            kv_bindings.extend(
+                handle
+                    .metadata
+                    .non_keys
+                    .iter()
+                    .map(|k| crate::data::symb::Symbol::new(k.name.clone(), Default::default())),
+            );
+
+            if !put_new.is_empty() && !handle.put_triggers.is_empty() {
+                for trigger in &handle.put_triggers {
+                    let reconciled_before = self.reconciled_tt_relations.len();
+                    let c = executor.run_tt_trigger(
+                        self,
+                        &handle.name,
+                        trigger,
+                        kv_bindings.clone(),
+                        None,
+                        put_new.clone(),
+                        put_old.clone(),
+                    )?;
+                    cleanups.extend(c);
+                    if !self.pending_tt_writes.is_empty()
+                        || !self.pending_tt_evicts.is_empty()
+                        || self.reconciled_tt_relations.len() > reconciled_before
+                    {
+                        bail!(TxTimeTriggerNestedWrite(handle.name.to_string()));
+                    }
+                }
+            }
+            if !rm_old.is_empty() && !handle.rm_triggers.is_empty() {
+                for trigger in &handle.rm_triggers {
+                    let reconciled_before = self.reconciled_tt_relations.len();
+                    let c = executor.run_tt_trigger(
+                        self,
+                        &handle.name,
+                        trigger,
+                        kv_bindings.clone(),
+                        Some(k_bindings.clone()),
+                        rm_new.clone(),
+                        rm_old.clone(),
+                    )?;
+                    cleanups.extend(c);
+                    if !self.pending_tt_writes.is_empty()
+                        || !self.pending_tt_evicts.is_empty()
+                        || self.reconciled_tt_relations.len() > reconciled_before
+                    {
+                        bail!(TxTimeTriggerNestedWrite(handle.name.to_string()));
+                    }
+                }
+            }
+        }
+        for (lower, upper) in cleanups {
+            self.store_tx.del_range_from_persisted(&lower, &upper)?;
+        }
+        Ok(())
     }
 
     pub(crate) fn apply_tt_evicts(&mut self) -> Result<()> {

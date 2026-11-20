@@ -413,6 +413,86 @@ pub enum TransactionPayload {
     Query(Payload),
 }
 
+fn check_tt_trigger_target(
+    tx: &SessionTx<'_>,
+    source_relation: &str,
+    program: &InputProgram,
+) -> Result<()> {
+    if let Some((target_meta, op, _)) = &program.out_opts.store_relation {
+        let target_name = target_meta.name.name.as_str();
+        let creates_txtime = matches!(op, RelationOp::Create)
+            && target_meta
+                .metadata
+                .keys
+                .iter()
+                .any(|c| matches!(c.typing.coltype, crate::data::relation::ColType::TxTime));
+        let writes_existing_txtime = target_name == source_relation
+            || tx
+                .get_relation(target_name, false)
+                .is_ok_and(|h| h.has_txtime());
+        if creates_txtime || writes_existing_txtime {
+            bail!(crate::runtime::txtime_index::TxTimeTriggerNestedWrite(
+                source_relation.to_string()
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl<'s, S: Storage<'s>> crate::runtime::transact::TtTriggerExecutor<'s> for Db<S> {
+    fn run_tt_trigger(
+        &'s self,
+        tx: &mut SessionTx<'_>,
+        source_relation: &str,
+        trigger: &str,
+        kv_bindings: Vec<Symbol>,
+        k_bindings: Option<Vec<Symbol>>,
+        new_tuples: Vec<DataValue>,
+        old_tuples: Vec<DataValue>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let cur_vld = current_validity();
+        let mut program = parse_script(
+            trigger,
+            &Default::default(),
+            &self.fixed_rules.read().unwrap(),
+            crate::data::aggr::CustomAggrRegistries {
+                meet: &Default::default(),
+                bounded: &Default::default(),
+            },
+            cur_vld,
+        )?
+        .get_single_program()?;
+        // Fail closed before execution so 0-row :put/:rm, no-diff :reconcile,
+        // and :create of a TxTime relation are rejected even when pending_tt_writes
+        // stays empty.
+        check_tt_trigger_target(tx, source_relation, &program)?;
+        let new_bindings = k_bindings.unwrap_or_else(|| kv_bindings.clone());
+        crate::query::stored::make_const_rule(&mut program, "_new", new_bindings, new_tuples);
+        crate::query::stored::make_const_rule(&mut program, "_old", kv_bindings, old_tuples);
+        // TxTime triggers run inside `tt_commit_lock` and do not dispatch
+        // event callbacks on derived target relations.
+        let callback_targets = BTreeSet::new();
+        let mut callback_collector = CallbackCollector::default();
+        let (_, cleanups) = self
+            .run_query(
+                tx,
+                program,
+                cur_vld,
+                &callback_targets,
+                &mut callback_collector,
+                false,
+            )
+            .map_err(|err| {
+                if err.source_code().is_some() {
+                    err
+                } else {
+                    err.with_source_code(format!("{trigger} "))
+                }
+            })?;
+        Ok(cleanups)
+    }
+}
+
 impl<'s, S: Storage<'s>> Db<S> {
     /// Create a new database object with the given storage.
     /// You must call [`initialize`](Self::initialize) immediately after creation.
@@ -1954,6 +2034,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         let cur_vld = current_validity();
 
         let mut tx = self.transact_write()?;
+        tx.suppress_tt_triggers = true;
 
         for (relation_op, in_data) in data {
             let is_delete;
@@ -2823,7 +2904,10 @@ impl<'s, S: Storage<'s>> Db<S> {
             projections: self.graph_projections.clone(),
             watermark,
             dirty_relations: Default::default(),
+            begun_commit_relations: Default::default(),
             commit_inflight: false,
+            tt_trigger_executor: None,
+            suppress_tt_triggers: false,
         };
         Ok(ret)
     }
@@ -2861,7 +2945,10 @@ impl<'s, S: Storage<'s>> Db<S> {
             projections: self.graph_projections.clone(),
             watermark,
             dirty_relations: Default::default(),
+            begun_commit_relations: Default::default(),
             commit_inflight: false,
+            tt_trigger_executor: Some(self),
+            suppress_tt_triggers: false,
         };
         Ok(ret)
     }
@@ -3469,6 +3556,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         if skip_locking && !standalone && !tx.defer_tt_cleanup {
             let targets: Vec<_> = match op {
                 SysOp::CreateIndex(name, _, _)
+                | SysOp::SetTriggers(name, _, _, _)
                 | SysOp::Reindex(name)
                 | SysOp::RemoveIndex(name, _) => vec![name],
                 SysOp::TtHistoryGc(name, _) | SysOp::RepairCorrupt(name) if skip_locking => vec![name],
@@ -4343,6 +4431,26 @@ impl<'s, S: Storage<'s>> Db<S> {
                 if read_only {
                     bail!("Cannot set triggers in read-only mode");
                 }
+                if let Ok(rel) = tx.get_relation(name, false) {
+                    if rel.is_tt_only() {
+                        let cur_vld = current_validity();
+                        let fixed_rules = self.fixed_rules.read().unwrap();
+                        for trigger in puts.iter().chain(rms.iter()) {
+                            let program = parse_script(
+                                trigger,
+                                &Default::default(),
+                                &fixed_rules,
+                                crate::data::aggr::CustomAggrRegistries {
+                                    meet: &Default::default(),
+                                    bounded: &Default::default(),
+                                },
+                                cur_vld,
+                            )?
+                            .get_single_program()?;
+                            check_tt_trigger_target(tx, &name.name, &program)?;
+                        }
+                    }
+                }
                 tx.set_relation_triggers(name, puts, rms, replaces)?;
                 Ok(NamedRows::new(
                     vec![STATUS_STR.to_string()],
@@ -4420,7 +4528,10 @@ impl<'s, S: Storage<'s>> Db<S> {
         // whose storage lock is held by a later request waiting for admission.
         let mut admission_names = BTreeSet::new();
         let exclusive = match &op {
-            SysOp::Reindex(name) | SysOp::RepairCorrupt(name) | SysOp::CreateIndex(name, _, _) => {
+            SysOp::Reindex(name)
+            | SysOp::RepairCorrupt(name)
+            | SysOp::CreateIndex(name, _, _)
+            | SysOp::SetTriggers(name, _, _, _) => {
                 admission_names.insert(name.name.clone()); true
             }
             SysOp::CreateVectorIndex(c) => { admission_names.insert(c.base_relation.clone()); true }

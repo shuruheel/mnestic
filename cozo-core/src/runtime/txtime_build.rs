@@ -902,7 +902,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         }
         let mut targets = BTreeSet::new();
         match op {
-            SysOp::RemoveIndex(base, _) | SysOp::RepairCorrupt(base) => {
+            SysOp::RemoveIndex(base, _)
+            | SysOp::RepairCorrupt(base)
+            | SysOp::SetTriggers(base, _, _, _) => {
                 targets.insert(base.name.clone());
             }
             SysOp::RemoveRelation(relations) => {
