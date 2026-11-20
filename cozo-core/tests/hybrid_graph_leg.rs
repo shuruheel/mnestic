@@ -355,3 +355,122 @@ fn budgeted_leg_errors_loudly_without_graph_algo() {
         "the error must name the missing feature: {e}"
     );
 }
+
+/// Target-mapped graph leg (`target_relation` + `limit`): traverses an entity
+/// graph (`edge` + reverse index `edge:by_dst`) and maps reached entities
+/// (including the seed at hop 0) through `mention` (`mention:by_eid`) to chunk
+/// ids. Intermediate entity ids must never enter fusion or results, and the
+/// native executor must match running `hybrid_search_script` directly.
+#[test]
+fn graph_leg_target_relation_and_limit_match_script() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("bipartite.db");
+    let db = DbInstance::new("sqlite", path.to_str().unwrap(), "").unwrap();
+    run(
+        &db,
+        r#"
+        ?[cid, text, emb] <- [
+            ['c1', 'alpha topic', [1.0, 0.0]],
+            ['c2', 'beta topic',  [0.0, 1.0]],
+            ['c3', 'gamma topic', [0.0, 1.0]],
+            ['c4', 'delta topic', [-1.0, 0.0]],
+            ['c5', 'epsilon',     [-1.0, 0.0]]
+        ]
+        :create chunk { cid: String => text: String, emb: <F32; 2> }
+        "#,
+    );
+    run(
+        &db,
+        r#"::hnsw create chunk:vec {
+            dim: 2, m: 16, dtype: F32, fields: [emb],
+            distance: Cosine, ef_construction: 20
+        }"#,
+    );
+    run(
+        &db,
+        r#"::fts create chunk:fts {
+            extractor: text, tokenizer: Simple, filters: [Lowercase]
+        }"#,
+    );
+    // Entity graph: e0 <-> e1 <-> e2, with edge:by_dst for reverse lookups.
+    run(
+        &db,
+        r#"
+        ?[src, dst] <- [['e0', 'e1'], ['e2', 'e1']]
+        :create edge { src: String, dst: String }
+        "#,
+    );
+    run(&db, "::index create edge:by_dst {dst, src}");
+    // Mentions: e0->c1,c2 (hop 0), e1->c3 (hop 1), e2->c4,c5 (hop 2).
+    run(
+        &db,
+        r#"
+        ?[cid, eid] <- [['c1', 'e0'], ['c2', 'e0'], ['c3', 'e1'], ['c4', 'e2'], ['c5', 'e2']]
+        :create mention { cid: String, eid: String }
+        "#,
+    );
+    run(&db, "::index create mention:by_eid {eid, cid}");
+
+    let mut leg = GraphLeg::default();
+    leg.edge_relation = "edge".into();
+    leg.from_col = "src".into();
+    leg.to_col = "dst".into();
+    leg.seeds = vec!["e0".into()];
+    leg.max_hops = 2;
+    leg.undirected = true;
+    leg.target_relation = Some("mention".into());
+    leg.target_node_col = Some("eid".into());
+    leg.target_id_col = Some("cid".into());
+    leg.limit = Some(4); // c1,c2 (hop 0), c3 (hop 1), c4 (hop 2); drops c5
+
+    let mut q = HybridSearch::default();
+    q.relation = "chunk".into();
+    q.id_col = "cid".into();
+    q.vector_index = Some("vec".into());
+    q.query_vector = vec![1.0, 0.0];
+    q.vector_k = 2;
+    q.fts_index = Some("fts".into());
+    q.query_text = "alpha".into();
+    q.fts_k = 2;
+    q.graph_legs = vec![leg];
+    q.limit = 10;
+
+    let native = db.hybrid_search(&q).unwrap();
+    let (script, params) = build_hybrid_query(&q).unwrap();
+    let via_script = db
+        .run_script(&script, params, ScriptMutability::Immutable)
+        .unwrap();
+
+    let native_ids = ids(&native);
+    assert_eq!(native_ids, ids(&via_script));
+    assert!(
+        native_ids.iter().all(|id| id.starts_with('c')),
+        "entity ids must never leak into results: {native_ids:?}"
+    );
+    // Hop-0 seed chunk c2 and hop-2 c4 must be present; c5 truncated by limit=4.
+    assert!(native_ids.contains(&"c2".to_string()));
+    assert!(native_ids.contains(&"c4".to_string()));
+    assert!(!native_ids.contains(&"c5".to_string()));
+
+    // Verify exact parity in `detailed: true` mode too.
+    q.detailed = true;
+    let native_det = db.hybrid_search(&q).unwrap();
+    let (script_det, params_det) = build_hybrid_query(&q).unwrap();
+    let script_det_rows = db
+        .run_script(&script_det, params_det, ScriptMutability::Immutable)
+        .unwrap();
+    assert_eq!(native_det.headers, script_det_rows.headers);
+    assert_eq!(native_det.rows, script_det_rows.rows);
+}
+
+#[test]
+fn native_hybrid_enforces_hidden_access_level() {
+    let (db, _dir) = make_db();
+    run(&db, "::access_level hidden edges");
+    let q = graph_dominated(&["d1"], 2, false);
+    let err = db.hybrid_search(&q).unwrap_err();
+    assert!(
+        format!("{err:?}").to_lowercase().contains("access"),
+        "expected access-level denial, got: {err:?}"
+    );
+}

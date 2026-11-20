@@ -702,6 +702,9 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// diversified with Maximal Marginal Relevance. Read-only. See
     /// [`crate::HybridSearch`].
     pub fn hybrid_search(&'s self, q: &crate::runtime::hybrid::HybridSearch) -> Result<NamedRows> {
+        if let Some(rows) = crate::runtime::hybrid::execute_hybrid_native(self, q)? {
+            return Ok(rows);
+        }
         let (script, params) = crate::runtime::hybrid::build_hybrid_query(q)?;
         self.run_script(&script, params, ScriptMutability::Immutable)
     }
@@ -787,7 +790,7 @@ impl<'s, S: Storage<'s>> Db<S> {
 
     /// Record one warning straight into the ring. For checks that run outside
     /// a script (at open), where no later flush on the same thread is certain.
-    fn record_warning(&self, warning: QueryWarning) {
+    pub(crate) fn record_warning(&self, warning: QueryWarning) {
         let mut ring = self.warnings.lock().unwrap();
         let seq = self.warning_seq.fetch_add(1, Ordering::Relaxed);
         ring.push_back((seq, warning));
@@ -845,7 +848,7 @@ impl<'s, S: Storage<'s>> Db<S> {
     /// Returns the earliest (`min`) of whichever are set; `None` if neither is
     /// set, if the budget overflows `Instant`, or if the target has no monotonic
     /// clock (wasm).
-    fn effective_outer_deadline(&self, call_timeout: Option<f64>) -> Option<Instant> {
+    pub(crate) fn effective_outer_deadline(&self, call_timeout: Option<f64>) -> Option<Instant> {
         let start = budget_now()?;
         let mut deadline = call_timeout.and_then(|secs| deadline_from_secs(start, secs));
         let default_ms = self.default_query_timeout_ms.load(Ordering::Relaxed);

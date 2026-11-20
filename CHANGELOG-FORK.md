@@ -53,6 +53,26 @@ provenance and licensing.
   `txtime_*` integration suites; the specification's performance release gates
   must pass before release acceptance.
 
+### Changed — native `hybrid_search` parity (E5)
+
+- **Native `Db::hybrid_search` executes independent legs in parallel on one
+  read-only snapshot.** When a `HybridSearch` query has no `extra_lists`,
+  `mmr`, budgeted (`max_nodes`) graph legs, or temporal relations, the engine
+  runs the HNSW, FTS, and recursive graph legs directly against one shared
+  read snapshot (concurrently via `rayon::scope` when `rayon` is enabled,
+  using primary/secondary prefix indexes for graph expansion) and fuses them
+  with exact RRF math — matching `hybrid_search_script` output while avoiding
+  per-query CozoScript parsing and serial leg evaluation. `runtime/hybrid.rs`,
+  `runtime/db.rs`.
+- **`GraphLeg` adds optional `target_relation` (`target_node_col`,
+  `target_id_col`) and `limit`.** Graphs that traverse entity/node edges and
+  map reached nodes (including seeds at hop 0) to target items (e.g., an
+  entity→chunk `mention` relation) no longer need a mixed edge table that
+  leaks non-target node IDs into RRF; `limit` caps the graph leg's candidate
+  list before fusion, matching `vector_k` and `fts_k`. Exposed in both Rust
+  and Python (`cozo-lib-python`). Existing `hybrid_search_script` output is
+  byte-identical when the new fields are unset.
+
 ### Changed — planner keyed access
 
 - Eligible trailing equalities now bind immediately before their stored-relation

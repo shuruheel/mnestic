@@ -362,7 +362,7 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
             // 'seed_from_leg', a trailing space) would otherwise silently run
             // the leg with defaults — plausible results, wrong depth/mode, no
             // signal anywhere.
-            const KNOWN_LEG_KEYS: [&str; 15] = [
+            const KNOWN_LEG_KEYS: [&str; 19] = [
                 "label",
                 "edge_relation",
                 "from_col",
@@ -378,6 +378,10 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
                 "gate_relation",
                 "gate_cols",
                 "admit",
+                "target_relation",
+                "target_node_col",
+                "target_id_col",
+                "limit",
             ];
             for key in gd.keys() {
                 let key: String = key.extract()?;
@@ -440,6 +444,18 @@ fn py_to_hybrid_search(d: &PyDict) -> PyResult<HybridSearch> {
             }
             if let Some(x) = gd.get_item("admit")? {
                 leg.admit = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("target_relation")? {
+                leg.target_relation = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("target_node_col")? {
+                leg.target_node_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("target_id_col")? {
+                leg.target_id_col = x.extract()?;
+            }
+            if let Some(x) = gd.get_item("limit")? {
+                leg.limit = x.extract()?;
             }
             legs.push(leg);
         }
