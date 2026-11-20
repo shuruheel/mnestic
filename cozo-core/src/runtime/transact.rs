@@ -49,6 +49,7 @@ pub struct SessionTx<'a> {
     pub(crate) fts_pending: crate::fts::persist::FtsPending,
     /// An interrupted graph mutation must never be committed by a legacy client.
     pub(crate) hnsw_mutations_incomplete: usize,
+    pub(crate) keyed_access: bool,
     /// Transaction-time commit clock (mnestic fork, bitemporality step 2);
     /// shared handle to the `Db`'s high-water mark. See `runtime/tt_clock.rs`.
     pub(crate) tt_clock: Arc<TtClock>,

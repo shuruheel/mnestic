@@ -727,6 +727,7 @@ impl Default for ValueRange {
 #[derive(Clone)]
 pub struct Op {
     pub(crate) name: &'static str,
+    pub(crate) deterministic: bool,
     pub(crate) min_arity: usize,
     pub(crate) vararg: bool,
     pub(crate) inner: fn(&[DataValue]) -> Result<DataValue>,

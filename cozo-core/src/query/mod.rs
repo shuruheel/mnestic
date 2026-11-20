@@ -11,6 +11,7 @@ pub(crate) mod eval;
 pub(crate) mod factorize;
 pub(crate) mod graph;
 pub(crate) mod logical;
+pub(crate) mod keyed_access;
 pub(crate) mod magic;
 pub(crate) mod ra;
 pub(crate) mod reorder;
