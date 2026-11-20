@@ -50,15 +50,28 @@ class PhaseTests(unittest.TestCase):
                 phase.measured_pairs(root)
 
     def test_native_disk_power_and_swap_conditions_fail_closed(self):
-        valid=dict(free_mib=3000,ac_power=True,low_power_disabled=True,native=[],swapouts=10)
+        valid=dict(free_mib=3000,ac_power=True,low_power_disabled=True,native=[],swapouts=10,steal_delta=0)
         self.assertIsNone(host.invalid(valid,10))
+        self.assertEqual(phase.BUDGET, 10800)
         for key,value,reason in [('free_mib',1000,'disk_limit'),('ac_power',False,'power_condition'),
                                   ('low_power_disabled',False,'power_condition'),('native',[(1,'cargo')],'competing_native_process'),
-                                  ('swapouts',11,'swapout_change')]:
+                                  ('swapouts',11,'swapout_change'),('steal_delta',1,'hypervisor_steal')]:
             self.assertEqual(host.invalid(dict(valid,**{key:value}),10),reason)
         self.assertEqual(host.swapouts('Swapouts: 123.\n'),123)
         self.assertEqual(host.swapouts('nr_free_pages 100\npswpout 42\n'),42)
         with self.assertRaises(ValueError): host.swapouts('no counter')
+
+    def test_monitor_fails_closed_on_hypervisor_steal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            monitor=host.Monitor(Path(tmp)/'host.jsonl',tmp,10)
+            self.addCleanup(monitor.close)
+            monitor.prev_steal = 100
+            sample=dict(free_mib=3000,ac_power=True,low_power_disabled=True,native=[],swapouts=10,busy=[])
+            with patch.object(host,'observation',side_effect=lambda *a,**kw: dict(sample)), \
+                 patch.object(host,'power',return_value={}), \
+                 patch.object(host,'read_linux_steal',side_effect=[100, 101]):
+                self.assertIsNone(monitor.observe([],set(),''))
+                self.assertEqual(monitor.observe([],set(),''),'hypervisor_steal')
 
     def fake_builds(self, root):
         builds={}

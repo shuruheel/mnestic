@@ -133,6 +133,8 @@ def invalid(sample, previous_swap):
         return 'competing_native_process'
     if previous_swap is not None and sample['swapouts'] != previous_swap:
         return 'swapout_change'
+    if sample.get('steal_delta') is not None and sample['steal_delta'] > 0:
+        return 'hypervisor_steal'
     return None
 
 

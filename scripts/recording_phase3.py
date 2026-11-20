@@ -19,9 +19,9 @@ from analyze_timing_diagnostics import quantile
 BLOCKS = 10
 PAIRS = 100
 DRAWS = 10000
-# Fresh Linux Fly dedicated-VM campaign (ea3-fly-linux-amendment.md); no prior observations pooled.
+# Fresh Hetzner dedicated-core Linux campaign (ea3-hetzner-linux-amendment.md); no prior observations pooled.
 PRIOR_ATTEMPT_SECONDS = 0
-BUDGET = 7200 - PRIOR_ATTEMPT_SECONDS
+BUDGET = 10800 - PRIOR_ATTEMPT_SECONDS
 BASELINE_HEAD = '94595f8e9b57941fcd3827aba78d0f8e61843dda'
 
 
@@ -168,7 +168,7 @@ def run(candidate, baseline, output, review_manifest):
     os.environ.update(environment)
     scripts = [Path(__file__),Path(host.__file__),Path(controls.__file__),Path(harness.__file__),
                Path(__file__).with_name('analyze_timing_diagnostics.py')]
-    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-fly-linux-amendment.md'
+    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-hetzner-linux-amendment.md'
     builds = {}
     for arm,path in [('candidate',candidate),('baseline',baseline)]:
         info = json.loads((path/'build.json').read_text())
@@ -201,7 +201,7 @@ def run(candidate, baseline, output, review_manifest):
                   order=[dict(block=b,cell=c['name']) for b in range(BLOCKS) for c in cells],
                   script_sha256={str(p.resolve()):file_hash(p) for p in scripts},
                   protocol=str(protocol),protocol_sha256=file_hash(protocol),environment=environment,
-                  blocks=BLOCKS,pairs_per_block=PAIRS,draws=DRAWS,total_budget_seconds=7200,
+                  blocks=BLOCKS,pairs_per_block=PAIRS,draws=DRAWS,total_budget_seconds=10800,
                   prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,remaining_budget_seconds=BUDGET,
                   host=dict(idle_seconds=30,max_preflight_seconds=300,other_cpu_percent=25),
                   cell_seconds=180,rss_mib=4096,min_free_mib=2048)

@@ -1252,7 +1252,7 @@ def run_qualification(candidate_dir, baseline_dir, controls_dir, bench_repo, out
                         else {}
                     )
                     reason = comp_cell.get("stop_reason")
-                    if attempt == 1 and reason in ("competing_native_process", "swapout_change", "sustained_competing_cpu"):
+                    if attempt == 1 and reason in ("competing_native_process", "swapout_change", "sustained_competing_cpu", "hypervisor_steal"):
                         if run_out.exists():
                             phase.archive(run_out)
                             _cleanup_db(run_out)
