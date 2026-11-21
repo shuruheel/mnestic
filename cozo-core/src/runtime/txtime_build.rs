@@ -20,7 +20,7 @@ use crate::runtime::db::{Db, Poison};
 use crate::runtime::relation::{AccessLevel, RelationHandle};
 use crate::runtime::transact::SessionTx;
 use crate::runtime::txtime_index::{BuildRegistration, TouchedRelation};
-use crate::storage::{Storage, StoreTx};
+use crate::storage::Storage;
 use crate::{DataValue, NamedRows};
 
 #[cfg(feature = "test-hooks")]
@@ -427,20 +427,25 @@ impl<'s, S: Storage<'s>> Db<S> {
             self.run_tt_index_build_fence("registered");
             #[cfg(feature = "test-hooks")]
             let backfill_span = crate::measurement::Span::new("build_backfill");
-            let has_non_hnsw = !build.indices.is_empty()
-                || !build.fts_indices.is_empty()
-                || !build.lsh_indices.is_empty();
             let mut count = 0usize;
-            if self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() && !has_non_hnsw {
-                // Stream base rows directly into `FlatHnswBuilder` and serialise
-                // into a flat sorted byte arena for `ingest_sorted`. This avoids
-                // buffering `Vec<Tuple>` + millions of `BTreeMap` allocations
-                // whose bulk deallocation can trigger glibc arena consolidation
-                // pauses against concurrent writers.
+            {
+                // Stream base rows once on SST-ingest backends (`self.db.supports_sst_ingest()`
+                // is guaranteed here because non-SST backends returned early above):
+                // - HNSW graphs stream into `FlatHnswBuilder` -> `SortedKvArena` -> `ingest_sorted`.
+                // - FTS postings and B-tree secondary keys stream into `SortedKvArena` -> `ingest_sorted`,
+                //   eliminating monolithic `WriteBatch` commits that stall RocksDB's write thread.
+                // - LSH (rare) buffers only its rows and commits in small 64-row chunks.
+                use crate::fts::indexing::encode_fts_rows_for_tuple;
+                use crate::runtime::hnsw::SortedKvArena;
                 use crate::runtime::hnsw_build::{build_threads, FlatHnswBuilder, NodeMeta};
-                let filters = SessionTx::make_hnsw_filters(&build)?;
+
+                let hnsw_filters = if !build.hnsw_indices.is_empty() {
+                    SessionTx::make_hnsw_filters(&build)?
+                } else {
+                    BTreeMap::new()
+                };
                 let key_len = build.index_key_len();
-                let mut builders: Vec<(
+                let mut hnsw_builders: Vec<(
                     &RelationHandle,
                     &crate::runtime::hnsw::HnswIndexManifest,
                     Option<&Vec<crate::data::expr::Bytecode>>,
@@ -452,19 +457,38 @@ impl<'s, S: Storage<'s>> Db<S> {
                         (
                             index,
                             manifest,
-                            filters.get(name),
+                            hnsw_filters.get(name),
                             FlatHnswBuilder::new(manifest),
                         )
                     })
                     .collect();
+                let fts_processors =
+                    if !build.fts_indices.is_empty() || !build.lsh_indices.is_empty() {
+                        snapshot.make_fts_lsh_processors(&build)?
+                    } else {
+                        BTreeMap::new()
+                    };
+                // Keep one `SortedKvArena` per detached index so each ingested
+                // SST covers only that index's own `RelationId` range and never
+                // spans an unrelated concurrent relation's `RelationId`.
+                let mut btree_arenas: Vec<SortedKvArena> = (0..build.indices.len())
+                    .map(|_| SortedKvArena::new())
+                    .collect();
+                let mut fts_arenas: Vec<SortedKvArena> = (0..build.fts_indices.len())
+                    .map(|_| SortedKvArena::new())
+                    .collect();
+                let need_lsh = !build.lsh_indices.is_empty();
+                let mut lsh_rows: Vec<Tuple> = Vec::new();
                 let mut stack = Vec::new();
+
                 for row_res in original.scan_current(&snapshot) {
                     if count % 256 == 0 {
                         poison.check()?;
                     }
                     let tuple = row_res?;
                     count += 1;
-                    for (_, manifest, filter, builder) in &mut builders {
+
+                    for (_, manifest, filter, builder) in &mut hnsw_builders {
                         if let Some(code) = filter {
                             if !crate::data::expr::eval_bytecode_pred(
                                 code,
@@ -507,8 +531,45 @@ impl<'s, S: Storage<'s>> Db<S> {
                             }
                         }
                     }
+
+                    for ((idx_handle, extraction_indices), arena) in
+                        build.indices.values().zip(btree_arenas.iter_mut())
+                    {
+                        if extraction_indices.iter().any(|&i| i >= tuple.len()) {
+                            continue;
+                        }
+                        let extracted: Vec<_> = extraction_indices
+                            .iter()
+                            .map(|&i| tuple[i].clone())
+                            .collect();
+                        let key =
+                            idx_handle.encode_key_for_store(&extracted, Default::default())?;
+                        arena.push(&key, &[]);
+                    }
+
+                    for ((fts_name, (idx_handle, _)), arena) in
+                        build.fts_indices.iter().zip(fts_arenas.iter_mut())
+                    {
+                        let (tokenizer, extractor) = fts_processors.get(fts_name).unwrap();
+                        let (postings, _tok_count) = encode_fts_rows_for_tuple(
+                            &tuple,
+                            extractor,
+                            &mut stack,
+                            tokenizer,
+                            &build,
+                            idx_handle,
+                        )?;
+                        for (k, v) in postings {
+                            arena.push(&k, &v);
+                        }
+                    }
+
+                    if need_lsh {
+                        lsh_rows.push(tuple);
+                    }
                 }
-                for (index, manifest, _, builder) in builders {
+
+                for (index, manifest, _, builder) in hnsw_builders {
                     poison.check()?;
                     if builder.is_empty() {
                         continue;
@@ -519,43 +580,35 @@ impl<'s, S: Storage<'s>> Db<S> {
                     poison.check()?;
                     self.db.ingest_sorted(Box::new(arena.iter_owned()))?;
                 }
-            } else {
-                let rows = original
-                    .scan_current(&snapshot)
-                    .collect::<Result<Vec<_>>>()?;
-                count = rows.len();
-                // Bulk-load detached HNSW graphs via sorted SST ingest when the
-                // backend supports it (matching plain `create_hnsw_index_nonblocking`),
-                // avoiding giant memtable/WAL write batches and downstream flush stalls.
-                if self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
-                    let filters = SessionTx::make_hnsw_filters(&build)?;
-                    let mut tx = self.transact()?;
-                    for (name, (index, manifest)) in &build.hnsw_indices {
-                        poison.check()?;
-                        let mut idx_temp = index.clone();
-                        idx_temp.is_temp = true;
-                        tx.hnsw_build_index(manifest, &build, &idx_temp, filters.get(name), &rows)?;
-                        let lower = Tuple::default().encode_as_key(index.id);
-                        let upper = Tuple::default().encode_as_key(index.id.next());
-                        self.db
-                            .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
+
+                for mut arena in btree_arenas.into_iter().chain(fts_arenas) {
+                    if arena.is_empty() {
+                        continue;
                     }
+                    poison.check()?;
+                    arena.sort();
+                    poison.check()?;
+                    self.db.ingest_sorted(Box::new(arena.iter_owned()))?;
                 }
-                if has_non_hnsw
-                    || (!self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty())
-                {
-                    let mut tx = self.transact_write()?;
-                    if !self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
-                        let filters = SessionTx::make_hnsw_filters(&build)?;
-                        for (name, (index, manifest)) in &build.hnsw_indices {
+
+                if !lsh_rows.is_empty() {
+                    const LSH_BACKFILL_CHUNK: usize = 64;
+                    let mut lsh_only = build.clone();
+                    lsh_only.indices.clear();
+                    lsh_only.fts_indices.clear();
+                    lsh_only.hnsw_indices.clear();
+                    for chunk in lsh_rows.chunks(LSH_BACKFILL_CHUNK) {
+                        poison.check()?;
+                        let mut tx = self.transact_write()?;
+                        let processors = tx.make_fts_lsh_processors(&lsh_only)?;
+                        let perms = tx.make_lsh_hash_perms(&lsh_only);
+                        let mut lsh_stack = Vec::new();
+                        for row in chunk {
                             poison.check()?;
-                            tx.hnsw_build_index(manifest, &build, index, filters.get(name), &rows)?;
+                            tx.put_in_lsh(&lsh_only, &mut lsh_stack, &processors, row, &perms)?;
                         }
+                        self.commit_tx_with_test_hook(&mut tx)?;
                     }
-                    if has_non_hnsw {
-                        tx.populate_tt_non_hnsw_indexes(&build, &rows, &poison)?;
-                    }
-                    self.commit_tx_with_test_hook(&mut tx)?;
                 }
             }
             #[cfg(feature = "test-hooks")]
@@ -568,11 +621,60 @@ impl<'s, S: Storage<'s>> Db<S> {
             let mut snapshot = Some(snapshot);
             let mut shadow_active = false;
             if !build.hnsw_indices.is_empty() {
-                // WRITE_ONLY (shadow dual-write) catch-up for HNSW builds
+                // Phase A: while `build` is still detached and invisible to
+                // writers, shrink any large backfill-era backlog via unlocked
+                // chunked catch-up rounds (zero `tt_commit_lock` holds during
+                // replay). Stop as soon as the backlog is small (<= 32 keys)
+                // or stops shrinking meaningfully, then hand off to WRITE_ONLY
+                // shadow dual-write maintenance so arbitrary writer bursts
+                // converge monotonically without long exclusive holds.
+                const HNSW_PRE_SHADOW_MAX_ROUNDS: usize = 4;
+                const HNSW_PRE_SHADOW_STOP_KEYS: usize = 32;
+                let mut prev_pending: Option<usize> = None;
+                for round in 0..HNSW_PRE_SHADOW_MAX_ROUNDS {
+                    poison.check()?;
+                    let (next_snapshot, pending) = {
+                        let _section =
+                            section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                        let peek_len = registration.keys()?.len();
+                        if peek_len <= HNSW_PRE_SHADOW_STOP_KEYS {
+                            break;
+                        }
+                        if prev_pending.is_some_and(|prev| peek_len * 4 >= prev * 3) {
+                            break;
+                        }
+                        let pending = registration.take_keys()?;
+                        let next_snapshot = self.transact()?;
+                        let current = next_snapshot.get_relation(name, false)?;
+                        validate(&original, &current, &build)?;
+                        (next_snapshot, pending)
+                    };
+                    let pending_len = pending.len();
+                    let t_round = Instant::now();
+                    count = self.replay_tt_catchup_unlocked(
+                        &original,
+                        &build,
+                        snapshot.as_ref().expect("snapshot live"),
+                        &next_snapshot,
+                        &pending,
+                        count,
+                        &poison,
+                    )?;
+                    if profile {
+                        eprintln!(
+                            "tt hnsw pre-shadow catchup round {round}: replayed {pending_len} keys in {:?}",
+                            t_round.elapsed()
+                        );
+                    }
+                    snapshot = Some(next_snapshot);
+                    prev_pending = Some(pending_len);
+                }
+
+                // Phase B: WRITE_ONLY (shadow dual-write) catch-up for HNSW builds
                 // (Google F1 / PostgreSQL CREATE INDEX CONCURRENTLY pattern):
-                // activate shadow mode unconditionally so both backfill-era
-                // keys and any post-backfill writer bursts are maintained
-                // directly by writers, while remaining backfill keys drain 1
+                // activate shadow mode unconditionally so both remaining
+                // backfill-era keys and any post-backfill writer bursts are
+                // maintained directly by writers, while residual keys drain 1
                 // per brief `tt_commit_lock` turn.
                 poison.check()?;
                 let initial_keys = {
@@ -918,8 +1020,8 @@ impl<'s, S: Storage<'s>> Db<S> {
         mut count: usize,
         poison: &Poison,
     ) -> Result<usize> {
-        const HNSW_CATCHUP_CHUNK: usize = 32;
-        const FTS_LSH_CATCHUP_CHUNK: usize = 256;
+        const HNSW_CATCHUP_CHUNK: usize = 8;
+        const FTS_LSH_CATCHUP_CHUNK: usize = 64;
         const MAX_CACHE_VECTORS: usize = 50_000;
 
         let mut pairs: Vec<(Option<Tuple>, Option<Tuple>)> = Vec::with_capacity(pending.len());

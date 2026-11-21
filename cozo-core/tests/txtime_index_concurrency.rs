@@ -789,3 +789,144 @@ fn hnsw_extend_candidates_concurrent_replacements_stay_consistent() {
     );
     assert_eq!(found.as_array().unwrap().len(), 24);
 }
+
+#[test]
+fn hnsw_pre_shadow_unlocked_catchup_drains_large_backlog_before_shadow_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "{}").unwrap(),
+    );
+    run(&db, ":create doc {id: String, tt: TxTime => v: <F32; 2>}");
+    for i in 0..64 {
+        let x = (i as f32) + 1.0;
+        let y = ((i % 9) as f32) + 0.5;
+        run(
+            &db,
+            &format!("?[id,v] <- [['d{i:03}', [{x}, {y}]]] :put doc{{id=>v}}"),
+        );
+    }
+
+    let (reg_arrived, reg_release) = fence(&db, "registered");
+    let building = start(
+        &db,
+        "::hnsw create doc:vec {dim: 2, m: 8, dtype: F32, fields: [v], distance: L2, ef_construction: 32}",
+    );
+    arrive(&reg_arrived);
+
+    // Mutate > 32 distinct keys while paused at `registered` so Phase A unlocked
+    // catch-up must execute before Phase B `shadow_active` activates.
+    for i in 0..40 {
+        let x = (i as f32) + 100.0;
+        run(
+            &db,
+            &format!("?[id,v] <- [['d{i:03}', [{x}, 2.0]]] :put doc{{id=>v}}"),
+        );
+    }
+    for i in 40..45 {
+        run(&db, &format!("?[id] <- [['d{i:03}']] :rm doc{{id}}"));
+    }
+    for i in 64..70 {
+        let x = (i as f32) + 200.0;
+        run(
+            &db,
+            &format!("?[id,v] <- [['d{i:03}', [{x}, 3.0]]] :put doc{{id=>v}}"),
+        );
+    }
+
+    let (sh_arrived, sh_release) = fence(&db, "shadow_active");
+    reg_release.send(()).unwrap();
+    arrive(&sh_arrived);
+
+    // Concurrent updates/inserts/retracts while shadow mode is active.
+    finish(start(
+        &db,
+        "?[id,v] <- [['d000', [500.0, 5.0]], ['d070', [501.0, 6.0]]] :put doc{id=>v}",
+    ))
+    .unwrap();
+    finish(start(&db, "?[id] <- [['d001']] :rm doc{id}")).unwrap();
+
+    sh_release.send(()).unwrap();
+    finish(building).unwrap();
+
+    // Expected live rows: 64 - 5 (d040..d044) + 6 (d064..d069) + 1 (d070) - 1 (d001) = 65.
+    assert_eq!(rows(&db, "?[count(id)] := *doc{id}"), json!([[65]]));
+    let found = rows(
+        &db,
+        "?[id] := ~doc:vec{id | query: vec([500.0, 5.0]), k: 100, ef: 128} :order id",
+    );
+    let expected = rows(&db, "?[id] := *doc{id} :order id");
+    assert_eq!(found, expected);
+}
+
+#[test]
+fn fts_sst_backfill_concurrent_writes_and_persisted_stats_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "{}").unwrap(),
+    );
+    db.enable_persisted_fts_stats().unwrap();
+    run(&db, ":create doc {id: String, tt: TxTime => body: String}");
+    for i in 0..120 {
+        run(
+            &db,
+            &format!(
+                "?[id,body] <- [['d{i:03}', 'alpha common term{i}']] :put doc{{id=>body}}"
+            ),
+        );
+    }
+
+    let (reg_arrived, reg_release) = fence(&db, "registered");
+    let building = start(
+        &db,
+        "::fts create doc:text {extractor: body, tokenizer: Simple, filters: [Lowercase]}",
+    );
+    arrive(&reg_arrived);
+
+    // Mutate during backfill (updates, retractions, and inserts).
+    for i in 0..20 {
+        run(
+            &db,
+            &format!(
+                "?[id,body] <- [['d{i:03}', 'beta updated term{i}']] :put doc{{id=>body}}"
+            ),
+        );
+    }
+    for i in 20..30 {
+        run(&db, &format!("?[id] <- [['d{i:03}']] :rm doc{{id}}"));
+    }
+    for i in 120..130 {
+        run(
+            &db,
+            &format!(
+                "?[id,body] <- [['d{i:03}', 'gamma inserted term{i}']] :put doc{{id=>body}}"
+            ),
+        );
+    }
+
+    reg_release.send(()).unwrap();
+    finish(building).unwrap();
+
+    // Verify exact FTS matches across backfill-only, updated, and inserted cohorts.
+    let alpha = rows(
+        &db,
+        "?[id] := ~doc:text{id | query: 'alpha', k: 200} :order id",
+    );
+    assert_eq!(alpha.as_array().unwrap().len(), 90); // d030..d119
+    let beta = rows(
+        &db,
+        "?[id] := ~doc:text{id | query: 'beta', k: 200} :order id",
+    );
+    assert_eq!(beta.as_array().unwrap().len(), 20); // d000..d019
+    let gamma = rows(
+        &db,
+        "?[id] := ~doc:text{id | query: 'gamma', k: 200} :order id",
+    );
+    assert_eq!(gamma.as_array().unwrap().len(), 10); // d120..d129
+
+    // Persisted stats seed and verify cleanly against full posting scan.
+    assert_eq!(db.seed_fts_stats().unwrap(), 1);
+    for check in db.verify_fts_stats().unwrap() {
+        assert_eq!(check.persisted, Some(check.scanned), "{}", check.index);
+        assert_eq!(check.scanned.1, 120, "exact live doc count");
+    }
+}

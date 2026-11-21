@@ -2914,8 +2914,21 @@ pub(crate) struct SortedKvArena {
 }
 
 impl SortedKvArena {
+    pub(crate) fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            vals: Vec::new(),
+            entries: Vec::new(),
+        }
+    }
+
     #[inline]
-    fn push(&mut self, k: &[u8], v: &[u8]) {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    #[inline]
+    pub(crate) fn push(&mut self, k: &[u8], v: &[u8]) {
         let ks = self.keys.len() as u64;
         let kl = k.len() as u32;
         let vs = self.vals.len() as u64;
@@ -2925,7 +2938,7 @@ impl SortedKvArena {
         self.entries.push((ks, kl, vs, vl));
     }
 
-    fn sort(&mut self) {
+    pub(crate) fn sort(&mut self) {
         let keys = &self.keys;
         // Stable sort preserves insertion order for duplicate keys (e.g., if
         // duplicate columns appear in `fields`), and deduplicating in reverse
