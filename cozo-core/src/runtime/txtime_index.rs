@@ -703,38 +703,49 @@ impl SessionTx<'_> {
                     inserted.push(new.as_ref().unwrap());
                 }
             }
-            if !removed.is_empty() {
-                let mut remove_cache = crate::runtime::hnsw::VectorCache::with_shadow(
+            if !removed.is_empty() || !inserted.is_empty() {
+                let mut vec_cache = crate::runtime::hnsw::VectorCache::with_shadow(
                     manifest.distance,
                     self.tt_index_builds.clone(),
                     token,
                 );
-                for row in &removed {
-                    remove_cache.seed_row(manifest, handle, row);
+                if !removed.is_empty() {
+                    for row in &removed {
+                        vec_cache.seed_row(manifest, handle, row);
+                    }
+                    for row in &removed {
+                        self.hnsw_remove_with_cache(
+                            manifest,
+                            handle,
+                            index,
+                            row,
+                            &mut vec_cache,
+                        )?;
+                    }
+                    // Evict removed rows' logical keys from the shared cache
+                    // before seeding their replacements so the new vectors are
+                    // never shadowed by pre-update entries.
+                    let key_len = handle.index_key_len();
+                    for row in &removed {
+                        let key = &row[..key_len];
+                        vec_cache.cache.retain(|k, _| k.0.as_slice() != key);
+                    }
                 }
-                for row in removed {
-                    self.hnsw_remove_with_cache(manifest, handle, index, row, &mut remove_cache)?;
-                }
-            }
-            if !inserted.is_empty() {
-                let mut insert_cache = crate::runtime::hnsw::VectorCache::with_shadow(
-                    manifest.distance,
-                    self.tt_index_builds.clone(),
-                    token,
-                );
-                for row in &inserted {
-                    insert_cache.seed_row(manifest, handle, row);
-                }
-                for row in inserted {
-                    self.hnsw_put_with_cache(
-                        manifest,
-                        handle,
-                        index,
-                        filter,
-                        &mut stack,
-                        row,
-                        &mut insert_cache,
-                    )?;
+                if !inserted.is_empty() {
+                    for row in &inserted {
+                        vec_cache.seed_row(manifest, handle, row);
+                    }
+                    for row in inserted {
+                        self.hnsw_put_with_cache(
+                            manifest,
+                            handle,
+                            index,
+                            filter,
+                            &mut stack,
+                            row,
+                            &mut vec_cache,
+                        )?;
+                    }
                 }
             }
         }
@@ -1008,6 +1019,31 @@ impl BuildRegistration {
         if let Some(shadow) = log.shadow.as_mut() {
             shadow.pending_old.remove(encoded);
             shadow.count_delta += count_delta;
+        }
+        Ok(())
+    }
+
+    /// Record that the builder committed removal of `prior` for `encoded` on
+    /// phase 1 of a two-phase HNSW shadow drain turn, leaving only insertion of
+    /// the current row pending (`prior = None`, `count_delta -= 1`).
+    pub(crate) fn mark_shadow_prior_removed(&self, encoded: &[u8]) -> Result<()> {
+        let mut registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get_mut(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        if let Some(shadow) = log.shadow.as_mut() {
+            if let Some((_, old)) = shadow.pending_old.get_mut(encoded) {
+                if old.is_some() {
+                    *old = None;
+                    shadow.count_delta -= 1;
+                }
+            }
         }
         Ok(())
     }

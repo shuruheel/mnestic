@@ -467,9 +467,6 @@ fn sustained_clustered_churn_never_fails_a_write() {
         live.len(),
         unreachable.len()
     );
-    // The fallback path must actually run here, or this test cannot tell 0.19.1
-    // from 0.19.0 (which rejects exactly these writes).
-    assert!(fallbacks > 0, "churn never exceeded a repair bound");
     // Measured on the 2,000-row, ten-round version of this churn (dim 64): 0.18.0
     // left 11% of rows unreachable, a plain unlink fallback 0.45%, the reconnect
     // fallback 0.05%. The 0.5% bound catches 0.18-style degradation; it is too
@@ -492,5 +489,54 @@ fn sustained_clustered_churn_never_fails_a_write() {
         orphans.rows.is_empty(),
         "orphaned bottom-layer vertices: {:?}",
         orphans.rows
+    );
+
+    // Tight degree-cap churn (`m: 2`, `m_max0: 4`) guarantees the bounded
+    // repair-limit fallback path actually runs and still preserves zero write
+    // failures and zero bottom-layer orphans.
+    let tight_db = DbInstance::new("mem", "", "").unwrap();
+    run(&tight_db, &format!(":create t {{id:Int=>v:<F32;{dim}>}}"));
+    run(
+        &tight_db,
+        &format!(
+            "::hnsw create t:vec {{dim:{dim},m:2,dtype:F32,fields:[v],distance:Cosine,ef_construction:32}}"
+        ),
+    );
+    let mut tight_rng = Rng(0x9E37_79B9_7F4A_7C15);
+    for id in 0..120i64 {
+        let v = clustered(&mut tight_rng, &centers[..2]);
+        run(
+            &tight_db,
+            &format!("?[id,v]<-[[{id},{}]] :put t{{id=>v}}", vec_literal(&v)),
+        );
+    }
+    for round in 0..4 {
+        for id in (round * 20)..((round + 1) * 20) {
+            let v = clustered(&mut tight_rng, &centers[..2]);
+            run(
+                &tight_db,
+                &format!("?[id,v]<-[[{id},{}]] :put t{{id=>v}}", vec_literal(&v)),
+            );
+        }
+    }
+    let tight_fallbacks = run(&tight_db, "::warnings")
+        .rows
+        .iter()
+        .filter(|row| row[1].get_str() == Some("hnsw.repair_fallback"))
+        .count();
+    assert!(
+        tight_fallbacks > 0,
+        "tight-cap churn must exercise the hnsw.repair_fallback path"
+    );
+    let tight_orphans = run(
+        &tight_db,
+        "verts[id] := *t:vec{layer: 0, fr_id: id, to_id: id}
+         has_in[id] := *t:vec{layer: 0, fr_id: f, to_id: id, ignore_link: false}, f != id
+         ?[id] := verts[id], not has_in[id]",
+    );
+    assert!(
+        tight_orphans.rows.is_empty(),
+        "tight-cap churn left orphaned bottom-layer vertices: {:?}",
+        tight_orphans.rows
     );
 }

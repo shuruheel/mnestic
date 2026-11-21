@@ -553,6 +553,7 @@ impl RelationHandle {
     /// Whether this relation is tt-stamped (its last key column is `TxTime`;
     /// mnestic fork, bitemporality). Guaranteed by `validate_temporal_axes`
     /// to be the only possible TxTime position.
+    #[inline]
     pub(crate) fn has_txtime(&self) -> bool {
         matches!(
             self.metadata.keys.last().map(|c| &c.typing.coltype),
@@ -561,6 +562,7 @@ impl RelationHandle {
     }
 
     /// tt-only (system-versioned): tt-stamped with no vt axis.
+    #[inline]
     pub(crate) fn is_tt_only(&self) -> bool {
         self.has_txtime() && {
             let n = self.metadata.keys.len();
@@ -574,35 +576,97 @@ impl RelationHandle {
 
     /// Search-index identity omits the engine-assigned TxTime axis. Physical
     /// row offsets and base storage encoding still use the complete key schema.
+    #[inline]
     pub(crate) fn index_key_len(&self) -> usize {
         self.metadata.keys.len() - usize::from(self.is_tt_only())
     }
 
     /// Resolve a search hit's logical identity to its current asserted row.
     /// Plain relations retain their existing point-read path.
+    #[inline]
     pub(crate) fn get_current(&self, tx: &SessionTx<'_>, key: &[DataValue]) -> Result<Option<Tuple>> {
         if self.is_tt_only() {
             self.skip_scan_prefix(tx, &key.to_vec(), crate::data::functions::MAX_VALIDITY_TS)
-                .next().transpose()
+                .next()
+                .transpose()
         } else {
             self.get(tx, key)
         }
     }
 
+    #[inline]
     pub(crate) fn get_current_batch(&self, tx: &SessionTx<'_>, keys: &[&[DataValue]]) -> Result<Vec<Option<Tuple>>> {
         if self.is_tt_only() {
-            keys.iter().map(|key| self.get_current(tx, key)).collect()
+            if keys.is_empty() {
+                return Ok(Vec::new());
+            }
+            if keys.len() == 1 {
+                return Ok(vec![self.get_current(tx, keys[0])?]);
+            }
+            let max_keys = self.metadata.keys.len();
+            let bounds: Vec<(Vec<u8>, Vec<u8>)> = keys
+                .iter()
+                .map(|key| {
+                    let mut lower = key.to_vec();
+                    lower.truncate(max_keys);
+                    let mut upper = lower.clone();
+                    upper.push(DataValue::Bot);
+                    (lower.encode_as_key(self.id), upper.encode_as_key(self.id))
+                })
+                .collect();
+            let rel_upper = Tuple::default().encode_as_key(self.id.next());
+            if self.is_temp {
+                tx.temp_store_tx.multi_skip_first(
+                    &rel_upper,
+                    &bounds,
+                    crate::data::functions::MAX_VALIDITY_TS,
+                )
+            } else {
+                tx.store_tx.multi_skip_first(
+                    &rel_upper,
+                    &bounds,
+                    crate::data::functions::MAX_VALIDITY_TS,
+                )
+            }
         } else {
             self.get_batch(tx, keys)
         }
     }
 
     /// Current-belief corpus for search builds and exact-search fallback.
-    pub(crate) fn scan_current<'a>(&self, tx: &'a SessionTx<'_>) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+    pub(crate) fn scan_current<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
         if self.is_tt_only() {
             Box::new(self.skip_scan_all(tx, crate::data::functions::MAX_VALIDITY_TS))
         } else {
             Box::new(self.scan_all(tx))
+        }
+    }
+
+    /// Full current-row scan bypassing the RocksDB LRU block cache so detached
+    /// background index backfills do not evict hot working sets belonging to
+    /// concurrent writers. (mnestic fork)
+    pub(crate) fn scan_current_uncached<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        let lower = Tuple::default().encode_as_key(self.id);
+        let upper = Tuple::default().encode_as_key(self.id.next());
+        if self.is_tt_only() {
+            let valid_at = crate::data::functions::MAX_VALIDITY_TS;
+            if self.is_temp {
+                tx.temp_store_tx
+                    .range_skip_scan_tuple_uncached(&lower, &upper, valid_at)
+            } else {
+                tx.store_tx
+                    .range_skip_scan_tuple_uncached(&lower, &upper, valid_at)
+            }
+        } else if self.is_temp {
+            tx.temp_store_tx.range_scan_tuple_uncached(&lower, &upper)
+        } else {
+            tx.store_tx.range_scan_tuple_uncached(&lower, &upper)
         }
     }
 
@@ -1381,7 +1445,7 @@ impl<'a> SessionTx<'a> {
 
         if self.preparing_tt_index {
             rel_handle.lsh_indices.insert(manifest.index_name.clone(), (idx_handle, inv_idx_handle, manifest));
-            self.prepared_tt_index = Some(rel_handle);
+            self.prepared_tt_index = Some(Box::new(rel_handle));
             return Ok(());
         }
 
@@ -1525,7 +1589,7 @@ impl<'a> SessionTx<'a> {
 
         if self.preparing_tt_index {
             rel_handle.fts_indices.insert(manifest.index_name.clone(), (idx_handle, manifest));
-            self.prepared_tt_index = Some(rel_handle);
+            self.prepared_tt_index = Some(Box::new(rel_handle));
             return Ok(());
         }
 
@@ -1835,7 +1899,7 @@ impl<'a> SessionTx<'a> {
             let id = idx_handle.id;
             let mut rel_handle = rel_handle;
             rel_handle.hnsw_indices.insert(config.index_name.clone(), (idx_handle, manifest));
-            self.prepared_tt_index = Some(rel_handle);
+            self.prepared_tt_index = Some(Box::new(rel_handle));
             return Ok(id);
         }
 
@@ -2112,7 +2176,7 @@ impl<'a> SessionTx<'a> {
             rel_handle
                 .indices
                 .insert(idx_name.name.clone(), (idx_handle, extraction_indices));
-            self.prepared_tt_index = Some(rel_handle);
+            self.prepared_tt_index = Some(Box::new(rel_handle));
             return Ok(());
         }
 

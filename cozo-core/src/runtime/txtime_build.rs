@@ -182,7 +182,8 @@ impl SessionTx<'_> {
                     _ => unreachable!(),
                 }
                 self.preparing_tt_index = false;
-                self.prepared_tt_index
+                *self
+                    .prepared_tt_index
                     .take()
                     .expect("prepared index definition")
             }
@@ -214,39 +215,6 @@ impl SessionTx<'_> {
                 .is_none_or(|(old, _, _)| old.id != index.id)
         });
         Ok(definition)
-    }
-
-    fn populate_tt_indexes(
-        &mut self,
-        build: &RelationHandle,
-        rows: &[Tuple],
-        poison: &Poison,
-    ) -> Result<()> {
-        let filters = Self::make_hnsw_filters(build)?;
-        let processors = self.make_fts_lsh_processors(build)?;
-        let perms = self.make_lsh_hash_perms(build);
-        for (name, (index, manifest)) in &build.hnsw_indices {
-            poison.check()?;
-            self.hnsw_build_index(manifest, build, index, filters.get(name), rows)?;
-        }
-        let mut stack = Vec::new();
-        for row in rows {
-            poison.check()?;
-            for (idx_handle, extraction_indices) in build.indices.values() {
-                if extraction_indices.iter().any(|&i| i >= row.len()) {
-                    continue;
-                }
-                let extracted: Vec<_> = extraction_indices
-                    .iter()
-                    .map(|&i| row[i].clone())
-                    .collect();
-                let key = idx_handle.encode_key_for_store(&extracted, Default::default())?;
-                self.store_tx.put(&key, &[])?;
-            }
-            self.put_in_fts(build, &mut stack, &processors, row)?;
-            self.put_in_lsh(build, &mut stack, &processors, row, &perms)?;
-        }
-        Ok(())
     }
 
     fn publish_tt_indexes(
@@ -294,6 +262,438 @@ fn result_rows(op: &SysOp, build: &RelationHandle, count: usize) -> NamedRows {
 }
 
 impl<'s, S: Storage<'s>> Db<S> {
+    /// Populate detached TxTime index generations from a snapshot row slice.
+    /// When the storage backend supports SST ingest (RocksDB), HNSW graphs are
+    /// constructed in the in-RAM temp store and FTS postings are encoded in
+    /// parallel and sorted, then bulk-published via `ingest_sorted` — matching
+    /// plain index builds, avoiding giant `WriteBatchWithIndex` memtable bloat,
+    /// and shortening the detached backfill window.
+    /// Thread budget for detached background index construction. When the
+    /// storage engine allows concurrent writers during detached builds (RocksDB
+    /// SST ingest) and the caller has not overridden `MNESTIC_INDEX_BUILD_THREADS`,
+    /// leave half the cores available so concurrent writers on the same host
+    /// are not CPU-starved by parallel graph/posting construction.
+    fn detached_build_threads(&self) -> usize {
+        let base = crate::runtime::hnsw_build::build_threads().max(1);
+        if self.db.supports_sst_ingest()
+            && std::env::var_os("MNESTIC_INDEX_BUILD_THREADS").is_none()
+        {
+            (base / 2).max(1)
+        } else {
+            base
+        }
+    }
+
+    fn populate_tt_indexes(
+        &'s self,
+        tx: &mut SessionTx<'_>,
+        build: &RelationHandle,
+        rows: &[Tuple],
+        poison: &Poison,
+    ) -> Result<()> {
+        let filters = SessionTx::make_hnsw_filters(build)?;
+        let processors = tx.make_fts_lsh_processors(build)?;
+        let perms = tx.make_lsh_hash_perms(build);
+        let use_sst = self.db.supports_sst_ingest();
+
+        for (name, (index, manifest)) in &build.hnsw_indices {
+            poison.check()?;
+            if use_sst {
+                let mut idx_temp = index.clone();
+                idx_temp.is_temp = true;
+                let key_len = build.index_key_len();
+                let mut builder = crate::runtime::hnsw_build::FlatHnswBuilder::new(manifest);
+                let mut stack = Vec::new();
+                let filter = filters.get(name);
+                for tuple in rows {
+                    if let Some(code) = filter {
+                        if !crate::data::expr::eval_bytecode_pred(
+                            code,
+                            tuple,
+                            &mut stack,
+                            Default::default(),
+                        )? {
+                            continue;
+                        }
+                    }
+                    for &field_idx in &manifest.vec_fields {
+                        match tuple.get(field_idx).unwrap() {
+                            DataValue::Vec(v) => {
+                                builder.add_node(
+                                    crate::runtime::hnsw_build::NodeMeta {
+                                        key: tuple[..key_len].to_vec(),
+                                        field_idx,
+                                        sub_idx: -1,
+                                        hash: v.get_hash().as_ref().to_vec(),
+                                    },
+                                    v,
+                                )?;
+                            }
+                            DataValue::List(l) => {
+                                for (sidx, val) in l.iter().enumerate() {
+                                    if let DataValue::Vec(v) = val {
+                                        builder.add_node(
+                                            crate::runtime::hnsw_build::NodeMeta {
+                                                key: tuple[..key_len].to_vec(),
+                                                field_idx,
+                                                sub_idx: sidx as i32,
+                                                hash: v.get_hash().as_ref().to_vec(),
+                                            },
+                                            v,
+                                        )?;
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !builder.is_empty() {
+                    let threads = self.detached_build_threads();
+                    let graph = builder.build(manifest, threads);
+                    let mut entries = SessionTx::serialize_hnsw_graph_sorted_iter(
+                        &graph, &idx_temp, key_len, threads,
+                    )?
+                    .peekable();
+                    poison.check()?;
+                    if entries.peek().is_some() {
+                        self.db.ingest_sorted(Box::new(entries))?;
+                    }
+                }
+            } else {
+                tx.hnsw_build_index(manifest, build, index, filters.get(name), rows)?;
+            }
+        }
+
+        for (name, (idx_handle, _manifest)) in &build.fts_indices {
+            poison.check()?;
+            let (tokenizer, extractor) = processors
+                .get(name)
+                .expect("FTS processor built for every detached FTS index");
+            let threads = self
+                .detached_build_threads()
+                .max(1)
+                .min(rows.len().max(1));
+            let mut total_tokens: u64 = 0;
+            let mut n_docs: u64 = 0;
+            let mut all_postings: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            if threads <= 1 || rows.len() < 64 {
+                let mut stack = Vec::new();
+                for row in rows {
+                    poison.check()?;
+                    let (tuple_rows, count) = crate::fts::indexing::encode_fts_rows_for_tuple(
+                        row, extractor, &mut stack, tokenizer, build, idx_handle,
+                    )?;
+                    if count > 0 {
+                        total_tokens += count as u64;
+                        n_docs += 1;
+                    }
+                    if use_sst {
+                        all_postings.extend(tuple_rows);
+                    } else {
+                        for (k, v) in tuple_rows {
+                            tx.store_tx.put(&k, &v)?;
+                        }
+                    }
+                }
+            } else {
+                let chunk_size = rows.len().div_ceil(threads);
+                type EncodedChunk = (Vec<(Vec<u8>, Vec<u8>)>, u64, u64);
+                let chunk_results: Vec<Result<EncodedChunk>> = std::thread::scope(|s| {
+                    let handles: Vec<_> = rows
+                        .chunks(chunk_size)
+                        .map(|chunk| {
+                            s.spawn(move || {
+                                let mut stack = Vec::new();
+                                let mut out = Vec::new();
+                                let mut chunk_tokens: u64 = 0;
+                                let mut chunk_docs: u64 = 0;
+                                for (i, tuple) in chunk.iter().enumerate() {
+                                    if i & 63 == 0 {
+                                        poison.check()?;
+                                    }
+                                    let (tuple_rows, count) =
+                                        crate::fts::indexing::encode_fts_rows_for_tuple(
+                                            tuple, extractor, &mut stack, tokenizer, build,
+                                            idx_handle,
+                                        )?;
+                                    if count > 0 {
+                                        chunk_tokens += count as u64;
+                                        chunk_docs += 1;
+                                    }
+                                    out.extend(tuple_rows);
+                                }
+                                Ok((out, chunk_tokens, chunk_docs))
+                            })
+                        })
+                        .collect();
+                    handles
+                        .into_iter()
+                        .map(|h| h.join().expect("FTS index build worker panicked"))
+                        .collect()
+                });
+                for result in chunk_results {
+                    let (chunk_rows, chunk_tokens, chunk_docs) = result?;
+                    total_tokens += chunk_tokens;
+                    n_docs += chunk_docs;
+                    if use_sst {
+                        all_postings.extend(chunk_rows);
+                    } else {
+                        for (k, v) in chunk_rows {
+                            tx.store_tx.put(&k, &v)?;
+                        }
+                    }
+                }
+            }
+            if use_sst && !all_postings.is_empty() {
+                poison.check()?;
+                all_postings.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                self.db
+                    .ingest_sorted(Box::new(all_postings.into_iter().map(Ok)))?;
+            }
+            tx.seed_fts_doc_stats(idx_handle, total_tokens, n_docs)?;
+        }
+
+        if !build.indices.is_empty() || !build.lsh_indices.is_empty() {
+            let mut stack = Vec::new();
+            for row in rows {
+                poison.check()?;
+                for (idx_handle, extraction_indices) in build.indices.values() {
+                    if extraction_indices.iter().any(|&i| i >= row.len()) {
+                        continue;
+                    }
+                    let extracted: Vec<_> = extraction_indices
+                        .iter()
+                        .map(|&i| row[i].clone())
+                        .collect();
+                    let key = idx_handle.encode_key_for_store(&extracted, Default::default())?;
+                    tx.store_tx.put(&key, &[])?;
+                }
+                tx.put_in_lsh(build, &mut stack, &processors, row, &perms)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Build detached TxTime HNSW index(es) in RAM, run unlocked in-RAM
+    /// catch-up rounds when concurrent writers mutated >= 64 keys during graph
+    /// construction, then parallel-serialise and SST-ingest directly into
+    /// RocksDB. Keeps the post-ingest shadow drain queue tiny (~100 keys
+    /// instead of thousands) while leaving small fence tests untouched.
+    #[allow(clippy::too_many_arguments)]
+    fn populate_tt_hnsw_with_ram_catchup(
+        &'s self,
+        name: &str,
+        original: &RelationHandle,
+        build: &RelationHandle,
+        snapshot: &mut SessionTx<'s>,
+        registration: &BuildRegistration,
+        rows: &[Tuple],
+        count: &mut usize,
+        poison: &Poison,
+    ) -> Result<()> {
+        use rustc_hash::FxHashMap;
+        const RAM_CATCHUP_MIN_KEYS: usize = 64;
+        const RAM_CATCHUP_STOP_KEYS: usize = 32;
+        const MAX_RAM_ROUNDS: usize = 4;
+
+        let profile = std::env::var_os("MNESTIC_BUILD_PROFILE").is_some();
+        let filters = SessionTx::make_hnsw_filters(build)?;
+        let key_len = build.index_key_len();
+        let threads = self.detached_build_threads();
+
+        let extract_row_vecs = |tuple: &Tuple,
+                                manifest: &crate::runtime::hnsw::HnswIndexManifest,
+                                filter: Option<&Vec<crate::data::expr::Bytecode>>,
+                                stack: &mut Vec<DataValue>|
+         -> Result<Vec<(usize, i32, crate::data::value::Vector, Vec<u8>)>> {
+            if let Some(code) = filter {
+                if !crate::data::expr::eval_bytecode_pred(code, tuple, stack, Default::default())? {
+                    return Ok(Vec::new());
+                }
+            }
+            let mut out = Vec::new();
+            for &field_idx in &manifest.vec_fields {
+                match tuple.get(field_idx).unwrap() {
+                    DataValue::Vec(v) => {
+                        out.push((field_idx, -1, v.clone(), v.get_hash().as_ref().to_vec()));
+                    }
+                    DataValue::List(l) => {
+                        for (sidx, val) in l.iter().enumerate() {
+                            if let DataValue::Vec(v) = val {
+                                out.push((
+                                    field_idx,
+                                    sidx as i32,
+                                    v.clone(),
+                                    v.get_hash().as_ref().to_vec(),
+                                ));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(out)
+        };
+
+        let mut states = Vec::with_capacity(build.hnsw_indices.len());
+        let mut stack = Vec::new();
+        for (idx_name, (idx_handle, manifest)) in &build.hnsw_indices {
+            poison.check()?;
+            let filter = filters.get(idx_name);
+            let mut builder = crate::runtime::hnsw_build::FlatHnswBuilder::new(manifest);
+            let mut key_to_nodes: FxHashMap<Vec<u8>, Vec<(usize, i32, u32)>> =
+                FxHashMap::default();
+            key_to_nodes.reserve(rows.len());
+            for tuple in rows {
+                let vecs = extract_row_vecs(tuple, manifest, filter, &mut stack)?;
+                if vecs.is_empty() {
+                    continue;
+                }
+                let logical_key = &tuple[..key_len];
+                let encoded_k = logical_key.encode_as_key(build.id);
+                let mut ids = Vec::with_capacity(vecs.len());
+                for (field_idx, sub_idx, v, hash) in vecs {
+                    let id = builder.add_node(
+                        crate::runtime::hnsw_build::NodeMeta {
+                            key: logical_key.to_vec(),
+                            field_idx,
+                            sub_idx,
+                            hash,
+                        },
+                        &v,
+                    )?;
+                    ids.push((field_idx, sub_idx, id));
+                }
+                key_to_nodes.insert(encoded_k, ids);
+            }
+            let t_graph = Instant::now();
+            builder.build_graph(manifest, threads);
+            if profile {
+                eprintln!(
+                    "tt hnsw ram graph ({idx_name}): {} rows in {:?}",
+                    rows.len(),
+                    t_graph.elapsed()
+                );
+            }
+            states.push((idx_name, idx_handle, manifest, filter, builder, key_to_nodes));
+        }
+
+        // Unlocked in-RAM catch-up rounds: apply backfill-era concurrent
+        // mutations directly to the in-RAM graph (~60us/key vs ~30ms on disk)
+        // before serialising & ingesting the SSTable.
+        let mut prev_pending: Option<usize> = None;
+        for round in 0..MAX_RAM_ROUNDS {
+            poison.check()?;
+            let taken = {
+                let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, poison)?;
+                let peek_len = registration.keys()?.len();
+                if peek_len < RAM_CATCHUP_MIN_KEYS
+                    || prev_pending.is_some_and(|prev| peek_len * 4 >= prev * 3)
+                {
+                    None
+                } else {
+                    let pending = registration.take_keys()?;
+                    let next_snap = self.transact()?;
+                    let current = next_snap.get_relation(name, false)?;
+                    validate(original, &current, build)?;
+                    Some((next_snap, pending))
+                }
+            };
+            let Some((next_snap, pending)) = taken else {
+                break;
+            };
+            let pending_len = pending.len();
+            let t_round = Instant::now();
+            let key_slices: Vec<&[DataValue]> = pending.iter().map(|k| k.as_slice()).collect();
+            let priors = original.get_current_batch(snapshot, &key_slices)?;
+            let nows = original.get_current_batch(&next_snap, &key_slices)?;
+            for (prior, now) in priors.iter().zip(nows.iter()) {
+                *count = *count + usize::from(now.is_some()) - usize::from(prior.is_some());
+            }
+            for (_, _, manifest, filter, builder, key_to_nodes) in &mut states {
+                builder.prepare_incremental();
+                for (key, now) in pending.iter().zip(nows.iter()) {
+                    poison.check()?;
+                    let encoded_k = key.encode_as_key(build.id);
+                    let new_vecs = match now {
+                        Some(row) => extract_row_vecs(row, manifest, *filter, &mut stack)?,
+                        None => Vec::new(),
+                    };
+                    if let Some(existing) = key_to_nodes.get(&encoded_k) {
+                        let unchanged = existing.len() == new_vecs.len()
+                            && existing.iter().zip(new_vecs.iter()).all(
+                                |(&(ef, es, eid), (nf, ns, _, nh))| {
+                                    ef == *nf && es == *ns && builder.node_hash(eid) == nh.as_slice()
+                                },
+                            );
+                        if unchanged {
+                            continue;
+                        }
+                    }
+                    if let Some(old_ids) = key_to_nodes.remove(&encoded_k) {
+                        for (_, _, id) in old_ids {
+                            builder.remove_node(id, name);
+                        }
+                    }
+                    if !new_vecs.is_empty() {
+                        let mut ids = Vec::with_capacity(new_vecs.len());
+                        for (field_idx, sub_idx, v, hash) in new_vecs {
+                            let id = builder.insert_dynamic(
+                                crate::runtime::hnsw_build::NodeMeta {
+                                    key: key.clone(),
+                                    field_idx,
+                                    sub_idx,
+                                    hash,
+                                },
+                                &v,
+                                manifest,
+                                name,
+                            )?;
+                            ids.push((field_idx, sub_idx, id));
+                        }
+                        key_to_nodes.insert(encoded_k, ids);
+                    }
+                }
+            }
+            *snapshot = next_snap;
+            if profile {
+                eprintln!(
+                    "tt hnsw ram catchup round {round}: applied {pending_len} keys in {:?}",
+                    t_round.elapsed()
+                );
+            }
+            if pending_len <= RAM_CATCHUP_STOP_KEYS {
+                break;
+            }
+            prev_pending = Some(pending_len);
+        }
+
+        for (idx_name, idx_handle, _, _, builder, _) in states {
+            poison.check()?;
+            let t_ser = Instant::now();
+            let graph = builder.into_graph();
+            let mut entries =
+                SessionTx::serialize_hnsw_graph_sorted_iter(&graph, idx_handle, key_len, threads)?
+                    .peekable();
+            let ser_elapsed = t_ser.elapsed();
+            poison.check()?;
+            let t_ing = Instant::now();
+            if entries.peek().is_some() {
+                self.db.ingest_sorted(Box::new(entries))?;
+            }
+            if profile {
+                eprintln!(
+                    "tt hnsw sst ({idx_name}): serialise {ser_elapsed:?}, ingest {:?}",
+                    t_ing.elapsed()
+                );
+            }
+        }
+        let mut tx = self.transact_write()?;
+        self.commit_tx_with_test_hook(&mut tx)?;
+        Ok(())
+    }
+
     /// Handles only tt-only search create/rebuild. Other operations retain their
     /// existing dispatch and diagnostics, including bitemporal rejection.
     pub(crate) fn run_tt_index_op(
@@ -349,7 +749,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             #[cfg(feature = "test-hooks")]
             let backfill_span = crate::measurement::Span::new("build_backfill");
             let rows = current.scan_current(&tx).collect::<Result<Vec<_>>>()?;
-            tx.populate_tt_indexes(&build, &rows, &poison)?;
+            self.populate_tt_indexes(&mut tx, &build, &rows, &poison)?;
             #[cfg(feature = "test-hooks")]
             backfill_span.finish();
             #[cfg(feature = "test-hooks")]
@@ -395,7 +795,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             // Pin the actual read snapshot and registration in one commit gap.
             #[cfg(feature = "test-hooks")]
             let registration_span = crate::measurement::Span::new("build_registration");
-            let snapshot = {
+            let mut snapshot = {
                 let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
                 let snapshot = self.transact()?;
                 let current = snapshot.get_relation(name, false)?;
@@ -416,12 +816,28 @@ impl<'s, S: Storage<'s>> Db<S> {
             #[cfg(feature = "test-hooks")]
             let backfill_span = crate::measurement::Span::new("build_backfill");
             let rows = original
-                .scan_current(&snapshot)
+                .scan_current_uncached(&snapshot)
                 .collect::<Result<Vec<_>>>()?;
             let mut count = rows.len();
+            if self.db.supports_sst_ingest()
+                && !build.hnsw_indices.is_empty()
+                && build.fts_indices.is_empty()
+                && build.indices.is_empty()
+                && build.lsh_indices.is_empty()
             {
+                self.populate_tt_hnsw_with_ram_catchup(
+                    name,
+                    &original,
+                    &build,
+                    &mut snapshot,
+                    registration,
+                    &rows,
+                    &mut count,
+                    &poison,
+                )?;
+            } else {
                 let mut tx = self.transact_write()?;
-                tx.populate_tt_indexes(&build, &rows, &poison)?;
+                self.populate_tt_indexes(&mut tx, &build, &rows, &poison)?;
                 self.commit_tx_with_test_hook(&mut tx)?;
             }
             #[cfg(feature = "test-hooks")]
@@ -446,11 +862,15 @@ impl<'s, S: Storage<'s>> Db<S> {
                 };
                 let snap = snapshot.as_ref().expect("snapshot live");
                 let mut preloaded: BTreeMap<Vec<u8>, (Tuple, Option<Tuple>)> = BTreeMap::new();
-                for key in initial_keys {
+                if !initial_keys.is_empty() {
                     poison.check()?;
-                    let encoded = key.encode_as_key(build.id);
-                    let prior = original.get_current(snap, &key)?;
-                    preloaded.insert(encoded, (key, prior));
+                    let key_slices: Vec<&[DataValue]> =
+                        initial_keys.iter().map(|k| k.as_slice()).collect();
+                    let priors = original.get_current_batch(snap, &key_slices)?;
+                    for (key, prior) in initial_keys.into_iter().zip(priors) {
+                        let encoded = key.encode_as_key(build.id);
+                        preloaded.insert(encoded, (key, prior));
+                    }
                 }
                 let activated_len = {
                     let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
@@ -479,6 +899,10 @@ impl<'s, S: Storage<'s>> Db<S> {
                 #[cfg(feature = "test-hooks")]
                 self.run_tt_index_build_fence("shadow_active");
                 if activated_len > 0 {
+                    let hnsw_only_shadow = !build.hnsw_indices.is_empty()
+                        && build.indices.is_empty()
+                        && build.fts_indices.is_empty()
+                        && build.lsh_indices.is_empty();
                     loop {
                         poison.check()?;
                         let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
@@ -488,6 +912,42 @@ impl<'s, S: Storage<'s>> Db<S> {
                         };
                         let mut tx = self.transact_write()?;
                         let now = original.get_current(&tx, &key)?;
+                        // For HNSW-only shadow builds, split a replace
+                        // (`Some(old) -> Some(new)`) across two brief commit
+                        // turns (remove old, then insert new) so the builder's
+                        // per-turn `tt_commit_lock` hold stays ~half of a full
+                        // writer update instead of acting as a full-cost 5th
+                        // contender. If a concurrent writer touches `key`
+                        // between turns, it sees `prior = None` in `pending_old`
+                        // and installs its own row cleanly.
+                        if hnsw_only_shadow {
+                            if let (Some(old_row), Some(new_row)) = (&prior, &now) {
+                                let unchanged = build.hnsw_indices.values().all(|(_, manifest)| {
+                                    manifest.index_filter.is_none()
+                                        && manifest
+                                            .vec_fields
+                                            .iter()
+                                            .all(|&i| old_row.get(i) == new_row.get(i))
+                                });
+                                if unchanged {
+                                    registration.complete_shadow_key(&encoded, 0)?;
+                                    drained_by_builder += 1;
+                                    continue;
+                                }
+                                tx.maintain_shadow_pairs(
+                                    &build,
+                                    registration.token(),
+                                    &[(prior, None)],
+                                )?;
+                                poison.check()?;
+                                if let Err(err) = self.commit_tx_with_test_hook(&mut tx) {
+                                    registration.invalidate_self();
+                                    return Err(err);
+                                }
+                                registration.mark_shadow_prior_removed(&encoded)?;
+                                continue;
+                            }
+                        }
                         let delta =
                             isize::from(now.is_some()) - isize::from(prior.is_some());
                         tx.maintain_shadow_pairs(&build, registration.token(), &[(prior, now)])?;

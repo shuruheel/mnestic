@@ -151,8 +151,10 @@ fn prune_redundant_edges(
 ) -> Result<()> {
     let mut work = MAX_REACH_STEPS;
     let mut scratch = ReachabilityScratch::default();
+    // Phase 1 (mandatory): bring any over-cap vertex within `cap`, failing with
+    // `RepairLimit` only if budget runs out while a vertex is still over-cap.
     for &(from, to, _) in added {
-        if degrees[from] <= cap {
+        if degrees[from] <= cap || !edges[from][to] {
             continue;
         }
         edges[from][to] = false;
@@ -162,6 +164,27 @@ fn prune_redundant_edges(
             edges[from][to] = true;
         }
     }
+    // Phase 2 (best-effort): prune remaining transitively redundant bypass
+    // edges on under-cap vertices to keep graph degree sparse, stopping cleanly
+    // if the reachability budget runs out rather than triggering a fallback.
+    for &(from, to, _) in added {
+        if !edges[from][to] {
+            continue;
+        }
+        edges[from][to] = false;
+        match scratch.reachable(edges, from, to, &mut work) {
+            Ok(true) => {
+                degrees[from] -= 1;
+            }
+            Ok(false) => {
+                edges[from][to] = true;
+            }
+            Err(_) => {
+                edges[from][to] = true;
+                break;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -169,6 +192,8 @@ impl SessionTx<'_> {
     /// Preserve paths during incremental pruning too: a replacement insertion
     /// must not immediately discard the bridges just repaired by deletion.
     /// As in the bulk builder, shrinking does not extend the neighbourhood.
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn hnsw_preserve_pruned_paths(
         &self,
         target: &CompoundKey,
@@ -178,6 +203,31 @@ impl SessionTx<'_> {
         preferred: &PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>,
         cap: usize,
         inserted: Option<&CompoundKey>,
+    ) -> Result<PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>> {
+        let mut adj_cache = FxHashMap::default();
+        self.hnsw_preserve_pruned_paths_with_cache(
+            target,
+            layer,
+            table,
+            candidates,
+            preferred,
+            cap,
+            inserted,
+            &mut adj_cache,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn hnsw_preserve_pruned_paths_with_cache(
+        &self,
+        target: &CompoundKey,
+        layer: i64,
+        table: &RelationHandle,
+        candidates: &PriorityQueue<CompoundKey, OrderedFloat<f64>>,
+        preferred: &PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>,
+        cap: usize,
+        inserted: Option<&CompoundKey>,
+        adj_cache: &mut FxHashMap<CompoundKey, Vec<CompoundKey>>,
     ) -> Result<PriorityQueue<CompoundKey, Reverse<OrderedFloat<f64>>>> {
         if candidates.len() > MAX_NEIGHBOURS {
             return Err(limit("pruning vertices"));
@@ -191,20 +241,9 @@ impl SessionTx<'_> {
             .enumerate()
             .map(|(i, k)| (k, i))
             .collect();
-        let mut edges = vec![vec![false; n + 1]; n + 1];
-        let mut removable = Vec::new();
+        let mut removable = Vec::with_capacity(n);
         for (i, key) in keys.iter().enumerate() {
-            edges[n][i] = true;
             removable.push((n, i, candidates.get_priority(key).unwrap().0));
-            for (dest, live) in self.repair_neighbours(table, layer, key)? {
-                if live {
-                    if &dest == target {
-                        edges[i][n] = true;
-                    } else if let Some(&j) = positions.get(&dest) {
-                        edges[i][j] = true;
-                    }
-                }
-            }
         }
         removable.sort_by(|a, b| {
             preferred
@@ -214,6 +253,81 @@ impl SessionTx<'_> {
                 .then_with(|| OrderedFloat(b.2).cmp(&OrderedFloat(a.2)))
                 .then_with(|| a.1.cmp(&b.1))
         });
+
+        // Fast path for the overwhelmingly common single-overflow shrink
+        // (`n == cap + 1`): the first candidate `v_drop` in `removable` with
+        // `inserted != Some(v_drop)` is dropped on iteration 0 of the full
+        // induced-graph loop iff there exists a live path from `target` to
+        // `v_drop` inside `keys`. Checking for a 2-hop witness `target -> u ->
+        // v_drop` (using `adj_cache` first, then `v_drop`'s paired reverse
+        // bookkeeping rows + point lookups for `u -> v_drop`) proves that
+        // exact drop with 1 scan instead of `n` scans. Any miss falls through
+        // to the full induced-graph + external witness algorithm unchanged.
+        if n == cap + 1 {
+            if let Some(&(_, drop_i, _)) = removable
+                .iter()
+                .find(|(_, i, _)| inserted != Some(&keys[*i]))
+            {
+                let v_drop = &keys[drop_i];
+                let mut found_2hop = keys.iter().enumerate().any(|(j, u)| {
+                    j != drop_i
+                        && adj_cache
+                            .get(u)
+                            .is_some_and(|nbs| nbs.iter().any(|d| d == v_drop))
+                });
+                if !found_2hop {
+                    let rows = self.repair_neighbours(table, layer, v_drop)?;
+                    adj_cache.entry(v_drop.clone()).or_insert_with(|| {
+                        rows.iter()
+                            .filter_map(|(dest, live)| live.then_some(dest.clone()))
+                            .collect()
+                    });
+                    for (other, _) in &rows {
+                        if other == target || other == v_drop || !positions.contains_key(other) {
+                            continue;
+                        }
+                        let is_live = if let Some(cached) = adj_cache.get(other) {
+                            cached.iter().any(|d| d == v_drop)
+                        } else {
+                            self.repair_edge_is_live(table, layer, other, v_drop)? == Some(true)
+                        };
+                        if is_live {
+                            found_2hop = true;
+                            break;
+                        }
+                    }
+                }
+                if found_2hop {
+                    let mut ret = PriorityQueue::with_capacity(cap);
+                    for (_, i, d) in removable {
+                        if i != drop_i {
+                            ret.push(keys[i].clone(), Reverse(OrderedFloat(d)));
+                        }
+                    }
+                    return Ok(ret);
+                }
+            }
+        }
+
+        let mut edges = vec![vec![false; n + 1]; n + 1];
+        for (i, key) in keys.iter().enumerate() {
+            edges[n][i] = true;
+            if !adj_cache.contains_key(key) {
+                let live_nbs: Vec<CompoundKey> = self
+                    .repair_neighbours(table, layer, key)?
+                    .into_iter()
+                    .filter_map(|(dest, live)| live.then_some(dest))
+                    .collect();
+                adj_cache.insert(key.clone(), live_nbs);
+            }
+            for dest in &adj_cache[key] {
+                if dest == target {
+                    edges[i][n] = true;
+                } else if let Some(&j) = positions.get(dest) {
+                    edges[i][j] = true;
+                }
+            }
+        }
         let mut degree = n;
         let mut local_work = MAX_REACH_STEPS;
         let mut scratch = ReachabilityScratch::default();
@@ -461,6 +575,30 @@ impl SessionTx<'_> {
             .transpose()
     }
 
+    fn repair_edge_is_live(
+        &self,
+        table: &RelationHandle,
+        layer: i64,
+        from: &CompoundKey,
+        to: &CompoundKey,
+    ) -> Result<Option<bool>> {
+        let key = table.encode_key_for_store(&edge_key(layer, from, to), Default::default())?;
+        match self.idx_get(table, &key)? {
+            None => Ok(None),
+            Some(v) => {
+                if let Some(ignored) = hnsw_edge_is_deleted_fast(&v) {
+                    return Ok(Some(!ignored));
+                }
+                let value = try_decode_val_only(&key, &v)?;
+                let ignored = value
+                    .get(2)
+                    .and_then(DataValue::get_bool)
+                    .ok_or_else(|| miette!("corrupt HNSW edge flag"))?;
+                Ok(Some(!ignored))
+            }
+        }
+    }
+
     fn repair_put_edge(
         &mut self,
         table: &RelationHandle,
@@ -496,31 +634,42 @@ impl SessionTx<'_> {
         prefix.push(DataValue::from(node.1 as i64));
         prefix.push(DataValue::from(node.2 as i64));
         let n = node.0.len();
+        let key_arity = 2 * n + 5;
         let mut ret = Vec::new();
-        for (count, row) in table.scan_prefix(self, &prefix).enumerate() {
+        for (count, pair) in table.scan_prefix_raw(self, &prefix).enumerate() {
             if count >= MAX_ADJACENCY_ROWS {
                 return Err(limit("adjacency rows"));
             }
             *rows_left = rows_left
                 .checked_sub(1)
                 .ok_or_else(|| limit("pruning witness adjacency rows"))?;
-            let row = row?;
-            if row.len() != 2 * n + 8 {
+            let (kvec, vvec) = pair?;
+            let ignored = match hnsw_edge_is_deleted_fast(&vvec) {
+                Some(b) => b,
+                None => {
+                    let vals = try_decode_val_only(&kvec, &vvec)?;
+                    if vals.len() != 3 {
+                        bail!("corrupt HNSW edge row during repair");
+                    }
+                    vals[2]
+                        .get_bool()
+                        .ok_or_else(|| miette!("corrupt HNSW edge flag"))?
+                }
+            };
+            let tuple = crate::data::tuple::decode_tuple_from_key(&kvec, key_arity);
+            if tuple.len() != key_arity {
                 bail!("corrupt HNSW edge row during repair");
             }
             let other = (
-                row[n + 3..2 * n + 3].to_vec(),
-                row[2 * n + 3]
+                tuple[n + 3..2 * n + 3].to_vec(),
+                tuple[2 * n + 3]
                     .get_int()
                     .ok_or_else(|| miette!("corrupt HNSW field"))? as usize,
-                row[2 * n + 4]
+                tuple[2 * n + 4]
                     .get_int()
                     .ok_or_else(|| miette!("corrupt HNSW subindex"))? as i32,
             );
             if &other != node {
-                let ignored = row[2 * n + 7]
-                    .get_bool()
-                    .ok_or_else(|| miette!("corrupt HNSW edge flag"))?;
                 ret.push((other, !ignored));
             }
         }
@@ -549,13 +698,8 @@ impl SessionTx<'_> {
             if exclude.contains(&&u) {
                 continue;
             }
-            if let Some(value) = self.repair_edge_value(table, layer, &u, node)? {
-                let ignored = value[2]
-                    .get_bool()
-                    .ok_or_else(|| miette!("corrupt HNSW edge flag"))?;
-                if !ignored {
-                    return Ok(true);
-                }
+            if self.repair_edge_is_live(table, layer, &u, node)? == Some(true) {
+                return Ok(true);
             }
         }
         Ok(false)
@@ -865,12 +1009,9 @@ impl SessionTx<'_> {
         let mut edges = vec![vec![false; n]; n];
         let mut degrees = Vec::with_capacity(n);
         for (i, key) in keys.iter().enumerate() {
-            let reverse = self
-                .repair_edge_value(table, layer, key, node)?
+            let active = self
+                .repair_edge_is_live(table, layer, key, node)?
                 .ok_or_else(|| miette!("corrupt HNSW index: missing reverse edge during repair"))?;
-            let active = !reverse[2]
-                .get_bool()
-                .ok_or_else(|| miette!("corrupt HNSW reverse flag"))?;
             incoming.push(active);
             let outgoing = self.repair_neighbours(table, layer, key)?;
             degrees.push(
@@ -887,15 +1028,66 @@ impl SessionTx<'_> {
                 }
             }
         }
+        let initial_degrees = degrees.clone();
+        // Only plan bypass edges `(i, j)` for pairs that do NOT already have a
+        // surviving directed path `i -> ... -> j` in the existing induced
+        // neighbourhood. Walk a compact adjacency list with early exit once all
+        // live out-neighbours are reached so high-degree neighbourhoods
+        // (`n <= MAX_NEIGHBOURS`) stay O(in_deg * |E|) instead of O(in_deg * n^2).
+        let adj: Vec<Vec<usize>> = edges
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .enumerate()
+                    .filter(|&(_, &connected)| connected)
+                    .map(|(v, _)| v)
+                    .collect()
+            })
+            .collect();
+        let live_out_flags: Vec<bool> = incident.iter().map(|(_, live)| *live).collect();
+        let total_live_outs = live_out_flags.iter().filter(|&&live| live).count();
+        let mut existing_reach = ReachabilityScratch::default();
+        let mut reach_work = MAX_REACH_STEPS;
         let mut added = Vec::new();
-        for i in 0..n {
-            for j in 0..n {
-                if incoming[i] && incident[j].1 && i != j && !edges[i][j] {
-                    added.push((i, j, 0.0));
-                    edges[i][j] = true;
-                    degrees[i] += 1;
+        for (i, &is_in) in incoming.iter().enumerate() {
+            if !is_in {
+                continue;
+            }
+            existing_reach.seen.resize(n, false);
+            existing_reach.seen.fill(false);
+            existing_reach.stack.clear();
+            existing_reach.stack.push(i);
+            existing_reach.seen[i] = true;
+            let mut outs_found = usize::from(live_out_flags[i]);
+            while let Some(u) = existing_reach.stack.pop() {
+                if outs_found == total_live_outs {
+                    break;
+                }
+                for &v in &adj[u] {
+                    reach_work = reach_work
+                        .checked_sub(1)
+                        .ok_or_else(|| limit("reachability work"))?;
+                    if !existing_reach.seen[v] {
+                        existing_reach.seen[v] = true;
+                        if live_out_flags[v] {
+                            outs_found += 1;
+                            if outs_found == total_live_outs {
+                                break;
+                            }
+                        }
+                        existing_reach.stack.push(v);
+                    }
                 }
             }
+            for (j, &out_live) in live_out_flags.iter().enumerate() {
+                if out_live && i != j && !existing_reach.seen[j] {
+                    added.push((i, j, 0.0));
+                }
+            }
+        }
+        for &(i, j, _) in &added {
+            edges[i][j] = true;
+            degrees[i] += 1;
         }
         if n.saturating_mul(manifest.vec_dim) > MAX_VECTOR_COMPONENTS
             || added.len().saturating_mul(manifest.vec_dim) > MAX_DISTANCE_COMPONENTS
@@ -903,9 +1095,18 @@ impl SessionTx<'_> {
             return Err(limit("vector/distance components"));
         }
         if !added.is_empty() {
-            for key in &keys {
-                cache.ensure_key(key, orig, self)?;
+            let mut needed = vec![false; n];
+            for &(from, to, _) in &added {
+                needed[from] = true;
+                needed[to] = true;
             }
+            let needed_keys: Vec<CompoundKey> = needed
+                .into_iter()
+                .enumerate()
+                .filter(|&(_, used)| used)
+                .map(|(i, _)| keys[i].clone())
+                .collect();
+            cache.ensure_keys(&needed_keys, orig, self)?;
             for (from, to, distance) in &mut added {
                 *distance = cache.k_dist(&keys[*from], &keys[*to]);
             }
@@ -968,7 +1169,7 @@ impl SessionTx<'_> {
             )?;
             // Retain existing reverse direction (including an ignored marker).
             if self
-                .repair_edge_value(table, layer, &keys[to], &keys[from])?
+                .repair_edge_is_live(table, layer, &keys[to], &keys[from])?
                 .is_none()
             {
                 self.repair_put_edge(
@@ -985,6 +1186,9 @@ impl SessionTx<'_> {
             }
         }
         for (i, key) in keys.iter().enumerate() {
+            if degrees[i] == initial_degrees[i] {
+                continue;
+            }
             let mut value = self
                 .repair_edge_value(table, layer, key, key)?
                 .ok_or_else(|| miette!("corrupt HNSW index: missing neighbour self row"))?;
@@ -2008,5 +2212,152 @@ mod tests {
     #[test]
     fn reachability_budget_is_enforced() {
         assert!(reachable(&[vec![false, true], vec![false, false]], 0, 1, &mut 0).is_err());
+    }
+
+    #[test]
+    fn single_overflow_two_hop_fast_path_drops_farthest_redundant_edge() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create r {id:Int=>v:<F32;2>}");
+        script(
+            &db,
+            "?[id,v]<-[[0,[0,0]],[1,[1,0]],[2,[2,0]],[3,[3,0]]] :put r{id=>v}",
+        );
+        script(
+            &db,
+            "::hnsw create r:g {fields:[v],dim:2,m:8,dtype:F32,distance:L2,ef_construction:50}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("r", false).unwrap();
+        let (table, _) = orig.hnsw_indices.get("g").unwrap().clone();
+        for row in table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap() {
+            let key = table
+                .encode_key_for_store(&row[..table.metadata.keys.len()], Default::default())
+                .unwrap();
+            tx.idx_del(&table, &key).unwrap();
+        }
+        let node = |id| (vec![DataValue::from(id)], 1, -1);
+        // target = 0, candidates = {1, 2, 3} (n=3, cap=2 -> n == cap + 1).
+        // Live edge 2 -> 3 with paired reverse bookkeeping 3 -> 2 proves 0 -> 2 -> 3.
+        for (from, to, ignored) in [
+            (0, 1, false),
+            (1, 0, true),
+            (0, 2, false),
+            (2, 0, true),
+            (0, 3, false),
+            (3, 0, true),
+            (2, 3, false),
+            (3, 2, true),
+        ] {
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(from),
+                &node(to),
+                &[DataValue::from(1.), DataValue::Null, DataValue::from(ignored)],
+            )
+            .unwrap();
+        }
+        let mut candidates = PriorityQueue::new();
+        candidates.push(node(1), OrderedFloat(1.0));
+        candidates.push(node(2), OrderedFloat(4.0));
+        candidates.push(node(3), OrderedFloat(9.0));
+        let mut preferred = PriorityQueue::new();
+        preferred.push(node(1), Reverse(OrderedFloat(1.0)));
+        preferred.push(node(2), Reverse(OrderedFloat(4.0)));
+        let kept = tx
+            .hnsw_preserve_pruned_paths(
+                &node(0),
+                0,
+                &table,
+                &candidates,
+                &preferred,
+                2,
+                Some(&node(1)),
+            )
+            .unwrap();
+        assert_eq!(kept.len(), 2);
+        assert!(kept.get_priority(&node(1)).is_some());
+        assert!(kept.get_priority(&node(2)).is_some());
+        assert!(kept.get_priority(&node(3)).is_none());
+    }
+
+    #[test]
+    fn high_degree_connected_removal_stays_within_reach_budget() {
+        let db = crate::DbInstance::new("mem", "", "").unwrap();
+        script(&db, ":create h {id:Int=>v:<F32;2>}");
+        let n = 128i64;
+        let rows: Vec<String> = (0..=n)
+            .map(|i| format!("[{i},[{},{}]]", i as f32 * 0.01, (i % 7) as f32))
+            .collect();
+        script(&db, &format!("?[id,v]<-[{}] :put h{{id=>v}}", rows.join(",")));
+        script(
+            &db,
+            "::hnsw create h:g {fields:[v],dim:2,m:64,dtype:F32,distance:L2,ef_construction:64}",
+        );
+        let crate::DbInstance::Mem(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let orig = tx.get_relation("h", false).unwrap();
+        let (table, manifest) = orig.hnsw_indices.get("g").unwrap().clone();
+        for row in table.scan_all(&tx).collect::<Result<Vec<_>>>().unwrap() {
+            let key = table
+                .encode_key_for_store(&row[..table.metadata.keys.len()], Default::default())
+                .unwrap();
+            tx.idx_del(&table, &key).unwrap();
+        }
+        let node = |id: i64| (vec![DataValue::from(id)], 1, -1);
+        // Wire vertex 0 bidirectionally to 1..=128, and wire 1..=128 in a cycle
+        // so all 128 neighbours are strongly connected without vertex 0.
+        for id in 0..=n {
+            let deg = if id == 0 { n as f64 } else { 2.0 };
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(id),
+                &node(id),
+                &[
+                    DataValue::from(deg),
+                    DataValue::Bytes(vec![id as u8]),
+                    DataValue::from(false),
+                ],
+            )
+            .unwrap();
+        }
+        for id in 1..=n {
+            for (from, to) in [(0, id), (id, 0)] {
+                tx.repair_put_edge(
+                    &table,
+                    0,
+                    &node(from),
+                    &node(to),
+                    &[DataValue::from(1.0), DataValue::Null, DataValue::from(false)],
+                )
+                .unwrap();
+            }
+            let next = if id == n { 1 } else { id + 1 };
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(id),
+                &node(next),
+                &[DataValue::from(1.0), DataValue::Null, DataValue::from(false)],
+            )
+            .unwrap();
+            tx.repair_put_edge(
+                &table,
+                0,
+                &node(next),
+                &node(id),
+                &[DataValue::from(1.0), DataValue::Null, DataValue::from(true)],
+            )
+            .unwrap();
+        }
+        let mut cache = VectorCache::new(manifest.distance);
+        tx.hnsw_repair_before_remove(&node(0), 0, &manifest, &orig, &table, &mut cache)
+            .expect("connected 128-neighbour removal must stay within MAX_REACH_STEPS");
     }
 }

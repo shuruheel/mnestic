@@ -87,7 +87,7 @@ pub struct SessionTx<'a> {
     pub(crate) tt_commit_failed: bool,
     pub(crate) tt_index_builds: crate::runtime::txtime_index::SharedBuildRegistry,
     pub(crate) preparing_tt_index: bool,
-    pub(crate) prepared_tt_index: Option<RelationHandle>,
+    pub(crate) prepared_tt_index: Option<Box<RelationHandle>>,
     pub(crate) defer_tt_cleanup: bool,
     pub(crate) tt_cleanup_ranges: Vec<(Vec<u8>, Vec<u8>)>,
     /// Relations `:reconcile`d in this transaction (provenance semirings
@@ -353,7 +353,7 @@ impl<'a> SessionTx<'a> {
             if result.is_ok() { commit_span.finish(); }
             return result;
         }
-        self.begun_commit_relations = self.dirty_relations.clone();
+        self.begun_commit_relations = std::mem::take(&mut self.dirty_relations);
         self.projections.begin_commit(&self.begun_commit_relations);
         self.commit_inflight = true;
         let res = self.commit_tx_inner();
@@ -361,16 +361,18 @@ impl<'a> SessionTx<'a> {
         self.projections.run_commit_fence(&self.begun_commit_relations);
         self.commit_inflight = false;
         self.projections.finish_commit(&self.begun_commit_relations);
-        let unbegun: BTreeSet<RelationId> = self
-            .dirty_relations
-            .difference(&self.begun_commit_relations)
-            .copied()
-            .collect();
-        if !unbegun.is_empty() {
-            self.projections.bump_aborted(&unbegun);
+        if !self.dirty_relations.is_empty() {
+            let unbegun: BTreeSet<RelationId> = self
+                .dirty_relations
+                .difference(&self.begun_commit_relations)
+                .copied()
+                .collect();
+            if !unbegun.is_empty() {
+                self.projections.bump_aborted(&unbegun);
+            }
+            self.dirty_relations.clear();
         }
         self.begun_commit_relations.clear();
-        self.dirty_relations.clear();
         if res.is_ok() {
             self.fts_stats.committed();
         }
@@ -475,7 +477,7 @@ impl<'a> SessionTx<'a> {
             self.fire_tt_triggers(&touched, tt)?;
             // If triggers dirtied any additional plain derived relations, enroll
             // them in the in-flight projection commit set before storage commit.
-            if self.commit_inflight {
+            if self.commit_inflight && !self.dirty_relations.is_empty() {
                 let extra: BTreeSet<RelationId> = self
                     .dirty_relations
                     .difference(&self.begun_commit_relations)

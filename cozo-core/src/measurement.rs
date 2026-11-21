@@ -19,7 +19,7 @@ use crate::runtime::db::Db;
 use crate::storage::Storage;
 use crate::{DataValue, DbInstance, NamedRows};
 
-const CAPACITY: usize = 256;
+const CAPACITY: usize = 8192;
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Process-local monotonic timestamp, comparable between capture threads.
@@ -84,7 +84,7 @@ pub fn capture<T>(operation_id: u64, enabled: bool, f: impl FnOnce() -> T) -> (T
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         assert!(!s.active, "nested measurement capture");
-        s.events = Vec::with_capacity(CAPACITY);
+        s.events = Vec::with_capacity(if enabled { 256 } else { 0 });
         s.overflow = false;
         s.active = true;
         s.enabled = enabled;

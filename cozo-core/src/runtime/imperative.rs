@@ -272,7 +272,11 @@ impl<'s, S: Storage<'s>> Db<S> {
         let is_write = !write_lock_names.is_empty();
         let admission_poison = Poison { deadline: outer_deadline, ..Default::default() };
         let writer_admission = self.admit_writer(is_write, &admission_poison)?;
-        let write_lock = self.obtain_relation_locks(write_lock_names.iter());
+        let write_lock = if is_write {
+            self.obtain_relation_locks(write_lock_names.iter())
+        } else {
+            Vec::new()
+        };
         let _write_lock_guards = write_lock.iter().map(|l| l.read_with_poison(&admission_poison)).collect::<Result<Vec<_>>>()?;
 
         let callback_targets = if is_write {

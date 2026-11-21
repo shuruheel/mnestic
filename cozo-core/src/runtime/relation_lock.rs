@@ -28,10 +28,68 @@ enum Mode {
 
 #[derive(Default)]
 struct State {
+    /// Inline fast-path slot for the common single-reader case (avoids HashMap
+    /// hashing and heap allocation on every uncontended relation/admission lock).
+    single_reader: Option<(ThreadId, usize)>,
     readers: HashMap<ThreadId, usize>,
     writer: Option<ThreadId>,
     queue: VecDeque<u64>,
     next_ticket: u64,
+}
+
+impl State {
+    #[inline]
+    fn has_readers(&self) -> bool {
+        self.single_reader.is_some() || !self.readers.is_empty()
+    }
+
+    #[inline]
+    fn contains_reader(&self, owner: &ThreadId) -> bool {
+        matches!(&self.single_reader, Some((id, _)) if id == owner)
+            || self.readers.contains_key(owner)
+    }
+
+    #[inline]
+    fn increment_existing_reader(&mut self, owner: &ThreadId) -> bool {
+        if let Some((id, count)) = &mut self.single_reader {
+            if id == owner {
+                *count += 1;
+                return true;
+            }
+        }
+        if let Some(count) = self.readers.get_mut(owner) {
+            *count += 1;
+            return true;
+        }
+        false
+    }
+
+    #[inline]
+    fn insert_new_reader(&mut self, owner: ThreadId) {
+        if self.single_reader.is_none() && self.readers.is_empty() {
+            self.single_reader = Some((owner, 1));
+        } else {
+            self.readers.insert(owner, 1);
+        }
+    }
+
+    #[inline]
+    fn release_reader(&mut self, owner: &ThreadId) {
+        if let Some((id, count)) = &mut self.single_reader {
+            if id == owner {
+                *count -= 1;
+                if *count == 0 {
+                    self.single_reader = None;
+                }
+                return;
+            }
+        }
+        let count = self.readers.get_mut(owner).unwrap();
+        *count -= 1;
+        if *count == 0 {
+            self.readers.remove(owner);
+        }
+    }
 }
 
 #[derive(Default)]
@@ -59,7 +117,9 @@ impl Drop for Waiting<'_> {
         if self.queued {
             let mut state = self.lock.state.lock().unwrap();
             state.queue.retain(|ticket| *ticket != self.ticket);
-            self.lock.changed.notify_all();
+            if !state.queue.is_empty() {
+                self.lock.changed.notify_all();
+            }
         }
     }
 }
@@ -67,7 +127,8 @@ impl Drop for Waiting<'_> {
 impl RelationLock {
     #[cfg(all(test, feature = "storage-rocksdb"))]
     pub(crate) fn active_readers(&self) -> usize {
-        self.state.lock().unwrap().readers.len()
+        let state = self.state.lock().unwrap();
+        usize::from(state.single_reader.is_some()) + state.readers.len()
     }
 
     #[cfg(test)]
@@ -105,28 +166,23 @@ impl RelationLock {
         poison.check()?;
         // A recursive shared acquisition must not queue behind a writer that
         // is itself waiting for this thread's existing shared guard to drain.
-        if mode == Mode::Shared {
-            if let Some(count) = state.readers.get_mut(&owner) {
-                *count += 1;
-                return Ok(guard());
-            }
+        if mode == Mode::Shared && state.increment_existing_reader(&owner) {
+            return Ok(guard());
         }
         ensure!(
             state.writer != Some(owner),
             "recursive exclusive relation admission"
         );
         ensure!(
-            mode != Mode::Exclusive || !state.readers.contains_key(&owner),
+            mode != Mode::Exclusive || !state.contains_reader(&owner),
             "cannot upgrade shared relation admission to exclusive admission"
         );
         if state.queue.is_empty()
             && state.writer.is_none()
-            && (mode == Mode::Shared || state.readers.is_empty())
+            && (mode == Mode::Shared || !state.has_readers())
         {
             match mode {
-                Mode::Shared => {
-                    state.readers.insert(owner, 1);
-                }
+                Mode::Shared => state.insert_new_reader(owner),
                 Mode::Exclusive => state.writer = Some(owner),
             }
             return Ok(guard());
@@ -147,19 +203,19 @@ impl RelationLock {
             let mut state = self.state.lock().unwrap();
             if state.queue.front() == Some(&ticket)
                 && state.writer.is_none()
-                && (mode == Mode::Shared || state.readers.is_empty())
+                && (mode == Mode::Shared || !state.has_readers())
             {
                 // Cancellation can race a wake-up; check again before admitting.
                 poison.check()?;
                 state.queue.pop_front();
                 waiting.queued = false;
                 match mode {
-                    Mode::Shared => {
-                        state.readers.insert(owner, 1);
-                    }
+                    Mode::Shared => state.insert_new_reader(owner),
                     Mode::Exclusive => state.writer = Some(owner),
                 }
-                self.changed.notify_all();
+                if !state.queue.is_empty() {
+                    self.changed.notify_all();
+                }
                 return Ok(guard());
             }
             let wait = poison
@@ -178,16 +234,12 @@ impl Drop for RelationGuard<'_> {
     fn drop(&mut self) {
         let mut state = self.lock.state.lock().unwrap();
         match self.mode {
-            Mode::Shared => {
-                let count = state.readers.get_mut(&self.owner).unwrap();
-                *count -= 1;
-                if *count == 0 {
-                    state.readers.remove(&self.owner);
-                }
-            }
+            Mode::Shared => state.release_reader(&self.owner),
             Mode::Exclusive => state.writer = None,
         }
-        self.lock.changed.notify_all();
+        if !state.queue.is_empty() {
+            self.lock.changed.notify_all();
+        }
     }
 }
 

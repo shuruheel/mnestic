@@ -599,6 +599,102 @@ impl<'s> StoreTx<'s> for RocksDbTx {
         })
     }
 
+    fn range_scan_tuple_uncached<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Box<dyn Iterator<Item = Result<Tuple>>>
+    where
+        's: 'a,
+    {
+        let mut inner = self
+            .iter_builder()
+            .fill_cache(false)
+            .upper_bound(upper)
+            .start();
+        inner.seek(lower);
+        Box::new(RocksDbIterator {
+            inner,
+            started: false,
+            upper_bound: upper.to_vec(),
+        })
+    }
+
+    fn range_skip_scan_tuple_uncached<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        valid_at: ValidityTs,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        let inner = self
+            .iter_builder()
+            .fill_cache(false)
+            .upper_bound(upper)
+            .start();
+        Box::new(RocksDbSkipIterator {
+            inner,
+            upper_bound: upper.to_vec(),
+            next_bound: lower.to_owned(),
+            valid_at,
+        })
+    }
+
+    fn multi_skip_first(
+        &self,
+        rel_upper: &[u8],
+        bounds: &[(Vec<u8>, Vec<u8>)],
+        valid_at: ValidityTs,
+    ) -> Result<Vec<Option<Tuple>>> {
+        if bounds.is_empty() {
+            return Ok(Vec::new());
+        }
+        if bounds.len() == 1 {
+            let first = self
+                .range_skip_scan_tuple(&bounds[0].0, &bounds[0].1, valid_at)
+                .next()
+                .transpose()?;
+            return Ok(vec![first]);
+        }
+        let mut order: Vec<usize> = (0..bounds.len()).collect();
+        order.sort_unstable_by(|&a, &b| bounds[a].0.cmp(&bounds[b].0));
+        let mut inner = self
+            .iter_builder()
+            .total_order_seek(true)
+            .upper_bound(rel_upper)
+            .start();
+        let mut out: Vec<Option<Tuple>> = vec![None; bounds.len()];
+        let mut next_buf = Vec::new();
+        for idx in order {
+            let (lower, upper) = &bounds[idx];
+            let mut use_lower = true;
+            loop {
+                let target = if use_lower {
+                    lower.as_slice()
+                } else {
+                    next_buf.as_slice()
+                };
+                inner.seek(target);
+                match inner.pair()? {
+                    None => break,
+                    Some((k_slice, v_slice)) => {
+                        if upper.as_slice() <= k_slice {
+                            break;
+                        }
+                        let (ret, nxt_bound) = check_key_for_validity(k_slice, valid_at, None);
+                        if let Some(mut tup) = ret {
+                            try_extend_tuple_from_v(&mut tup, v_slice)?;
+                            out[idx] = Some(tup);
+                            break;
+                        }
+                        next_buf = nxt_bound;
+                        use_lower = false;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
     fn range_bitemporal_scan_tuple<'a>(
         &'a self,
         lower: &[u8],
@@ -968,6 +1064,83 @@ mod tests {
         assert_eq!(result.rows[0][0], DataValue::from(3));
         assert_eq!(result.rows[3][0], DataValue::from(6));
 
+        Ok(())
+    }
+
+    #[test]
+    fn multi_skip_first_and_uncached_scan_match_reference() -> Result<()> {
+        let temp_dir = TempDir::new().into_diagnostic()?;
+        let db = new_cozo_rocksdb(temp_dir.path())?;
+        db.run_script(
+            ":create items {k: String, tt: TxTime => v: Int}",
+            Default::default(),
+            ScriptMutability::Mutable,
+        )?;
+        // Assert k1..k4, update k2, retract k3, leave k9 missing.
+        db.run_script(
+            "?[k, v] <- [['k1', 10], ['k2', 20], ['k3', 30], ['k4', 40]] :put items {k => v}",
+            Default::default(),
+            ScriptMutability::Mutable,
+        )?;
+        db.run_script(
+            "?[k, v] <- [['k2', 200]] :put items {k => v}",
+            Default::default(),
+            ScriptMutability::Mutable,
+        )?;
+        db.run_script(
+            "?[k] <- [['k3']] :rm items {k}",
+            Default::default(),
+            ScriptMutability::Mutable,
+        )?;
+
+        {
+            let tx = db.transact()?;
+            let handle = tx.get_relation("items", false)?;
+            // Unsorted keys with duplicate + retracted + missing + updated.
+            let probes: Vec<Vec<DataValue>> = vec![
+                vec![DataValue::from("k4")],
+                vec![DataValue::from("k9")],
+                vec![DataValue::from("k2")],
+                vec![DataValue::from("k3")],
+                vec![DataValue::from("k1")],
+                vec![DataValue::from("k2")],
+            ];
+            let slices: Vec<&[DataValue]> = probes.iter().map(|p| p.as_slice()).collect();
+            let batched = handle.get_current_batch(&tx, &slices)?;
+            for (probe, got) in probes.iter().zip(batched.iter()) {
+                let single = handle.get_current(&tx, probe)?;
+                assert_eq!(got, &single, "mismatch for probe {probe:?}");
+            }
+            assert_eq!(batched[0].as_ref().unwrap()[2], DataValue::from(40));
+            assert!(batched[1].is_none());
+            assert_eq!(batched[2].as_ref().unwrap()[2], DataValue::from(200));
+            assert!(batched[3].is_none());
+            assert_eq!(batched[4].as_ref().unwrap()[2], DataValue::from(10));
+            assert_eq!(batched[5].as_ref().unwrap()[2], DataValue::from(200));
+
+            let cached: Vec<_> = handle.scan_current(&tx).collect::<Result<_>>()?;
+            let uncached: Vec<_> = handle.scan_current_uncached(&tx).collect::<Result<_>>()?;
+            assert_eq!(cached, uncached);
+            assert_eq!(cached.len(), 3);
+        }
+
+        // Verify reopen + compaction preserves all rows under adaptive LRU shard sizing.
+        db.db.range_compact(&[], &[0xff])?;
+        drop(db);
+        let db2 = new_cozo_rocksdb(temp_dir.path())?;
+        let res = db2.run_script(
+            "?[k, v] := *items{k, v} :order k",
+            Default::default(),
+            ScriptMutability::Immutable,
+        )?;
+        assert_eq!(
+            res.rows,
+            vec![
+                vec![DataValue::from("k1"), DataValue::from(10)],
+                vec![DataValue::from("k2"), DataValue::from(200)],
+                vec![DataValue::from("k4"), DataValue::from(40)],
+            ]
+        );
         Ok(())
     }
 }

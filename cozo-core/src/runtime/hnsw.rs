@@ -94,8 +94,22 @@ mod distance_order_tests {
     }
 }
 
+#[inline]
+fn vector_norm_sq(v: &Vector) -> f64 {
+    match v {
+        Vector::F32(a) => a
+            .as_slice()
+            .map(|s| s.iter().map(|&x| (x as f64) * (x as f64)).sum())
+            .unwrap_or_else(|| a.dot(a) as f64),
+        Vector::F64(a) => a
+            .as_slice()
+            .map(|s| s.iter().map(|&x| x * x).sum())
+            .unwrap_or_else(|| a.dot(a)),
+    }
+}
+
 pub(crate) struct VectorCache<'r, 's> {
-    pub(crate) cache: FxHashMap<CompoundKey, Vector>,
+    pub(crate) cache: FxHashMap<CompoundKey, (Vector, f64)>,
     pub(crate) distance: HnswDistance,
     pub(crate) base_tx: Option<&'r SessionTx<'s>>,
     pub(crate) shadow: Option<(crate::runtime::txtime_index::SharedBuildRegistry, u64)>,
@@ -133,6 +147,13 @@ impl<'r, 's> VectorCache<'r, 's> {
             shadow: None,
         }
     }
+    #[inline]
+    fn norm_for_cache(&self, v: &Vector) -> f64 {
+        match self.distance {
+            HnswDistance::Cosine => vector_norm_sq(v),
+            _ => 0.0,
+        }
+    }
     pub(crate) fn seed_row(
         &mut self,
         manifest: &HnswIndexManifest,
@@ -143,13 +164,16 @@ impl<'r, 's> VectorCache<'r, 's> {
         for &field in &manifest.vec_fields {
             match &row[field] {
                 DataValue::Vec(v) => {
-                    self.cache.insert((key.clone(), field, -1), v.clone());
+                    let norm = self.norm_for_cache(v);
+                    self.cache
+                        .insert((key.clone(), field, -1), (v.clone(), norm));
                 }
                 DataValue::List(values) => {
                     for (sub, value) in values.iter().enumerate() {
                         if let DataValue::Vec(v) = value {
+                            let norm = self.norm_for_cache(v);
                             self.cache
-                                .insert((key.clone(), field, sub as i32), v.clone());
+                                .insert((key.clone(), field, sub as i32), (v.clone(), norm));
                         }
                     }
                 }
@@ -158,26 +182,16 @@ impl<'r, 's> VectorCache<'r, 's> {
         }
     }
     fn insert(&mut self, k: CompoundKey, v: Vector) {
-        self.cache.insert(k, v);
+        let norm = self.norm_for_cache(&v);
+        self.cache.insert(k, (v, norm));
     }
     fn dist(&self, v1: &Vector, v2: &Vector) -> f64 {
-        let q_norm_sq = match self.distance {
-            HnswDistance::Cosine => match v1 {
-                Vector::F32(a) => a
-                    .as_slice()
-                    .map(|s| s.iter().map(|&x| (x as f64) * (x as f64)).sum())
-                    .unwrap_or_else(|| a.dot(a) as f64),
-                Vector::F64(a) => a
-                    .as_slice()
-                    .map(|s| s.iter().map(|&x| x * x).sum())
-                    .unwrap_or_else(|| a.dot(a)),
-            },
-            _ => 0.0,
-        };
-        self.dist_with_norm(v1, q_norm_sq, v2)
+        let v1_norm_sq = self.norm_for_cache(v1);
+        let v2_norm_sq = self.norm_for_cache(v2);
+        self.dist_with_norms(v1, v1_norm_sq, v2, v2_norm_sq)
     }
     #[inline]
-    fn dist_with_norm(&self, v1: &Vector, v1_norm_sq: f64, v2: &Vector) -> f64 {
+    fn dist_with_norms(&self, v1: &Vector, v1_norm_sq: f64, v2: &Vector, v2_norm_sq: f64) -> f64 {
         match self.distance {
             HnswDistance::L2 => match (v1, v2) {
                 (Vector::F32(a), Vector::F32(b)) => {
@@ -216,38 +230,31 @@ impl<'r, 's> VectorCache<'r, 's> {
             },
             HnswDistance::Cosine => match (v1, v2) {
                 (Vector::F32(a), Vector::F32(b)) => {
-                    if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                    let dot = if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
                         if sa.len() == sb.len() {
-                            let mut dot = 0.0f64;
-                            let mut b_norm = 0.0f64;
-                            for (&x, &y) in sa.iter().zip(sb.iter()) {
-                                let xf = x as f64;
-                                let yf = y as f64;
-                                dot += xf * yf;
-                                b_norm += yf * yf;
-                            }
-                            return cosine_distance(v1_norm_sq, b_norm, dot);
+                            sa.iter()
+                                .zip(sb.iter())
+                                .map(|(&x, &y)| (x as f64) * (y as f64))
+                                .sum::<f64>()
+                        } else {
+                            a.dot(b) as f64
                         }
-                    }
-                    let b_norm = b.dot(b) as f64;
-                    let dot = a.dot(b) as f64;
-                    cosine_distance(v1_norm_sq, b_norm, dot)
+                    } else {
+                        a.dot(b) as f64
+                    };
+                    cosine_distance(v1_norm_sq, v2_norm_sq, dot)
                 }
                 (Vector::F64(a), Vector::F64(b)) => {
-                    if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
+                    let dot = if let (Some(sa), Some(sb)) = (a.as_slice(), b.as_slice()) {
                         if sa.len() == sb.len() {
-                            let mut dot = 0.0f64;
-                            let mut b_norm = 0.0f64;
-                            for (&x, &y) in sa.iter().zip(sb.iter()) {
-                                dot += x * y;
-                                b_norm += y * y;
-                            }
-                            return cosine_distance(v1_norm_sq, b_norm, dot);
+                            sa.iter().zip(sb.iter()).map(|(&x, &y)| x * y).sum::<f64>()
+                        } else {
+                            a.dot(b)
                         }
-                    }
-                    let b_norm = b.dot(b);
-                    let dot = a.dot(b);
-                    cosine_distance(v1_norm_sq, b_norm, dot)
+                    } else {
+                        a.dot(b)
+                    };
+                    cosine_distance(v1_norm_sq, v2_norm_sq, dot)
                 }
                 _ => panic!(
                     "Cannot compute cosine distance between {:?} and {:?}",
@@ -284,21 +291,23 @@ impl<'r, 's> VectorCache<'r, 's> {
         }
     }
     fn v_dist(&self, v: &Vector, key: &CompoundKey) -> f64 {
-        let v2 = self.cache.get(key).unwrap();
-        self.dist(v, v2)
+        let v1_norm_sq = self.norm_for_cache(v);
+        let (v2, v2_norm_sq) = self.cache.get(key).unwrap();
+        self.dist_with_norms(v, v1_norm_sq, v2, *v2_norm_sq)
     }
     #[inline]
     fn v_dist_with_norm(&self, v: &Vector, v_norm_sq: f64, key: &CompoundKey) -> f64 {
-        let v2 = self.cache.get(key).unwrap();
-        self.dist_with_norm(v, v_norm_sq, v2)
+        let (v2, v2_norm_sq) = self.cache.get(key).unwrap();
+        self.dist_with_norms(v, v_norm_sq, v2, *v2_norm_sq)
     }
+    #[inline]
     fn k_dist(&self, k1: &CompoundKey, k2: &CompoundKey) -> f64 {
-        let v1 = self.cache.get(k1).unwrap();
-        let v2 = self.cache.get(k2).unwrap();
-        self.dist(v1, v2)
+        let (v1, v1_norm_sq) = self.cache.get(k1).unwrap();
+        let (v2, v2_norm_sq) = self.cache.get(k2).unwrap();
+        self.dist_with_norms(v1, *v1_norm_sq, v2, *v2_norm_sq)
     }
     fn get_key(&self, key: &CompoundKey) -> &Vector {
-        self.cache.get(key).unwrap()
+        &self.cache.get(key).unwrap().0
     }
     fn ensure_key(
         &mut self,
@@ -409,7 +418,8 @@ impl<'r, 's> VectorCache<'r, 's> {
         }
         match field {
             DataValue::Vec(v) => {
-                self.cache.insert(key.clone(), v.clone());
+                let norm = self.norm_for_cache(v);
+                self.cache.insert(key.clone(), (v.clone(), norm));
             }
             _ => bail!("Cannot interpret {} as vector", field),
         }
@@ -555,6 +565,12 @@ impl<'a> SessionTx<'a> {
                 } else {
                     manifest.m_max
                 };
+                // Standard HNSW (Malkov & Yashunin 2018, Alg. 1): select up to
+                // `M` (`m_neighbours`) outgoing links for the newly inserted
+                // vertex while allowing existing neighbours up to `m_max0 = 2*M`
+                // on layer 0 so incoming links have headroom without saturating
+                // every neighbour into a shrink cascade.
+                let m_select = manifest.m_neighbours.min(m_max);
                 self.hnsw_search_level(
                     q,
                     manifest.ef_construction,
@@ -568,7 +584,7 @@ impl<'a> SessionTx<'a> {
                 let neighbours = self.hnsw_select_neighbours_heuristic(
                     q,
                     &found_nn,
-                    m_max,
+                    m_select,
                     current_level,
                     manifest,
                     idx_table,
@@ -630,6 +646,13 @@ impl<'a> SessionTx<'a> {
                 // Pruning must see every selected link in this layer. Otherwise
                 // paths through the new vertex's not-yet-written neighbours are
                 // invisible and a feasible insertion can be rejected.
+                // Share a per-layer live-adjacency cache across the shrink loop:
+                // shrinking `neighbour` mutates only `neighbour`'s own outgoing
+                // edges, so invalidating `neighbour` after each shrink keeps the
+                // cache exact while avoiding ~15x redundant RocksDB scans in
+                // dense clusters.
+                let mut shrink_adj_cache: FxHashMap<CompoundKey, Vec<CompoundKey>> =
+                    FxHashMap::default();
                 let mut kept_links = 0usize;
                 for (neighbour, _) in neighbours.iter() {
                     // shrink links if necessary
@@ -667,7 +690,9 @@ impl<'a> SessionTx<'a> {
                             idx_table,
                             orig_table,
                             vec_cache,
+                            &mut shrink_adj_cache,
                         )?;
+                        shrink_adj_cache.remove(neighbour);
                         target_degree = degree;
                         kept_links += usize::from(kept);
                     } else {
@@ -722,6 +747,7 @@ impl<'a> SessionTx<'a> {
         }
         Ok(())
     }
+    #[allow(clippy::too_many_arguments)]
     fn hnsw_shrink_neighbour(
         &mut self,
         target_key: &CompoundKey,
@@ -732,15 +758,18 @@ impl<'a> SessionTx<'a> {
         idx_table: &RelationHandle,
         orig_table: &RelationHandle,
         vec_cache: &mut VectorCache<'_, '_>,
+        adj_cache: &mut FxHashMap<CompoundKey, Vec<CompoundKey>>,
     ) -> Result<(usize, bool)> {
-        vec_cache.ensure_key(target_key, orig_table, self)?;
-        let vec = vec_cache.get_key(target_key).clone();
+        let mut cand_keys = vec![target_key.clone()];
         let mut candidates = PriorityQueue::new();
         for (neighbour_key, neighbour_dist) in
             self.hnsw_get_neighbours(target_key, level, idx_table, false)?
         {
+            cand_keys.push(neighbour_key.clone());
             candidates.push(neighbour_key, OrderedFloat(neighbour_dist));
         }
+        vec_cache.ensure_keys(&cand_keys, orig_table, self)?;
+        let vec = vec_cache.get_key(target_key).clone();
         let heuristic = self.hnsw_select_neighbours_heuristic(
             &vec,
             &candidates,
@@ -751,7 +780,7 @@ impl<'a> SessionTx<'a> {
             orig_table,
             vec_cache,
         )?;
-        let new_candidates = match self.hnsw_preserve_pruned_paths(
+        let new_candidates = match self.hnsw_preserve_pruned_paths_with_cache(
             target_key,
             level,
             idx_table,
@@ -759,6 +788,7 @@ impl<'a> SessionTx<'a> {
             &heuristic,
             m,
             Some(inserted),
+            adj_cache,
         ) {
             Ok(preserved) => preserved,
             // Path-preserving pruning is read-only and fails before any write,
@@ -841,11 +871,19 @@ impl<'a> SessionTx<'a> {
                         bail!("Indexed vector not found, this signifies a bug in the index implementation")
                     }
                 };
-                let old_existing_val = try_decode_val_only(&old_key_bytes, &old_existing_val)?;
-                let is_deleted = old_existing_val
-                    .get(2)
-                    .and_then(DataValue::get_bool)
-                    .ok_or_else(|| miette!("corrupt HNSW edge row: missing deletion marker"))?;
+                let is_deleted = match hnsw_edge_is_deleted_fast(&old_existing_val) {
+                    Some(b) => b,
+                    None => {
+                        let old_existing_val =
+                            try_decode_val_only(&old_key_bytes, &old_existing_val)?;
+                        old_existing_val
+                            .get(2)
+                            .and_then(DataValue::get_bool)
+                            .ok_or_else(|| {
+                                miette!("corrupt HNSW edge row: missing deletion marker")
+                            })?
+                    }
+                };
                 if is_deleted {
                     self.idx_del(idx_table, &old_key_bytes)?;
                 } else {
@@ -888,29 +926,34 @@ impl<'a> SessionTx<'a> {
 
         let mut ret: PriorityQueue<CompoundKey, Reverse<OrderedFloat<_>>> = PriorityQueue::new();
         let mut discarded: PriorityQueue<_, Reverse<OrderedFloat<_>>> = PriorityQueue::new();
+        let found_keys: Vec<CompoundKey> = found.iter().map(|(item, _)| item.clone()).collect();
+        vec_cache.ensure_keys(&found_keys, orig_table, self)?;
         for (item, dist) in found.iter() {
             // Add to candidates
             candidates.push(item.clone(), Reverse(*dist));
         }
         if manifest.extend_candidates {
+            let q_norm_sq = vec_cache.norm_for_cache(q);
+            let mut ext_keys = Vec::new();
             for (item, _) in found.iter() {
                 // Extend by neighbours
                 for (neighbour_key, _) in self.hnsw_get_neighbours(item, level, idx_table, false)? {
-                    vec_cache.ensure_key(&neighbour_key, orig_table, self)?;
-                    let dist = vec_cache.v_dist(q, &neighbour_key);
-                    candidates.push(
-                        (neighbour_key.0, neighbour_key.1, neighbour_key.2),
-                        Reverse(OrderedFloat(dist)),
-                    );
+                    ext_keys.push(neighbour_key);
                 }
+            }
+            vec_cache.ensure_keys(&ext_keys, orig_table, self)?;
+            for neighbour_key in ext_keys {
+                let dist = vec_cache.v_dist_with_norm(q, q_norm_sq, &neighbour_key);
+                candidates.push(
+                    (neighbour_key.0, neighbour_key.1, neighbour_key.2),
+                    Reverse(OrderedFloat(dist)),
+                );
             }
         }
         while !candidates.is_empty() && ret.len() < m {
             let (cand_key, Reverse(OrderedFloat(cand_dist_to_q))) = candidates.pop().unwrap();
             let mut should_add = true;
             for (existing, _) in ret.iter() {
-                vec_cache.ensure_key(&cand_key, orig_table, self)?;
-                vec_cache.ensure_key(existing, orig_table, self)?;
                 let dist_to_existing = vec_cache.k_dist(existing, &cand_key);
                 if distance_is_closer(dist_to_existing, cand_dist_to_q) {
                     should_add = false;
@@ -1075,46 +1118,66 @@ impl<'a> SessionTx<'a> {
         idx_handle: &RelationHandle,
         include_deleted: bool,
     ) -> Result<impl Iterator<Item = (CompoundKey, f64)> + 'b> {
-        let mut start_tuple = Vec::with_capacity(cand_key.0.len() + 3);
+        let key_len = cand_key.0.len();
+        let key_arity = 2 * key_len + 5;
+        let mut start_tuple = Vec::with_capacity(key_len + 3);
         start_tuple.push(DataValue::from(level));
         start_tuple.extend_from_slice(&cand_key.0);
         start_tuple.push(DataValue::from(cand_key.1 as i64));
         start_tuple.push(DataValue::from(cand_key.2 as i64));
-        let key_len = cand_key.0.len();
-        let neighbours = idx_handle
-            .scan_prefix(self, &start_tuple)
-            .map(|res| {
-                let tuple = res?;
-                let expected_len = 2 * key_len + 8;
-                if tuple.len() < expected_len {
-                    bail!(
-                        "corrupt HNSW edge row: expected at least {expected_len} fields, got {}",
-                        tuple.len()
-                    );
+        let mut neighbours = Vec::new();
+        for res in idx_handle.scan_prefix_raw(self, &start_tuple) {
+            let (kvec, vvec) = res?;
+            let (distance, is_deleted) = match hnsw_edge_dist_and_deleted_fast(&vvec) {
+                Some(pair) => pair,
+                None => {
+                    let vals = try_decode_val_only(&kvec, &vvec)?;
+                    if vals.len() < 3 {
+                        bail!(
+                            "corrupt HNSW edge row: expected at least {} fields, got {}",
+                            2 * key_len + 8,
+                            key_arity + vals.len()
+                        );
+                    }
+                    let dist = vals[0]
+                        .get_float()
+                        .ok_or_else(|| miette!("corrupt HNSW edge row: distance is not numeric"))?;
+                    let del = if include_deleted {
+                        false
+                    } else {
+                        vals[2].get_bool().ok_or_else(|| {
+                            miette!("corrupt HNSW edge row: deletion marker is not boolean")
+                        })?
+                    };
+                    (dist, del)
                 }
-                let key_idx = tuple[2 * key_len + 3].get_int().ok_or_else(|| {
-                    miette!("corrupt HNSW edge row: vector index is not an integer")
-                })? as usize;
-                let key_subidx = tuple[2 * key_len + 4].get_int().ok_or_else(|| {
-                    miette!("corrupt HNSW edge row: vector sub-index is not an integer")
-                })? as i32;
-                let key_tup = tuple[key_len + 3..2 * key_len + 3].to_vec();
-                if key_tup == cand_key.0 && key_idx == cand_key.1 && key_subidx == cand_key.2 {
-                    return Ok(None);
-                }
-                let distance = tuple[2 * key_len + 5]
-                    .get_float()
-                    .ok_or_else(|| miette!("corrupt HNSW edge row: distance is not numeric"))?;
-                if include_deleted {
-                    return Ok(Some(((key_tup, key_idx, key_subidx), distance)));
-                }
-                let is_deleted = tuple[2 * key_len + 7].get_bool().ok_or_else(|| {
-                    miette!("corrupt HNSW edge row: deletion marker is not boolean")
-                })?;
-                Ok((!is_deleted).then_some(((key_tup, key_idx, key_subidx), distance)))
-            })
-            .filter_map(|res| res.transpose())
-            .collect::<Result<Vec<_>>>()?;
+            };
+            if !include_deleted && is_deleted {
+                continue;
+            }
+            let tuple = crate::data::tuple::decode_tuple_from_key(&kvec, key_arity);
+            if tuple.len() < key_arity {
+                bail!(
+                    "corrupt HNSW edge row: expected at least {} key fields, got {}",
+                    key_arity,
+                    tuple.len()
+                );
+            }
+            let key_idx = tuple[2 * key_len + 3].get_int().ok_or_else(|| {
+                miette!("corrupt HNSW edge row: vector index is not an integer")
+            })? as usize;
+            let key_subidx = tuple[2 * key_len + 4].get_int().ok_or_else(|| {
+                miette!("corrupt HNSW edge row: vector sub-index is not an integer")
+            })? as i32;
+            let dst_slice = &tuple[key_len + 3..2 * key_len + 3];
+            if dst_slice == cand_key.0.as_slice()
+                && key_idx == cand_key.1
+                && key_subidx == cand_key.2
+            {
+                continue;
+            }
+            neighbours.push(((dst_slice.to_vec(), key_idx, key_subidx), distance));
+        }
         Ok(neighbours.into_iter())
     }
     fn hnsw_put_fresh_at_levels(
@@ -1298,6 +1361,9 @@ impl<'a> SessionTx<'a> {
         // Serialise: per node × level, one self row + one row per out-edge.
         let mut key_buf: Vec<DataValue> = Vec::with_capacity(2 * key_len + 5);
         for (i, meta) in graph.metas.iter().enumerate() {
+            if graph.deleted.get(i).copied().unwrap_or(false) {
+                continue;
+            }
             for (d, list) in graph.towers[i].iter().enumerate() {
                 let level = -(d as i64);
                 key_buf.clear();
@@ -1379,6 +1445,191 @@ impl<'a> SessionTx<'a> {
             );
         }
         Ok(())
+    }
+
+    /// Encode a finished `FlatHnswGraph` into per-worker sorted chunks of
+    /// `(key, value)` byte pairs in parallel, then stream them in strictly
+    /// ascending key order via a k-way merge directly into RocksDB
+    /// `ingest_sorted`. Avoids both the giant merged `Vec` allocation and the
+    /// single-threaded full-graph sort while producing byte-identical rows to
+    /// `hnsw_build_index`.
+    pub(crate) fn serialize_hnsw_graph_sorted_iter(
+        graph: &crate::runtime::hnsw_build::FlatHnswGraph,
+        idx_table: &RelationHandle,
+        key_len: usize,
+        threads: usize,
+    ) -> Result<Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>>>> {
+        let n = graph.metas.len();
+        if n == 0 || graph.entry.is_none() {
+            return Ok(Box::new(std::iter::empty()));
+        }
+        let threads = threads.max(1).min(n.max(1));
+        let chunk_size = n.div_ceil(threads);
+        let chunks: Vec<Result<Vec<(Vec<u8>, Vec<u8>)>>> = std::thread::scope(|s| {
+            let mut handles = Vec::with_capacity(threads);
+            for start in (0..n).step_by(chunk_size) {
+                let end = (start + chunk_size).min(n);
+                handles.push(s.spawn(move || {
+                    let mut out = Vec::new();
+                    let mut key_buf: Vec<DataValue> = Vec::with_capacity(2 * key_len + 5);
+                    for i in start..end {
+                        if graph.deleted.get(i).copied().unwrap_or(false) {
+                            continue;
+                        }
+                        let meta = &graph.metas[i];
+                        for (d, list) in graph.towers[i].iter().enumerate() {
+                            let level = -(d as i64);
+                            key_buf.clear();
+                            key_buf.push(DataValue::from(level));
+                            for _ in 0..2 {
+                                key_buf.extend_from_slice(&meta.key);
+                                key_buf.push(DataValue::from(meta.field_idx as i64));
+                                key_buf.push(DataValue::from(meta.sub_idx as i64));
+                            }
+                            let self_val = [
+                                DataValue::from(list.len() as f64),
+                                DataValue::Bytes(meta.hash.clone()),
+                                DataValue::from(false),
+                            ];
+                            let k = idx_table.encode_key_for_store(&key_buf, Default::default())?;
+                            let v =
+                                idx_table.encode_val_only_for_store(&self_val, Default::default())?;
+                            out.push((k, v));
+
+                            for (nb, dist, ignore_link) in list
+                                .iter()
+                                .map(|&(nb, dist)| (nb, dist, false))
+                                .chain(
+                                    graph.dead[i][d]
+                                        .iter()
+                                        .map(|&(nb, dist)| (nb, dist, true)),
+                                )
+                            {
+                                let nb_meta = &graph.metas[nb as usize];
+                                key_buf.clear();
+                                key_buf.push(DataValue::from(level));
+                                key_buf.extend_from_slice(&meta.key);
+                                key_buf.push(DataValue::from(meta.field_idx as i64));
+                                key_buf.push(DataValue::from(meta.sub_idx as i64));
+                                key_buf.extend_from_slice(&nb_meta.key);
+                                key_buf.push(DataValue::from(nb_meta.field_idx as i64));
+                                key_buf.push(DataValue::from(nb_meta.sub_idx as i64));
+                                let edge_val = [
+                                    DataValue::from(dist),
+                                    DataValue::Null,
+                                    DataValue::from(ignore_link),
+                                ];
+                                let k =
+                                    idx_table.encode_key_for_store(&key_buf, Default::default())?;
+                                let v = idx_table
+                                    .encode_val_only_for_store(&edge_val, Default::default())?;
+                                out.push((k, v));
+                            }
+                        }
+                    }
+                    out.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+                    Ok(out)
+                }));
+            }
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("HNSW serialisation worker panicked"))
+                .collect()
+        });
+        let mut sorted_runs: Vec<std::vec::IntoIter<(Vec<u8>, Vec<u8>)>> =
+            Vec::with_capacity(chunks.len() + 1);
+        for c in chunks {
+            let v = c?;
+            if !v.is_empty() {
+                sorted_runs.push(v.into_iter());
+            }
+        }
+        if let Some((ep, ep_top)) = graph.entry {
+            let ep_meta = &graph.metas[ep as usize];
+            let mut target_key = vec![DataValue::Null];
+            let mut canary_key = vec![DataValue::from(1)];
+            for _ in 0..2 {
+                for k in ep_meta.key.iter() {
+                    target_key.push(k.clone());
+                    canary_key.push(DataValue::Null);
+                }
+                target_key.push(DataValue::from(ep_meta.field_idx as i64));
+                target_key.push(DataValue::from(ep_meta.sub_idx as i64));
+                canary_key.push(DataValue::Null);
+                canary_key.push(DataValue::Null);
+            }
+            let target_key_bytes =
+                idx_table.encode_key_for_store(&target_key, Default::default())?;
+            let canary_value = [
+                DataValue::from(ep_top),
+                DataValue::Bytes(target_key_bytes),
+                DataValue::from(false),
+            ];
+            let canary_key_bytes =
+                idx_table.encode_key_for_store(&canary_key, Default::default())?;
+            let canary_value_bytes =
+                idx_table.encode_val_only_for_store(&canary_value, Default::default())?;
+            sorted_runs.push(vec![(canary_key_bytes, canary_value_bytes)].into_iter());
+        }
+        if sorted_runs.len() == 1 {
+            return Ok(Box::new(sorted_runs.pop().unwrap().map(Ok)));
+        }
+        struct MergeItem {
+            key: Vec<u8>,
+            val: Vec<u8>,
+            run: usize,
+        }
+        impl PartialEq for MergeItem {
+            fn eq(&self, other: &Self) -> bool {
+                self.key == other.key && self.run == other.run
+            }
+        }
+        impl Eq for MergeItem {}
+        impl PartialOrd for MergeItem {
+            fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+                Some(self.cmp(other))
+            }
+        }
+        impl Ord for MergeItem {
+            fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+                other
+                    .key
+                    .cmp(&self.key)
+                    .then_with(|| other.run.cmp(&self.run))
+            }
+        }
+        struct KWayMergeIter {
+            runs: Vec<std::vec::IntoIter<(Vec<u8>, Vec<u8>)>>,
+            heap: std::collections::BinaryHeap<MergeItem>,
+        }
+        impl Iterator for KWayMergeIter {
+            type Item = Result<(Vec<u8>, Vec<u8>)>;
+            fn next(&mut self) -> Option<Self::Item> {
+                let item = self.heap.pop()?;
+                if let Some((k, v)) = self.runs[item.run].next() {
+                    self.heap.push(MergeItem {
+                        key: k,
+                        val: v,
+                        run: item.run,
+                    });
+                }
+                Some(Ok((item.key, item.val)))
+            }
+        }
+        let mut heap = std::collections::BinaryHeap::with_capacity(sorted_runs.len());
+        for (run_idx, iter) in sorted_runs.iter_mut().enumerate() {
+            if let Some((k, v)) = iter.next() {
+                heap.push(MergeItem {
+                    key: k,
+                    val: v,
+                    run: run_idx,
+                });
+            }
+        }
+        Ok(Box::new(KWayMergeIter {
+            runs: sorted_runs,
+            heap,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1573,39 +1824,48 @@ impl<'a> SessionTx<'a> {
                 in_key.push(DataValue::from(idx as i64));
                 in_key.push(DataValue::from(subidx as i64));
                 let in_key_bytes = idx_table.encode_key_for_store(&in_key, Default::default())?;
-                let incoming = self
+                let incoming_bytes = self
                     .idx_get(idx_table, &in_key_bytes)?
                     .ok_or_else(|| miette!("corrupt HNSW index: missing reverse edge"))?;
-                let incoming = try_decode_val_only(&in_key_bytes, &incoming)?;
-                let incoming_active = !incoming[2]
-                    .get_bool()
-                    .ok_or_else(|| miette!("corrupt HNSW edge flag"))?;
+                let incoming_active = match hnsw_edge_is_deleted_fast(&incoming_bytes) {
+                    Some(b) => !b,
+                    None => {
+                        let incoming = try_decode_val_only(&in_key_bytes, &incoming_bytes)?;
+                        !incoming[2]
+                            .get_bool()
+                            .ok_or_else(|| miette!("corrupt HNSW edge flag"))?
+                    }
+                };
                 self.idx_del(idx_table, &in_key_bytes)?;
-                let mut neighbour_self_key = vec![DataValue::from(layer)];
-                for _ in 0..2 {
-                    neighbour_self_key.extend_from_slice(&neighbour_key.0);
-                    neighbour_self_key.push(DataValue::from(neighbour_key.1 as i64));
-                    neighbour_self_key.push(DataValue::from(neighbour_key.2 as i64));
+                if incoming_active {
+                    let mut neighbour_self_key = vec![DataValue::from(layer)];
+                    for _ in 0..2 {
+                        neighbour_self_key.extend_from_slice(&neighbour_key.0);
+                        neighbour_self_key.push(DataValue::from(neighbour_key.1 as i64));
+                        neighbour_self_key.push(DataValue::from(neighbour_key.2 as i64));
+                    }
+                    let neighbour_self_key_bytes =
+                        idx_table.encode_key_for_store(&neighbour_self_key, Default::default())?;
+                    let neighbour_val_bytes = self
+                        .idx_get(idx_table, &neighbour_self_key_bytes)?
+                        .ok_or_else(|| {
+                            miette!("corrupt HNSW index: neighbour self-row is missing")
+                        })?;
+                    let mut neighbour_val =
+                        try_decode_val_only(&neighbour_self_key_bytes, &neighbour_val_bytes)?;
+                    let degree = neighbour_val
+                        .first()
+                        .and_then(DataValue::get_float)
+                        .ok_or_else(|| miette!("corrupt HNSW self-row: missing numeric degree"))?;
+                    neighbour_val[0] = DataValue::from(degree - 1.);
+                    let neighbour_val_bytes_new =
+                        idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?;
+                    self.idx_put(
+                        idx_table,
+                        &neighbour_self_key_bytes,
+                        &neighbour_val_bytes_new,
+                    )?;
                 }
-                let neighbour_self_key_bytes =
-                    idx_table.encode_key_for_store(&neighbour_self_key, Default::default())?;
-                let neighbour_val_bytes = self
-                    .idx_get(idx_table, &neighbour_self_key_bytes)?
-                    .ok_or_else(|| miette!("corrupt HNSW index: neighbour self-row is missing"))?;
-                let mut neighbour_val =
-                    try_decode_val_only(&neighbour_self_key_bytes, &neighbour_val_bytes)?;
-                let degree = neighbour_val
-                    .first()
-                    .and_then(DataValue::get_float)
-                    .ok_or_else(|| miette!("corrupt HNSW self-row: missing numeric degree"))?;
-                neighbour_val[0] = DataValue::from(degree - if incoming_active { 1. } else { 0. });
-                let neighbour_val_bytes_new =
-                    idx_table.encode_val_only_for_store(&neighbour_val, Default::default())?;
-                self.idx_put(
-                    idx_table,
-                    &neighbour_self_key_bytes,
-                    &neighbour_val_bytes_new,
-                )?;
             }
         }
 
@@ -2032,12 +2292,21 @@ fn hnsw_edge_is_deleted_fast(vvec: &[u8]) -> Option<bool> {
     }
 }
 
+#[inline]
+fn hnsw_edge_dist_and_deleted_fast(vvec: &[u8]) -> Option<(f64, bool)> {
+    let is_deleted = hnsw_edge_is_deleted_fast(vvec)?;
+    let dist = f64::from_be_bytes(vvec[22..30].try_into().ok()?);
+    Some((dist, is_deleted))
+}
+
 /// Base rows an exact filtered rescan may read before giving up (0.19.2).
 const FILTERED_EXACT_MAX_ROWS: usize = 200_000;
 
 #[cfg(test)]
 mod tests {
-    use super::{hnsw_edge_is_deleted_fast, HnswDistance, VectorCache};
+    use super::{
+        hnsw_edge_dist_and_deleted_fast, hnsw_edge_is_deleted_fast, HnswDistance, VectorCache,
+    };
     use crate::data::value::{DataValue, Vector};
     use ndarray::Array1;
     use rand::Rng;
@@ -2069,10 +2338,18 @@ mod tests {
         let live = encode(&[DataValue::from(0.25f64), DataValue::Null, DataValue::from(false)]);
         assert_eq!(live.len(), 42);
         assert_eq!(hnsw_edge_is_deleted_fast(&live), Some(false));
+        assert_eq!(hnsw_edge_dist_and_deleted_fast(&live), Some((0.25, false)));
 
         let deleted = encode(&[DataValue::from(1.75f64), DataValue::Null, DataValue::from(true)]);
         assert_eq!(deleted.len(), 42);
         assert_eq!(hnsw_edge_is_deleted_fast(&deleted), Some(true));
+        assert_eq!(
+            hnsw_edge_dist_and_deleted_fast(&deleted),
+            Some((1.75, true))
+        );
+
+        let zero = encode(&[DataValue::from(0.0f64), DataValue::Null, DataValue::from(false)]);
+        assert_eq!(hnsw_edge_dist_and_deleted_fast(&zero), Some((0.0, false)));
 
         // Self-edge carries Bytes(hash) instead of Null -> falls back.
         let self_edge = encode(&[
@@ -2081,6 +2358,7 @@ mod tests {
             DataValue::from(false),
         ]);
         assert_eq!(hnsw_edge_is_deleted_fast(&self_edge), None);
+        assert_eq!(hnsw_edge_dist_and_deleted_fast(&self_edge), None);
 
         // Truncated 7-byte blob ending in BOOL_FALSE_TAIL -> must fall back.
         assert_eq!(
@@ -2091,16 +2369,18 @@ mod tests {
         // Wrong arity ending in Bool(false) -> must fall back.
         let short_arity = encode(&[DataValue::from(false)]);
         assert_eq!(hnsw_edge_is_deleted_fast(&short_arity), None);
+        assert_eq!(hnsw_edge_dist_and_deleted_fast(&short_arity), None);
 
         // Bit-flipped distance header -> must fall back.
         let mut flipped = live.clone();
         flipped[8] ^= 0x01;
         assert_eq!(hnsw_edge_is_deleted_fast(&flipped), None);
+        assert_eq!(hnsw_edge_dist_and_deleted_fast(&flipped), None);
     }
 
     #[test]
     fn cosine_f32_self_distance_is_zero_and_symmetric() {
-        let vc = VectorCache::new(HnswDistance::Cosine);
+        let mut vc = VectorCache::new(HnswDistance::Cosine);
         let v1 = Vector::F32(Array1::from_vec(
             (0..384).map(|i| ((i as f32) * 0.137).sin() + 0.01).collect(),
         ));
@@ -2113,5 +2393,15 @@ mod tests {
         let d21 = vc.dist(&v2, &v1);
         assert_eq!(d12, d21, "cosine distance must be symmetric");
         assert!((0.0..=2.0).contains(&d12));
+
+        let k1 = (vec![DataValue::from(1i64)], 0usize, -1i32);
+        let k2 = (vec![DataValue::from(2i64)], 0usize, -1i32);
+        vc.insert(k1.clone(), v1.clone());
+        vc.insert(k2.clone(), v2.clone());
+        assert_eq!(vc.k_dist(&k1, &k2), d12);
+        assert_eq!(vc.k_dist(&k1, &k1), 0.0);
+        assert_eq!(vc.v_dist(&v1, &k2), d12);
+        let n1 = super::vector_norm_sq(&v1);
+        assert_eq!(vc.v_dist_with_norm(&v1, n1, &k2), d12);
     }
 }
