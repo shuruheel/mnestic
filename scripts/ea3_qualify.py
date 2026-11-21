@@ -343,6 +343,13 @@ def build_all_plans(metas, plans_dir):
     }
 
     def add(group, name, arm, backend, seed, plan_obj, report_only=False):
+        # Disambiguate untimed setup[0].id per plan name so shared P1 baseline/candidate
+        # workloads never collide on plan sha256 inside qualification-manifest.json["plans"].
+        if plan_obj.get("setup"):
+            plan_obj = dict(plan_obj)
+            setup = [dict(op) for op in plan_obj["setup"]]
+            setup[0]["id"] = f"{setup[0]['id']}-{name}"
+            plan_obj["setup"] = setup
         p = plans_dir / f"{name}.json"
         save_json(p, plan_obj)
         grouped[group].append(
@@ -1195,6 +1202,8 @@ def run_qualification(candidate_dir, baseline_dir, controls_dir, bench_repo, out
         },
         order=[s["name"] for s in all_specs],
     )
+    if len(qual_manifest["plans"]) != len(all_specs):
+        raise ValueError(f"plan sha256 collision: {len(qual_manifest['plans'])} unique hashes for {len(all_specs)} plans")
     qman_path = output_dir / "qualification-manifest.json"
     save_pretty(qman_path, qual_manifest)
     os.environ["MNESTIC_QUALIFICATION_MANIFEST"] = str(qman_path)

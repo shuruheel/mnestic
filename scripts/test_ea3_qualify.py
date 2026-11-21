@@ -135,6 +135,7 @@ class Ea3QualifyTests(unittest.TestCase):
                     h1_expected_by_bucket={str(k): [["c0"]] for k in range(100)},
                 )
             specs = qual.build_all_plans(metas, p / "plans")
+            self.assertEqual(len({s["sha256"] for s in specs}), len(specs))
             groups = [s["group"] for s in specs]
             first_h1 = groups.index("H1")
             self.assertTrue(all(g == "H1" for g in groups[first_h1:]))
