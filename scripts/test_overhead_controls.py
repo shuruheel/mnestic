@@ -7,8 +7,10 @@ import overhead_controls as controls
 
 
 class ControlsTests(unittest.TestCase):
-    def fixture(self, root):
-        plan=controls.fixture('rocksdb',False,'read')
+    def fixture(self, root, shared_readonly=False, pairs=100):
+        kind = 'read' if shared_readonly else 'single'
+        warmup_count = 100 if shared_readonly else 20
+        plan=controls.fixture('rocksdb',False,kind,pairs=pairs,warmup_count=warmup_count,shared_readonly=shared_readonly)
         (root/'plan.json').write_text(json.dumps(plan))
         (root/'summary.json').write_text(json.dumps({'development_conformance':True}))
         root.with_suffix('.completion.json').write_text(json.dumps({'exit_code':0,'stop_reason':None,'elapsed_s':1}))
@@ -20,10 +22,10 @@ class ControlsTests(unittest.TestCase):
         (root/'manifest.json').write_text(json.dumps(manifest))
         root.with_suffix('.supervisor.json').write_text(json.dumps(dict(build_manifest=build,
             build_manifest_sha256=digest(root/'build.json'),binary_sha256=digest(binary),
-            plan_sha256=digest(root/'plan.json'),limits={'seconds':180,'rss_mib':4096,'min_free_mib':2048})))
+            plan_sha256=digest(root/'plan.json'),limits={'seconds':300,'rss_mib':4096,'min_free_mib':2048})))
         root.with_suffix('.resources.csv').write_text('rss_kib,free_mib\n100,3000\n')
         files={'database':'a'*64}
-        snapshots=[{'kind':'seed','files':files}]
+        snapshots=[{'kind':'seed','files':files,'shared_readonly':shared_readonly}]
         rows=[]
         def add(cell,writer,name):
             n=len(rows)
@@ -31,14 +33,25 @@ class ControlsTests(unittest.TestCase):
                              oracle_ok=True,trace_valid=True,output_sha256='same',
                              timing={'start_ns':n*1000,'end_ns':n*1000+100}))
         for op in plan['setup']: add('setup',0,op['id'])
-        for pair in range(100):
-            for enabled in [True,False]:
-                label=str(enabled)
-                snapshots.extend([dict(kind='arm_start',pair=pair,enabled=enabled,files=files),
-                                  dict(kind='arm_end',pair=pair,enabled=enabled,files=files,copy_ns=1,validation_ns=1,open_ns=1,close_ns=1,final_inventory_ns=1,cleanup_ns=1,warmups=[{'worker':1,'start_ns':0,'end_ns':0}])])
-                for i in range(100): add('overhead',1,f'warmup-{pair}-{label}-{i}')
-                add('overhead',1,f'pair-{pair}-{label}')
-                add('overhead_verify',0,f'verify-{pair}-{label}-0')
+        if shared_readonly:
+            snapshots.append(dict(kind='block_start',files=files))
+            for i in range(warmup_count): add('overhead',1,f'warmup-block-{i}')
+            for pair in range(pairs):
+                for enabled in [True,False]:
+                    add('overhead',1,f'pair-{pair}-{enabled}')
+            for i in range(len(plan['overhead_control']['rounds'][-1]['verify'])):
+                add('overhead_verify',0,f'verify-block-{i}')
+            snapshots.append(dict(kind='block_end',files=files,copy_ns=1,validation_ns=1,open_ns=1,close_ns=1,final_inventory_ns=1,cleanup_ns=1,warmups=[{'worker':1,'start_ns':0,'end_ns':0}]))
+        else:
+            for pair, round_ in enumerate(plan['overhead_control']['rounds']):
+                for enabled in [True,False]:
+                    label=str(enabled)
+                    snapshots.extend([dict(kind='arm_start',pair=pair,enabled=enabled,files=files),
+                                      dict(kind='arm_end',pair=pair,enabled=enabled,files=files,copy_ns=1,validation_ns=1,open_ns=1,close_ns=1,final_inventory_ns=1,cleanup_ns=1,warmups=[{'worker':1,'start_ns':0,'end_ns':0}])])
+                    for i in range(warmup_count): add('overhead',1,f'warmup-{pair}-{label}-{i}')
+                    add('overhead',1,f'pair-{pair}-{label}')
+                    for i in range(len(round_['verify'])):
+                        add('overhead_verify',0,f'verify-{pair}-{label}-{i}')
         self.save(root/'records.jsonl',rows)
         self.save(root/'snapshots.jsonl',snapshots)
         return rows,snapshots
@@ -46,12 +59,23 @@ class ControlsTests(unittest.TestCase):
     def save(self,path,rows): path.write_text(''.join(json.dumps(r)+'\n' for r in rows))
 
     def test_complete_matched_pairs_report_unit_ratio(self):
+        for shared_ro, pairs in [(False, 100), (True, 200)]:
+            with self.subTest(shared_ro=shared_ro), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)/'run';root.mkdir();self.fixture(root, shared_readonly=shared_ro, pairs=pairs)
+                result=controls.report(root)
+                self.assertEqual(result['status'],'complete')
+                self.assertTrue(result['freeze_control_passed'])
+                self.assertEqual(result['pairs'],pairs)
+                self.assertEqual(result['estimates']['0.99']['conservative_upper95'],1)
+
+    def test_shared_readonly_rejects_mutated_final_snapshot(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)/'run';root.mkdir();self.fixture(root)
+            root=Path(tmp)/'run';root.mkdir();_,snapshots=self.fixture(root, shared_readonly=True, pairs=100)
+            snapshots[-1]['files']={'database':'c'*64}
+            self.save(root/'snapshots.jsonl',snapshots)
             result=controls.report(root)
-            self.assertEqual(result['status'],'complete')
-            self.assertTrue(result['freeze_control_passed'])
-            self.assertEqual(result['estimates']['0.99']['conservative_upper95'],1)
+            self.assertEqual(result['status'],'incomplete')
+            self.assertFalse(result['snapshots_match'])
 
     def test_missing_measured_pair_suppresses_estimates(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,7 +108,7 @@ class ControlsTests(unittest.TestCase):
                 if mismatch=='plan':
                     path=root/'plan.json';path.write_text(path.read_text()+' ')
                 else:
-                    root.with_suffix('.completion.json').write_text(json.dumps({'exit_code':0,'elapsed_s':181}))
+                    root.with_suffix('.completion.json').write_text(json.dumps({'exit_code':0,'elapsed_s':301}))
                 result=controls.report(root)
                 self.assertEqual(result['status'],'incomplete')
                 self.assertNotIn('estimates',result)

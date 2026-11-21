@@ -7,6 +7,8 @@ use super::*;
 pub(super) struct Control {
     warmup: Vec<Operation>,
     rounds: Vec<Round>,
+    #[serde(default)]
+    shared_readonly: bool,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -20,6 +22,15 @@ struct Work {
     warmup: Vec<Operation>,
     ready: Arc<Barrier>,
     abort: Arc<AtomicBool>,
+}
+
+struct ScratchDirGuard(Option<PathBuf>);
+impl Drop for ScratchDirGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = fs::remove_dir_all(path);
+        }
+    }
 }
 
 fn inventory(path: &Path) -> Result<BTreeMap<String, String>> {
@@ -78,8 +89,12 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
         "controls own their measured/verification schedule"
     );
     ensure!(
-        control.rounds.len() == 100 && control.warmup.len() == 100,
-        "require 100 pairs and 100 warm-ups per arm"
+        control.rounds.len() >= 100 && control.rounds.len() % 100 == 0,
+        "require a positive multiple of 100 pairs per block"
+    );
+    ensure!(
+        (20..=100).contains(&control.warmup.len()),
+        "require 20..=100 warm-ups per arm"
     );
     let width = control.rounds[0].workers.len();
     ensure!(
@@ -93,6 +108,28 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
             .all(|o| o.immutable && !o.batch && o.expected_error.is_none()),
         "warm-up must be read-only"
     );
+    if control.shared_readonly {
+        ensure!(width == 1, "shared_readonly requires single-worker read controls");
+        ensure!(
+            control.rounds.iter().all(|r| r
+                .workers
+                .iter()
+                .all(|o| o.immutable && !o.batch && o.expected_error.is_none())
+                && r.verify.iter().all(|o| o.immutable)),
+            "shared_readonly requires all measured and verify ops to be immutable"
+        );
+    }
+    let scratch_guard = match std::env::var_os("MNESTIC_OVERHEAD_SCRATCH_DIR") {
+        Some(base) if !base.is_empty() => {
+            let root = PathBuf::from(base);
+            fs::create_dir_all(&root).into_diagnostic()?;
+            let sub = root.join(format!("overhead-{}-{}", std::process::id(), now_ns()));
+            fs::create_dir(&sub).into_diagnostic()?;
+            ScratchDirGuard(Some(sub))
+        }
+        _ => ScratchDirGuard(None),
+    };
+    let arm_parent = scratch_guard.0.as_deref().unwrap_or(dir);
     let seed = dir.join("seed-database");
     let db = DbInstance::new(&plan.backend, seed.to_str().unwrap(), "{}")?;
     let timeout = Duration::from_secs(30);
@@ -112,9 +149,89 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
     let mut provenance = file(&dir.join("snapshots.jsonl"))?;
     append(
         &mut provenance,
-        &json!({"kind":"seed","files":seed_inventory}),
+        &json!({"kind":"seed","files":seed_inventory,"shared_readonly":control.shared_readonly}),
     )?;
     let mut verify = Context::new(dir, "overhead_verify", 0)?;
+    if control.shared_readonly {
+        let path = arm_parent.join("shared-readonly-database");
+        let copy_start = Instant::now();
+        copy_snapshot(&seed, &path)?;
+        let copy_ns = copy_start.elapsed().as_nanos();
+        let validation_start = Instant::now();
+        let initial = inventory(&path)?;
+        let validation_ns = validation_start.elapsed().as_nanos();
+        ensure!(
+            initial == seed_inventory,
+            "snapshot copy differs before opening"
+        );
+        append(
+            &mut provenance,
+            &json!({"kind":"block_start","files":initial}),
+        )?;
+        let open_start = Instant::now();
+        let db = DbInstance::new(&plan.backend, path.to_str().unwrap(), "{}")?;
+        let open_ns = open_start.elapsed().as_nanos();
+        if let Some(enabled) = plan.keyed_access {
+            db.set_keyed_access_for_tests(enabled);
+        }
+        let mut context = Context::new(dir, "overhead", 1)?;
+        let warmup_start = now_ns();
+        for (i, op) in control.warmup.iter().enumerate() {
+            let mut op = op.clone();
+            op.id = format!("warmup-block-{i}");
+            op.warmup = true;
+            context.run(&db, &op, timeout)?;
+        }
+        let warmup_end = now_ns();
+        let warmups = vec![json!({"worker":1,"start_ns":warmup_start,"end_ns":warmup_end})];
+        for (pair, round) in control.rounds.iter().enumerate() {
+            for enabled in if pair % 2 == 0 {
+                [true, false]
+            } else {
+                [false, true]
+            } {
+                let label = if enabled { "True" } else { "False" };
+                let mut operation = round.workers[0].clone();
+                operation.id = format!("pair-{pair}-{label}");
+                operation.disabled = !enabled;
+                if !enabled {
+                    operation.phases.clear();
+                }
+                context.run(&db, &operation, timeout)?;
+            }
+        }
+        if let Some(last) = control.rounds.last() {
+            for (i, op) in last.verify.iter().enumerate() {
+                let mut op = op.clone();
+                op.id = format!("verify-block-{i}");
+                verify.run(&db, &op, timeout)?;
+            }
+        }
+        let close_start = Instant::now();
+        drop(db);
+        let close_ns = close_start.elapsed().as_nanos();
+        let inventory_start = Instant::now();
+        let final_files = inventory(&path)?;
+        let final_inventory_ns = inventory_start.elapsed().as_nanos();
+        ensure!(
+            final_files == seed_inventory,
+            "shared_readonly database files changed during block"
+        );
+        let cleanup_start = Instant::now();
+        if path.is_dir() {
+            fs::remove_dir_all(&path).into_diagnostic()?;
+        } else {
+            fs::remove_file(&path).into_diagnostic()?;
+        }
+        let cleanup_ns = cleanup_start.elapsed().as_nanos();
+        append(
+            &mut provenance,
+            &json!({"kind":"block_end","files":final_files,
+            "copy_ns":copy_ns,"validation_ns":validation_ns,"open_ns":open_ns,"warmups":warmups,
+            "close_ns":close_ns,"final_inventory_ns":final_inventory_ns,"cleanup_ns":cleanup_ns}),
+        )?;
+        return Ok(());
+    }
     std::thread::scope(|scope| -> Result<()> {
         let contexts = (1..=width)
             .map(|w| Context::new(dir, "overhead", w))
@@ -169,7 +286,7 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
                     [false, true]
                 } {
                     let label = if enabled { "True" } else { "False" };
-                    let path = dir.join(format!("pair-{pair}-{label}-database"));
+                    let path = arm_parent.join(format!("pair-{pair}-{label}-database"));
                     let copy_start = Instant::now();
                     copy_snapshot(&seed, &path)?;
                     let copy_ns = copy_start.elapsed().as_nanos();

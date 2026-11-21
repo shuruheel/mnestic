@@ -11,15 +11,21 @@ import timing_harness as harness
 from analyze_timing_diagnostics import quantile
 
 
-def fixture(backend, temporal, kind):
+def fixture(backend, temporal, kind, pairs=None, warmup_count=None, shared_readonly=None):
     base = harness.plan(backend, 'txtime' if temporal else 'plain')
     width = 4 if kind == 'contention' else 1
+    if shared_readonly is None:
+        shared_readonly = (kind == 'read')
+    if pairs is None:
+        pairs = 1000 if shared_readonly else 500
+    if warmup_count is None:
+        warmup_count = 100 if shared_readonly else 20
     rows = base['setup'][1]['params']['r']
     warmup = [harness.op(f'warmup-{i}', '?[cid] := *chunk{cid}, cid=$id',
-                        params={'id': rows[i][0]}, rows=[[rows[i][0]]], immutable=True,
-                        phases=['query_execution']) for i in range(100)]
+                        params={'id': rows[i % len(rows)][0]}, rows=[[rows[i % len(rows)][0]]], immutable=True,
+                        phases=['query_execution']) for i in range(warmup_count)]
     rounds = []
-    for pair in range(100):
+    for pair in range(pairs):
         workers, verify = [], []
         for worker in range(width):
             row = list(rows[worker*20])
@@ -49,10 +55,11 @@ def fixture(backend, temporal, kind):
                     verify.append(harness.op('history', '::history chunk [[$id]]', params={'id':row[0]},
                                              expected_row_count=2, immutable=True))
             workers.append(operation)
-        verify.append(harness.op('count', '?[count(cid)] := *chunk{cid}', rows=[[120]], immutable=True))
+        if not shared_readonly or pair == pairs - 1:
+            verify.append(harness.op('count', '?[count(cid)] := *chunk{cid}', rows=[[120]], immutable=True))
         rounds.append(dict(workers=workers, verify=verify))
     return dict(version=1,purpose='development',seed=99,backend=backend,setup=base['setup'],
-                steps=[],verify=[],overhead_control=dict(warmup=warmup,rounds=rounds))
+                steps=[],verify=[],overhead_control=dict(warmup=warmup,rounds=rounds,shared_readonly=shared_readonly))
 
 
 def jsonl_records(directory, include_snapshots=False):
@@ -89,7 +96,7 @@ def report(directory, estimates=True):
         and runner.get('executable_sha256')==supervisor.get('binary_sha256')==built.get('executable_sha256')
         and runner.get('plan_sha256')==supervisor.get('plan_sha256')==plan_hash)
     limits=supervisor.get('limits',{})
-    resources_ok=(0 < limits.get('seconds',0) <= 180 and 0 < limits.get('rss_mib',0) <= 4096
+    resources_ok=(0 < limits.get('seconds',0) <= 300 and 0 < limits.get('rss_mib',0) <= 4096
         and limits.get('min_free_mib',0)>=2048 and bool(resources)
         and all(float(r['rss_kib'])<=4096*1024 and float(r['free_mib'])>=2048 for r in resources))
     summary=json.loads(required[1].read_text()); completion=json.loads(required[3].read_text())
@@ -97,44 +104,72 @@ def report(directory, estimates=True):
     with opener(snapshot_path,'rt') as source:
         snapshots=[json.loads(line) for line in source]
     rows=[r for r in jsonl_records(directory) if 'timing' in r]
+    n_pairs=len(control['rounds'])
+    n_warmup=len(control['warmup'])
+    shared_ro=bool(control.get('shared_readonly',False))
     width=len(control['rounds'][0]['workers'])
     expected=Counter(('setup',0,o['id']) for o in plan['setup'])
-    for pair,round_ in enumerate(control['rounds']):
-        for label in ['True','False']:
-            expected.update(('overhead',i%width+1,f'warmup-{pair}-{label}-{i}') for i in range(len(control['warmup'])))
-            expected.update(('overhead',w,f'pair-{pair}-{label}') for w in range(1,width+1))
-            expected.update(('overhead_verify',0,f'verify-{pair}-{label}-{i}') for i in range(len(round_['verify'])))
+    if shared_ro:
+        expected.update(('overhead',1,f'warmup-block-{i}') for i in range(n_warmup))
+        for pair in range(n_pairs):
+            for label in ['True','False']:
+                expected.update([('overhead',1,f'pair-{pair}-{label}')])
+        last_verify=control['rounds'][-1]['verify']
+        expected.update(('overhead_verify',0,f'verify-block-{i}') for i in range(len(last_verify)))
+    else:
+        for pair,round_ in enumerate(control['rounds']):
+            for label in ['True','False']:
+                expected.update(('overhead',i%width+1,f'warmup-{pair}-{label}-{i}') for i in range(n_warmup))
+                expected.update(('overhead',w,f'pair-{pair}-{label}') for w in range(1,width+1))
+                expected.update(('overhead_verify',0,f'verify-{pair}-{label}-{i}') for i in range(len(round_['verify'])))
     observed=Counter((r['cell'],r['writer'],r['input_id']) for r in rows)
     seeds=[r['files'] for r in snapshots if r.get('kind')=='seed']
-    starts=[r for r in snapshots if r.get('kind')=='arm_start']
-    ends=[r for r in snapshots if r.get('kind')=='arm_end']
-    expected_arms=Counter((p,e) for p in range(100) for e in [True,False])
-    snapshots_ok=(len(seeds)==1 and Counter((r['pair'],r['enabled']) for r in starts)==expected_arms
-                  and Counter((r['pair'],r['enabled']) for r in ends)==expected_arms
-                  and all(r['files']==seeds[0] for r in starts))
-    valid=(observed==expected and len(control['rounds'])==100 and len(control['warmup'])==100
+    if shared_ro:
+        bstarts=[r for r in snapshots if r.get('kind')=='block_start']
+        bends=[r for r in snapshots if r.get('kind')=='block_end']
+        snapshots_ok=(len(seeds)==1 and len(bstarts)==1 and len(bends)==1
+                      and bstarts[0]['files']==seeds[0] and bends[0]['files']==seeds[0])
+    else:
+        starts=[r for r in snapshots if r.get('kind')=='arm_start']
+        ends=[r for r in snapshots if r.get('kind')=='arm_end']
+        expected_arms=Counter((p,e) for p in range(n_pairs) for e in [True,False])
+        snapshots_ok=(len(seeds)==1 and Counter((r['pair'],r['enabled']) for r in starts)==expected_arms
+                      and Counter((r['pair'],r['enabled']) for r in ends)==expected_arms
+                      and all(r['files']==seeds[0] for r in starts))
+    valid=(observed==expected and n_pairs >= 100 and n_pairs % 100 == 0 and 20 <= n_warmup <= 100
            and width in [1,4] and all(len(r['workers'])==width for r in control['rounds'])
-           and snapshots_ok and provenance_ok and resources_ok and 0 < completion.get('elapsed_s',0) <= 180
+           and (not shared_ro or width == 1)
+           and snapshots_ok and provenance_ok and resources_ok and 0 < completion.get('elapsed_s',0) <= 300
            and summary.get('development_conformance') and completion.get('exit_code')==0
            and not completion.get('stop_reason') and len({r['operation_id'] for r in rows})==len(rows)
            and all(r['status']=='ok' and r['oracle_ok'] and r['trace_valid'] for r in rows))
     by_key={(r['cell'],r['writer'],r['input_id']):r for r in rows}
     if valid:
-        for arm in ends:
-            label=str(arm['enabled']);pair=arm['pair']
-            measured=[by_key[('overhead',w,f'pair-{pair}-{label}')] for w in range(1,width+1)]
-            warmups=arm.get('warmups',[])
-            valid &= (set(w.get('worker') for w in warmups)==set(range(1,width+1)) and len(warmups)==width
-                and all(w['start_ns']<=w['end_ns']<=min(r['timing']['start_ns'] for r in measured) for w in warmups)
-                and all(isinstance(arm.get(k),int) and arm[k]>=0 for k in
+        if shared_ro:
+            bend=bends[0]
+            first_measured=min(by_key[('overhead',1,f'pair-{pair}-{label}')]['timing']['start_ns']
+                               for pair in range(n_pairs) for label in ['True','False'])
+            warmups=bend.get('warmups',[])
+            valid &= (len(warmups)==1 and warmups[0].get('worker')==1
+                and warmups[0]['start_ns']<=warmups[0]['end_ns']<=first_measured
+                and all(isinstance(bend.get(k),int) and bend[k]>=0 for k in
                     ['copy_ns','validation_ns','open_ns','close_ns','final_inventory_ns','cleanup_ns']))
-        for pair,round_ in enumerate(control['rounds']):
-            for i,op in enumerate(round_['verify']):
-                # Real commit timestamps differ, but history cardinality is checked by the runner.
-                if op['script'].startswith('::history'): continue
-                a=by_key[('overhead_verify',0,f'verify-{pair}-True-{i}')]
-                b=by_key[('overhead_verify',0,f'verify-{pair}-False-{i}')]
-                valid &= a['output_sha256']==b['output_sha256']
+        else:
+            for arm in ends:
+                label=str(arm['enabled']);pair=arm['pair']
+                measured=[by_key[('overhead',w,f'pair-{pair}-{label}')] for w in range(1,width+1)]
+                warmups=arm.get('warmups',[])
+                valid &= (set(w.get('worker') for w in warmups)==set(range(1,width+1)) and len(warmups)==width
+                    and all(w['start_ns']<=w['end_ns']<=min(r['timing']['start_ns'] for r in measured) for w in warmups)
+                    and all(isinstance(arm.get(k),int) and arm[k]>=0 for k in
+                        ['copy_ns','validation_ns','open_ns','close_ns','final_inventory_ns','cleanup_ns']))
+            for pair,round_ in enumerate(control['rounds']):
+                for i,op in enumerate(round_['verify']):
+                    # Real commit timestamps differ, but history cardinality is checked by the runner.
+                    if op['script'].startswith('::history'): continue
+                    a=by_key[('overhead_verify',0,f'verify-{pair}-True-{i}')]
+                    b=by_key[('overhead_verify',0,f'verify-{pair}-False-{i}')]
+                    valid &= a['output_sha256']==b['output_sha256']
     result=dict(status='complete' if valid else 'incomplete',development_only=True,operations=len(rows),
                 missing=sum((expected-observed).values()),unexpected=sum((observed-expected).values()),
                 snapshots_match=snapshots_ok,provenance_valid=provenance_ok,resource_limits_valid=resources_ok,
@@ -144,7 +179,7 @@ def report(directory, estimates=True):
     on=[]; off=[]
     worker_durations={w:{label:[] for label in ["True","False"]} for w in range(1,width+1)}
     rank_changes=0
-    for pair in range(100):
+    for pair in range(n_pairs):
         ranks={}
         for label,values in [('True',on),('False',off)]:
             group=[by_key[('overhead',w,f'pair-{pair}-{label}')] for w in range(1,width+1)]
@@ -154,6 +189,7 @@ def report(directory, estimates=True):
             ranks[label]={r['writer']:i for i,r in enumerate(sorted(group,key=lambda r:(r['timing']['end_ns'],r['writer'])))}
         rank_changes+=sum(ranks['True'][w]!=ranks['False'][w] for w in range(1,width+1))
     estimates={}
+    sub_block=n_pairs//10
     for q in [.5,.99]:
         upper={}
         for method in ['block10','conditional_iid']:
@@ -161,17 +197,17 @@ def report(directory, estimates=True):
             samples=[]
             for _ in range(10000):
                 if method=='block10':
-                    starts=[rng.randrange(10)*10 for _ in range(10)]
-                    indices=[i for start in starts for i in range(start,start+10)]
-                else: indices=[rng.randrange(100) for _ in range(100)]
+                    starts=[rng.randrange(10)*sub_block for _ in range(10)]
+                    indices=[i for start in starts for i in range(start,start+sub_block)]
+                else: indices=[rng.randrange(n_pairs) for _ in range(n_pairs)]
                 samples.append(quantile([on[i] for i in indices],q)/quantile([off[i] for i in indices],q))
             upper[method]=quantile(samples,.95)
         estimates[str(q)]=dict(ratio=quantile(on,q)/quantile(off,q),upper95=upper,
                                conservative_upper95=max(upper.values()))
     result.update(per_writer={str(w):{label:{"p50_ns":quantile(v,.5),"p99_ns":quantile(v,.99)}
                                               for label,v in arms.items()} for w,arms in worker_durations.items()},
-                  writer_finish_rank_changes=rank_changes,writer_pairs=100*width,
-                  pairs=100,workers=width,statistic='complete round makespan',estimates=estimates,
+                  writer_finish_rank_changes=rank_changes,writer_pairs=n_pairs*width,
+                  pairs=n_pairs,workers=width,statistic='complete round makespan',estimates=estimates,
                   freeze_control_passed=all(e['conservative_upper95']<=1.05 for e in estimates.values()),
                   limitation='Incremental recording cost over disabled hooks; not total instrumentation cost or release performance acceptance.')
     return result

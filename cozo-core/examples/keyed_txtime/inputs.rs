@@ -72,8 +72,8 @@ fn validate_proof(
     let controls = control_ref.read()?;
     ensure!(
         completion["all_recording_controls_passed"] == true
-            && completion["phase"] == 3
-            && controls["phase"] == 3
+            && completion["phase"] == 4
+            && controls["phase"] == 4
             && completion["completed_blocks"] == 180
             && completion["scripts_and_protocol_unchanged"] == true
             && completion["campaign_manifest_sha256"] == control_ref.sha256,
@@ -144,11 +144,11 @@ mod tests {
         let plan: Plan = serde_json::from_slice(&bytes).unwrap();
         let controls = frozen_file(
             &dir.path().join("controls.json"),
-            json!({"phase":3,"builds":{"candidate":{"executable_sha256":"binary"}}}),
+            json!({"phase":4,"builds":{"candidate":{"executable_sha256":"binary"}}}),
         );
         let completion = frozen_file(
             &dir.path().join("completion.json"),
-            json!({"all_recording_controls_passed":true,"phase":3,"completed_blocks":180,"scripts_and_protocol_unchanged":true,"campaign_manifest_sha256":controls["sha256"]}),
+            json!({"all_recording_controls_passed":true,"phase":4,"completed_blocks":180,"scripts_and_protocol_unchanged":true,"campaign_manifest_sha256":controls["sha256"]}),
         );
         let mut proof = json!({"version":1,"qualification_authorized":true,"plans":{},"inputs":{},"controls_manifest":controls,"controls_completion":completion});
         proof["plans"][hash(&bytes)] =

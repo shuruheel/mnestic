@@ -16,10 +16,13 @@ import overhead_controls as controls
 import timing_harness as harness
 from analyze_timing_diagnostics import quantile
 
+PHASE = 4
 BLOCKS = 10
 PAIRS = 100
+READ_PAIRS = 1000
+MUTATION_PAIRS = 500
 DRAWS = 10000
-# Fresh Hetzner dedicated-core Linux campaign (ea3-hetzner-linux-amendment.md); no prior observations pooled.
+# Fresh Phase 4 Hetzner dedicated-core Linux campaign (ea3-phase4-hetzner-amendment.md); no prior observations pooled.
 PRIOR_ATTEMPT_SECONDS = 0
 BUDGET = 10800 - PRIOR_ATTEMPT_SECONDS
 BASELINE_HEAD = '94595f8e9b57941fcd3827aba78d0f8e61843dda'
@@ -64,6 +67,12 @@ def archive(directory):
 
 
 def measured_pairs(directory):
+    directory = Path(directory)
+    plan_path = directory / 'plan.json'
+    n_pairs = PAIRS
+    if plan_path.exists():
+        plan = json.loads(plan_path.read_text())
+        n_pairs = len(plan['overhead_control']['rounds'])
     rows = {}
     for row in controls.jsonl_records(directory):
         if row.get('cell') == 'overhead' and row.get('input_id','').startswith('pair-'):
@@ -76,11 +85,11 @@ def measured_pairs(directory):
             rows[key] = row
     widths = {r['writer'] for r in rows.values()}
     width = len(widths)
-    expected = {(p,e,w) for p in range(PAIRS) for e in ['True','False'] for w in range(1,width+1)}
+    expected = {(p,e,w) for p in range(n_pairs) for e in ['True','False'] for w in range(1,width+1)}
     if width not in [1,4] or set(rows) != expected:
         raise ValueError('incomplete paired schedule')
     values = {e:[] for e in ['True','False']}
-    for pair in range(PAIRS):
+    for pair in range(n_pairs):
         for enabled in values:
             group = [rows[pair,enabled,w]['timing'] for w in range(1,width+1)]
             values[enabled].append(max(r['end_ns'] for r in group)-min(r['start_ns'] for r in group))
@@ -90,10 +99,14 @@ def measured_pairs(directory):
 
 
 def estimates(blocks, draws=DRAWS, check_budget=lambda: None):
-    if len(blocks) != BLOCKS or any(len(a) != PAIRS or len(b) != PAIRS for a,b in blocks):
+    if len(blocks) != BLOCKS or not blocks[0][0]:
+        raise ValueError('all ten complete blocks are required')
+    n_pairs = len(blocks[0][0])
+    if n_pairs < 100 or n_pairs % 10 != 0 or any(len(a) != n_pairs or len(b) != n_pairs for a,b in blocks):
         raise ValueError('all ten complete blocks are required')
     if any(v <= 0 for arms in blocks for arm in arms for v in arm):
         raise ValueError('nonpositive duration')
+    sub_block = n_pairs // 10
     on = [v for a,_ in blocks for v in a]
     off = [v for _,b in blocks for v in b]
     output = {str(q):dict(ratio=quantile(on,q)/quantile(off,q),upper95={}) for q in [.5,.99]}
@@ -107,10 +120,10 @@ def estimates(blocks, draws=DRAWS, check_budget=lambda: None):
                 selected = [rng.randrange(BLOCKS) for _ in range(BLOCKS)]
                 indices = []
                 for block in selected:
-                    starts = [rng.randrange(10)*10 for _ in range(10)]
-                    indices.extend(block*PAIRS+i for start in starts for i in range(start,start+10))
+                    starts = [rng.randrange(10)*sub_block for _ in range(10)]
+                    indices.extend(block*n_pairs+i for start in starts for i in range(start,start+sub_block))
             else:
-                indices = [rng.randrange(BLOCKS*PAIRS) for _ in range(BLOCKS*PAIRS)]
+                indices = [rng.randrange(BLOCKS*n_pairs) for _ in range(BLOCKS*n_pairs)]
             a = sorted(on[i] for i in indices)
             b = sorted(off[i] for i in indices)
             for q in distributions:
@@ -120,7 +133,7 @@ def estimates(blocks, draws=DRAWS, check_budget=lambda: None):
             output[str(q)]['upper95'][method] = quantile(samples,.95)
     for e in output.values():
         e['conservative_upper95'] = max(e['upper95'].values())
-    return dict(estimates=output,blocks=BLOCKS,pairs=BLOCKS*PAIRS,
+    return dict(estimates=output,blocks=BLOCKS,pairs=BLOCKS*n_pairs,
                 block_quantiles=[{str(q):dict(on_ns=quantile(a,q),off_ns=quantile(b,q)) for q in [.5,.99]} for a,b in blocks],
                 freeze_control_passed=all(e['conservative_upper95'] <= 1.05 for e in output.values()))
 
@@ -139,8 +152,8 @@ def semantic_environment(build):
 
 
 def validate_review(builds, review):
-    if review.get('phase') != 3 or review.get('implementation_review_passed') is not True:
-        raise ValueError('phase 3 implementation review required')
+    if review.get('phase') != PHASE or review.get('implementation_review_passed') is not True:
+        raise ValueError(f'phase {PHASE} implementation review required')
     for arm,item in builds.items():
         expected=review['builds'][arm]
         if expected['build_manifest_sha256'] != item['build_manifest_sha256'] or expected['executable_sha256'] != item['executable_sha256']:
@@ -160,15 +173,22 @@ def validate_review(builds, review):
         raise ValueError('baseline differs from protocol')
 
 
-def run(candidate, baseline, output, review_manifest):
+def run(candidate, baseline, output, review_manifest, scratch_dir=None):
     candidate,baseline,output = (Path(p).resolve() for p in [candidate,baseline,output])
     output.mkdir()
     started = time.monotonic()
     environment = dict(RAYON_NUM_THREADS='2',OMP_NUM_THREADS='1',OPENBLAS_NUM_THREADS='1')
+    if scratch_dir:
+        scratch_resolved = str(Path(scratch_dir).resolve())
+        Path(scratch_resolved).mkdir(parents=True, exist_ok=True)
+        environment['MNESTIC_OVERHEAD_SCRATCH_DIR'] = scratch_resolved
+    else:
+        os.environ.pop('MNESTIC_OVERHEAD_SCRATCH_DIR', None)
+        scratch_resolved = None
     os.environ.update(environment)
     scripts = [Path(__file__),Path(host.__file__),Path(controls.__file__),Path(harness.__file__),
                Path(__file__).with_name('analyze_timing_diagnostics.py')]
-    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-hetzner-linux-amendment.md'
+    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-phase4-hetzner-amendment.md'
     builds = {}
     for arm,path in [('candidate',candidate),('baseline',baseline)]:
         info = json.loads((path/'build.json').read_text())
@@ -196,15 +216,17 @@ def run(candidate, baseline, output, review_manifest):
                 path = output/(name+'.json')
                 save(path,controls.fixture(backend,temporal,kind))
                 cells.append(dict(name=name,arm=arm,plan_sha256=file_hash(path)))
-    frozen = dict(version=1,purpose='development',phase=3,builds=builds,cells=cells,
+    frozen = dict(version=1,purpose='development',phase=PHASE,builds=builds,cells=cells,
                   review_manifest=str(review_manifest),review_manifest_sha256=file_hash(review_manifest),
                   order=[dict(block=b,cell=c['name']) for b in range(BLOCKS) for c in cells],
                   script_sha256={str(p.resolve()):file_hash(p) for p in scripts},
                   protocol=str(protocol),protocol_sha256=file_hash(protocol),environment=environment,
-                  blocks=BLOCKS,pairs_per_block=PAIRS,draws=DRAWS,total_budget_seconds=10800,
+                  scratch_dir=scratch_resolved,
+                  blocks=BLOCKS,read_pairs_per_block=READ_PAIRS,mutation_pairs_per_block=MUTATION_PAIRS,
+                  draws=DRAWS,total_budget_seconds=10800,
                   prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,remaining_budget_seconds=BUDGET,
                   host=dict(idle_seconds=30,max_preflight_seconds=300,other_cpu_percent=25),
-                  cell_seconds=180,rss_mib=4096,min_free_mib=2048)
+                  cell_seconds=300,rss_mib=4096,min_free_mib=2048)
     save(output/'campaign-manifest.json',frozen)
     observations = {c['name']:[] for c in cells}
     aggregate = {}
@@ -233,7 +255,7 @@ def run(candidate, baseline, output, review_manifest):
                 failure = None
                 try:
                     harness.supervise(build/'keyed_txtime_timing',output/(name+'.json'),prefix,
-                                      build/'build.json',min(180,BUDGET-(time.monotonic()-started)),4096,2048,monitor)
+                                      build/'build.json',min(300,BUDGET-(time.monotonic()-started)),4096,2048,monitor)
                 except RuntimeError as error:
                     failure = str(error)
                 finally:
@@ -266,7 +288,7 @@ def run(candidate, baseline, output, review_manifest):
     elapsed = time.monotonic()-started
     passed = (stop is None and elapsed <= BUDGET and unchanged and completed == 180 and len(aggregate) == 18
               and all(r['freeze_control_passed'] for r in aggregate.values()))
-    result = dict(version=1,phase=3,status='complete' if completed == 180 and len(aggregate) == 18 and not stop else 'incomplete',
+    result = dict(version=1,phase=PHASE,status='complete' if completed == 180 and len(aggregate) == 18 and not stop else 'incomplete',
                   elapsed_s=elapsed,prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,
                   accounted_elapsed_s=elapsed+PRIOR_ATTEMPT_SECONDS,
                   stop_reason=stop,completed_blocks=completed,required_blocks=180,
@@ -281,5 +303,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(__doc__)
     parser.add_argument('candidate_build'); parser.add_argument('baseline_build'); parser.add_argument('new_output')
     parser.add_argument('--review-manifest',required=True)
+    parser.add_argument('--scratch-dir',default=None)
     args = parser.parse_args()
-    run(args.candidate_build,args.baseline_build,args.new_output,args.review_manifest)
+    run(args.candidate_build,args.baseline_build,args.new_output,args.review_manifest,scratch_dir=args.scratch_dir)

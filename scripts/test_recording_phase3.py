@@ -85,7 +85,7 @@ class PhaseTests(unittest.TestCase):
             (path/'build.json').write_text(json.dumps(info))
             builds[arm]=dict(directory=str(path),executable_sha256=info['executable_sha256'],
                              build_manifest_sha256=phase.file_hash(path/'build.json'),build=info)
-        review=dict(phase=3,implementation_review_passed=True,
+        review=dict(phase=4,implementation_review_passed=True,
                     builds={arm:dict(build_manifest_sha256=b['build_manifest_sha256'],executable_sha256=b['executable_sha256'],source=b['build']['source']) for arm,b in builds.items()},
                     shared_runner={name:{arm:'same' for arm in builds} for name in ['cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']})
         review_path=root/'review.json';review_path.write_text(json.dumps(review))
