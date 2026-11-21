@@ -349,6 +349,7 @@ impl NormalFormProgram {
                                 span: fixed.span,
                                 fixed_handle: fixed.fixed_handle.clone(),
                                 fixed_impl: fixed.fixed_impl.clone(),
+                                tx_valid_at: fixed.tx_valid_at,
                                 rule_args: fixed
                                     .rule_args
                                     .iter()

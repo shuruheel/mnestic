@@ -60,6 +60,28 @@ provenance and licensing.
   `tx::history_import_non_empty`. Added explicit physical `backup_db` /
   `restore_backup` parity and clock-skew monotonicity integration tests.
 
+### Added — commit-section triggers and cached graph projections on transaction-time relations (EA4 Batch 4.2)
+
+- `::set_triggers` `on put` and `on rm` are now supported on tt-only relations.
+  Trigger scripts execute inside the `tt_commit_lock` section after the base
+  commit so `_new` and `_old` reflect the logical-key belief transition (with
+  `_old` resolved from the prior asserted row when updating or retracting).
+  `on replace` and bitemporal triggers remain rejected; writes into any
+  transaction-time relation from inside a tt trigger are rejected statically at
+  `::set_triggers` and dynamically at runtime with
+  `eval::txtime_trigger_nested_tt_write`; bulk `import_relations` suppresses
+  triggers; `::set_triggers` on a tt-only relation is standalone exclusive DDL
+  serialized through `tt_commit_lock`. Event callbacks on derived trigger
+  targets are not dispatched from inside `tt_commit_lock`.
+- Cached graph projections (`::graph create` / `drop` / `list`) now accept
+  tt-only relations as sources (bitemporal sources remain rejected, and source
+  arity checks exclude the engine `tt` column). Cached CSR variants track
+  current asserted beliefs and remain fresh across base mutations, retractions,
+  imports, and `::evict`. Querying `graph: <name>` under query-level `:as_of`
+  bypasses and preserves the cached current projection, building an ephemeral
+  CSR over historical beliefs subject to `:mem_limit`, the `::history_gc`
+  floor, and the 200,000-row scan bound (`query::as_of_scan_limit`).
+
 ### Added — as-of vector search and B-tree secondary indexes on transaction-time relations (EA4 Batch 4.1)
 
 - `:as_of` vector search on tt-only relations executes a bounded exact scan over

@@ -257,6 +257,7 @@ pub(crate) fn parse_query(
                             arity,
                             span,
                             fixed_impl: Arc::new(fixed_impl),
+                            tx_valid_at: None,
                         },
                     },
                 );
@@ -1226,6 +1227,7 @@ fn parse_fixed_rule(
             arity,
             span: args_list_span,
             fixed_impl: fixed_impl.clone(),
+            tx_valid_at: None,
         },
     ))
 }
@@ -1264,6 +1266,7 @@ fn make_empty_const_rule(prog: &mut InputProgram, bindings: &[Symbol]) {
                 arity: bindings.len(),
                 span: Default::default(),
                 fixed_impl: Arc::new(Box::new(Constant)),
+                tx_valid_at: None,
             },
         },
     );

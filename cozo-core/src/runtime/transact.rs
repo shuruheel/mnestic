@@ -12,8 +12,22 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use crate::data::program::ReturnMutation;
+use crate::data::symb::Symbol;
 use miette::{bail, Diagnostic, Result};
 use thiserror::Error;
+
+pub(crate) trait TtTriggerExecutor<'s> {
+    fn run_tt_trigger(
+        &'s self,
+        tx: &mut SessionTx<'_>,
+        source_relation: &str,
+        trigger: &str,
+        kv_bindings: Vec<Symbol>,
+        k_bindings: Option<Vec<Symbol>>,
+        new_tuples: Vec<DataValue>,
+        old_tuples: Vec<DataValue>,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+}
 
 use crate::data::tuple::TupleT;
 use crate::data::value::DataValue;
@@ -114,10 +128,18 @@ pub struct SessionTx<'a> {
     /// come from a separate per-transaction counter and collide numerically
     /// with persistent ids.
     pub(crate) dirty_relations: BTreeSet<RelationId>,
+    /// Subset of `dirty_relations` whose `inflight` counter was raised by
+    /// `begin_commit` (including relations dirtied by commit-section TxTime
+    /// triggers before storage commit). Always balanced in `finish_commit`/`Drop`.
+    pub(crate) begun_commit_relations: BTreeSet<RelationId>,
     /// Set between `begin_commit` and `finish_commit`. If a panic unwinds
     /// through the storage commit, `Drop` reads this and balances the `inflight`
     /// increment — otherwise the sources would be denied cache hits forever.
     pub(crate) commit_inflight: bool,
+    /// Commit-section trigger executor for `tt-only` relations (EA4 Batch 4.2).
+    pub(crate) tt_trigger_executor: Option<&'a (dyn TtTriggerExecutor<'a> + Send + Sync)>,
+    /// True inside `import_relations` so bulk imports do not fire TxTime triggers.
+    pub(crate) suppress_tt_triggers: bool,
 }
 
 /// One statement's worth of buffered writes to a tt-stamped relation.
@@ -156,7 +178,15 @@ const OK_STR: &str = "OK";
 impl Drop for SessionTx<'_> {
     fn drop(&mut self) {
         if self.commit_inflight {
-            self.projections.finish_commit(&self.dirty_relations);
+            self.projections.finish_commit(&self.begun_commit_relations);
+            let unbegun: BTreeSet<RelationId> = self
+                .dirty_relations
+                .difference(&self.begun_commit_relations)
+                .copied()
+                .collect();
+            if !unbegun.is_empty() {
+                self.projections.bump_aborted(&unbegun);
+            }
         } else if !self.dirty_relations.is_empty() {
             self.projections.bump_aborted(&self.dirty_relations);
         }
@@ -323,13 +353,23 @@ impl<'a> SessionTx<'a> {
             if result.is_ok() { commit_span.finish(); }
             return result;
         }
-        self.projections.begin_commit(&self.dirty_relations);
+        self.begun_commit_relations = self.dirty_relations.clone();
+        self.projections.begin_commit(&self.begun_commit_relations);
         self.commit_inflight = true;
         let res = self.commit_tx_inner();
         #[cfg(any(test, feature = "test-hooks"))]
-        self.projections.run_commit_fence(&self.dirty_relations);
+        self.projections.run_commit_fence(&self.begun_commit_relations);
         self.commit_inflight = false;
-        self.projections.finish_commit(&self.dirty_relations);
+        self.projections.finish_commit(&self.begun_commit_relations);
+        let unbegun: BTreeSet<RelationId> = self
+            .dirty_relations
+            .difference(&self.begun_commit_relations)
+            .copied()
+            .collect();
+        if !unbegun.is_empty() {
+            self.projections.bump_aborted(&unbegun);
+        }
+        self.begun_commit_relations.clear();
         self.dirty_relations.clear();
         if res.is_ok() {
             self.fts_stats.committed();
@@ -432,6 +472,20 @@ impl<'a> SessionTx<'a> {
             self.apply_tt_evicts()?;
             self.stamp_pending_tt_writes(tt)?;
             self.maintain_tt_indexes(&touched)?;
+            self.fire_tt_triggers(&touched, tt)?;
+            // If triggers dirtied any additional plain derived relations, enroll
+            // them in the in-flight projection commit set before storage commit.
+            if self.commit_inflight {
+                let extra: BTreeSet<RelationId> = self
+                    .dirty_relations
+                    .difference(&self.begun_commit_relations)
+                    .copied()
+                    .collect();
+                if !extra.is_empty() {
+                    self.projections.begin_commit(&extra);
+                    self.begun_commit_relations.extend(extra);
+                }
+            }
             let shadow_updates = self.maintain_shadow_tt_indexes(&touched)?;
             // Persist totals after the final current-belief posting change.
             self.write_fts_deltas()?;

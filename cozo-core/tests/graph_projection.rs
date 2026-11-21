@@ -382,9 +382,13 @@ fn a_temp_relation_cannot_be_a_source() {
 #[test]
 fn a_transaction_time_relation_cannot_be_a_source() {
     let db = mem();
-    run(&db, ":create tt {a: Int, b: Int, at: TxTime}");
-    let msg = err(&db, "::graph create g {edges: tt}");
+    // Bitemporal (Validity + TxTime) relations remain rejected as projection sources.
+    run(&db, ":create bi {a: Int, b: Int, vt: Validity, at: TxTime}");
+    let msg = err(&db, "::graph create g {edges: bi}");
     assert!(msg.contains("transaction-time relation"), "{msg}");
+    // Pure tt-only relations are supported (current-belief CSR, EA4 Batch 4.2).
+    run(&db, ":create tt {a: Int, b: Int, at: TxTime}");
+    run(&db, "::graph create tt_ok {edges: tt}");
     // And a plain validity relation is *not* rejected: its selector-less scan
     // returns every version row on every engine path, projection included.
     run(&db, ":create vt {a: Int, b: Int, at: Validity}");
@@ -396,8 +400,8 @@ fn renaming_a_tt_relation_into_a_source_name_errors_at_use() {
     let db = graph_db();
     run(&db, "::graph create g {edges: knows}");
     run(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
-    run(&db, ":create tt {a: Int, b: Int, at: TxTime}");
-    run(&db, "::rename knows -> gone, tt -> knows");
+    run(&db, ":create bi {a: Int, b: Int, vt: Validity, at: TxTime}");
+    run(&db, "::rename knows -> gone, bi -> knows");
     // Source kinds are re-checked at every use, not only at create.
     let msg = err(&db, "?[n, c] <~ ConnectedComponents(graph: 'g')");
     assert!(msg.contains("transaction-time relation"), "{msg}");

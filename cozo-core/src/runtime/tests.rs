@@ -2062,13 +2062,19 @@ fn txtime_unsupported_ops_error() {
         .expect_err("replace must fail");
     assert!(format!("{err:?}").contains("history"), "{err:?}");
 
+    // EA4 Batch 4.2: tt-only `on put`/`on rm` triggers are admitted; `on replace`
+    // and bitemporal `(vt, tt)` triggers stay rejected.
     let err = db
-        .run_default(r#"::set_triggers audit_ops on put { ?[k] <- [[1]] }"#)
-        .expect_err("triggers must fail");
+        .run_default(r#"::set_triggers audit_ops on replace { ?[k] <- [[1]] }"#)
+        .expect_err("on replace trigger on tt-only must fail");
     assert!(format!("{err:?}").contains("not supported"), "{err:?}");
 
     db.run_default(":create audit_bt {k, vt: Validity, tt: TxTime => v: Int}")
         .unwrap();
+    let err = db
+        .run_default(r#"::set_triggers audit_bt on put { ?[k] <- [[1]] }"#)
+        .expect_err("bitemporal triggers must fail");
+    assert!(format!("{err:?}").contains("not supported"), "{err:?}");
     let err = db
         .run_default("::index create audit_bt:by_v {v}")
         .expect_err("bitemporal index create must fail");

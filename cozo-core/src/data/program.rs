@@ -300,6 +300,8 @@ pub struct FixedRuleApply {
     pub arity: usize,
     pub span: SourceSpan,
     pub fixed_impl: Arc<Box<dyn FixedRule>>,
+    /// Query-level `:as_of` transaction-time selector propagated to graph projections (EA4 Batch 4.2).
+    pub tx_valid_at: Option<ValidityTs>,
 }
 
 impl FixedRuleApply {
@@ -327,6 +329,7 @@ pub(crate) struct MagicFixedRuleApply {
     pub(crate) span: SourceSpan,
     pub(crate) arity: usize,
     pub(crate) fixed_impl: Arc<Box<dyn FixedRule>>,
+    pub(crate) tx_valid_at: Option<ValidityTs>,
 }
 
 #[derive(Error, Diagnostic, Debug)]
@@ -1099,6 +1102,36 @@ fn apply_as_of_default(
             }
         }
         InputInlineRulesOrFixed::Fixed { fixed } => {
+            #[cfg(feature = "graph-algo")]
+            if let Some(graph_expr) = fixed.options.get("graph") {
+                let proj_name = match graph_expr {
+                    Expr::Binding { var, .. } => Some(var.name.to_string()),
+                    Expr::Const {
+                        val: DataValue::Str(s),
+                        ..
+                    } => Some(s.to_string()),
+                    other => match other.clone().eval_to_const() {
+                        Ok(DataValue::Str(s)) => Some(s.to_string()),
+                        _ => None,
+                    },
+                };
+                if let Some(proj_name) = proj_name {
+                    if let Ok((_, edges_name, nodes_name)) = tx.projections.definition(&proj_name) {
+                        let edges_tt = tx
+                            .get_relation(&edges_name, false)
+                            .is_ok_and(|h| h.has_txtime());
+                        let nodes_tt = nodes_name
+                            .as_deref()
+                            .is_some_and(|n| tx.get_relation(n, false).is_ok_and(|h| h.has_txtime()));
+                        if edges_tt || nodes_tt {
+                            *applied = true;
+                            if fixed.tx_valid_at.is_none() {
+                                fixed.tx_valid_at = Some(t);
+                            }
+                        }
+                    }
+                }
+            }
             for arg in fixed.rule_args.iter_mut() {
                 match arg {
                     FixedRuleArg::Stored {
