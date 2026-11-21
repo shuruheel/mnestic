@@ -1072,9 +1072,18 @@ fn apply_as_of_default(
                 }
             }
             InputAtom::Search { inner } => {
-                if is_tt_stamped(&inner.relation, tx) {
-                    *applied = true;
-                    return Err(unsupported(&inner.relation.name));
+                if let Ok(handle) = tx.get_relation(&inner.relation, false) {
+                    if handle.has_txtime() {
+                        *applied = true;
+                        if handle.is_tt_only() && handle.hnsw_indices.contains_key(&inner.index.name)
+                        {
+                            if inner.tx_valid_at.is_none() {
+                                inner.tx_valid_at = Some(t);
+                            }
+                        } else {
+                            return Err(unsupported(&inner.relation.name));
+                        }
+                    }
                 }
             }
             InputAtom::Rule { .. } | InputAtom::Predicate { .. } | InputAtom::Unification { .. } => {}
@@ -1156,6 +1165,7 @@ pub struct SearchInput {
     pub bindings: BTreeMap<SmartString<LazyCompact>, Expr>,
     pub parameters: BTreeMap<SmartString<LazyCompact>, Expr>,
     pub span: SourceSpan,
+    pub tx_valid_at: Option<ValidityTs>,
 }
 
 #[derive(Clone, Debug)]
@@ -1173,6 +1183,7 @@ pub(crate) struct HnswSearch {
     pub(crate) bind_vector: Option<Symbol>,
     pub(crate) radius: Option<f64>,
     pub(crate) filter: Option<Expr>,
+    pub(crate) tx_valid_at: Option<ValidityTs>,
     pub(crate) span: SourceSpan,
 }
 
@@ -1854,6 +1865,7 @@ impl SearchInput {
             bind_vector,
             radius,
             filter,
+            tx_valid_at: self.tx_valid_at,
             span: self.span,
         }));
 

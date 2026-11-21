@@ -2531,9 +2531,14 @@ impl<'s, S: Storage<'s>> Db<S> {
                                     RelAlgebra::StoredWithValidity(StoredWithValidityRA {
                                         storage,
                                         filters,
+                                        historical_scan_limit,
                                         ..
                                     }) => (
-                                        "load_stored_with_validity",
+                                        if historical_scan_limit.is_some() {
+                                            "load_stored_history"
+                                        } else {
+                                            "load_stored_with_validity"
+                                        },
                                         json!(format!(":{}", storage.name)),
                                         json!(null),
                                         json!(filters.iter().map(|f| f.to_string()).collect_vec()),
@@ -2633,7 +2638,11 @@ impl<'s, S: Storage<'s>> Db<S> {
                                     RelAlgebra::HnswSearch(HnswSearchRA {
                                         hnsw_search, ..
                                     }) => (
-                                        "hnsw_index",
+                                        if hnsw_search.tx_valid_at.is_some() {
+                                            "hnsw_history_scan"
+                                        } else {
+                                            "hnsw_index"
+                                        },
                                         json!(format!(":{}", hnsw_search.query.name)),
                                         json!(hnsw_search.query.name),
                                         json!(hnsw_search
@@ -2933,7 +2942,9 @@ impl<'s, S: Storage<'s>> Db<S> {
         // cannot use detached publication or acquire the TT commit section here.
         if skip_locking && !standalone && !tx.defer_tt_cleanup {
             let targets: Vec<_> = match op {
-                SysOp::Reindex(name) | SysOp::RemoveIndex(name, _) => vec![name],
+                SysOp::CreateIndex(name, _, _)
+                | SysOp::Reindex(name)
+                | SysOp::RemoveIndex(name, _) => vec![name],
                 SysOp::TtHistoryGc(name, _) | SysOp::RepairCorrupt(name) if skip_locking => vec![name],
                 SysOp::RemoveRelation(names) => names.iter().collect(),
                 SysOp::RenameRelation(pairs) => pairs.iter().flat_map(|(a, b)| [a, b]).collect(),

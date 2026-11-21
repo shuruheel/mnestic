@@ -107,7 +107,26 @@ impl<'a, 'b> FixedRuleInputRelation<'a, 'b> {
                     // bitemporal input (mnestic fork, 4b): two-level scan
                     Box::new(relation.bitemporal_scan_all(self.tx, *valid_at, *tt))
                 } else if let Some(valid_at) = valid_at {
-                    Box::new(relation.skip_scan_all(self.tx, *valid_at))
+                    if relation.is_tt_only()
+                        && *valid_at != crate::data::functions::MAX_VALIDITY_TS
+                    {
+                        let limit = crate::runtime::txtime_index::as_of_scan_max_rows();
+                        let rel_name = relation.name.clone();
+                        Box::new(relation.skip_scan_all(self.tx, *valid_at).enumerate().map(
+                            move |(scanned, res)| {
+                                if scanned >= limit {
+                                    return Err(
+                                        crate::runtime::txtime_index::as_of_scan_limit_error(
+                                            &rel_name, limit,
+                                        ),
+                                    );
+                                }
+                                res
+                            },
+                        ))
+                    } else {
+                        Box::new(relation.skip_scan_all(self.tx, *valid_at))
+                    }
                 } else {
                     Box::new(relation.scan_all(self.tx))
                 }

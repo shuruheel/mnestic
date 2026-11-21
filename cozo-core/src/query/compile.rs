@@ -297,14 +297,19 @@ impl<'a> SessionTx<'a> {
                         }
                     }
 
-                    let chosen_index = store.choose_index(
-                        &join_indices,
-                        // tt-stamped reads are validity-style even with no
-                        // explicit selector (implicit current-state MAX);
-                        // indexes cannot exist on tt relations until step 5,
-                        // but keep the flag honest for when they do.
-                        rel_app.valid_at.is_some() || store.has_txtime(),
-                    );
+                    let is_historical_tt = store.is_tt_only() && rel_app.tx_valid_at.is_some();
+                    let chosen_index = if is_historical_tt {
+                        None
+                    } else {
+                        store.choose_index(
+                            &join_indices,
+                            // Current-belief reads on tt-only relations use plain
+                            // current-belief secondary indexes; bitemporal and
+                            // valid-time queries keep the trailing-validity rule.
+                            rel_app.valid_at.is_some()
+                                || (store.has_txtime() && !store.is_tt_only()),
+                        )
+                    };
 
                     match chosen_index {
                         None => {
@@ -326,12 +331,17 @@ impl<'a> SessionTx<'a> {
                                 .into_iter()
                                 .map(|i| right_vars[i].clone())
                                 .collect_vec();
+                            let (idx_valid_at, idx_tx_valid_at) = if store.is_tt_only() {
+                                (None, None)
+                            } else {
+                                (rel_app.valid_at, rel_app.tx_valid_at)
+                            };
                             let right = RelAlgebra::relation(
                                 new_right_vars,
                                 chosen_index,
                                 rel_app.span,
-                                rel_app.valid_at,
-                                rel_app.tx_valid_at,
+                                idx_valid_at,
+                                idx_tx_valid_at,
                             )?;
                             debug_assert_eq!(prev_joiner_vars.len(), right_joiner_vars.len());
                             ret =
@@ -341,6 +351,11 @@ impl<'a> SessionTx<'a> {
                             // index-with-join
                             let mut not_bound = vec![true; prev_joiner_vars.len()];
                             let mut index_vars = vec![];
+                            let (idx_valid_at, idx_tx_valid_at) = if store.is_tt_only() {
+                                (None, None)
+                            } else {
+                                (rel_app.valid_at, rel_app.tx_valid_at)
+                            };
                             // Get the index and its keys
                             {
                                 let mut left_keys = vec![];
@@ -363,8 +378,8 @@ impl<'a> SessionTx<'a> {
                                     index_vars.clone(),
                                     chosen_index,
                                     rel_app.span,
-                                    rel_app.valid_at,
-                                    rel_app.tx_valid_at,
+                                    idx_valid_at,
+                                    idx_tx_valid_at,
                                 )?;
                                 ret = ret.join(index, left_keys, right_keys, rel_app.span);
                             }
@@ -492,14 +507,16 @@ impl<'a> SessionTx<'a> {
                         }
                     }
 
-                    let chosen_index = store.choose_index(
-                        &join_indices,
-                        // tt-stamped reads are validity-style even with no
-                        // explicit selector (implicit current-state MAX);
-                        // indexes cannot exist on tt relations until step 5,
-                        // but keep the flag honest for when they do.
-                        rel_app.valid_at.is_some() || store.has_txtime(),
-                    );
+                    let is_historical_tt = store.is_tt_only() && rel_app.tx_valid_at.is_some();
+                    let chosen_index = if is_historical_tt {
+                        None
+                    } else {
+                        store.choose_index(
+                            &join_indices,
+                            rel_app.valid_at.is_some()
+                                || (store.has_txtime() && !store.is_tt_only()),
+                        )
+                    };
 
                     match chosen_index {
                         None | Some((_, _, true)) => {
@@ -524,12 +541,17 @@ impl<'a> SessionTx<'a> {
                                 .into_iter()
                                 .map(|i| right_vars[i].clone())
                                 .collect_vec();
+                            let (idx_valid_at, idx_tx_valid_at) = if store.is_tt_only() {
+                                (None, None)
+                            } else {
+                                (rel_app.valid_at, rel_app.tx_valid_at)
+                            };
                             let right = RelAlgebra::relation(
                                 new_right_vars,
                                 chosen_index,
                                 rel_app.span,
-                                rel_app.valid_at,
-                                rel_app.tx_valid_at,
+                                idx_valid_at,
+                                idx_tx_valid_at,
                             )?;
                             debug_assert_eq!(prev_joiner_vars.len(), right_joiner_vars.len());
                             ret = ret.neg_join(

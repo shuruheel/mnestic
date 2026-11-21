@@ -460,14 +460,22 @@ impl RelAlgebra {
                 filters_bytecodes: vec![],
                 span,
             })),
-            TemporalRead::AsOf(vld) => Ok(Self::StoredWithValidity(StoredWithValidityRA {
-                bindings,
-                storage,
-                filters: vec![],
-                filters_bytecodes: vec![],
-                valid_at: vld,
-                span,
-            })),
+            TemporalRead::AsOf(vld) => {
+                let historical_scan_limit = if storage.is_tt_only() && tx_validity.is_some() {
+                    Some(crate::runtime::txtime_index::as_of_scan_max_rows())
+                } else {
+                    None
+                };
+                Ok(Self::StoredWithValidity(StoredWithValidityRA {
+                    bindings,
+                    storage,
+                    filters: vec![],
+                    filters_bytecodes: vec![],
+                    valid_at: vld,
+                    historical_scan_limit,
+                    span,
+                }))
+            }
             TemporalRead::Bitemporal { vt, tt } => Ok(Self::StoredBitemporal(StoredBitemporalRA {
                 bindings,
                 storage,
@@ -559,6 +567,7 @@ impl RelAlgebra {
                 filters_bytecodes: filter_bytecodes,
                 span,
                 valid_at,
+                historical_scan_limit,
             }) => {
                 filters.push(filter);
                 RelAlgebra::StoredWithValidity(StoredWithValidityRA {
@@ -567,6 +576,7 @@ impl RelAlgebra {
                     filters,
                     span,
                     valid_at,
+                    historical_scan_limit,
                     filters_bytecodes: filter_bytecodes,
                 })
             }
@@ -1372,6 +1382,7 @@ impl HnswSearchRA {
         let config = self.hnsw_search.clone();
         let filter_code = self.filter_bytecode.clone();
         let mut stack = vec![];
+        let search_poison = poison.clone();
         let it = self
             .parent
             .iter(tx, delta_rule, stores, poison)?
@@ -1381,7 +1392,7 @@ impl HnswSearchRA {
                     d => bail!("Expected vector, got {:?}", d),
                 };
 
-                let res = tx.hnsw_knn(v, &config, &filter_code, &mut stack)?;
+                let res = tx.hnsw_knn(v, &config, &filter_code, &mut stack, &search_poison)?;
                 Ok(res.into_iter().map(move |t| {
                     let mut r = tuple.clone();
                     r.extend(t);
@@ -1401,6 +1412,7 @@ pub(crate) struct StoredWithValidityRA {
     pub(crate) filters: Vec<Expr>,
     pub(crate) filters_bytecodes: Vec<(Vec<Bytecode>, SourceSpan)>,
     pub(crate) valid_at: ValidityTs,
+    pub(crate) historical_scan_limit: Option<usize>,
     pub(crate) span: SourceSpan,
 }
 
@@ -1473,7 +1485,15 @@ impl StoredWithValidityRA {
         } else {
             let mut right_join_vals = BTreeSet::new();
 
-            for tuple in self.storage.skip_scan_all(tx, self.valid_at) {
+            for (scanned, tuple) in self.storage.skip_scan_all(tx, self.valid_at).enumerate() {
+                if let Some(limit) = self.historical_scan_limit {
+                    if scanned >= limit {
+                        return Err(crate::runtime::txtime_index::as_of_scan_limit_error(
+                            &self.storage.name,
+                            limit,
+                        ));
+                    }
+                }
                 let tuple = tuple?;
                 let to_join: Box<[DataValue]> = right_join_indices
                     .iter()
@@ -1529,9 +1549,22 @@ impl StoredWithValidityRA {
         Ok(())
     }
     fn iter<'a>(&'a self, tx: &'a SessionTx<'_>, poison: Poison) -> Result<TupleIter<'a>> {
-        let it = self.storage.skip_scan_all(tx, self.valid_at);
+        let base_it = self.storage.skip_scan_all(tx, self.valid_at);
+        let it: TupleIter<'a> = if let Some(limit) = self.historical_scan_limit {
+            let rel_name = self.storage.name.clone();
+            Box::new(base_it.enumerate().map(move |(scanned, res)| {
+                if scanned >= limit {
+                    return Err(crate::runtime::txtime_index::as_of_scan_limit_error(
+                        &rel_name, limit,
+                    ));
+                }
+                res
+            }))
+        } else {
+            Box::new(base_it)
+        };
         Ok(if self.filters.is_empty() {
-            Box::new(it)
+            it
         } else {
             // the raw scan is wrapped so fused filters that drop every tuple
             // still hit poison checks (mnestic fork, interruptibility)
@@ -1557,6 +1590,8 @@ impl StoredWithValidityRA {
             .collect_vec();
 
         let mut skip_range_check = false;
+        let scanned_counter = std::rc::Rc::new(std::cell::Cell::new(0usize));
+        let hist_limit = self.historical_scan_limit;
 
         let it = left_iter
             .map_ok(move |tuple| {
@@ -1574,6 +1609,7 @@ impl StoredWithValidityRA {
                         || !u_bound.iter().all(|v| *v == DataValue::Bot)
                     {
                         let mut stack = vec![];
+                        let counter = scanned_counter.clone();
                         return Left(
                             poisoned(
                                 self.storage.skip_scan_bounded_prefix(
@@ -1586,6 +1622,18 @@ impl StoredWithValidityRA {
                                 poison.clone(),
                             )
                             .map(move |res_found| -> Result<Option<Tuple>> {
+                                if let Some(limit) = hist_limit {
+                                    let n = counter.get();
+                                    if n >= limit {
+                                        return Err(
+                                            crate::runtime::txtime_index::as_of_scan_limit_error(
+                                                &self.storage.name,
+                                                limit,
+                                            ),
+                                        );
+                                    }
+                                    counter.set(n + 1);
+                                }
                                 let found = res_found?;
                                 for (p, span) in self.filters_bytecodes.iter() {
                                     if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
@@ -1602,12 +1650,25 @@ impl StoredWithValidityRA {
                 }
                 skip_range_check = true;
                 let mut stack = vec![];
+                let counter = scanned_counter.clone();
                 Right(
                     poisoned(
                         self.storage.skip_scan_prefix(tx, &prefix, self.valid_at),
                         poison.clone(),
                     )
                     .map(move |res_found| -> Result<Option<Tuple>> {
+                        if let Some(limit) = hist_limit {
+                            let n = counter.get();
+                            if n >= limit {
+                                return Err(
+                                    crate::runtime::txtime_index::as_of_scan_limit_error(
+                                        &self.storage.name,
+                                        limit,
+                                    ),
+                                );
+                            }
+                            counter.set(n + 1);
+                        }
                         let found = res_found?;
                         for (p, span) in self.filters_bytecodes.iter() {
                             if !eval_bytecode_pred(p, &found, &mut stack, *span)? {
@@ -2424,7 +2485,7 @@ impl NegJoin {
                     StoredAccess::Materialized => "stored_neg_mat_join",
                 }
             }
-            RelAlgebra::StoredWithValidity(_) => {
+            RelAlgebra::StoredWithValidity(r) => {
                 let join_indices = self
                     .joiner
                     .join_indices(
@@ -2432,8 +2493,15 @@ impl NegJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_is_prefix(&join_indices.1) {
-                    "stored_vld_neg_prefix_join"
+                let plain_len = r.storage.metadata.keys.len().saturating_sub(1);
+                if join_prefix_is_temporally_safe(&join_indices.1, plain_len) {
+                    if r.historical_scan_limit.is_some() {
+                        "stored_history_neg_prefix_join"
+                    } else {
+                        "stored_vld_neg_prefix_join"
+                    }
+                } else if r.historical_scan_limit.is_some() {
+                    "stored_history_neg_mat_join"
                 } else {
                     "stored_vld_neg_mat_join"
                 }
@@ -2614,8 +2682,17 @@ impl InnerJoin {
                         &self.right.bindings_after_eliminate(),
                     )
                     .unwrap();
-                if join_prefix_is_temporally_safe(&join_indices.1, r.storage.metadata.keys.len().saturating_sub(1)) {
-                    "stored_prefix_join"
+                if join_prefix_is_temporally_safe(
+                    &join_indices.1,
+                    r.storage.metadata.keys.len().saturating_sub(1),
+                ) {
+                    if r.historical_scan_limit.is_some() {
+                        "stored_history_prefix_join"
+                    } else {
+                        "stored_prefix_join"
+                    }
+                } else if r.historical_scan_limit.is_some() {
+                    "stored_history_mat_join"
                 } else {
                     "stored_mat_join"
                 }

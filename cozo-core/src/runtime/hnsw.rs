@@ -1656,6 +1656,7 @@ impl<'a> SessionTx<'a> {
         config: &HnswSearch,
         filter_bytecode: &Option<(Vec<Bytecode>, SourceSpan)>,
         stack: &mut Vec<DataValue>,
+        poison: &crate::runtime::db::Poison,
     ) -> Result<Vec<Tuple>> {
         if q.len() != config.manifest.vec_dim {
             bail!("query vector dimension mismatch");
@@ -1668,6 +1669,25 @@ impl<'a> SessionTx<'a> {
         };
 
         let mut vec_cache = VectorCache::new(config.manifest.distance);
+
+        if let Some(as_of_tt) = config.tx_valid_at {
+            config
+                .base_handle
+                .check_tt_gc_floor(Some(as_of_tt), config.span)?;
+            let rows = config.base_handle.skip_scan_all(self, as_of_tt);
+            return Ok(self
+                .hnsw_exact_scan_rows(
+                    &q,
+                    config,
+                    filter_bytecode,
+                    stack,
+                    &vec_cache,
+                    rows,
+                    true,
+                    poison,
+                )?
+                .expect("as-of exact scan either succeeds or returns an error"));
+        }
 
         let ep_res = config
             .idx_handle
@@ -1768,9 +1788,14 @@ impl<'a> SessionTx<'a> {
             // score every eligible row exactly instead (bounded; see
             // `hnsw_filtered_exact`).
             if filter_bytecode.is_some() && ret.len() < config.k {
-                if let Some(exact) =
-                    self.hnsw_filtered_exact(&q, config, filter_bytecode, stack, &vec_cache)?
-                {
+                if let Some(exact) = self.hnsw_filtered_exact(
+                    &q,
+                    config,
+                    filter_bytecode,
+                    stack,
+                    &vec_cache,
+                    poison,
+                )? {
                     return Ok(exact);
                 }
             }
@@ -1792,6 +1817,32 @@ impl<'a> SessionTx<'a> {
         filter_bytecode: &Option<(Vec<Bytecode>, SourceSpan)>,
         stack: &mut Vec<DataValue>,
         vec_cache: &VectorCache<'_, '_>,
+        poison: &crate::runtime::db::Poison,
+    ) -> Result<Option<Vec<Tuple>>> {
+        let rows = config.base_handle.scan_current(self);
+        self.hnsw_exact_scan_rows(
+            q,
+            config,
+            filter_bytecode,
+            stack,
+            vec_cache,
+            rows,
+            false,
+            poison,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hnsw_exact_scan_rows<'b>(
+        &self,
+        q: &Vector,
+        config: &HnswSearch,
+        filter_bytecode: &Option<(Vec<Bytecode>, SourceSpan)>,
+        stack: &mut Vec<DataValue>,
+        vec_cache: &VectorCache<'_, '_>,
+        rows: impl Iterator<Item = Result<Tuple>> + 'b,
+        fail_on_limit: bool,
+        poison: &crate::runtime::db::Poison,
     ) -> Result<Option<Vec<Tuple>>> {
         let index_filter = match &config.manifest.index_filter {
             Some(f_code) => {
@@ -1808,8 +1859,22 @@ impl<'a> SessionTx<'a> {
         type Ranked = (OrderedFloat<f64>, Tuple, usize, i32);
         let mut best: std::collections::BinaryHeap<(Ranked, Tuple)> = Default::default();
         let n_keys = config.base_handle.index_key_len();
-        for (scanned, row) in config.base_handle.scan_current(self).enumerate() {
-            if scanned >= FILTERED_EXACT_MAX_ROWS {
+        let max_rows = if fail_on_limit {
+            crate::runtime::txtime_index::as_of_scan_max_rows()
+        } else {
+            FILTERED_EXACT_MAX_ROWS
+        };
+        for (scanned, row) in rows.enumerate() {
+            if scanned & 63 == 0 {
+                poison.check()?;
+            }
+            if scanned >= max_rows {
+                if fail_on_limit {
+                    return Err(crate::runtime::txtime_index::as_of_scan_limit_error(
+                        &config.base_handle.name,
+                        max_rows,
+                    ));
+                }
                 crate::runtime::diagnostics::emit(
                     "hnsw.filtered_incomplete",
                     format!(

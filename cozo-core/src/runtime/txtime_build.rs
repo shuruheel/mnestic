@@ -100,8 +100,9 @@ fn index_ids(handle: &RelationHandle, name: &str) -> Option<Vec<u64>> {
 
 fn names(handle: &RelationHandle) -> BTreeSet<String> {
     handle
-        .fts_indices
+        .indices
         .keys()
+        .chain(handle.fts_indices.keys())
         .chain(handle.hnsw_indices.keys())
         .chain(handle.lsh_indices.keys())
         .map(ToString::to_string)
@@ -110,9 +111,10 @@ fn names(handle: &RelationHandle) -> BTreeSet<String> {
 
 fn handles(handle: &RelationHandle) -> Vec<&RelationHandle> {
     handle
-        .fts_indices
+        .indices
         .values()
         .map(|(i, _)| i)
+        .chain(handle.fts_indices.values().map(|(i, _)| i))
         .chain(handle.hnsw_indices.values().map(|(i, _)| i))
         .chain(handle.lsh_indices.values().flat_map(|(i, j, _)| [i, j]))
         .collect()
@@ -169,6 +171,7 @@ impl SessionTx<'_> {
             _ => {
                 self.preparing_tt_index = true;
                 match op {
+                    SysOp::CreateIndex(rel, idx, cols) => self.create_index(rel, idx, cols)?,
                     SysOp::CreateFtsIndex(config) => self.create_fts_index(config)?,
                     SysOp::CreateVectorIndex(config) => {
                         self.create_hnsw_index(config)?;
@@ -186,7 +189,12 @@ impl SessionTx<'_> {
         };
         // Retain only the newly reserved generations. Existing indexes remain
         // attached and maintained by ordinary commits throughout backfill.
-        definition.indices.clear();
+        definition.indices.retain(|name, (index, _)| {
+            original
+                .indices
+                .get(name)
+                .is_none_or(|(old, _)| old.id != index.id)
+        });
         definition.fts_indices.retain(|name, (index, _)| {
             original
                 .fts_indices
@@ -224,6 +232,17 @@ impl SessionTx<'_> {
         let mut stack = Vec::new();
         for row in rows {
             poison.check()?;
+            for (idx_handle, extraction_indices) in build.indices.values() {
+                if extraction_indices.iter().any(|&i| i >= row.len()) {
+                    continue;
+                }
+                let extracted: Vec<_> = extraction_indices
+                    .iter()
+                    .map(|&i| row[i].clone())
+                    .collect();
+                let key = idx_handle.encode_key_for_store(&extracted, Default::default())?;
+                self.store_tx.put(&key, &[])?;
+            }
             self.put_in_fts(build, &mut stack, &processors, row)?;
             self.put_in_lsh(build, &mut stack, &processors, row, &perms)?;
         }
@@ -238,6 +257,7 @@ impl SessionTx<'_> {
         for index in handles(build) {
             self.publish_relation_metadata(index)?;
         }
+        current.indices.extend(build.indices.clone());
         current.fts_indices.extend(build.fts_indices.clone());
         current.hnsw_indices.extend(build.hnsw_indices.clone());
         current.lsh_indices.extend(build.lsh_indices.clone());
@@ -283,6 +303,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         deadline: Option<Instant>,
     ) -> Result<Option<NamedRows>> {
         let name = match op {
+            SysOp::CreateIndex(base, _, _) => base.name.as_str(),
             SysOp::CreateFtsIndex(config) => config.base_relation.as_str(),
             SysOp::CreateVectorIndex(config) => config.base_relation.as_str(),
             SysOp::CreateMinHashLshIndex(config) => config.base_relation.as_str(),
@@ -298,6 +319,13 @@ impl<'s, S: Storage<'s>> Db<S> {
         };
         if !original.is_tt_only() {
             return Ok(None);
+        }
+        if matches!(op, SysOp::Reindex(_))
+            && original.fts_indices.is_empty()
+            && original.hnsw_indices.is_empty()
+            && original.lsh_indices.is_empty()
+        {
+            return Ok(Some(result_rows(op, &original, 0)));
         }
         let poison = Poison {
             deadline,
@@ -802,7 +830,10 @@ impl<'s, S: Storage<'s>> Db<S> {
             }
         }
 
-        if !build.fts_indices.is_empty() || !build.lsh_indices.is_empty() {
+        if !build.indices.is_empty()
+            || !build.fts_indices.is_empty()
+            || !build.lsh_indices.is_empty()
+        {
             for chunk in pairs.chunks(FTS_LSH_CATCHUP_CHUNK) {
                 poison.check()?;
                 let mut tx = self.transact_write()?;
@@ -812,13 +843,18 @@ impl<'s, S: Storage<'s>> Db<S> {
                     .iter()
                     .map(|(old, new)| (old.as_ref(), new.as_ref()))
                     .collect();
-                tx.maintain_tt_fts_lsh_pairs(
-                    build,
-                    &chunk_pairs,
-                    &processors,
-                    &hashes,
-                    &mut stack,
-                )?;
+                if !build.indices.is_empty() {
+                    tx.maintain_tt_btree_pairs(build, &chunk_pairs)?;
+                }
+                if !build.fts_indices.is_empty() || !build.lsh_indices.is_empty() {
+                    tx.maintain_tt_fts_lsh_pairs(
+                        build,
+                        &chunk_pairs,
+                        &processors,
+                        &hashes,
+                        &mut stack,
+                    )?;
+                }
                 self.commit_tx_with_test_hook(&mut tx)?;
             }
         }

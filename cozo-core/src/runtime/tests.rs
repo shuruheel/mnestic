@@ -2067,9 +2067,11 @@ fn txtime_unsupported_ops_error() {
         .expect_err("triggers must fail");
     assert!(format!("{err:?}").contains("not supported"), "{err:?}");
 
+    db.run_default(":create audit_bt {k, vt: Validity, tt: TxTime => v: Int}")
+        .unwrap();
     let err = db
-        .run_default("::index create audit_ops:by_v {v}")
-        .expect_err("index create must fail");
+        .run_default("::index create audit_bt:by_v {v}")
+        .expect_err("bitemporal index create must fail");
     assert!(format!("{err:?}").contains("not supported"), "{err:?}");
 }
 

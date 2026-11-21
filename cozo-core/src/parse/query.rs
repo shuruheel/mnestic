@@ -784,6 +784,7 @@ fn parse_atom(
                 bindings,
                 span,
                 parameters,
+                tx_valid_at: None,
             };
 
             InputAtom::Search { inner: opts }
