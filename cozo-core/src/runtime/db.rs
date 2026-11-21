@@ -157,6 +157,10 @@ pub struct Db<S> {
     /// Strict FIFO ticket queue guarding entry to `tt_commit_lock`, preventing
     /// mutual starvation between concurrent writers and shadow index drain.
     pub(crate) tt_commit_queue: Arc<crate::runtime::relation_lock::RelationLock>,
+    /// Ring buffer of recently committed TxTime logical keys so speculative
+    /// pre-search/VectorCache warming done outside `tt_commit_lock` can
+    /// accurately evict concurrently mutated keys before applying updates.
+    pub(crate) tt_recent_mutations: Arc<crate::runtime::txtime_index::TtRecentMutations>,
     /// User-registered aggregates (mnestic fork, provenance semirings R0b) —
     /// mirrors `fixed_rules`. In-memory, `Db`-scoped; consulted by the parser
     /// when a head aggregate is not a builtin. NOT consulted when parsing
@@ -505,6 +509,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_clock: Default::default(),
             tt_commit_lock: Default::default(),
             tt_commit_queue: Default::default(),
+            tt_recent_mutations: Default::default(),
             custom_aggrs: Default::default(),
             custom_bounded_meets: Default::default(),
             queries_count: Default::default(),
@@ -1769,6 +1774,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 tx.dirty_relations.clear();
             }
             commit_res?;
+            self.tt_recent_mutations.invalidate_all();
             if new_hwm > 0 {
                 self.tt_clock.seed(Some(new_hwm));
             }
@@ -2508,6 +2514,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                         dst_tx.dirty_relations.clear();
                     }
                     commit_res?;
+                    self.tt_recent_mutations.invalidate_all();
                     if new_hwm > 0 {
                         self.tt_clock.seed(Some(new_hwm));
                     }
@@ -2873,6 +2880,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         // struct-literal field would be evaluated in source order, which is
         // too easy to reorder by accident — hence the separate binding.
         let watermark = self.graph_projections.watermark();
+        let tt_pre_seq = self.tt_recent_mutations.seq();
         let fts_stats = self.fts_doc_stats_cache.transaction();
         let ret = SessionTx {
             store_tx: Box::new(self.db.transact(false)?),
@@ -2888,6 +2896,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             tt_commit_queue: self.tt_commit_queue.clone(),
+            tt_recent_mutations: self.tt_recent_mutations.clone(),
+            tt_pre_seq,
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
             pending_tt_evicts: Vec::new(),
@@ -2914,6 +2924,7 @@ impl<'s, S: Storage<'s>> Db<S> {
     pub(crate) fn transact_write(&'s self) -> Result<SessionTx<'s>> {
         // See `transact`: the watermark capture must precede the pin.
         let watermark = self.graph_projections.watermark();
+        let tt_pre_seq = self.tt_recent_mutations.seq();
         let fts_stats = self.fts_doc_stats_cache.transaction();
         let ret = SessionTx {
             store_tx: Box::new(self.db.transact(true)?),
@@ -2929,6 +2940,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
             tt_commit_queue: self.tt_commit_queue.clone(),
+            tt_recent_mutations: self.tt_recent_mutations.clone(),
+            tt_pre_seq,
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
             pending_tt_evicts: Vec::new(),

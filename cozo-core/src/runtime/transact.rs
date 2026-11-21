@@ -72,6 +72,8 @@ pub struct SessionTx<'a> {
     /// §13.10). Held only inside `commit_tx_with_tt`.
     pub(crate) tt_commit_lock: Arc<Mutex<()>>,
     pub(crate) tt_commit_queue: Arc<crate::runtime::relation_lock::RelationLock>,
+    pub(crate) tt_recent_mutations: Arc<crate::runtime::txtime_index::TtRecentMutations>,
+    pub(crate) tt_pre_seq: u64,
     /// Buffered writes to tt-stamped relations (mnestic fork, bitemporality
     /// step 3): rows are collected at statement time and stamped + written at
     /// commit inside `commit_tx_with_tt`, so every row of the transaction
@@ -449,6 +451,11 @@ impl<'a> SessionTx<'a> {
             ..Default::default()
         };
         let result = (|| {
+            // Speculatively pre-search layer-0 HNSW candidates and warm
+            // VectorCache on this transaction's read snapshot BEFORE entering
+            // `tt_commit_queue` / `tt_commit_lock`, so concurrent writers run
+            // read-only ANN descent and base-vector fetches in parallel.
+            let mut prewarm = self.prewarm_tt_hnsw_outside_lock()?;
             #[cfg(feature = "test-hooks")]
             let wait = crate::measurement::Span::new("tt_commit_section");
             let _turn = queue.write_with_poison(&poison)?;
@@ -471,7 +478,7 @@ impl<'a> SessionTx<'a> {
             let touched = self.collect_tt_index_old_rows()?;
             self.apply_tt_evicts()?;
             self.stamp_pending_tt_writes(tt)?;
-            self.maintain_tt_indexes(&touched)?;
+            self.maintain_tt_indexes(&touched, &mut prewarm)?;
             self.fire_tt_triggers(&touched, tt)?;
             // If triggers dirtied any additional plain derived relations, enroll
             // them in the in-flight projection commit set before storage commit.
@@ -486,7 +493,7 @@ impl<'a> SessionTx<'a> {
                     self.begun_commit_relations.extend(extra);
                 }
             }
-            let shadow_updates = self.maintain_shadow_tt_indexes(&touched)?;
+            let shadow_updates = self.maintain_shadow_tt_indexes(&touched, &mut prewarm)?;
             // Persist totals after the final current-belief posting change.
             self.write_fts_deltas()?;
             poison.check()?;
@@ -497,6 +504,7 @@ impl<'a> SessionTx<'a> {
             );
             self.store_tx.commit()?;
             notification.committed();
+            self.tt_recent_mutations.record_touched(&touched);
             Ok(tt)
         })();
         if result.is_err() { self.tt_commit_failed = true; }

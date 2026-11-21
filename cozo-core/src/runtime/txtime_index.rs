@@ -6,17 +6,133 @@
  */
 
 //! Current-belief index maintenance inside the transaction-time commit section.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::Mutex;
 
+use rustc_hash::FxHashSet;
 use miette::{bail, ensure, Diagnostic, Result};
+use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
 use crate::data::expr::{eval_bytecode, eval_bytecode_pred};
 use crate::data::tuple::{Tuple, TupleT};
 use crate::data::value::DataValue;
+use crate::runtime::hnsw::{CompoundKey, HnswPresearch, PrecomputedLayerRemoval, VectorCache};
 use crate::runtime::minhash_lsh::HashValues;
 use crate::runtime::relation::RelationHandle;
 use crate::runtime::transact::SessionTx;
+
+const RECENT_MUTATIONS_CAP: usize = 512;
+
+#[derive(Default)]
+struct TtRecentMutationsInner {
+    seq: u64,
+    oldest_seq: u64,
+    ring: VecDeque<(u64, u64, Tuple)>,
+}
+
+/// Bounded ring buffer of recently committed TxTime logical keys.
+/// Recorded inside `tt_commit_lock` after storage commit so speculative HNSW
+/// pre-search and `VectorCache` pre-warming done outside `tt_commit_lock` can
+/// deterministically evict concurrently mutated keys (or fall back fail-closed
+/// if more than `RECENT_MUTATIONS_CAP` keys were mutated in the interim).
+#[derive(Default)]
+pub(crate) struct TtRecentMutations {
+    inner: Mutex<TtRecentMutationsInner>,
+}
+
+impl TtRecentMutations {
+    pub(crate) fn seq(&self) -> u64 {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .seq
+    }
+
+    pub(crate) fn record_touched(&self, touched: &BTreeMap<u64, TouchedRelation>) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for (&rel_id, entry) in touched {
+            for (key, _) in entry.old.values() {
+                inner.seq += 1;
+                let seq = inner.seq;
+                if inner.ring.len() == RECENT_MUTATIONS_CAP {
+                    inner.ring.pop_front();
+                    inner.oldest_seq = inner.ring.front().map_or(seq, |(s, _, _)| *s);
+                } else if inner.ring.is_empty() {
+                    inner.oldest_seq = seq;
+                }
+                inner.ring.push_back((seq, rel_id, key.clone()));
+            }
+        }
+    }
+
+    pub(crate) fn record_key(&self, rel_id: u64, key: Tuple) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.seq += 1;
+        let seq = inner.seq;
+        if inner.ring.len() == RECENT_MUTATIONS_CAP {
+            inner.ring.pop_front();
+            inner.oldest_seq = inner.ring.front().map_or(seq, |(s, _, _)| *s);
+        } else if inner.ring.is_empty() {
+            inner.oldest_seq = seq;
+        }
+        inner.ring.push_back((seq, rel_id, key));
+    }
+
+    /// Invalidate all speculative caches/presearches captured before this point
+    /// (called after index publication / rebuild / catalog transitions).
+    pub(crate) fn invalidate_all(&self) {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inner.seq += 1;
+        inner.ring.clear();
+        inner.oldest_seq = inner.seq + 1;
+    }
+
+    /// Returns all logical keys mutated on `rel_id` strictly after `pre_seq`,
+    /// or `None` if the ring overflowed and callers must discard speculative
+    /// caches/pre-search fail-closed.
+    pub(crate) fn mutated_since(&self, pre_seq: u64, rel_id: u64) -> Option<FxHashSet<Tuple>> {
+        let inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if pre_seq >= inner.seq {
+            return Some(FxHashSet::default());
+        }
+        if inner.oldest_seq > pre_seq + 1 {
+            return None;
+        }
+        let mut out = FxHashSet::default();
+        for (seq, rid, key) in &inner.ring {
+            if *seq > pre_seq && *rid == rel_id {
+                out.insert(key.clone());
+            }
+        }
+        Some(out)
+    }
+}
+
+pub(crate) struct PrewarmedIndex {
+    pub(crate) vec_cache: VectorCache<'static, 'static>,
+    pub(crate) presearch: BTreeMap<Tuple, BTreeMap<(usize, i32), HnswPresearch>>,
+    pub(crate) removals: BTreeMap<Tuple, BTreeMap<(usize, i32), Vec<PrecomputedLayerRemoval>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct PrewarmedTtHnsw {
+    pub(crate) pre_seq: u64,
+    pub(crate) attached: BTreeMap<(u64, SmartString<LazyCompact>), PrewarmedIndex>,
+    pub(crate) shadow: BTreeMap<(u64, SmartString<LazyCompact>), PrewarmedIndex>,
+}
 
 pub(crate) struct PendingTtEvict {
     pub(crate) handle: RelationHandle,
@@ -336,9 +452,214 @@ impl SessionTx<'_> {
 
     /// The base rows have already advanced. Cache all stale vectors before
     /// removing any graph vertices, then add new vertices against the new base.
+    /// Speculatively warm `VectorCache` and pre-run read-only layer-0 HNSW
+    /// candidate searches on this transaction's open snapshot BEFORE acquiring
+    /// `tt_commit_queue` / `tt_commit_lock`.
+    pub(crate) fn prewarm_tt_hnsw_outside_lock(&self) -> Result<PrewarmedTtHnsw> {
+        let mut out = PrewarmedTtHnsw {
+            pre_seq: self.tt_pre_seq,
+            attached: BTreeMap::new(),
+            shadow: BTreeMap::new(),
+        };
+        if self.pending_tt_writes.is_empty() {
+            return Ok(out);
+        }
+        // Group latest pending non-retract write per (rel_id, logical_key) for
+        // tt-only relations that have attached HNSW or active shadow HNSW.
+        let mut by_rel: BTreeMap<u64, (RelationHandle, BTreeMap<Tuple, Option<Tuple>>)> =
+            BTreeMap::new();
+        for w in &self.pending_tt_writes {
+            if !w.handle.is_tt_only() {
+                continue;
+            }
+            let rel_id = w.handle.id.0;
+            let entry = by_rel
+                .entry(rel_id)
+                .or_insert_with(|| (w.handle.clone(), BTreeMap::new()));
+            let klen = w.handle.index_key_len();
+            for raw in &w.rows {
+                let key = raw[..klen].to_vec();
+                if w.is_retract {
+                    entry.1.insert(key, None);
+                } else {
+                    let mut full = Vec::with_capacity(raw.len() + 1);
+                    full.extend_from_slice(&raw[..klen]);
+                    full.push(DataValue::Null);
+                    full.extend_from_slice(&raw[klen..]);
+                    entry.1.insert(key, Some(full));
+                }
+            }
+        }
+        if by_rel.is_empty() {
+            return Ok(out);
+        }
+        // Snapshot any active shadow HNSW targets under the leaf registry mutex.
+        let shadow_targets: Vec<(u64, u64, RelationHandle)> = {
+            let registry = self
+                .tt_index_builds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .builds
+                .iter()
+                .filter_map(|(&token, log)| {
+                    if log.invalid || !by_rel.contains_key(&log.base) {
+                        return None;
+                    }
+                    let shadow = log.shadow.as_ref()?;
+                    if shadow.handle.hnsw_indices.is_empty() {
+                        return None;
+                    }
+                    Some((token, log.base, shadow.handle.clone()))
+                })
+                .collect()
+        };
+        let mut stack = Vec::new();
+        for (&rel_id, (orig_handle, pending_keys)) in &by_rel {
+            let Ok(current_handle) = self.get_relation(&orig_handle.name, false) else {
+                continue;
+            };
+            if current_handle.id != orig_handle.id {
+                continue;
+            }
+            let has_attached = !current_handle.hnsw_indices.is_empty();
+            let rel_shadows: Vec<&(u64, u64, RelationHandle)> = shadow_targets
+                .iter()
+                .filter(|(_, base, _)| *base == rel_id)
+                .collect();
+            if !has_attached && rel_shadows.is_empty() {
+                continue;
+            }
+            // Fetch current (pre-write) rows on this read snapshot once per key.
+            let mut old_by_key: BTreeMap<&Tuple, Option<Tuple>> = BTreeMap::new();
+            for key in pending_keys.keys() {
+                old_by_key.insert(key, current_handle.get_current(self, key)?);
+            }
+            if has_attached {
+                let filters = Self::make_hnsw_filters(&current_handle)?;
+                for (idx_name, (idx_handle, manifest)) in &current_handle.hnsw_indices {
+                    let filter = filters.get(idx_name);
+                    let mut vec_cache = VectorCache::new(manifest.distance);
+                    let mut presearch_map = BTreeMap::new();
+                    let mut removals_map = BTreeMap::new();
+                    for (key, new_opt) in pending_keys {
+                        let old_opt = old_by_key.get(key).and_then(|o| o.as_ref());
+                        let new_passes = match (new_opt.as_ref(), filter) {
+                            (None, _) => false,
+                            (Some(_), None) => true,
+                            (Some(r), Some(code)) => {
+                                eval_bytecode_pred(code, r, &mut stack, Default::default())?
+                            }
+                        };
+                        let new_for_hnsw = new_passes.then(|| new_opt.as_ref().unwrap());
+                        if let (Some(o), Some(n)) = (old_opt, new_for_hnsw) {
+                            let same_vecs = manifest
+                                .vec_fields
+                                .iter()
+                                .all(|&i| o.get(i) == n.get(i));
+                            if same_vecs {
+                                continue;
+                            }
+                        }
+                        if let Some(o) = old_opt {
+                            vec_cache.seed_row(manifest, &current_handle, o);
+                        }
+                        if let Ok(found) = self.hnsw_presearch_and_warm(
+                            old_opt,
+                            new_for_hnsw,
+                            manifest,
+                            &current_handle,
+                            idx_handle,
+                            &mut vec_cache,
+                        ) {
+                            if !found.inserts.is_empty() {
+                                presearch_map.insert(key.clone(), found.inserts);
+                            }
+                            if !found.removals.is_empty() {
+                                removals_map.insert(key.clone(), found.removals);
+                            }
+                        }
+                    }
+                    out.attached.insert(
+                        (rel_id, idx_name.clone()),
+                        PrewarmedIndex {
+                            vec_cache,
+                            presearch: presearch_map,
+                            removals: removals_map,
+                        },
+                    );
+                }
+            }
+            for &(token, _, ref shadow_handle) in &rel_shadows {
+                let Ok(filters) = Self::make_hnsw_filters(shadow_handle) else {
+                    continue;
+                };
+                for (idx_name, (idx_handle, manifest)) in &shadow_handle.hnsw_indices {
+                    let filter = filters.get(idx_name);
+                    let mut vec_cache = VectorCache::with_shadow(
+                        manifest.distance,
+                        self.tt_index_builds.clone(),
+                        *token,
+                    );
+                    let mut presearch_map = BTreeMap::new();
+                    let mut removals_map = BTreeMap::new();
+                    for (key, new_opt) in pending_keys {
+                        let encoded = key.encode_as_key(shadow_handle.id);
+                        let shadow_pending_old =
+                            lookup_shadow_pending(&self.tt_index_builds, *token, &encoded)
+                                .ok()
+                                .flatten();
+                        let old_opt = match shadow_pending_old.as_ref() {
+                            Some(opt) => opt.as_ref(),
+                            None => old_by_key.get(key).and_then(|o| o.as_ref()),
+                        };
+                        let new_passes = match (new_opt.as_ref(), filter) {
+                            (None, _) => false,
+                            (Some(_), None) => true,
+                            (Some(r), Some(code)) => {
+                                eval_bytecode_pred(code, r, &mut stack, Default::default())
+                                    .unwrap_or(false)
+                            }
+                        };
+                        let new_for_hnsw = new_passes.then(|| new_opt.as_ref().unwrap());
+                        if let Some(o) = old_opt {
+                            vec_cache.seed_row(manifest, shadow_handle, o);
+                        }
+                        // Shadow pre-warm is strictly best-effort (error-isolated).
+                        if let Ok(found) = self.hnsw_presearch_and_warm(
+                            old_opt,
+                            new_for_hnsw,
+                            manifest,
+                            shadow_handle,
+                            idx_handle,
+                            &mut vec_cache,
+                        ) {
+                            if !found.inserts.is_empty() {
+                                presearch_map.insert(key.clone(), found.inserts);
+                            }
+                            if !found.removals.is_empty() {
+                                removals_map.insert(key.clone(), found.removals);
+                            }
+                        }
+                    }
+                    out.shadow.insert(
+                        (*token, idx_name.clone()),
+                        PrewarmedIndex {
+                            vec_cache,
+                            presearch: presearch_map,
+                            removals: removals_map,
+                        },
+                    );
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub(crate) fn maintain_tt_indexes(
         &mut self,
         touched: &BTreeMap<u64, TouchedRelation>,
+        prewarm: &mut PrewarmedTtHnsw,
     ) -> Result<()> {
         for entry in touched.values() {
             if entry.old.is_empty() || !has_search_indexes(&entry.handle) {
@@ -415,18 +736,66 @@ impl SessionTx<'_> {
                     }
                 }
                 if !removed.is_empty() || !inserted.is_empty() {
-                    let mut vec_cache = crate::runtime::hnsw::VectorCache::new(manifest.distance);
+                    let mutated_opt = self
+                        .tt_recent_mutations
+                        .mutated_since(prewarm.pre_seq, handle.id.0);
+                    let (mut vec_cache, mut presearch_map, mut removals_map, no_concurrent) = match (
+                        mutated_opt,
+                        prewarm.attached.remove(&(handle.id.0, name.clone())),
+                    ) {
+                        (Some(mut mutated), Some(mut pw)) => {
+                            let no_concurrent =
+                                mutated.is_empty() && removed.len() <= 1 && inserted.len() <= 1;
+                            for k in &mutated {
+                                pw.vec_cache.evict_logical_key(k);
+                            }
+                            for row in &removed {
+                                mutated.insert(row[..handle.index_key_len()].to_vec());
+                            }
+                            for (key, per_vec) in &mut pw.presearch {
+                                for pre in per_vec.values_mut() {
+                                    pre.prune_keys(&mutated, key);
+                                }
+                                per_vec.retain(|_, pre| pre.is_usable(manifest));
+                            }
+                            if !mutated.is_empty() {
+                                for per_vec in pw.removals.values_mut() {
+                                    for layers in per_vec.values_mut() {
+                                        layers.retain(|plan| {
+                                            plan.added_edges.iter().all(|(u, v, _)| {
+                                                !mutated.contains(&u.0) && !mutated.contains(&v.0)
+                                            })
+                                        });
+                                    }
+                                    per_vec.retain(|_, layers| !layers.is_empty());
+                                }
+                            }
+                            (pw.vec_cache, pw.presearch, pw.removals, no_concurrent)
+                        }
+                        _ => (
+                            VectorCache::new(manifest.distance),
+                            BTreeMap::new(),
+                            BTreeMap::new(),
+                            false,
+                        ),
+                    };
+                    let mut touched_by_remove: FxHashSet<CompoundKey> = FxHashSet::default();
                     if !removed.is_empty() {
                         for row in &removed {
                             vec_cache.seed_row(manifest, handle, row);
                         }
                         for row in &removed {
-                            self.hnsw_remove_with_cache(
+                            let key = row[..handle.index_key_len()].to_vec();
+                            let pre_rm = removals_map.remove(&key);
+                            self.hnsw_remove_with_cache_and_pre(
                                 manifest,
                                 handle,
                                 index,
                                 row,
                                 &mut vec_cache,
+                                pre_rm.as_ref(),
+                                no_concurrent,
+                                Some(&mut touched_by_remove),
                             )?;
                         }
                         // Evict old vectors of removed/replaced keys so subsequent
@@ -437,7 +806,9 @@ impl SessionTx<'_> {
                         }
                     }
                     for row in inserted {
-                        self.hnsw_put_with_cache(
+                        let key = row[..handle.index_key_len()].to_vec();
+                        let mut pre = presearch_map.remove(&key);
+                        self.hnsw_put_with_cache_and_presearch(
                             manifest,
                             handle,
                             index,
@@ -445,6 +816,9 @@ impl SessionTx<'_> {
                             &mut stack,
                             row,
                             &mut vec_cache,
+                            pre.as_mut(),
+                            no_concurrent,
+                            Some(&touched_by_remove),
                         )?;
                     }
                 }
@@ -589,6 +963,7 @@ impl SessionTx<'_> {
     pub(crate) fn maintain_shadow_tt_indexes(
         &mut self,
         touched: &BTreeMap<u64, TouchedRelation>,
+        prewarm: &mut PrewarmedTtHnsw,
     ) -> Result<Vec<ShadowCommitUpdate>> {
         // Snapshot the active shadow targets + per-touched-key prior rows under
         // the leaf `BuildRegistry` mutex without holding it across storage I/O.
@@ -643,7 +1018,7 @@ impl SessionTx<'_> {
             // detached key range, and let the user's commit proceed cleanly.
             let saved_hnsw_incomplete = self.hnsw_mutations_incomplete;
             if self
-                .maintain_shadow_pairs(&shadow_handle, token, &pairs)
+                .maintain_shadow_pairs_with_prewarm(&shadow_handle, token, &pairs, Some(prewarm))
                 .is_err()
             {
                 self.hnsw_mutations_incomplete = saved_hnsw_incomplete;
@@ -674,6 +1049,16 @@ impl SessionTx<'_> {
         handle: &RelationHandle,
         token: u64,
         pairs: &[(Option<Tuple>, Option<Tuple>)],
+    ) -> Result<()> {
+        self.maintain_shadow_pairs_with_prewarm(handle, token, pairs, None)
+    }
+
+    pub(crate) fn maintain_shadow_pairs_with_prewarm(
+        &mut self,
+        handle: &RelationHandle,
+        token: u64,
+        pairs: &[(Option<Tuple>, Option<Tuple>)],
+        mut prewarm: Option<&mut PrewarmedTtHnsw>,
     ) -> Result<()> {
         if pairs.is_empty() || !has_search_indexes(handle) {
             return Ok(());
@@ -721,17 +1106,85 @@ impl SessionTx<'_> {
                 }
             }
             if !removed.is_empty() || !inserted.is_empty() {
-                let mut vec_cache = crate::runtime::hnsw::VectorCache::with_shadow(
-                    manifest.distance,
-                    self.tt_index_builds.clone(),
-                    token,
-                );
+                let (mut vec_cache, mut presearch_map, mut removals_map, no_concurrent) =
+                    match prewarm.as_deref_mut() {
+                        Some(pw_all) => {
+                            let mutated_opt = self
+                                .tt_recent_mutations
+                                .mutated_since(pw_all.pre_seq, handle.id.0);
+                            match (mutated_opt, pw_all.shadow.remove(&(token, name.clone()))) {
+                                (Some(mut mutated), Some(mut pw)) => {
+                                    let no_concurrent = mutated.is_empty()
+                                        && removed.len() <= 1
+                                        && inserted.len() <= 1;
+                                    for k in &mutated {
+                                        pw.vec_cache.evict_logical_key(k);
+                                    }
+                                    for row in &removed {
+                                        mutated.insert(row[..handle.index_key_len()].to_vec());
+                                    }
+                                    for (key, per_vec) in &mut pw.presearch {
+                                        for pre in per_vec.values_mut() {
+                                            pre.prune_keys(&mutated, key);
+                                        }
+                                        per_vec.retain(|_, pre| pre.is_usable(manifest));
+                                    }
+                                    if !mutated.is_empty() {
+                                        for per_vec in pw.removals.values_mut() {
+                                            for layers in per_vec.values_mut() {
+                                                layers.retain(|plan| {
+                                                    plan.added_edges.iter().all(|(u, v, _)| {
+                                                        !mutated.contains(&u.0)
+                                                            && !mutated.contains(&v.0)
+                                                    })
+                                                });
+                                            }
+                                            per_vec.retain(|_, layers| !layers.is_empty());
+                                        }
+                                    }
+                                    (pw.vec_cache, pw.presearch, pw.removals, no_concurrent)
+                                }
+                                _ => (
+                                    VectorCache::with_shadow(
+                                        manifest.distance,
+                                        self.tt_index_builds.clone(),
+                                        token,
+                                    ),
+                                    BTreeMap::new(),
+                                    BTreeMap::new(),
+                                    false,
+                                ),
+                            }
+                        }
+                        None => (
+                            VectorCache::with_shadow(
+                                manifest.distance,
+                                self.tt_index_builds.clone(),
+                                token,
+                            ),
+                            BTreeMap::new(),
+                            BTreeMap::new(),
+                            false,
+                        ),
+                    };
+                let mut touched_by_remove: FxHashSet<CompoundKey> = FxHashSet::default();
                 if !removed.is_empty() {
                     for row in &removed {
                         vec_cache.seed_row(manifest, handle, row);
                     }
                     for row in &removed {
-                        self.hnsw_remove_with_cache(manifest, handle, index, row, &mut vec_cache)?;
+                        let key = row[..handle.index_key_len()].to_vec();
+                        let pre_rm = removals_map.remove(&key);
+                        self.hnsw_remove_with_cache_and_pre(
+                            manifest,
+                            handle,
+                            index,
+                            row,
+                            &mut vec_cache,
+                            pre_rm.as_ref(),
+                            no_concurrent,
+                            Some(&mut touched_by_remove),
+                        )?;
                     }
                     for row in &removed {
                         vec_cache.evict_row(manifest, handle, row);
@@ -742,7 +1195,9 @@ impl SessionTx<'_> {
                         vec_cache.seed_row(manifest, handle, row);
                     }
                     for row in inserted {
-                        self.hnsw_put_with_cache(
+                        let key = row[..handle.index_key_len()].to_vec();
+                        let mut pre = presearch_map.remove(&key);
+                        self.hnsw_put_with_cache_and_presearch(
                             manifest,
                             handle,
                             index,
@@ -750,6 +1205,9 @@ impl SessionTx<'_> {
                             &mut stack,
                             row,
                             &mut vec_cache,
+                            pre.as_mut(),
+                            no_concurrent,
+                            Some(&touched_by_remove),
                         )?;
                     }
                 }
@@ -1008,6 +1466,26 @@ impl BuildRegistration {
             .iter()
             .next()
             .map(|(encoded, (key, old))| (encoded.clone(), key.clone(), old.clone())))
+    }
+
+    /// Re-check whether a specific speculatively pre-warmed key is still
+    /// pending (not yet claimed by a concurrent writer).
+    pub(crate) fn is_shadow_key_pending(&self, encoded: &[u8]) -> Result<bool> {
+        let registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        let shadow = log
+            .shadow
+            .as_ref()
+            .expect("shadow mode active during drain");
+        Ok(shadow.pending_old.contains_key(encoded))
     }
 
     /// Mark one builder-drained shadow key completed after its commit succeeds.
