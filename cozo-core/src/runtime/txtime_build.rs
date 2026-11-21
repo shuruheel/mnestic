@@ -20,7 +20,7 @@ use crate::runtime::db::{Db, Poison};
 use crate::runtime::relation::{AccessLevel, RelationHandle};
 use crate::runtime::transact::SessionTx;
 use crate::runtime::txtime_index::{BuildRegistration, TouchedRelation};
-use crate::storage::Storage;
+use crate::storage::{Storage, StoreTx};
 use crate::{DataValue, NamedRows};
 
 #[cfg(feature = "test-hooks")]
@@ -222,13 +222,24 @@ impl SessionTx<'_> {
         rows: &[Tuple],
         poison: &Poison,
     ) -> Result<()> {
-        let filters = Self::make_hnsw_filters(build)?;
+        if !build.hnsw_indices.is_empty() {
+            let filters = Self::make_hnsw_filters(build)?;
+            for (name, (index, manifest)) in &build.hnsw_indices {
+                poison.check()?;
+                self.hnsw_build_index(manifest, build, index, filters.get(name), rows)?;
+            }
+        }
+        self.populate_tt_non_hnsw_indexes(build, rows, poison)
+    }
+
+    fn populate_tt_non_hnsw_indexes(
+        &mut self,
+        build: &RelationHandle,
+        rows: &[Tuple],
+        poison: &Poison,
+    ) -> Result<()> {
         let processors = self.make_fts_lsh_processors(build)?;
         let perms = self.make_lsh_hash_perms(build);
-        for (name, (index, manifest)) in &build.hnsw_indices {
-            poison.check()?;
-            self.hnsw_build_index(manifest, build, index, filters.get(name), rows)?;
-        }
         let mut stack = Vec::new();
         for row in rows {
             poison.check()?;
@@ -419,9 +430,38 @@ impl<'s, S: Storage<'s>> Db<S> {
                 .scan_current(&snapshot)
                 .collect::<Result<Vec<_>>>()?;
             let mut count = rows.len();
-            {
+            // Bulk-load detached HNSW graphs via sorted SST ingest when the
+            // backend supports it (matching plain `create_hnsw_index_nonblocking`),
+            // avoiding giant memtable/WAL write batches and downstream flush stalls.
+            if self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
+                let filters = SessionTx::make_hnsw_filters(&build)?;
+                let mut tx = self.transact()?;
+                for (name, (index, manifest)) in &build.hnsw_indices {
+                    poison.check()?;
+                    let mut idx_temp = index.clone();
+                    idx_temp.is_temp = true;
+                    tx.hnsw_build_index(manifest, &build, &idx_temp, filters.get(name), &rows)?;
+                    let lower = Tuple::default().encode_as_key(index.id);
+                    let upper = Tuple::default().encode_as_key(index.id.next());
+                    self.db
+                        .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
+                }
+            }
+            let has_non_hnsw = !build.indices.is_empty()
+                || !build.fts_indices.is_empty()
+                || !build.lsh_indices.is_empty();
+            if has_non_hnsw || (!self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty()) {
                 let mut tx = self.transact_write()?;
-                tx.populate_tt_indexes(&build, &rows, &poison)?;
+                if !self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
+                    let filters = SessionTx::make_hnsw_filters(&build)?;
+                    for (name, (index, manifest)) in &build.hnsw_indices {
+                        poison.check()?;
+                        tx.hnsw_build_index(manifest, &build, index, filters.get(name), &rows)?;
+                    }
+                }
+                if has_non_hnsw {
+                    tx.populate_tt_non_hnsw_indexes(&build, &rows, &poison)?;
+                }
                 self.commit_tx_with_test_hook(&mut tx)?;
             }
             #[cfg(feature = "test-hooks")]
@@ -429,6 +469,8 @@ impl<'s, S: Storage<'s>> Db<S> {
             drop(rows);
             #[cfg(feature = "test-hooks")]
             self.run_tt_index_build_fence("populated");
+            #[cfg(feature = "test-hooks")]
+            let catchup_span = crate::measurement::Span::new("build_catchup");
             let profile = std::env::var_os("MNESTIC_BUILD_PROFILE").is_some();
             let mut snapshot = Some(snapshot);
             let mut shadow_active = false;
@@ -622,8 +664,6 @@ impl<'s, S: Storage<'s>> Db<S> {
                 }
                 let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
                 validate(&original, &current, &build)?;
-                #[cfg(feature = "test-hooks")]
-                let catchup_span = crate::measurement::Span::new("build_catchup");
                 if shadow_active {
                     let delta = registration.finish_shadow()?;
                     count = (count as isize + delta).max(0) as usize;

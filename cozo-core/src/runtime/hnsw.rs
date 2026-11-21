@@ -157,6 +157,27 @@ impl<'r, 's> VectorCache<'r, 's> {
             }
         }
     }
+    pub(crate) fn evict_row(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        orig: &RelationHandle,
+        row: &Tuple,
+    ) {
+        let key = row[..orig.index_key_len()].to_vec();
+        for &field in &manifest.vec_fields {
+            match &row[field] {
+                DataValue::Vec(_) => {
+                    self.cache.remove(&(key.clone(), field, -1));
+                }
+                DataValue::List(values) => {
+                    for sub in 0..values.len() {
+                        self.cache.remove(&(key.clone(), field, sub as i32));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     fn insert(&mut self, k: CompoundKey, v: Vector) {
         self.cache.insert(k, v);
     }

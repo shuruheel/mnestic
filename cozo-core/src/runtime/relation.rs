@@ -553,6 +553,7 @@ impl RelationHandle {
     /// Whether this relation is tt-stamped (its last key column is `TxTime`;
     /// mnestic fork, bitemporality). Guaranteed by `validate_temporal_axes`
     /// to be the only possible TxTime position.
+    #[inline]
     pub(crate) fn has_txtime(&self) -> bool {
         matches!(
             self.metadata.keys.last().map(|c| &c.typing.coltype),
@@ -561,6 +562,7 @@ impl RelationHandle {
     }
 
     /// tt-only (system-versioned): tt-stamped with no vt axis.
+    #[inline]
     pub(crate) fn is_tt_only(&self) -> bool {
         self.has_txtime() && {
             let n = self.metadata.keys.len();
@@ -574,21 +576,40 @@ impl RelationHandle {
 
     /// Search-index identity omits the engine-assigned TxTime axis. Physical
     /// row offsets and base storage encoding still use the complete key schema.
+    #[inline]
     pub(crate) fn index_key_len(&self) -> usize {
         self.metadata.keys.len() - usize::from(self.is_tt_only())
     }
 
     /// Resolve a search hit's logical identity to its current asserted row.
     /// Plain relations retain their existing point-read path.
+    #[inline]
     pub(crate) fn get_current(&self, tx: &SessionTx<'_>, key: &[DataValue]) -> Result<Option<Tuple>> {
         if self.is_tt_only() {
-            self.skip_scan_prefix(tx, &key.to_vec(), crate::data::functions::MAX_VALIDITY_TS)
-                .next().transpose()
+            use crate::data::memcmp::MemCmpEncoder;
+            let prefix_len = key.len().min(self.metadata.keys.len());
+            let prefix_encoded = (&key[..prefix_len]).encode_as_key(self.id);
+            let mut upper_encoded = Vec::with_capacity(prefix_encoded.len() + 1);
+            upper_encoded.extend_from_slice(&prefix_encoded);
+            upper_encoded.encode_datavalue(&DataValue::Bot);
+            let valid_at = crate::data::functions::MAX_VALIDITY_TS;
+            if self.is_temp {
+                tx.temp_store_tx
+                    .range_skip_scan_tuple(&prefix_encoded, &upper_encoded, valid_at)
+                    .next()
+                    .transpose()
+            } else {
+                tx.store_tx
+                    .range_skip_scan_tuple(&prefix_encoded, &upper_encoded, valid_at)
+                    .next()
+                    .transpose()
+            }
         } else {
             self.get(tx, key)
         }
     }
 
+    #[inline]
     pub(crate) fn get_current_batch(&self, tx: &SessionTx<'_>, keys: &[&[DataValue]]) -> Result<Vec<Option<Tuple>>> {
         if self.is_tt_only() {
             keys.iter().map(|key| self.get_current(tx, key)).collect()

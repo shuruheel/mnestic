@@ -19,7 +19,10 @@ use crate::runtime::db::Db;
 use crate::storage::Storage;
 use crate::{DataValue, DbInstance, NamedRows};
 
-const CAPACITY: usize = 256;
+const INITIAL_CAPACITY: usize = 256;
+// Accommodates bounded per-key shadow HNSW drain events (BuildRegistry::key_limit = 50_000,
+// 2 events/key) without allocating past INITIAL_CAPACITY for ordinary operations.
+const CAPACITY: usize = 131_072;
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
 /// Process-local monotonic timestamp, comparable between capture threads.
@@ -84,7 +87,7 @@ pub fn capture<T>(operation_id: u64, enabled: bool, f: impl FnOnce() -> T) -> (T
     STATE.with(|s| {
         let mut s = s.borrow_mut();
         assert!(!s.active, "nested measurement capture");
-        s.events = Vec::with_capacity(CAPACITY);
+        s.events = Vec::with_capacity(INITIAL_CAPACITY);
         s.overflow = false;
         s.active = true;
         s.enabled = enabled;

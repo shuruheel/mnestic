@@ -414,11 +414,28 @@ impl SessionTx<'_> {
                         inserted.push(new);
                     }
                 }
-                if !removed.is_empty() {
-                    self.hnsw_remove_snapshot_rows(manifest, handle, index, &removed)?;
-                }
-                if !inserted.is_empty() {
-                    let mut insert_cache = crate::runtime::hnsw::VectorCache::new(manifest.distance);
+                if !removed.is_empty() || !inserted.is_empty() {
+                    let mut vec_cache = crate::runtime::hnsw::VectorCache::new(manifest.distance);
+                    if !removed.is_empty() {
+                        for row in &removed {
+                            vec_cache.seed_row(manifest, handle, row);
+                        }
+                        for row in &removed {
+                            self.hnsw_remove_with_cache(
+                                manifest,
+                                handle,
+                                index,
+                                row,
+                                &mut vec_cache,
+                            )?;
+                        }
+                        // Evict old vectors of removed/replaced keys so subsequent
+                        // inserts never read stale cached vectors, while keeping
+                        // untouched neighbor vectors warm in `vec_cache`.
+                        for row in &removed {
+                            vec_cache.evict_row(manifest, handle, row);
+                        }
+                    }
                     for row in inserted {
                         self.hnsw_put_with_cache(
                             manifest,
@@ -427,7 +444,7 @@ impl SessionTx<'_> {
                             filter,
                             &mut stack,
                             row,
-                            &mut insert_cache,
+                            &mut vec_cache,
                         )?;
                     }
                 }
@@ -703,38 +720,38 @@ impl SessionTx<'_> {
                     inserted.push(new.as_ref().unwrap());
                 }
             }
-            if !removed.is_empty() {
-                let mut remove_cache = crate::runtime::hnsw::VectorCache::with_shadow(
+            if !removed.is_empty() || !inserted.is_empty() {
+                let mut vec_cache = crate::runtime::hnsw::VectorCache::with_shadow(
                     manifest.distance,
                     self.tt_index_builds.clone(),
                     token,
                 );
-                for row in &removed {
-                    remove_cache.seed_row(manifest, handle, row);
+                if !removed.is_empty() {
+                    for row in &removed {
+                        vec_cache.seed_row(manifest, handle, row);
+                    }
+                    for row in &removed {
+                        self.hnsw_remove_with_cache(manifest, handle, index, row, &mut vec_cache)?;
+                    }
+                    for row in &removed {
+                        vec_cache.evict_row(manifest, handle, row);
+                    }
                 }
-                for row in removed {
-                    self.hnsw_remove_with_cache(manifest, handle, index, row, &mut remove_cache)?;
-                }
-            }
-            if !inserted.is_empty() {
-                let mut insert_cache = crate::runtime::hnsw::VectorCache::with_shadow(
-                    manifest.distance,
-                    self.tt_index_builds.clone(),
-                    token,
-                );
-                for row in &inserted {
-                    insert_cache.seed_row(manifest, handle, row);
-                }
-                for row in inserted {
-                    self.hnsw_put_with_cache(
-                        manifest,
-                        handle,
-                        index,
-                        filter,
-                        &mut stack,
-                        row,
-                        &mut insert_cache,
-                    )?;
+                if !inserted.is_empty() {
+                    for row in &inserted {
+                        vec_cache.seed_row(manifest, handle, row);
+                    }
+                    for row in inserted {
+                        self.hnsw_put_with_cache(
+                            manifest,
+                            handle,
+                            index,
+                            filter,
+                            &mut stack,
+                            row,
+                            &mut vec_cache,
+                        )?;
+                    }
                 }
             }
         }
