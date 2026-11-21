@@ -79,6 +79,27 @@ fn copy_snapshot(source: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
+fn logical_digest(db: &DbInstance) -> Result<String> {
+    let rels = db
+        .run_script("::relations", BTreeMap::new(), ScriptMutability::Immutable)?
+        .into_json();
+    let mut names: Vec<String> = rels["rows"]
+        .as_array()
+        .ok_or_else(|| miette!("expected ::relations rows array"))?
+        .iter()
+        .filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(str::to_owned))
+        .collect();
+    names.sort();
+    let exported: BTreeMap<String, Value> = db
+        .export_relations(names.iter().map(String::as_str))?
+        .into_iter()
+        .map(|(k, v)| (k, v.into_json()))
+        .collect();
+    let payload =
+        serde_json::to_vec(&json!({"relations": rels, "data": exported})).into_diagnostic()?;
+    Ok(hash(&payload))
+}
+
 pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
     ensure!(
         ["sqlite", "rocksdb"].contains(&plan.backend.as_str()),
@@ -164,13 +185,14 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
             initial == seed_inventory,
             "snapshot copy differs before opening"
         );
-        append(
-            &mut provenance,
-            &json!({"kind":"block_start","files":initial}),
-        )?;
         let open_start = Instant::now();
         let db = DbInstance::new(&plan.backend, path.to_str().unwrap(), "{}")?;
         let open_ns = open_start.elapsed().as_nanos();
+        let pre_logical_sha256 = logical_digest(&db)?;
+        append(
+            &mut provenance,
+            &json!({"kind":"block_start","files":initial,"logical_sha256":pre_logical_sha256}),
+        )?;
         if let Some(enabled) = plan.keyed_access {
             db.set_keyed_access_for_tests(enabled);
         }
@@ -207,16 +229,23 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
                 verify.run(&db, &op, timeout)?;
             }
         }
+        let post_logical_sha256 = logical_digest(&db)?;
+        ensure!(
+            post_logical_sha256 == pre_logical_sha256,
+            "shared_readonly logical database state changed during block"
+        );
         let close_start = Instant::now();
         drop(db);
         let close_ns = close_start.elapsed().as_nanos();
         let inventory_start = Instant::now();
         let final_files = inventory(&path)?;
         let final_inventory_ns = inventory_start.elapsed().as_nanos();
-        ensure!(
-            final_files == seed_inventory,
-            "shared_readonly database files changed during block"
-        );
+        if plan.backend == "sqlite" {
+            ensure!(
+                final_files == seed_inventory,
+                "shared_readonly database files changed during block"
+            );
+        }
         let cleanup_start = Instant::now();
         if path.is_dir() {
             fs::remove_dir_all(&path).into_diagnostic()?;
@@ -226,7 +255,7 @@ pub(super) fn run(plan: &Plan, dir: &Path, control: &Control) -> Result<()> {
         let cleanup_ns = cleanup_start.elapsed().as_nanos();
         append(
             &mut provenance,
-            &json!({"kind":"block_end","files":final_files,
+            &json!({"kind":"block_end","files":final_files,"logical_sha256":post_logical_sha256,
             "copy_ns":copy_ns,"validation_ns":validation_ns,"open_ns":open_ns,"warmups":warmups,
             "close_ns":close_ns,"final_inventory_ns":final_inventory_ns,"cleanup_ns":cleanup_ns}),
         )?;

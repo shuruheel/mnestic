@@ -128,7 +128,10 @@ def report(directory, estimates=True):
         bstarts=[r for r in snapshots if r.get('kind')=='block_start']
         bends=[r for r in snapshots if r.get('kind')=='block_end']
         snapshots_ok=(len(seeds)==1 and len(bstarts)==1 and len(bends)==1
-                      and bstarts[0]['files']==seeds[0] and bends[0]['files']==seeds[0])
+                      and bstarts[0]['files']==seeds[0]
+                      and bool(bstarts[0].get('logical_sha256'))
+                      and bends[0].get('logical_sha256')==bstarts[0]['logical_sha256']
+                      and (plan['backend']!='sqlite' or bends[0]['files']==seeds[0]))
     else:
         starts=[r for r in snapshots if r.get('kind')=='arm_start']
         ends=[r for r in snapshots if r.get('kind')=='arm_end']

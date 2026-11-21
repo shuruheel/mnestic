@@ -7,10 +7,10 @@ import overhead_controls as controls
 
 
 class ControlsTests(unittest.TestCase):
-    def fixture(self, root, shared_readonly=False, pairs=100):
+    def fixture(self, root, shared_readonly=False, pairs=100, backend='rocksdb'):
         kind = 'read' if shared_readonly else 'single'
         warmup_count = 100 if shared_readonly else 20
-        plan=controls.fixture('rocksdb',False,kind,pairs=pairs,warmup_count=warmup_count,shared_readonly=shared_readonly)
+        plan=controls.fixture(backend,False,kind,pairs=pairs,warmup_count=warmup_count,shared_readonly=shared_readonly)
         (root/'plan.json').write_text(json.dumps(plan))
         (root/'summary.json').write_text(json.dumps({'development_conformance':True}))
         root.with_suffix('.completion.json').write_text(json.dumps({'exit_code':0,'stop_reason':None,'elapsed_s':1}))
@@ -34,14 +34,14 @@ class ControlsTests(unittest.TestCase):
                              timing={'start_ns':n*1000,'end_ns':n*1000+100}))
         for op in plan['setup']: add('setup',0,op['id'])
         if shared_readonly:
-            snapshots.append(dict(kind='block_start',files=files))
+            snapshots.append(dict(kind='block_start',files=files,logical_sha256='d'*64))
             for i in range(warmup_count): add('overhead',1,f'warmup-block-{i}')
             for pair in range(pairs):
                 for enabled in [True,False]:
                     add('overhead',1,f'pair-{pair}-{enabled}')
             for i in range(len(plan['overhead_control']['rounds'][-1]['verify'])):
                 add('overhead_verify',0,f'verify-block-{i}')
-            snapshots.append(dict(kind='block_end',files=files,copy_ns=1,validation_ns=1,open_ns=1,close_ns=1,final_inventory_ns=1,cleanup_ns=1,warmups=[{'worker':1,'start_ns':0,'end_ns':0}]))
+            snapshots.append(dict(kind='block_end',files=files,logical_sha256='d'*64,copy_ns=1,validation_ns=1,open_ns=1,close_ns=1,final_inventory_ns=1,cleanup_ns=1,warmups=[{'worker':1,'start_ns':0,'end_ns':0}]))
         else:
             for pair, round_ in enumerate(plan['overhead_control']['rounds']):
                 for enabled in [True,False]:
@@ -69,13 +69,17 @@ class ControlsTests(unittest.TestCase):
                 self.assertEqual(result['estimates']['0.99']['conservative_upper95'],1)
 
     def test_shared_readonly_rejects_mutated_final_snapshot(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root=Path(tmp)/'run';root.mkdir();_,snapshots=self.fixture(root, shared_readonly=True, pairs=100)
-            snapshots[-1]['files']={'database':'c'*64}
-            self.save(root/'snapshots.jsonl',snapshots)
-            result=controls.report(root)
-            self.assertEqual(result['status'],'incomplete')
-            self.assertFalse(result['snapshots_match'])
+        for case, backend in [('logical', 'rocksdb'), ('sqlite_files', 'sqlite')]:
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp)/'run';root.mkdir();_,snapshots=self.fixture(root, shared_readonly=True, pairs=100, backend=backend)
+                if case == 'logical':
+                    snapshots[-1]['logical_sha256']='e'*64
+                else:
+                    snapshots[-1]['files']={'database':'c'*64}
+                self.save(root/'snapshots.jsonl',snapshots)
+                result=controls.report(root)
+                self.assertEqual(result['status'],'incomplete')
+                self.assertFalse(result['snapshots_match'])
 
     def test_missing_measured_pair_suppresses_estimates(self):
         with tempfile.TemporaryDirectory() as tmp:
