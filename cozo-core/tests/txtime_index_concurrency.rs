@@ -740,3 +740,52 @@ fn hnsw_shadow_reindex_with_fts_keeps_exact_counts_stats_and_post_pub_writes() {
         json!([["a"], ["c"], ["d"], ["e"]])
     );
 }
+
+#[test]
+fn hnsw_extend_candidates_concurrent_replacements_stay_consistent() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(
+        DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "{}").unwrap(),
+    );
+    run(&db, ":create doc {id: String, tt: TxTime => v: <F32; 4>}");
+    for i in 0..24 {
+        let a = (i as f32) * 0.1 + 1.0;
+        let b = ((i % 7) as f32) * 0.2 + 0.5;
+        run(
+            &db,
+            &format!("?[id,v] <- [['k{i}', [{a}, {b}, 0.3, 0.7]]] :put doc{{id=>v}}"),
+        );
+    }
+    run(
+        &db,
+        "::hnsw create doc:vec {dim: 4, m: 4, dtype: F32, fields: [v], distance: Cosine, ef_construction: 32, extend_candidates: true}",
+    );
+    let handles: Vec<_> = (0..4)
+        .map(|w| {
+            let db = db.clone();
+            std::thread::spawn(move || {
+                for round in 0..8 {
+                    let i = (w * 6 + round) % 24;
+                    let a = (round as f32) * 0.3 + (w as f32) + 0.5;
+                    let b = (i as f32) * 0.05 + 0.2;
+                    run(
+                        &db,
+                        &format!(
+                            "?[id,v] <- [['k{i}', [{a}, {b}, 0.4, 0.9]]] :put doc{{id=>v}}"
+                        ),
+                    );
+                }
+            })
+        })
+        .collect();
+    for h in handles {
+        h.join().unwrap();
+    }
+    let count = rows(&db, "?[count(id)] := *doc{id}");
+    assert_eq!(count, json!([[24]]));
+    let found = rows(
+        &db,
+        "?[id] := ~doc:vec{id | query: vec([1.0, 0.5, 0.4, 0.9]), k: 24, ef: 64} :order id",
+    );
+    assert_eq!(found.as_array().unwrap().len(), 24);
+}

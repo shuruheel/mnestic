@@ -368,6 +368,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             tx.publish_tt_indexes(current.clone(), &build)?;
             poison.check()?;
             self.commit_tx_with_test_hook(&mut tx)?;
+            self.tt_recent_mutations.invalidate_all();
             #[cfg(feature = "test-hooks")]
             publication_span.finish();
             let result = result_rows(op, &build, rows.len());
@@ -426,47 +427,139 @@ impl<'s, S: Storage<'s>> Db<S> {
             self.run_tt_index_build_fence("registered");
             #[cfg(feature = "test-hooks")]
             let backfill_span = crate::measurement::Span::new("build_backfill");
-            let rows = original
-                .scan_current(&snapshot)
-                .collect::<Result<Vec<_>>>()?;
-            let mut count = rows.len();
-            // Bulk-load detached HNSW graphs via sorted SST ingest when the
-            // backend supports it (matching plain `create_hnsw_index_nonblocking`),
-            // avoiding giant memtable/WAL write batches and downstream flush stalls.
-            if self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
-                let filters = SessionTx::make_hnsw_filters(&build)?;
-                let mut tx = self.transact()?;
-                for (name, (index, manifest)) in &build.hnsw_indices {
-                    poison.check()?;
-                    let mut idx_temp = index.clone();
-                    idx_temp.is_temp = true;
-                    tx.hnsw_build_index(manifest, &build, &idx_temp, filters.get(name), &rows)?;
-                    let lower = Tuple::default().encode_as_key(index.id);
-                    let upper = Tuple::default().encode_as_key(index.id.next());
-                    self.db
-                        .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
-                }
-            }
             let has_non_hnsw = !build.indices.is_empty()
                 || !build.fts_indices.is_empty()
                 || !build.lsh_indices.is_empty();
-            if has_non_hnsw || (!self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty()) {
-                let mut tx = self.transact_write()?;
-                if !self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
-                    let filters = SessionTx::make_hnsw_filters(&build)?;
-                    for (name, (index, manifest)) in &build.hnsw_indices {
+            let mut count = 0usize;
+            if self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() && !has_non_hnsw {
+                // Stream base rows directly into `FlatHnswBuilder` and serialise
+                // into a flat sorted byte arena for `ingest_sorted`. This avoids
+                // buffering `Vec<Tuple>` + millions of `BTreeMap` allocations
+                // whose bulk deallocation can trigger glibc arena consolidation
+                // pauses against concurrent writers.
+                use crate::runtime::hnsw_build::{build_threads, FlatHnswBuilder, NodeMeta};
+                let filters = SessionTx::make_hnsw_filters(&build)?;
+                let key_len = build.index_key_len();
+                let mut builders: Vec<(
+                    &RelationHandle,
+                    &crate::runtime::hnsw::HnswIndexManifest,
+                    Option<&Vec<crate::data::expr::Bytecode>>,
+                    FlatHnswBuilder,
+                )> = build
+                    .hnsw_indices
+                    .iter()
+                    .map(|(name, (index, manifest))| {
+                        (
+                            index,
+                            manifest,
+                            filters.get(name),
+                            FlatHnswBuilder::new(manifest),
+                        )
+                    })
+                    .collect();
+                let mut stack = Vec::new();
+                for row_res in original.scan_current(&snapshot) {
+                    if count % 256 == 0 {
                         poison.check()?;
-                        tx.hnsw_build_index(manifest, &build, index, filters.get(name), &rows)?;
+                    }
+                    let tuple = row_res?;
+                    count += 1;
+                    for (_, manifest, filter, builder) in &mut builders {
+                        if let Some(code) = filter {
+                            if !crate::data::expr::eval_bytecode_pred(
+                                code,
+                                &tuple,
+                                &mut stack,
+                                Default::default(),
+                            )? {
+                                continue;
+                            }
+                        }
+                        for &idx in &manifest.vec_fields {
+                            match tuple.get(idx) {
+                                Some(DataValue::Vec(v)) => {
+                                    builder.add_node(
+                                        NodeMeta {
+                                            key: tuple[..key_len].to_vec(),
+                                            field_idx: idx,
+                                            sub_idx: -1,
+                                            hash: v.get_hash().as_ref().to_vec(),
+                                        },
+                                        v,
+                                    )?;
+                                }
+                                Some(DataValue::List(l)) => {
+                                    for (sidx, v) in l.iter().enumerate() {
+                                        if let DataValue::Vec(v) = v {
+                                            builder.add_node(
+                                                NodeMeta {
+                                                    key: tuple[..key_len].to_vec(),
+                                                    field_idx: idx,
+                                                    sub_idx: sidx as i32,
+                                                    hash: v.get_hash().as_ref().to_vec(),
+                                                },
+                                                v,
+                                            )?;
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
                     }
                 }
-                if has_non_hnsw {
-                    tx.populate_tt_non_hnsw_indexes(&build, &rows, &poison)?;
+                for (index, manifest, _, builder) in builders {
+                    poison.check()?;
+                    if builder.is_empty() {
+                        continue;
+                    }
+                    let graph = builder.build(manifest, build_threads());
+                    poison.check()?;
+                    let arena = SessionTx::hnsw_serialise_graph_sorted(&build, index, graph)?;
+                    poison.check()?;
+                    self.db.ingest_sorted(Box::new(arena.iter_owned()))?;
                 }
-                self.commit_tx_with_test_hook(&mut tx)?;
+            } else {
+                let rows = original
+                    .scan_current(&snapshot)
+                    .collect::<Result<Vec<_>>>()?;
+                count = rows.len();
+                // Bulk-load detached HNSW graphs via sorted SST ingest when the
+                // backend supports it (matching plain `create_hnsw_index_nonblocking`),
+                // avoiding giant memtable/WAL write batches and downstream flush stalls.
+                if self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
+                    let filters = SessionTx::make_hnsw_filters(&build)?;
+                    let mut tx = self.transact()?;
+                    for (name, (index, manifest)) in &build.hnsw_indices {
+                        poison.check()?;
+                        let mut idx_temp = index.clone();
+                        idx_temp.is_temp = true;
+                        tx.hnsw_build_index(manifest, &build, &idx_temp, filters.get(name), &rows)?;
+                        let lower = Tuple::default().encode_as_key(index.id);
+                        let upper = Tuple::default().encode_as_key(index.id.next());
+                        self.db
+                            .ingest_sorted(tx.temp_store_tx.range_scan(&lower, &upper))?;
+                    }
+                }
+                if has_non_hnsw
+                    || (!self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty())
+                {
+                    let mut tx = self.transact_write()?;
+                    if !self.db.supports_sst_ingest() && !build.hnsw_indices.is_empty() {
+                        let filters = SessionTx::make_hnsw_filters(&build)?;
+                        for (name, (index, manifest)) in &build.hnsw_indices {
+                            poison.check()?;
+                            tx.hnsw_build_index(manifest, &build, index, filters.get(name), &rows)?;
+                        }
+                    }
+                    if has_non_hnsw {
+                        tx.populate_tt_non_hnsw_indexes(&build, &rows, &poison)?;
+                    }
+                    self.commit_tx_with_test_hook(&mut tx)?;
+                }
             }
             #[cfg(feature = "test-hooks")]
             backfill_span.finish();
-            drop(rows);
             #[cfg(feature = "test-hooks")]
             self.run_tt_index_build_fence("populated");
             #[cfg(feature = "test-hooks")]
@@ -521,18 +614,93 @@ impl<'s, S: Storage<'s>> Db<S> {
                 #[cfg(feature = "test-hooks")]
                 self.run_tt_index_build_fence("shadow_active");
                 if activated_len > 0 {
+                    let drain_filters = SessionTx::make_hnsw_filters(&build)?;
                     loop {
                         poison.check()?;
-                        let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                        // Peek the next pending key and pre-search/pre-warm on a
+                        // read snapshot OUTSIDE `tt_commit_lock` so the builder
+                        // holds `tt_commit_lock` only for graph mutation + commit.
                         let Some((encoded, key, prior)) = registration.peek_shadow_pending()?
                         else {
                             break;
                         };
+                        let mut prewarm = {
+                            let pre_tx = self.transact()?;
+                            let mut pw = crate::runtime::txtime_index::PrewarmedTtHnsw {
+                                pre_seq: pre_tx.tt_pre_seq,
+                                attached: BTreeMap::new(),
+                                shadow: BTreeMap::new(),
+                            };
+                            if let Ok(now_spec) = original.get_current(&pre_tx, &key) {
+                                let mut stack = Vec::new();
+                                for (idx_name, (idx_handle, manifest)) in &build.hnsw_indices {
+                                    let filter = drain_filters.get(idx_name);
+                                    let new_passes = match (now_spec.as_ref(), filter) {
+                                        (None, _) => false,
+                                        (Some(_), None) => true,
+                                        (Some(r), Some(code)) => crate::data::expr::eval_bytecode_pred(
+                                            code,
+                                            r,
+                                            &mut stack,
+                                            Default::default(),
+                                        )
+                                        .unwrap_or(false),
+                                    };
+                                    let new_for_hnsw =
+                                        new_passes.then(|| now_spec.as_ref().unwrap());
+                                    let mut vec_cache =
+                                        crate::runtime::hnsw::VectorCache::with_shadow(
+                                            manifest.distance,
+                                            self.tt_index_builds.clone(),
+                                            registration.token(),
+                                        );
+                                    if let Some(p) = prior.as_ref() {
+                                        vec_cache.seed_row(manifest, &build, p);
+                                    }
+                                    let mut presearch_map = BTreeMap::new();
+                                    let mut removals_map = BTreeMap::new();
+                                    if let Ok(found) = pre_tx.hnsw_presearch_and_warm(
+                                        prior.as_ref(),
+                                        new_for_hnsw,
+                                        manifest,
+                                        &build,
+                                        idx_handle,
+                                        &mut vec_cache,
+                                    ) {
+                                        if !found.inserts.is_empty() {
+                                            presearch_map.insert(key.clone(), found.inserts);
+                                        }
+                                        if !found.removals.is_empty() {
+                                            removals_map.insert(key.clone(), found.removals);
+                                        }
+                                    }
+                                    pw.shadow.insert(
+                                        (registration.token(), idx_name.clone()),
+                                        crate::runtime::txtime_index::PrewarmedIndex {
+                                            vec_cache,
+                                            presearch: presearch_map,
+                                            removals: removals_map,
+                                        },
+                                    );
+                                }
+                            }
+                            pw
+                        };
+                        let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                        if !registration.is_shadow_key_pending(&encoded)? {
+                            // A concurrent writer already claimed this key while we pre-warmed.
+                            continue;
+                        }
                         let mut tx = self.transact_write()?;
                         let now = original.get_current(&tx, &key)?;
                         let delta =
                             isize::from(now.is_some()) - isize::from(prior.is_some());
-                        tx.maintain_shadow_pairs(&build, registration.token(), &[(prior, now)])?;
+                        tx.maintain_shadow_pairs_with_prewarm(
+                            &build,
+                            registration.token(),
+                            &[(prior, now)],
+                            Some(&mut prewarm),
+                        )?;
                         poison.check()?;
                         if let Err(err) = self.commit_tx_with_test_hook(&mut tx) {
                             // Invalidate under `_section` so no writer can enter
@@ -540,7 +708,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                             registration.invalidate_self();
                             return Err(err);
                         }
-                        registration.complete_shadow_key(&encoded, delta)?;
+                        let complete_res = registration.complete_shadow_key(&encoded, delta);
+                        self.tt_recent_mutations.record_key(original.id.0, key);
+                        complete_res?;
                         drained_by_builder += 1;
                         if profile && drained_by_builder % 500 == 0 {
                             eprintln!(
@@ -683,7 +853,8 @@ impl<'s, S: Storage<'s>> Db<S> {
                             old,
                         },
                     )]);
-                    tx.maintain_tt_indexes(&changes)?;
+                    let mut no_prewarm = crate::runtime::txtime_index::PrewarmedTtHnsw::default();
+                    tx.maintain_tt_indexes(&changes, &mut no_prewarm)?;
                 }
                 #[cfg(feature = "test-hooks")]
                 catchup_span.finish();
@@ -691,6 +862,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 poison.check()?;
                 publication_attempted = true;
                 self.commit_tx_with_test_hook(&mut tx)?;
+                self.tt_recent_mutations.invalidate_all();
                 #[cfg(feature = "test-hooks")]
                 publication_span.finish();
             }
@@ -1009,6 +1181,7 @@ impl<'s, S: Storage<'s>> Db<S> {
         let rows = self.run_sys_op_with_tx(&mut tx, op, false, true, true)?;
         poison.check()?;
         self.commit_tx_with_test_hook(&mut tx)?;
+        self.tt_recent_mutations.invalidate_all();
         let cleanup = std::mem::take(&mut tx.tt_cleanup_ranges);
         drop(tx);
         drop(guard);
