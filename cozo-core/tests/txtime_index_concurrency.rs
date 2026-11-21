@@ -527,3 +527,216 @@ fn mutation_deadlines_cover_admission_and_cancelled_waiters_do_not_block_publica
         json!([["a"]])
     );
 }
+
+#[test]
+fn hnsw_shadow_maintenance_handles_concurrent_puts_retractions_evictions_and_buffered_tx() {
+    // Exercise every Shadow (WRITE_ONLY) dual-write path on an HNSW create when
+    // the base relation has NO pre-existing search index (`has_search_indexes == false`):
+    // 1. Backfill touches `a` and `b` (`pending_old` contains both).
+    // 2. While paused at `shadow_active`:
+    //    - `:put` updates `a` (IN `pending_old`, claimed by writer) and inserts `d` (NOT in `pending_old`)
+    //    - `:rm` retracts `b` (IN `pending_old`, claimed by writer)
+    //    - `:put` inserts then retracts `e` (NOT in `pending_old`)
+    //    - `::evict` evicts `c` (pre-existing untouched key)
+    //    - buffered `multi_transaction` commits `f`
+    // 3. Builder drains remaining `pending_old` keys (`p` untouched during shadow) and publishes.
+    let dir = tempfile::tempdir().unwrap();
+    let db = DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "{}").unwrap();
+    run(
+        &db,
+        ":create doc {id:String,tt:TxTime => body:String,v:<F32;2>}",
+    );
+    run(
+        &db,
+        "?[id,body,v] <- [['a','a0',[0,0]],['b','b0',[1,0]],['c','c0',[2,0]],['p','p0',[3,0]]] :put doc{id=>body,v}",
+    );
+
+    // Stage 1: pause at `registered` and mutate `a`, `b`, `p` so `pending_old` is non-empty.
+    let (reg_arrived, reg_release) = fence(&db, "registered");
+    let building = start(&db, HNSW);
+    arrive(&reg_arrived);
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['a','a1',[10,0]],['b','b1',[11,0]],['p','p1',[12,0]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+
+    // Re-arm fence for `shadow_active` before releasing `registered`.
+    let (sh_arrived, sh_release) = fence(&db, "shadow_active");
+    reg_release.send(()).unwrap();
+    arrive(&sh_arrived);
+
+    // Stage 2: live concurrent writes during active WRITE_ONLY shadow mode.
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['a','a2',[20,0]],['d','d0',[21,0]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+    finish(start(&db, "?[id] <- [['b']] :rm doc{id}")).unwrap();
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['e','e0',[22,0]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+    finish(start(&db, "?[id] <- [['e']] :rm doc{id}")).unwrap();
+    finish(start(&db, "::evict doc [['c']]")).unwrap();
+
+    let mtx = db.multi_transaction(true);
+    mtx.run_script(
+        "?[id,body,v] <- [['f','f0',[23,0]]] :put doc{id=>body,v}",
+        BTreeMap::new(),
+    )
+    .unwrap();
+    mtx.commit().unwrap();
+
+    sh_release.send(()).unwrap();
+    finish(building).unwrap();
+
+    // Expected live set: a=[20,0], d=[21,0], f=[23,0], p=[12,0]. Gone: b, c, e.
+    assert_eq!(
+        rows(
+            &db,
+            "?[id] := ~doc:vec{id | query:vec([20,0]),k:50,ef:100} :order id"
+        ),
+        json!([["a"], ["d"], ["f"], ["p"]])
+    );
+    // Exact nearest match for each surviving key's latest vector.
+    assert_eq!(
+        rows(&db, "?[id] := ~doc:vec{id | query:vec([20,0]),k:1,ef:50}"),
+        json!([["a"]])
+    );
+    assert_eq!(
+        rows(&db, "?[id] := ~doc:vec{id | query:vec([12,0]),k:1,ef:50}"),
+        json!([["p"]])
+    );
+    assert_eq!(
+        rows(&db, "?[id] := ~doc:vec{id | query:vec([23,0]),k:1,ef:50}"),
+        json!([["f"]])
+    );
+}
+
+#[test]
+fn hnsw_shadow_build_abort_preserves_committed_writes_and_allows_retry() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(&dir);
+    let (reg_arrived, reg_release) = fence(&db, "registered");
+    let building = start(&db, HNSW);
+    arrive(&reg_arrived);
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['a','a1',[4,4]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+
+    let (sh_arrived, sh_release) = fence(&db, "shadow_active");
+    reg_release.send(()).unwrap();
+    arrive(&sh_arrived);
+
+    // Concurrent write updates shadow index while build is paused in shadow mode.
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['c','c0',[9,9]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+
+    // Fail the next commit (builder's shadow drain commit) and release.
+    db.fail_next_commit_for_tests();
+    sh_release.send(()).unwrap();
+    assert!(finish(building)
+        .unwrap_err()
+        .contains("injected commit failure"));
+
+    let DbInstance::RocksDb(inner) = &db else {
+        unreachable!()
+    };
+    inner.set_tt_index_build_fence_for_tests(None);
+
+    // Index was NOT published; committed base writes remain intact.
+    assert!(db
+        .run_script(
+            "?[id] := ~doc:vec{id | query:vec([9,9]),k:5,ef:50}",
+            BTreeMap::new(),
+            ScriptMutability::Immutable
+        )
+        .is_err());
+    assert_eq!(
+        rows(&db, "?[id] := *doc{id} :order id"),
+        json!([["a"], ["b"], ["c"]])
+    );
+
+    // Subsequent HNSW create succeeds cleanly over all committed rows.
+    run(&db, HNSW);
+    assert_eq!(
+        rows(
+            &db,
+            "?[id] := ~doc:vec{id | query:vec([9,9]),k:10,ef:50} :order id"
+        ),
+        json!([["a"], ["b"], ["c"]])
+    );
+}
+
+#[test]
+fn hnsw_shadow_reindex_with_fts_keeps_exact_counts_stats_and_post_pub_writes() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = database(&dir);
+    db.enable_persisted_fts_stats().unwrap();
+    run(&db, FTS);
+    run(&db, HNSW);
+    assert_eq!(db.seed_fts_stats().unwrap(), 1);
+
+    let (reg_arrived, reg_release) = fence(&db, "registered");
+    let reindexing = start(&db, "::reindex doc");
+    arrive(&reg_arrived);
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['a','shadow one',[3,3]],['c','shadow two',[4,4]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+
+    let (sh_arrived, sh_release) = fence(&db, "shadow_active");
+    reg_release.send(()).unwrap();
+    arrive(&sh_arrived);
+
+    // Multi-row concurrent writes while BOTH FTS and HNSW rebuild in shadow mode.
+    finish(start(
+        &db,
+        "?[id,body,v] <- [['a','shadow updated',[5,5]],['d','shadow extra',[6,6]]] :put doc{id=>body,v}",
+    ))
+    .unwrap();
+    finish(start(&db, "?[id] <- [['b']] :rm doc{id}")).unwrap();
+
+    sh_release.send(()).unwrap();
+    finish(reindexing).unwrap();
+
+    // Immediate post-publication write must not double-maintain or fail.
+    run(
+        &db,
+        "?[id,body,v] <- [['e','post pub',[7,7]]] :put doc{id=>body,v}",
+    );
+
+    // Persisted FTS stats reset to unseeded on reindex, then reseed cleanly.
+    assert!(db
+        .verify_fts_stats()
+        .unwrap()
+        .iter()
+        .all(|c| c.persisted.is_none()));
+    assert_eq!(db.seed_fts_stats().unwrap(), 1);
+    for check in db.verify_fts_stats().unwrap() {
+        assert_eq!(check.persisted, Some(check.scanned), "{}", check.index);
+    }
+
+    assert_eq!(
+        rows(
+            &db,
+            "?[id] := ~doc:text{id | query:'shadow OR post',k:50} :order id"
+        ),
+        json!([["a"], ["c"], ["d"], ["e"]])
+    );
+    assert_eq!(
+        rows(
+            &db,
+            "?[id] := ~doc:vec{id | query:vec([7,7]),k:50,ef:100} :order id"
+        ),
+        json!([["a"], ["c"], ["d"], ["e"]])
+    );
+}

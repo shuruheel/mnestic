@@ -105,11 +105,13 @@ impl SessionTx<'_> {
             if !entry.handle.is_tt_only() {
                 continue;
             }
+            let need_old =
+                has_search_indexes(&entry.handle) || self.has_active_shadow(entry.handle.id.0);
             for row in &write.rows {
                 let key = row[..entry.handle.index_key_len()].to_vec();
                 let encoded = key.encode_as_key(entry.handle.id);
                 if !entry.old.contains_key(&encoded) {
-                    let old = if has_search_indexes(&entry.handle) {
+                    let old = if need_old {
                         entry.handle.get_current(self, &key)?
                     } else {
                         None
@@ -124,9 +126,11 @@ impl SessionTx<'_> {
             let count = evict_counts.entry(entry.handle.id.0).or_default();
             *count += 1;
             check_evict_limit(&entry.handle, *count)?;
+            let need_old =
+                has_search_indexes(&entry.handle) || self.has_active_shadow(entry.handle.id.0);
             let encoded = evict.logical_key.encode_as_key(entry.handle.id);
             if !entry.old.contains_key(&encoded) {
-                let old = if has_search_indexes(&entry.handle) {
+                let old = if need_old {
                     entry.handle.get_current(self, &evict.logical_key)?
                 } else {
                     None
@@ -299,6 +303,270 @@ impl SessionTx<'_> {
         }
         Ok(())
     }
+
+    pub(crate) fn has_active_shadow(&self, base_id: u64) -> bool {
+        let registry = self
+            .tt_index_builds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry
+            .builds
+            .values()
+            .any(|log| !log.invalid && log.base == base_id && log.shadow.is_some())
+    }
+
+    /// Maintain any active WRITE_ONLY (shadow) detached index generations on
+    /// relations touched by this commit (called inside `tt_commit_lock` after
+    /// base rows have advanced). Returns the pending keys claimed by this commit
+    /// so `BuildCommitNotification::committed()` removes them from `pending_old`
+    /// only after `store_tx.commit()` succeeds.
+    pub(crate) fn maintain_shadow_tt_indexes(
+        &mut self,
+        touched: &BTreeMap<u64, TouchedRelation>,
+    ) -> Result<Vec<ShadowCommitUpdate>> {
+        // Snapshot the active shadow targets + per-touched-key prior rows under
+        // the leaf `BuildRegistry` mutex without holding it across storage I/O.
+        let targets: Vec<(u64, RelationHandle, Vec<(Vec<u8>, Tuple, Option<Tuple>, bool)>)> = {
+            let registry = self
+                .tt_index_builds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut out = Vec::new();
+            for (&token, log) in &registry.builds {
+                if log.invalid {
+                    continue;
+                }
+                let Some(shadow) = log.shadow.as_ref() else {
+                    continue;
+                };
+                let Some(entry) = touched.get(&log.base) else {
+                    continue;
+                };
+                if entry.old.is_empty() || !has_search_indexes(&shadow.handle) {
+                    continue;
+                }
+                let mut rows = Vec::with_capacity(entry.old.len());
+                for (encoded, (key, writer_old)) in &entry.old {
+                    if let Some((_, pending_prior)) = shadow.pending_old.get(encoded) {
+                        rows.push((encoded.clone(), key.clone(), pending_prior.clone(), true));
+                    } else {
+                        rows.push((encoded.clone(), key.clone(), writer_old.clone(), false));
+                    }
+                }
+                out.push((token, shadow.handle.clone(), rows));
+            }
+            out
+        };
+
+        let mut updates = Vec::with_capacity(targets.len());
+        for (token, shadow_handle, rows) in targets {
+            let mut pairs: Vec<(Option<Tuple>, Option<Tuple>)> = Vec::with_capacity(rows.len());
+            let mut claimed_keys = Vec::new();
+            let mut count_delta: isize = 0;
+            for (encoded, key, shadow_old, from_pending) in rows {
+                let now = shadow_handle.get_current(self, &key)?;
+                count_delta += isize::from(now.is_some()) - isize::from(shadow_old.is_some());
+                if from_pending {
+                    claimed_keys.push(encoded);
+                }
+                pairs.push((shadow_old, now));
+            }
+            // Error isolation: an unpublished shadow build must NEVER fail an
+            // unrelated user write commit. On any shadow error, restore tx-local
+            // HNSW/FTS bookkeeping, invalidate the build so it cleans up its
+            // detached key range, and let the user's commit proceed cleanly.
+            let saved_hnsw_incomplete = self.hnsw_mutations_incomplete;
+            if self
+                .maintain_shadow_pairs(&shadow_handle, token, &pairs)
+                .is_err()
+            {
+                self.hnsw_mutations_incomplete = saved_hnsw_incomplete;
+                for (idx, _) in shadow_handle.fts_indices.values() {
+                    self.fts_pending.remove(&idx.id);
+                    self.fts_stats.removed(idx.id);
+                }
+                self.tt_index_builds
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .invalidate_token(token);
+                continue;
+            }
+            updates.push(ShadowCommitUpdate {
+                token,
+                claimed_keys,
+                count_delta,
+            });
+        }
+        Ok(updates)
+    }
+
+    /// Apply explicit `(old, new)` row pairs to a detached shadow generation
+    /// while consulting `ShadowState::pending_old` for any untouched backfill-era
+    /// neighbor vectors in HNSW.
+    pub(crate) fn maintain_shadow_pairs(
+        &mut self,
+        handle: &RelationHandle,
+        token: u64,
+        pairs: &[(Option<Tuple>, Option<Tuple>)],
+    ) -> Result<()> {
+        if pairs.is_empty() || !has_search_indexes(handle) {
+            return Ok(());
+        }
+        let filters = Self::make_hnsw_filters(handle)?;
+        let mut stack = Vec::new();
+        for (name, (index, manifest)) in &handle.hnsw_indices {
+            let filter = filters.get(name);
+            let mut removed: Vec<&Tuple> = Vec::new();
+            let mut inserted: Vec<&Tuple> = Vec::new();
+            for (old, new) in pairs {
+                let old_passes = match (old.as_ref(), filter) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(r), Some(code)) => {
+                        eval_bytecode_pred(code, r, &mut stack, Default::default())?
+                    }
+                };
+                let new_passes = match (new.as_ref(), filter) {
+                    (None, _) => false,
+                    (Some(_), None) => true,
+                    (Some(r), Some(code)) => {
+                        eval_bytecode_pred(code, r, &mut stack, Default::default())?
+                    }
+                };
+                if !old_passes && !new_passes {
+                    continue;
+                }
+                if old_passes && new_passes {
+                    if let (Some(o), Some(n)) = (old.as_ref(), new.as_ref()) {
+                        let same_vectors = manifest
+                            .vec_fields
+                            .iter()
+                            .all(|&i| o.get(i) == n.get(i));
+                        if same_vectors {
+                            continue;
+                        }
+                    }
+                }
+                if old_passes {
+                    removed.push(old.as_ref().unwrap());
+                }
+                if new_passes {
+                    inserted.push(new.as_ref().unwrap());
+                }
+            }
+            if !removed.is_empty() {
+                let mut remove_cache = crate::runtime::hnsw::VectorCache::with_shadow(
+                    manifest.distance,
+                    self.tt_index_builds.clone(),
+                    token,
+                );
+                for row in &removed {
+                    remove_cache.seed_row(manifest, handle, row);
+                }
+                for row in removed {
+                    self.hnsw_remove_with_cache(manifest, handle, index, row, &mut remove_cache)?;
+                }
+            }
+            if !inserted.is_empty() {
+                let mut insert_cache = crate::runtime::hnsw::VectorCache::with_shadow(
+                    manifest.distance,
+                    self.tt_index_builds.clone(),
+                    token,
+                );
+                for row in &inserted {
+                    insert_cache.seed_row(manifest, handle, row);
+                }
+                for row in inserted {
+                    self.hnsw_put_with_cache(
+                        manifest,
+                        handle,
+                        index,
+                        filter,
+                        &mut stack,
+                        row,
+                        &mut insert_cache,
+                    )?;
+                }
+            }
+        }
+        if !handle.fts_indices.is_empty() || !handle.lsh_indices.is_empty() {
+            let processors = self.make_fts_lsh_processors(handle)?;
+            let hashes = self.make_lsh_hash_perms(handle);
+            let fts_lsh_pairs: Vec<(Option<&Tuple>, Option<&Tuple>)> = pairs
+                .iter()
+                .map(|(old, new)| (old.as_ref(), new.as_ref()))
+                .collect();
+            self.maintain_tt_fts_lsh_pairs(
+                handle,
+                &fts_lsh_pairs,
+                &processors,
+                &hashes,
+                &mut stack,
+            )?;
+        }
+        Ok(())
+    }
+}
+
+/// Active WRITE_ONLY (shadow dual-write) state for a detached TxTime index
+/// generation (Google F1 / PostgreSQL `CREATE INDEX CONCURRENTLY` pattern).
+///
+/// Invariant at every commit boundary while active:
+/// - Keys in `pending_old` are still indexed in `handle` at their pre-backfill
+///   `S_0` row (`pending_old[k].1`).
+/// - Keys not in `pending_old` are indexed in `handle` at the live base row.
+pub(crate) struct ShadowState {
+    pub(crate) handle: RelationHandle,
+    pub(crate) pending_old: BTreeMap<Vec<u8>, (Tuple, Option<Tuple>)>,
+    pub(crate) count_delta: isize,
+}
+
+pub(crate) struct ShadowCommitUpdate {
+    pub(crate) token: u64,
+    pub(crate) claimed_keys: Vec<Vec<u8>>,
+    pub(crate) count_delta: isize,
+}
+
+/// Lookup one key in a shadow build's `pending_old` map without holding the
+/// `BuildRegistry` mutex across storage I/O.
+pub(crate) fn lookup_shadow_pending(
+    shared: &SharedBuildRegistry,
+    token: u64,
+    encoded: &[u8],
+) -> Result<Option<Option<Tuple>>> {
+    let registry = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(log) = registry.builds.get(&token) else {
+        bail!("shadow index build was cancelled");
+    };
+    ensure!(!log.invalid, "shadow index build was invalidated");
+    let Some(shadow) = log.shadow.as_ref() else {
+        bail!("shadow index build is no longer active");
+    };
+    Ok(shadow.pending_old.get(encoded).map(|(_, old)| old.clone()))
+}
+
+/// Batch lookup in a shadow build's `pending_old` map under a single brief lock.
+pub(crate) fn lookup_shadow_pending_batch(
+    shared: &SharedBuildRegistry,
+    token: u64,
+    encoded_keys: &[Vec<u8>],
+) -> Result<Vec<Option<Option<Tuple>>>> {
+    let registry = shared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(log) = registry.builds.get(&token) else {
+        bail!("shadow index build was cancelled");
+    };
+    ensure!(!log.invalid, "shadow index build was invalidated");
+    let Some(shadow) = log.shadow.as_ref() else {
+        bail!("shadow index build is no longer active");
+    };
+    Ok(encoded_keys
+        .iter()
+        .map(|k| shadow.pending_old.get(k).map(|(_, old)| old.clone()))
+        .collect())
 }
 
 // This log is only a catch-up aid. Losing or overflowing a log fails its build;
@@ -326,6 +594,7 @@ struct BuildLog {
     keys: BTreeMap<Vec<u8>, Tuple>,
     bytes: usize,
     invalid: bool,
+    shadow: Option<ShadowState>,
 }
 
 pub(crate) type SharedBuildRegistry = std::sync::Arc<std::sync::Mutex<BuildRegistry>>;
@@ -335,6 +604,7 @@ pub(crate) type SharedBuildRegistry = std::sync::Arc<std::sync::Mutex<BuildRegis
 pub(crate) struct BuildCommitNotification<'a> {
     shared: SharedBuildRegistry,
     touched: &'a BTreeMap<u64, TouchedRelation>,
+    shadow_updates: Vec<ShadowCommitUpdate>,
     notified: bool,
 }
 
@@ -342,18 +612,22 @@ impl<'a> BuildCommitNotification<'a> {
     pub(crate) fn new(
         shared: SharedBuildRegistry,
         touched: &'a BTreeMap<u64, TouchedRelation>,
+        shadow_updates: Vec<ShadowCommitUpdate>,
     ) -> Self {
         Self {
             shared,
             touched,
+            shadow_updates,
             notified: false,
         }
     }
     pub(crate) fn committed(mut self) {
-        self.shared
+        let mut registry = self
+            .shared
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .notify(self.touched);
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.apply_shadow_updates(&self.shadow_updates);
+        registry.notify(self.touched);
         self.notified = true;
     }
 }
@@ -399,11 +673,124 @@ impl BuildRegistration {
                     keys: Default::default(),
                     bytes: 0,
                     invalid: false,
+                    shadow: None,
                 },
             );
             token
         };
         Self { shared, token }
+    }
+
+    pub(crate) fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Transition this build from Backfill log mode into WRITE_ONLY (shadow
+    /// dual-write) mode under `tt_commit_lock`.
+    pub(crate) fn activate_shadow(
+        &self,
+        handle: RelationHandle,
+        pending_old: BTreeMap<Vec<u8>, (Tuple, Option<Tuple>)>,
+    ) -> Result<()> {
+        let mut registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get_mut(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        log.keys.clear();
+        log.bytes = 0;
+        log.shadow = Some(ShadowState {
+            handle,
+            pending_old,
+            count_delta: 0,
+        });
+        Ok(())
+    }
+
+    /// Peek one pending backfill-era key for the builder to drain under
+    /// `tt_commit_lock`.
+    pub(crate) fn peek_shadow_pending(&self) -> Result<Option<(Vec<u8>, Tuple, Option<Tuple>)>> {
+        let registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        let shadow = log
+            .shadow
+            .as_ref()
+            .expect("shadow mode active during drain");
+        Ok(shadow
+            .pending_old
+            .iter()
+            .next()
+            .map(|(encoded, (key, old))| (encoded.clone(), key.clone(), old.clone())))
+    }
+
+    /// Mark one builder-drained shadow key completed after its commit succeeds.
+    pub(crate) fn complete_shadow_key(&self, encoded: &[u8], count_delta: isize) -> Result<()> {
+        let mut registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get_mut(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        if let Some(shadow) = log.shadow.as_mut() {
+            shadow.pending_old.remove(encoded);
+            shadow.count_delta += count_delta;
+        }
+        Ok(())
+    }
+
+    /// Invalidate this registration directly (e.g., on an ambiguous drain
+    /// commit failure while still holding `tt_commit_lock`).
+    pub(crate) fn invalidate_self(&self) {
+        self.shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .invalidate_token(self.token);
+    }
+
+    /// Atomically deactivate shadow mode while `tt_commit_lock` is still held
+    /// right before catalog publication, verifying the build is valid and fully
+    /// drained, and returning its accumulated row-count delta. Clearing
+    /// `log.shadow` inside `_section` ensures no post-publication writer can
+    /// observe both the published index and an active shadow targeting the same
+    /// index `RelationId`s.
+    pub(crate) fn finish_shadow(&self) -> Result<isize> {
+        let mut registry = self
+            .shared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let log = registry.builds.get_mut(&self.token).expect("live registration");
+        ensure!(
+            !log.invalid,
+            "transaction-time index build at {} was invalidated or exceeded its catch-up budget",
+            log.watermark
+        );
+        let shadow = log
+            .shadow
+            .take()
+            .expect("shadow mode active at publication");
+        ensure!(
+            shadow.pending_old.is_empty(),
+            "shadow index build still has {} pending key(s) at publication",
+            shadow.pending_old.len()
+        );
+        Ok(shadow.count_delta)
     }
 
     /// Drain currently accumulated catch-up keys while keeping the registration
@@ -451,21 +838,47 @@ impl Drop for BuildRegistration {
 }
 
 impl BuildRegistry {
+    pub(crate) fn invalidate_token(&mut self, token: u64) {
+        if let Some(log) = self.builds.get_mut(&token) {
+            log.invalid = true;
+            log.keys.clear();
+            log.shadow = None;
+        }
+    }
+
     pub(crate) fn invalidate(&mut self, base: u64, index: Option<&str>) -> bool {
         let mut matched = false;
         for log in self.builds.values_mut() {
             if log.base == base && index.is_none_or(|name| log.names.contains(name)) {
                 log.invalid = true;
                 log.keys.clear();
+                log.shadow = None;
                 matched = true;
             }
         }
         matched
     }
 
+    fn apply_shadow_updates(&mut self, updates: &[ShadowCommitUpdate]) {
+        for update in updates {
+            let Some(log) = self.builds.get_mut(&update.token) else {
+                continue;
+            };
+            if log.invalid {
+                continue;
+            }
+            if let Some(shadow) = log.shadow.as_mut() {
+                for key in &update.claimed_keys {
+                    shadow.pending_old.remove(key);
+                }
+                shadow.count_delta += update.count_delta;
+            }
+        }
+    }
+
     pub(crate) fn notify(&mut self, touched: &BTreeMap<u64, TouchedRelation>) {
         for log in self.builds.values_mut() {
-            if log.invalid {
+            if log.invalid || log.shadow.is_some() {
                 continue;
             }
             let Some(relation) = touched.get(&log.base) else {

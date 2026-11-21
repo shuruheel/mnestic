@@ -28,9 +28,21 @@ type SectionGuard<'a> = crate::measurement::SectionGuard<'a>;
 #[cfg(not(feature = "test-hooks"))]
 type SectionGuard<'a> = MutexGuard<'a, ()>;
 
-pub(crate) fn section<'a>(lock: &'a Mutex<()>, poison: &Poison) -> Result<SectionGuard<'a>> {
+pub(crate) struct CommitSection<'a> {
+    // Field drop order is declaration order: drop the inner mutex guard before
+    // releasing the outer FIFO turn so the next queued waiter acquires immediately.
+    _guard: SectionGuard<'a>,
+    _turn: crate::runtime::relation_lock::RelationGuard<'a>,
+}
+
+pub(crate) fn section<'a>(
+    queue: &'a crate::runtime::relation_lock::RelationLock,
+    lock: &'a Mutex<()>,
+    poison: &Poison,
+) -> Result<CommitSection<'a>> {
     #[cfg(feature = "test-hooks")]
     let wait = crate::measurement::Span::new("tt_ddl_section");
+    let turn = queue.write_with_poison(poison)?;
     loop {
         poison.check()?;
         match lock.try_lock() {
@@ -38,14 +50,20 @@ pub(crate) fn section<'a>(lock: &'a Mutex<()>, poison: &Poison) -> Result<Sectio
                 #[cfg(feature = "test-hooks")]
                 let guard = wait.acquired(guard);
                 poison.check()?;
-                return Ok(guard);
+                return Ok(CommitSection {
+                    _guard: guard,
+                    _turn: turn,
+                });
             }
             Err(TryLockError::Poisoned(error)) => {
                 let guard = error.into_inner();
                 #[cfg(feature = "test-hooks")]
                 let guard = wait.acquired(guard);
                 poison.check()?;
-                return Ok(guard);
+                return Ok(CommitSection {
+                    _guard: guard,
+                    _turn: turn,
+                });
             }
             Err(TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(2)),
         }
@@ -294,7 +312,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             drop(admission);
             let mut tx = self.transact_write()?;
             let current = tx.get_relation(name, true)?;
-            let _section = section(&self.tt_commit_lock, &poison)?;
+            let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
             #[cfg(feature = "test-hooks")]
             let registration_span = crate::measurement::Span::new("build_registration");
             let build = tx.prepare_tt_indexes(&current, op)?;
@@ -341,23 +359,28 @@ impl<'s, S: Storage<'s>> Db<S> {
         #[cfg(feature = "test-hooks")]
         reservation_span.finish();
         let mut publication_attempted = false;
+        // Keep `registration` outside `outcome` so on error/abort it is only
+        // dropped under `tt_commit_lock`, preventing an uncoordinated drop race
+        // with an in-flight writer inside `commit_tx_with_tt`.
+        let mut registration_slot: Option<BuildRegistration> = None;
         let outcome = (|| {
             // Pin the actual read snapshot and registration in one commit gap.
             #[cfg(feature = "test-hooks")]
             let registration_span = crate::measurement::Span::new("build_registration");
-            let (snapshot, registration) = {
-                let _section = section(&self.tt_commit_lock, &poison)?;
+            let snapshot = {
+                let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
                 let snapshot = self.transact()?;
                 let current = snapshot.get_relation(name, false)?;
                 validate(&original, &current, &build)?;
-                let registration = BuildRegistration::register(
+                registration_slot = Some(BuildRegistration::register(
                     self.tt_index_builds.clone(),
                     original.id.0,
                     snapshot.read_persisted_tt_hwm()?.unwrap_or_default(),
                     names(&build),
-                );
-                (snapshot, registration)
+                ));
+                snapshot
             };
+            let registration = registration_slot.as_ref().expect("registered");
             #[cfg(feature = "test-hooks")]
             registration_span.finish();
             #[cfg(feature = "test-hooks")]
@@ -378,115 +401,121 @@ impl<'s, S: Storage<'s>> Db<S> {
             drop(rows);
             #[cfg(feature = "test-hooks")]
             self.run_tt_index_build_fence("populated");
-            // Iterative unlocked catch-up rounds: advance the detached
-            // generation in small committed batches against pinned read
-            // snapshots before acquiring `relation_write` + `tt_commit_lock`.
-            // Keeps RocksDB `WriteBatchWithIndex` small (avoiding O(N^2) HNSW
-            // catch-up blowup) and shrinks the exclusive publication tail to a
-            // handful of keys.
-            const MAX_UNLOCKED_CATCHUP_ROUNDS: usize = 16;
-            const UNLOCKED_CATCHUP_STOP_KEYS: usize = 8;
-            const UNLOCKED_HNSW_MAX_BACKLOG: usize = 256;
-            const FINAL_LOCKED_MAX_KEYS: usize = 32;
             let profile = std::env::var_os("MNESTIC_BUILD_PROFILE").is_some();
-            let mut snapshot = snapshot;
-            let mut prev_pending: Option<usize> = None;
-            for round in 0..MAX_UNLOCKED_CATCHUP_ROUNDS {
+            let mut snapshot = Some(snapshot);
+            let mut shadow_active = false;
+            if !build.hnsw_indices.is_empty() {
+                // WRITE_ONLY (shadow dual-write) catch-up for HNSW builds
+                // (Google F1 / PostgreSQL CREATE INDEX CONCURRENTLY pattern):
+                // activate shadow mode unconditionally so both backfill-era
+                // keys and any post-backfill writer bursts are maintained
+                // directly by writers, while remaining backfill keys drain 1
+                // per brief `tt_commit_lock` turn.
                 poison.check()?;
-                let (next_snapshot, pending) = {
-                    let _section = section(&self.tt_commit_lock, &poison)?;
-                    let peek_len = registration.keys()?.len();
-                    if peek_len == 0 {
-                        break;
-                    }
-                    // When building HNSW under heavy concurrent write load,
-                    // incremental RocksDB HNSW catch-up cannot outpace
-                    // unthrottled writers. Skip unlocked rounds when the HNSW
-                    // backlog already exceeds `UNLOCKED_HNSW_MAX_BACKLOG` so
-                    // backlog does not amplify before the chunked
-                    // `relation_write` drain (which still keeps `tt_commit_lock`
-                    // free for other relations).
-                    if !build.hnsw_indices.is_empty() && peek_len > UNLOCKED_HNSW_MAX_BACKLOG {
-                        if profile {
-                            eprintln!(
-                                "tt catchup round {round}: HNSW backlog {peek_len} > {UNLOCKED_HNSW_MAX_BACKLOG}, switching to chunked relation_write drain"
-                            );
-                        }
-                        break;
-                    }
-                    // Stop unlocked rounds BEFORE replaying if backlog did not
-                    // shrink by at least 25% since the previous round, so
-                    // faster writers never amplify the backlog.
-                    if prev_pending.is_some_and(|prev| peek_len * 4 >= prev * 3) {
-                        if profile {
-                            eprintln!(
-                                "tt catchup round {round}: non-shrinking ({peek_len} vs prev {:?}), switching to relation_write drain",
-                                prev_pending
-                            );
-                        }
-                        break;
-                    }
-                    let pending = registration.take_keys()?;
-                    let next_snapshot = self.transact()?;
-                    let current = next_snapshot.get_relation(name, false)?;
-                    validate(&original, &current, &build)?;
-                    (next_snapshot, pending)
+                let initial_keys = {
+                    let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                    registration.keys()?
                 };
-                let pending_len = pending.len();
-                let t_round = Instant::now();
-                count = self.replay_tt_catchup_unlocked(
-                    &original,
-                    &build,
-                    &snapshot,
-                    &next_snapshot,
-                    &pending,
-                    count,
-                    &poison,
-                )?;
-                if profile {
+                let snap = snapshot.as_ref().expect("snapshot live");
+                let mut preloaded: BTreeMap<Vec<u8>, (Tuple, Option<Tuple>)> = BTreeMap::new();
+                for key in initial_keys {
+                    poison.check()?;
+                    let encoded = key.encode_as_key(build.id);
+                    let prior = original.get_current(snap, &key)?;
+                    preloaded.insert(encoded, (key, prior));
+                }
+                let activated_len = {
+                    let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                    let current_snap = self.transact()?;
+                    let current = current_snap.get_relation(name, false)?;
+                    validate(&original, &current, &build)?;
+                    for key in registration.keys()? {
+                        let encoded = key.encode_as_key(build.id);
+                        if let std::collections::btree_map::Entry::Vacant(e) =
+                            preloaded.entry(encoded)
+                        {
+                            let prior = original.get_current(snap, &key)?;
+                            e.insert((key, prior));
+                        }
+                    }
+                    let len = preloaded.len();
+                    registration.activate_shadow(build.clone(), preloaded)?;
+                    len
+                };
+                shadow_active = true;
+                // `pending_old` now carries every S_0 prior row; release the
+                // RocksDB snapshot immediately so compaction is not pinned.
+                snapshot = None;
+                let t_shadow = Instant::now();
+                let mut drained_by_builder = 0usize;
+                #[cfg(feature = "test-hooks")]
+                self.run_tt_index_build_fence("shadow_active");
+                if activated_len > 0 {
+                    loop {
+                        poison.check()?;
+                        let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                        let Some((encoded, key, prior)) = registration.peek_shadow_pending()?
+                        else {
+                            break;
+                        };
+                        let mut tx = self.transact_write()?;
+                        let now = original.get_current(&tx, &key)?;
+                        let delta =
+                            isize::from(now.is_some()) - isize::from(prior.is_some());
+                        tx.maintain_shadow_pairs(&build, registration.token(), &[(prior, now)])?;
+                        poison.check()?;
+                        if let Err(err) = self.commit_tx_with_test_hook(&mut tx) {
+                            // Invalidate under `_section` so no writer can enter
+                            // shadow mode after an ambiguous drain commit error.
+                            registration.invalidate_self();
+                            return Err(err);
+                        }
+                        registration.complete_shadow_key(&encoded, delta)?;
+                        drained_by_builder += 1;
+                        if profile && drained_by_builder % 500 == 0 {
+                            eprintln!(
+                                "tt shadow drain progress: builder_drained={drained_by_builder}/{activated_len} elapsed={:?}",
+                                t_shadow.elapsed()
+                            );
+                        }
+                    }
+                }
+                if profile && activated_len > 0 {
                     eprintln!(
-                        "tt catchup round {round}: replayed {pending_len} keys in {:?}",
-                        t_round.elapsed()
+                        "tt shadow drain: initial={activated_len}, builder_drained={drained_by_builder}, elapsed={:?}",
+                        t_shadow.elapsed()
                     );
                 }
-                snapshot = next_snapshot;
-                if pending_len <= UNLOCKED_CATCHUP_STOP_KEYS {
-                    break;
-                }
-                prev_pending = Some(pending_len);
-            }
-            {
-                #[cfg(feature = "test-hooks")]
-                let publication_span = crate::measurement::Span::new("build_publication");
-                let admission = self.admit_relation_maintenance(&poison)?;
-                let _relation = relation_write(&locks[0], &poison)?;
-                drop(admission);
-                // Ordinary writers to `name` are now paused by `_relation` while
-                // `tt_commit_lock` is still free. If unlocked catch-up did not
-                // converge (e.g. fast writers outpaced HNSW catch-up), drain the
-                // remaining backlog here in small committed chunks so the final
-                // single-tx `WriteBatchWithIndex` never goes quadratic and
-                // `tt_commit_lock` is held only for the tiny tail + publication.
-                let drain_batch = {
-                    let _section = section(&self.tt_commit_lock, &poison)?;
-                    let peek_len = registration.keys()?.len();
-                    if peek_len > FINAL_LOCKED_MAX_KEYS {
+            } else {
+                // Iterative unlocked catch-up rounds for FTS/LSH-only builds:
+                // advance the detached generation in small committed batches
+                // against pinned read snapshots before acquiring exclusive locks.
+                const MAX_UNLOCKED_CATCHUP_ROUNDS: usize = 16;
+                const UNLOCKED_CATCHUP_STOP_KEYS: usize = 8;
+                let mut prev_pending: Option<usize> = None;
+                for round in 0..MAX_UNLOCKED_CATCHUP_ROUNDS {
+                    poison.check()?;
+                    let (next_snapshot, pending) = {
+                        let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                        let peek_len = registration.keys()?.len();
+                        if peek_len == 0 {
+                            break;
+                        }
+                        if prev_pending.is_some_and(|prev| peek_len * 4 >= prev * 3) {
+                            break;
+                        }
                         let pending = registration.take_keys()?;
                         let next_snapshot = self.transact()?;
                         let current = next_snapshot.get_relation(name, false)?;
                         validate(&original, &current, &build)?;
-                        Some((next_snapshot, pending))
-                    } else {
-                        None
-                    }
-                };
-                if let Some((next_snapshot, pending)) = drain_batch {
-                    let n = pending.len();
-                    let t_drain = Instant::now();
+                        (next_snapshot, pending)
+                    };
+                    let pending_len = pending.len();
+                    let t_round = Instant::now();
                     count = self.replay_tt_catchup_unlocked(
                         &original,
                         &build,
-                        &snapshot,
+                        snapshot.as_ref().expect("snapshot live"),
                         &next_snapshot,
                         &pending,
                         count,
@@ -494,11 +523,58 @@ impl<'s, S: Storage<'s>> Db<S> {
                     )?;
                     if profile {
                         eprintln!(
-                            "tt relation_write drain: replayed {n} keys in {:?}",
-                            t_drain.elapsed()
+                            "tt catchup round {round}: replayed {pending_len} keys in {:?}",
+                            t_round.elapsed()
                         );
                     }
-                    snapshot = next_snapshot;
+                    snapshot = Some(next_snapshot);
+                    if pending_len <= UNLOCKED_CATCHUP_STOP_KEYS {
+                        break;
+                    }
+                    prev_pending = Some(pending_len);
+                }
+            }
+            {
+                #[cfg(feature = "test-hooks")]
+                let publication_span = crate::measurement::Span::new("build_publication");
+                let admission = self.admit_relation_maintenance(&poison)?;
+                let _relation = relation_write(&locks[0], &poison)?;
+                drop(admission);
+                if !shadow_active {
+                    const FINAL_LOCKED_MAX_KEYS: usize = 32;
+                    let drain_batch = {
+                        let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
+                        let peek_len = registration.keys()?.len();
+                        if peek_len > FINAL_LOCKED_MAX_KEYS {
+                            let pending = registration.take_keys()?;
+                            let next_snapshot = self.transact()?;
+                            let current = next_snapshot.get_relation(name, false)?;
+                            validate(&original, &current, &build)?;
+                            Some((next_snapshot, pending))
+                        } else {
+                            None
+                        }
+                    };
+                    if let Some((next_snapshot, pending)) = drain_batch {
+                        let n = pending.len();
+                        let t_drain = Instant::now();
+                        count = self.replay_tt_catchup_unlocked(
+                            &original,
+                            &build,
+                            snapshot.as_ref().expect("snapshot live"),
+                            &next_snapshot,
+                            &pending,
+                            count,
+                            &poison,
+                        )?;
+                        if profile {
+                            eprintln!(
+                                "tt relation_write drain: replayed {n} keys in {:?}",
+                                t_drain.elapsed()
+                            );
+                        }
+                        snapshot = Some(next_snapshot);
+                    }
                 }
                 let mut tx = self.transact_write()?;
                 // Catalog lock before the commit section, never while owning it.
@@ -516,25 +592,31 @@ impl<'s, S: Storage<'s>> Db<S> {
                         .encode_as_key(crate::runtime::relation::RelationId::SYSTEM);
                     tx.store_tx.get(&key, true)?;
                 }
-                let _section = section(&self.tt_commit_lock, &poison)?;
+                let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
                 validate(&original, &current, &build)?;
                 #[cfg(feature = "test-hooks")]
                 let catchup_span = crate::measurement::Span::new("build_catchup");
-                let mut old = BTreeMap::new();
-                for key in registration.keys()? {
-                    let prior = original.get_current(&snapshot, &key)?;
-                    let now = current.get_current(&tx, &key)?;
-                    count = count + usize::from(now.is_some()) - usize::from(prior.is_some());
-                    old.insert(key.encode_as_key(build.id), (key, prior));
+                if shadow_active {
+                    let delta = registration.finish_shadow()?;
+                    count = (count as isize + delta).max(0) as usize;
+                } else {
+                    let snap = snapshot.as_ref().expect("snapshot live");
+                    let mut old = BTreeMap::new();
+                    for key in registration.keys()? {
+                        let prior = original.get_current(snap, &key)?;
+                        let now = current.get_current(&tx, &key)?;
+                        count = count + usize::from(now.is_some()) - usize::from(prior.is_some());
+                        old.insert(key.encode_as_key(build.id), (key, prior));
+                    }
+                    let changes = BTreeMap::from([(
+                        build.id.0,
+                        TouchedRelation {
+                            handle: build.clone(),
+                            old,
+                        },
+                    )]);
+                    tx.maintain_tt_indexes(&changes)?;
                 }
-                let changes = BTreeMap::from([(
-                    build.id.0,
-                    TouchedRelation {
-                        handle: build.clone(),
-                        old,
-                    },
-                )]);
-                tx.maintain_tt_indexes(&changes)?;
                 #[cfg(feature = "test-hooks")]
                 catchup_span.finish();
                 tx.publish_tt_indexes(current, &build)?;
@@ -544,15 +626,29 @@ impl<'s, S: Storage<'s>> Db<S> {
                 #[cfg(feature = "test-hooks")]
                 publication_span.finish();
             }
-            drop(registration);
             Ok(result_rows(op, &build, count))
         })();
         match outcome {
             Ok(rows) => {
+                drop(registration_slot.take());
                 self.cleanup_tt_generations(&original, &names(&build));
                 Ok(Some(rows))
             }
             Err(error) => {
+                // Drop `registration` only while holding `tt_commit_lock` so no
+                // in-flight writer inside `commit_tx_with_tt` can race with its
+                // removal or land stray shadow writes after cleanup.
+                {
+                    let _turn = self
+                        .tt_commit_queue
+                        .write_with_poison(&Poison::default())
+                        .ok();
+                    let _drain = self
+                        .tt_commit_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    drop(registration_slot.take());
+                }
                 // Storage commit errors can be ambiguous. Never erase a
                 // generation that might already be attached in the catalog.
                 if !publication_attempted {
@@ -830,7 +926,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 .encode_as_key(crate::runtime::relation::RelationId::SYSTEM);
             tx.store_tx.get(&key, true)?;
         }
-        let guard = section(&self.tt_commit_lock, &poison)?;
+        let guard = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
         tx.defer_tt_cleanup = true;
         let rows = self.run_sys_op_with_tx(&mut tx, op, false, true, true)?;
         poison.check()?;

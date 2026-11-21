@@ -57,6 +57,7 @@ pub struct SessionTx<'a> {
     /// commit for tt-stamped transactions (`docs/specs/bitemporality.md`
     /// §13.10). Held only inside `commit_tx_with_tt`.
     pub(crate) tt_commit_lock: Arc<Mutex<()>>,
+    pub(crate) tt_commit_queue: Arc<crate::runtime::relation_lock::RelationLock>,
     /// Buffered writes to tt-stamped relations (mnestic fork, bitemporality
     /// step 3): rows are collected at statement time and stamped + written at
     /// commit inside `commit_tx_with_tt`, so every row of the transaction
@@ -401,6 +402,7 @@ impl<'a> SessionTx<'a> {
     pub(crate) fn commit_tx_with_tt(&mut self) -> Result<i64> {
         self.ensure_tt_usable()?;
         let lock = self.tt_commit_lock.clone();
+        let queue = self.tt_commit_queue.clone();
         let poison = crate::runtime::db::Poison {
             deadline: self.script_deadline,
             parent_cancellation: self.script_cancellation.clone(),
@@ -409,6 +411,7 @@ impl<'a> SessionTx<'a> {
         let result = (|| {
             #[cfg(feature = "test-hooks")]
             let wait = crate::measurement::Span::new("tt_commit_section");
+            let _turn = queue.write_with_poison(&poison)?;
             let _guard = loop {
                 poison.check()?;
                 match lock.try_lock() {
@@ -429,11 +432,14 @@ impl<'a> SessionTx<'a> {
             self.apply_tt_evicts()?;
             self.stamp_pending_tt_writes(tt)?;
             self.maintain_tt_indexes(&touched)?;
+            let shadow_updates = self.maintain_shadow_tt_indexes(&touched)?;
             // Persist totals after the final current-belief posting change.
             self.write_fts_deltas()?;
             poison.check()?;
             let notification = crate::runtime::txtime_index::BuildCommitNotification::new(
-                self.tt_index_builds.clone(), &touched,
+                self.tt_index_builds.clone(),
+                &touched,
+                shadow_updates,
             );
             self.store_tx.commit()?;
             notification.committed();
