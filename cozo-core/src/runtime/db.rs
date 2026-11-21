@@ -33,13 +33,13 @@ use serde_json::json;
 use smartstring::{LazyCompact, SmartString};
 use thiserror::Error;
 
-use crate::data::functions::current_validity;
+use crate::data::functions::{current_validity, MAX_VALIDITY_TS};
 use crate::data::json::JsonValue;
 use crate::data::memsize::est_tuple_bytes;
 use crate::data::program::{InputProgram, QueryAssertion, RelationOp, ReturnMutation};
 use crate::data::relation::ColumnDef;
 use crate::data::tuple::{Tuple, TupleT};
-use crate::data::value::{DataValue, ValidityTs, LARGEST_UTF_CHAR};
+use crate::data::value::{DataValue, Validity, ValidityTs, LARGEST_UTF_CHAR};
 use crate::fixed_rule::DEFAULT_FIXED_RULES;
 use crate::fts::stats::FtsStatsCache;
 use crate::fts::TokenizerCache;
@@ -62,7 +62,7 @@ use crate::runtime::relation::{
 };
 use crate::runtime::stored_queries;
 use crate::runtime::transact::SessionTx;
-use crate::runtime::tt_clock::{wall_clock_micros, TtClock};
+use crate::runtime::tt_clock::{tt_hwm_key, wall_clock_micros, TtClock};
 use crate::storage::temp::TempStorage;
 use crate::storage::{Storage, StoreTx};
 use crate::{try_decode_tuple_from_kv, FixedRule, Symbol};
@@ -1283,36 +1283,429 @@ impl<'s, S: Storage<'s>> Db<S> {
         let mut ret: BTreeMap<String, NamedRows> = BTreeMap::new();
         for rel in relations {
             let handle = tx.get_relation_for_read(rel.as_ref(), "data export")?;
-            let size_hint = handle.metadata.keys.len() + handle.metadata.non_keys.len();
+            ret.insert(rel.as_ref().to_string(), export_relation_raw(&tx, &handle)?);
+        }
+        Ok(ret)
+    }
 
-            let mut cols = handle
+    /// Export full transaction-time state for `relations` in a single read
+    /// snapshot (mnestic fork, EA4 Batch 4.3).
+    ///
+    /// Captures the persisted `tt_hwm`, exact per-relation schemas, per-relation
+    /// `::history_gc` floors, full raw version rows (including `tt` and
+    /// assertion/retraction flags), and `mnestic_evict_audit` rows when present.
+    pub fn export_txtime_state<I, T>(&'s self, relations: I) -> Result<TxTimeExportBundle>
+    where
+        T: AsRef<str>,
+        I: Iterator<Item = T>,
+    {
+        let tx = self.transact()?;
+        let tt_hwm = tx.read_persisted_tt_hwm()?.unwrap_or(0);
+        let mut schemas: BTreeMap<String, TxTimeRelationSchema> = BTreeMap::new();
+        let mut gc_floors: BTreeMap<String, i64> = BTreeMap::new();
+        let mut ret: BTreeMap<String, NamedRows> = BTreeMap::new();
+        for rel in relations {
+            let name = rel.as_ref();
+            if name == "mnestic_evict_audit" {
+                // Exported exclusively in `evict_audit` below to avoid duplicate
+                // inclusion when callers pass the full output of `::relations`.
+                continue;
+            }
+            let handle = tx.get_relation_for_read(name, "txtime state export")?;
+            schemas.insert(
+                name.to_string(),
+                TxTimeRelationSchema::from_metadata(&handle.metadata),
+            );
+            if let Some(floor) = handle.tt_gc_floor {
+                gc_floors.insert(name.to_string(), floor);
+            }
+            ret.insert(name.to_string(), export_relation_raw(&tx, &handle)?);
+        }
+        let evict_audit = if tx.relation_exists("mnestic_evict_audit")? {
+            let audit_handle =
+                tx.get_relation_for_read("mnestic_evict_audit", "txtime state export")?;
+            Some(export_relation_raw(&tx, &audit_handle)?)
+        } else {
+            None
+        };
+        Ok(TxTimeExportBundle {
+            tt_hwm,
+            schemas,
+            gc_floors,
+            relations: ret,
+            evict_audit,
+        })
+    }
+
+    /// Restore full transaction-time history from a [`TxTimeExportBundle`] into
+    /// empty, schema-matched relations (mnestic fork, EA4 Batch 4.3).
+    ///
+    /// Preserves original commit timestamps and retractions verbatim, restores
+    /// (or clears) per-relation `::history_gc` floors, rebuilds attached B-tree
+    /// secondary indexes in-transaction from current asserted beliefs, advances
+    /// and persists `tt_hwm` under `tt_commit_lock` (and invalidates concurrent
+    /// detached index builds) so subsequent writes stay strictly monotonic even
+    /// across backward wall-clock jumps, invalidates graph projections, and
+    /// reports any search indexes (`::fts`/`::hnsw`/`::lsh`) requiring
+    /// `::reindex`. Triggers are not fired.
+    pub fn import_relations_with_history(
+        &'s self,
+        bundle: TxTimeExportBundle,
+    ) -> Result<HistoryImportReport> {
+        ensure!(
+            bundle.tt_hwm >= 0 && bundle.tt_hwm != i64::MAX,
+            HistoryImportInvalidTt(format!("bundle tt_hwm {} must be in [0, i64::MAX)", bundle.tt_hwm))
+        );
+        for rel in bundle.schemas.keys() {
+            ensure!(
+                bundle.relations.contains_key(rel),
+                HistoryImportSchemaMismatch(rel.clone())
+            );
+        }
+        for (rel, &floor) in &bundle.gc_floors {
+            ensure!(
+                bundle.relations.contains_key(rel),
+                HistoryImportInvalidGcFloor(
+                    rel.clone(),
+                    "gc_floor references a relation not present in bundle.relations".to_string()
+                )
+            );
+            ensure!(
+                floor >= 0 && floor != i64::MAX,
+                HistoryImportInvalidGcFloor(
+                    rel.clone(),
+                    format!("gc_floor {floor} must be in [0, i64::MAX)")
+                )
+            );
+        }
+        for rel in bundle.relations.keys() {
+            if rel.contains(':') {
+                bail!(ImportIntoIndex(rel.clone()));
+            }
+            if rel.starts_with('-') {
+                bail!("history import does not accept delete prefix in relation name '{rel}'");
+            }
+            if rel == "mnestic_evict_audit" {
+                bail!("mnestic_evict_audit must be supplied via bundle.evict_audit, not bundle.relations");
+            }
+        }
+
+        let mut lock_names: Vec<SmartString<LazyCompact>> = bundle
+            .relations
+            .keys()
+            .map(|n| SmartString::from(n.as_str()))
+            .collect();
+        if bundle.evict_audit.is_some() {
+            lock_names.push(SmartString::from("mnestic_evict_audit"));
+        }
+
+        // Exclusive writer admission + write relation locks serialize against
+        // concurrent TxTime commits, DDL, and `tt_hwm` persistence across all
+        // storage backends (including concurrent-writer RocksDB).
+        let _writer_admission = self
+            .writer_admission
+            .write_with_poison(&Poison::default())?;
+        let locks = self.obtain_relation_locks(lock_names.iter());
+        let _guards = locks
+            .iter()
+            .map(|l| l.write_with_poison(&Poison::default()))
+            .collect::<Result<Vec<_>>>()?;
+
+        let cur_vld = current_validity();
+        let mut tx = self.transact_write()?;
+
+        let mut max_imported_tt: i64 = 0;
+        let mut max_gc_floor: i64 = 0;
+        let mut rows_imported: usize = 0;
+        let mut indexes_needing_reindex: Vec<String> = Vec::new();
+        let mut stranded_handles: Vec<(RelationHandle, String)> = Vec::new();
+        let mut imported_tt_rel_ids: Vec<u64> = Vec::new();
+
+        for (relation, in_data) in bundle.relations {
+            let mut handle = tx.get_relation(&relation, false)?;
+            if handle.access_level < AccessLevel::Protected {
+                bail!(InsufficientAccessLevel(
+                    handle.name.to_string(),
+                    "history import".to_string(),
+                    handle.access_level
+                ));
+            }
+            let expected_schema = bundle
+                .schemas
+                .get(&relation)
+                .ok_or_else(|| HistoryImportSchemaMismatch(relation.clone()))?;
+            let actual_schema = TxTimeRelationSchema::from_metadata(&handle.metadata);
+            ensure!(
+                *expected_schema == actual_schema,
+                HistoryImportSchemaMismatch(relation.clone())
+            );
+            let expected_headers: Vec<String> = handle
                 .metadata
                 .keys
                 .iter()
-                .map(|col| col.name.clone())
-                .collect_vec();
-            cols.extend(
-                handle
-                    .metadata
-                    .non_keys
-                    .iter()
-                    .map(|col| col.name.clone())
-                    .collect_vec(),
+                .chain(handle.metadata.non_keys.iter())
+                .map(|c| c.name.to_string())
+                .collect();
+            ensure!(
+                in_data.headers == expected_headers,
+                HistoryImportSchemaMismatch(relation.clone())
             );
 
             let start = Tuple::default().encode_as_key(handle.id);
             let end = Tuple::default().encode_as_key(handle.id.next());
-
-            let mut rows = vec![];
-            for data in tx.store_tx.range_scan(&start, &end) {
-                let (k, v) = data?;
-                let tuple = try_decode_tuple_from_kv(&k, &v, Some(size_hint))?;
-                rows.push(tuple);
+            if tx.store_tx.range_scan(&start, &end).next().is_some() {
+                bail!(HistoryImportNonEmpty(relation.clone()));
             }
-            let headers = cols.iter().map(|col| col.to_string()).collect_vec();
-            ret.insert(rel.as_ref().to_string(), NamedRows::new(headers, rows));
+
+            tx.mark_dirty(&handle);
+
+            if !handle.has_txtime() {
+                ensure!(
+                    !bundle.gc_floors.contains_key(&relation),
+                    HistoryImportInvalidGcFloor(
+                        relation.clone(),
+                        "gc_floor is only valid for TxTime relations".to_string()
+                    )
+                );
+                let col_defs: Vec<&ColumnDef> = handle
+                    .metadata
+                    .keys
+                    .iter()
+                    .chain(handle.metadata.non_keys.iter())
+                    .collect();
+                for row in in_data.rows {
+                    ensure!(
+                        row.len() == col_defs.len(),
+                        HistoryImportSchemaMismatch(relation.clone())
+                    );
+                    let tuple: Vec<DataValue> = row
+                        .into_iter()
+                        .zip(col_defs.iter())
+                        .map(|(v, col)| col.typing.coerce(v, cur_vld))
+                        .try_collect()?;
+                    write_import_tuple(&mut tx, &handle, tuple, false)?;
+                    rows_imported += 1;
+                }
+                let stranded = stranded_index_names(&handle);
+                if !stranded.is_empty() {
+                    for idx_name in stranded {
+                        indexes_needing_reindex.push(format!("{relation}:{idx_name}"));
+                    }
+                    stranded_handles.push((handle, relation));
+                }
+                continue;
+            }
+
+            imported_tt_rel_ids.push(handle.id.0);
+            let kpos = handle.metadata.keys.len() - 1;
+            let is_bitemporal = !handle.is_tt_only();
+            let gc_floor = bundle.gc_floors.get(&relation).copied();
+            if let Some(floor) = gc_floor {
+                max_gc_floor = max_gc_floor.max(floor);
+            }
+
+            let col_defs: Vec<&ColumnDef> = handle
+                .metadata
+                .keys
+                .iter()
+                .chain(handle.metadata.non_keys.iter())
+                .collect();
+
+            // Enforce per-(logical_key, tt) assert/retract uniqueness and
+            // gc_floor keeper invariant across all imported rows.
+            let mut seen_op: BTreeMap<(Vec<u8>, i64), bool> = BTreeMap::new();
+            let mut below_floor_counts: BTreeMap<Vec<u8>, usize> = BTreeMap::new();
+
+            for row in in_data.rows {
+                ensure!(
+                    row.len() == col_defs.len(),
+                    HistoryImportSchemaMismatch(relation.clone())
+                );
+                let mut coerced = Vec::with_capacity(col_defs.len());
+                let mut tt_vld: Option<Validity> = None;
+                for (i, (v, col)) in row.into_iter().zip(col_defs.iter()).enumerate() {
+                    if i == kpos {
+                        let vld = parse_history_tt(v, is_bitemporal, &relation)?;
+                        tt_vld = Some(vld);
+                        coerced.push(DataValue::Validity(vld));
+                    } else {
+                        coerced.push(col.typing.coerce(v, cur_vld)?);
+                    }
+                }
+                let tt_vld = tt_vld.expect("tt column at kpos");
+                let tt_us = tt_vld.timestamp.0 .0;
+                max_imported_tt = max_imported_tt.max(tt_us);
+
+                let (norm_key, flag) = if is_bitemporal {
+                    let (vt_ts, vt_flag) = match &coerced[kpos - 1] {
+                        DataValue::Validity(v) => (v.timestamp, v.is_assert.0),
+                        _ => bail!(HistoryImportSchemaMismatch(relation.clone())),
+                    };
+                    let mut norm = coerced[0..kpos].to_vec();
+                    norm[kpos - 1] = DataValue::Validity(Validity {
+                        timestamp: vt_ts,
+                        is_assert: std::cmp::Reverse(true),
+                    });
+                    (handle.encode_partial_key_for_store(&norm), vt_flag)
+                } else {
+                    (
+                        handle.encode_partial_key_for_store(&coerced[0..kpos]),
+                        tt_vld.is_assert.0,
+                    )
+                };
+
+                if let Some(prev) = seen_op.insert((norm_key.clone(), tt_us), flag) {
+                    if prev != flag {
+                        #[derive(Debug, Error, Diagnostic)]
+                        #[error("history import asserts AND retracts one key at the same tt in relation {0}")]
+                        #[diagnostic(
+                            code(eval::txtime_assert_retract_conflict),
+                            help("a logical key cannot be both asserted and retracted at the same transaction time")
+                        )]
+                        struct HistoryAssertRetractConflict(String);
+                        bail!(HistoryAssertRetractConflict(relation.clone()));
+                    }
+                }
+                if let Some(floor) = gc_floor {
+                    if tt_us < floor {
+                        let count = below_floor_counts.entry(norm_key).or_insert(0);
+                        *count += 1;
+                        ensure!(
+                            *count <= 1,
+                            HistoryImportInvalidGcFloor(
+                                relation.clone(),
+                                format!(
+                                    "multiple versions with tt < gc_floor ({floor}) for one logical key violate the ::history_gc invariant"
+                                )
+                            )
+                        );
+                    }
+                }
+
+                let key = handle.encode_key_for_store(&coerced, Default::default())?;
+                let val = handle.encode_val_for_store(&coerced, Default::default())?;
+                tx.store_tx.put(&key, &val)?;
+                rows_imported += 1;
+            }
+
+            // Always synchronize destination `tt_gc_floor` (including clearing
+            // a stale floor left behind by prior `::history_gc` + `::evict`).
+            if handle.tt_gc_floor != gc_floor {
+                handle.tt_gc_floor = gc_floor;
+                persist_relation_handle(&mut tx, &handle)?;
+            }
+
+            if handle.is_tt_only() && !handle.indices.is_empty() {
+                rebuild_tt_btree_indexes(&mut tx, &handle)?;
+            }
+
+            let stranded = stranded_index_names(&handle);
+            if !stranded.is_empty() {
+                for idx_name in stranded {
+                    indexes_needing_reindex.push(format!("{relation}:{idx_name}"));
+                }
+                stranded_handles.push((handle, relation));
+            }
         }
-        Ok(ret)
+
+        if let Some(audit_data) = bundle.evict_audit {
+            let audit_handle = self.tt_evict_audit_relation(&mut tx)?;
+            if audit_handle.access_level < AccessLevel::Protected {
+                bail!(InsufficientAccessLevel(
+                    audit_handle.name.to_string(),
+                    "history import".to_string(),
+                    audit_handle.access_level
+                ));
+            }
+            let expected_headers: Vec<String> = audit_handle
+                .metadata
+                .keys
+                .iter()
+                .chain(audit_handle.metadata.non_keys.iter())
+                .map(|c| c.name.to_string())
+                .collect();
+            ensure!(
+                audit_data.headers == expected_headers,
+                HistoryImportSchemaMismatch("mnestic_evict_audit".to_string())
+            );
+            let col_defs: Vec<&ColumnDef> = audit_handle
+                .metadata
+                .keys
+                .iter()
+                .chain(audit_handle.metadata.non_keys.iter())
+                .collect();
+            tx.mark_dirty(&audit_handle);
+            for row in audit_data.rows {
+                ensure!(
+                    row.len() == col_defs.len(),
+                    HistoryImportSchemaMismatch("mnestic_evict_audit".to_string())
+                );
+                let tuple: Vec<DataValue> = row
+                    .into_iter()
+                    .zip(col_defs.iter())
+                    .map(|(v, col)| col.typing.coerce(v, cur_vld))
+                    .try_collect()?;
+                if let Some(tt_i) = tuple.get(2).and_then(|v| v.get_int()) {
+                    ensure!(
+                        tt_i >= 0 && tt_i != i64::MAX,
+                        HistoryImportInvalidTt(format!(
+                            "mnestic_evict_audit tt {tt_i} must be in [0, i64::MAX)"
+                        ))
+                    );
+                    max_imported_tt = max_imported_tt.max(tt_i);
+                }
+                write_import_tuple(&mut tx, &audit_handle, tuple, false)?;
+                rows_imported += 1;
+            }
+        }
+
+        let new_hwm = {
+            let _tt_guard = self
+                .tt_commit_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let _invalidate_builds = InvalidateTtBuildsOnDrop {
+                registry: &self.tt_index_builds,
+                ids: &imported_tt_rel_ids,
+            };
+            let existing_persisted = tx.read_persisted_tt_hwm()?;
+            let existing_hwm = existing_persisted.unwrap_or(0);
+            let new_hwm = existing_hwm
+                .max(bundle.tt_hwm)
+                .max(max_imported_tt)
+                .max(max_gc_floor);
+            if new_hwm > existing_hwm || (new_hwm > 0 && existing_persisted.is_none()) {
+                tx.store_tx
+                    .put_externally_serialized(&tt_hwm_key(), &new_hwm.to_be_bytes())?;
+            }
+            if !tx.dirty_relations.is_empty() {
+                self.graph_projections.begin_commit(&tx.dirty_relations);
+                tx.commit_inflight = true;
+            }
+            let commit_res = tx.store_tx.commit();
+            if tx.commit_inflight {
+                tx.commit_inflight = false;
+                self.graph_projections.finish_commit(&tx.dirty_relations);
+                tx.dirty_relations.clear();
+            }
+            commit_res?;
+            if new_hwm > 0 {
+                self.tt_clock.seed(Some(new_hwm));
+            }
+            new_hwm
+        };
+
+        self.graph_projections.invalidate_all();
+        for (handle, relation) in &stranded_handles {
+            warn_if_indexes_stranded(handle, relation, "history import into");
+        }
+        self.flush_warnings();
+
+        Ok(HistoryImportReport {
+            rows_imported,
+            tt_hwm: new_hwm,
+            indexes_needing_reindex,
+        })
     }
     /// Export one triple-shaped relation as RDF (mnestic fork,
     /// `docs/specs/rdf-boundary-io.md` §6 — round-trip export, the inverse of
@@ -1808,24 +2201,67 @@ impl<'s, S: Storage<'s>> Db<S> {
 
         #[cfg(feature = "storage-sqlite")]
         {
-            let _writer_admission = self.admit_writer(true, &Poison::default())?;
-            let rel_names = relations.iter().map(SmartString::from).collect_vec();
-            let locks = self.obtain_relation_locks(rel_names.iter());
-            let _guards = locks.iter().map(|l| l.read().unwrap()).collect_vec();
-
             let source_db = crate::new_cozo_sqlite_with_options(
                 in_file,
                 crate::SqliteOptions::keep_file_mode(),
             )?;
             let mut src_tx = source_db.transact()?;
+
+            // Inspect whether any requested relation is TxTime before acquiring
+            // destination locks so TxTime restores take exclusive writer
+            // admission and write relation locks cleanly without lock inversion.
+            let mut any_txtime = false;
+            for relation in relations {
+                if relation.contains(':') {
+                    bail!(ImportIntoIndex(relation.to_string()))
+                }
+                let src_handle = src_tx.get_relation(relation, false)?;
+                if src_handle.has_txtime() {
+                    any_txtime = true;
+                }
+            }
+
+            let _exclusive_admission = if any_txtime {
+                Some(
+                    self.writer_admission
+                        .write_with_poison(&Poison::default())?,
+                )
+            } else {
+                None
+            };
+            let _writer_admission = if any_txtime {
+                None
+            } else {
+                self.admit_writer(true, &Poison::default())?
+            };
+            let rel_names = relations.iter().map(SmartString::from).collect_vec();
+            let locks = self.obtain_relation_locks(rel_names.iter());
+            let _write_guards = if any_txtime {
+                locks
+                    .iter()
+                    .map(|l| l.write_with_poison(&Poison::default()))
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                vec![]
+            };
+            let _read_guards = if any_txtime {
+                vec![]
+            } else {
+                locks.iter().map(|l| l.read().unwrap()).collect_vec()
+            };
+
             let mut dst_tx = self.transact_write()?;
+            let mut max_imported_tt: i64 = 0;
+            let mut max_gc_floor: i64 = 0;
+            let mut stranded_handles: Vec<(RelationHandle, String)> = Vec::new();
+            let mut imported_tt_rel_ids: Vec<u64> = Vec::new();
 
             for relation in relations {
                 if relation.contains(':') {
                     bail!(ImportIntoIndex(relation.to_string()))
                 }
                 let src_handle = src_tx.get_relation(relation, false)?;
-                let dst_handle = dst_tx.get_relation(relation, false)?;
+                let mut dst_handle = dst_tx.get_relation(relation, false)?;
 
                 // mnestic fork (0.13.0, Part III §0): this path raw-puts the
                 // source's KV rows after a key rewrite — no `coerce`, no
@@ -1861,13 +2297,16 @@ impl<'s, S: Storage<'s>> Db<S> {
                 dst_tx.mark_dirty(&dst_handle);
 
                 if dst_handle.has_txtime() || src_handle.has_txtime() {
-                    bail!(
-                        "cannot import TxTime relation '{}' from a backup: its rows carry \
-                         transaction times from the source store's clock, which this store's \
-                         high-water mark knows nothing about — restore the full store with \
-                         restore_backup() (which re-seeds the commit clock) or re-ingest",
-                        relation
-                    );
+                    let dst_lower = Tuple::default().encode_as_key(dst_handle.id);
+                    let dst_upper = Tuple::default().encode_as_key(dst_handle.id.next());
+                    if dst_tx
+                        .store_tx
+                        .range_scan(&dst_lower, &dst_upper)
+                        .next()
+                        .is_some()
+                    {
+                        bail!(HistoryImportNonEmpty(relation.to_string()));
+                    }
                 }
 
                 if !dst_handle.indices.is_empty() {
@@ -1880,18 +2319,6 @@ impl<'s, S: Storage<'s>> Db<S> {
                     bail!(RestoreIntoRelWithIndices(dst_handle.name.to_string()))
                 }
 
-                // mnestic fork (0.12.1): the B-tree bail above is the only guard
-                // this path had. It then raw-puts the source's KV rows straight
-                // into the store, so a relation carrying HNSW/FTS/LSH indexes had
-                // its rows restored underneath them with **zero signal** — the
-                // operator restores a backup and hybrid retrieval silently returns
-                // nothing for the restored rows. `import_relations` has warned
-                // about exactly this since the fork's hardening pass; backup
-                // restore never did. Same warning, one shared helper, so they
-                // cannot drift apart again.
-                warn_if_indexes_stranded(&dst_handle, relation, "backup restore into");
-                self.flush_warnings();
-
                 if dst_handle.access_level < AccessLevel::Protected {
                     bail!(InsufficientAccessLevel(
                         dst_handle.name.to_string(),
@@ -1900,25 +2327,124 @@ impl<'s, S: Storage<'s>> Db<S> {
                     ));
                 }
 
+                stranded_handles.push((dst_handle.clone(), relation.clone()));
+
                 let src_lower = Tuple::default().encode_as_key(src_handle.id);
                 let src_upper = Tuple::default().encode_as_key(src_handle.id.next());
+                let size_hint =
+                    src_handle.metadata.keys.len() + src_handle.metadata.non_keys.len();
+                let tt_kpos = if src_handle.has_txtime() {
+                    Some(src_handle.metadata.keys.len() - 1)
+                } else {
+                    None
+                };
 
                 let data_it = src_tx.store_tx.range_scan(&src_lower, &src_upper).map(
-                    |src_pair| -> Result<(Vec<u8>, Vec<u8>)> {
+                    |src_pair| -> Result<(Vec<u8>, Vec<u8>, Option<i64>)> {
                         let (mut src_k, mut src_v) = src_pair?;
+                        let row_tt = if let Some(kpos) = tt_kpos {
+                            let tuple = try_decode_tuple_from_kv(&src_k, &src_v, Some(size_hint))?;
+                            match tuple.get(kpos) {
+                                Some(DataValue::Validity(v)) => Some(v.timestamp.0 .0),
+                                _ => bail!(HistoryImportInvalidTt(format!(
+                                    "corrupt tt value in backup relation '{relation}'"
+                                ))),
+                            }
+                        } else {
+                            None
+                        };
                         dst_handle.amend_key_prefix(&mut src_k);
                         dst_handle.amend_key_prefix(&mut src_v);
-                        Ok((src_k, src_v))
+                        Ok((src_k, src_v, row_tt))
                     },
                 );
                 for result in data_it {
-                    let (key, val) = result?;
+                    let (key, val, row_tt) = result?;
+                    if let Some(tt_us) = row_tt {
+                        ensure!(
+                            tt_us >= 0 && tt_us != i64::MAX,
+                            HistoryImportInvalidTt(format!(
+                                "invalid tt {tt_us} in backup relation '{relation}'"
+                            ))
+                        );
+                        max_imported_tt = max_imported_tt.max(tt_us);
+                    }
                     dst_tx.store_tx.put(&key, &val)?;
+                }
+
+                if dst_handle.has_txtime() {
+                    imported_tt_rel_ids.push(dst_handle.id.0);
+                    if let Some(floor) = src_handle.tt_gc_floor {
+                        ensure!(
+                            floor >= 0 && floor != i64::MAX,
+                            HistoryImportInvalidGcFloor(
+                                relation.clone(),
+                                format!("invalid gc_floor {floor} in backup")
+                            )
+                        );
+                        max_gc_floor = max_gc_floor.max(floor);
+                    }
+                    if dst_handle.tt_gc_floor != src_handle.tt_gc_floor {
+                        dst_handle.tt_gc_floor = src_handle.tt_gc_floor;
+                        persist_relation_handle(&mut dst_tx, &dst_handle)?;
+                    }
                 }
             }
 
-            src_tx.commit_tx()?;
-            dst_tx.commit_tx()
+            if any_txtime {
+                let src_hwm = src_tx.read_persisted_tt_hwm()?.unwrap_or(0);
+                src_tx.commit_tx()?;
+                {
+                    let _tt_guard = self
+                        .tt_commit_lock
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let _invalidate_builds = InvalidateTtBuildsOnDrop {
+                        registry: &self.tt_index_builds,
+                        ids: &imported_tt_rel_ids,
+                    };
+                    let existing_persisted = dst_tx.read_persisted_tt_hwm()?;
+                    let existing_hwm = existing_persisted.unwrap_or(0);
+                    let new_hwm = existing_hwm
+                        .max(src_hwm)
+                        .max(max_imported_tt)
+                        .max(max_gc_floor);
+                    if new_hwm > existing_hwm || (new_hwm > 0 && existing_persisted.is_none()) {
+                        dst_tx
+                            .store_tx
+                            .put_externally_serialized(&tt_hwm_key(), &new_hwm.to_be_bytes())?;
+                    }
+                    if !dst_tx.dirty_relations.is_empty() {
+                        self.graph_projections
+                            .begin_commit(&dst_tx.dirty_relations);
+                        dst_tx.commit_inflight = true;
+                    }
+                    let commit_res = dst_tx.store_tx.commit();
+                    if dst_tx.commit_inflight {
+                        dst_tx.commit_inflight = false;
+                        self.graph_projections
+                            .finish_commit(&dst_tx.dirty_relations);
+                        dst_tx.dirty_relations.clear();
+                    }
+                    commit_res?;
+                    if new_hwm > 0 {
+                        self.tt_clock.seed(Some(new_hwm));
+                    }
+                }
+                self.graph_projections.invalidate_all();
+                for (handle, relation) in &stranded_handles {
+                    warn_if_indexes_stranded(handle, relation, "backup restore into");
+                }
+                self.flush_warnings();
+                Ok(())
+            } else {
+                for (handle, relation) in &stranded_handles {
+                    warn_if_indexes_stranded(handle, relation, "backup restore into");
+                }
+                self.flush_warnings();
+                src_tx.commit_tx()?;
+                dst_tx.commit_tx()
+            }
         }
     }
     /// Register a custom fixed rule implementation.
@@ -4742,7 +5268,279 @@ pub(crate) fn write_import_tuple(
     Ok(())
 }
 
-#[cfg(feature = "columnar-io")]
+/// Serializable descriptor of one relation column in a [`TxTimeExportBundle`].
+#[derive(Debug, Clone, Eq, PartialEq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub struct TxTimeColumnSchema {
+    pub name: String,
+    pub typing: crate::data::relation::NullableColType,
+    pub default_expr: Option<String>,
+}
+
+/// Serializable descriptor of a relation's exact schema (`keys` + `non_keys`,
+/// types, nullability, and defaults) stored in a [`TxTimeExportBundle`].
+#[derive(Debug, Clone, Eq, PartialEq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub struct TxTimeRelationSchema {
+    pub keys: Vec<TxTimeColumnSchema>,
+    pub non_keys: Vec<TxTimeColumnSchema>,
+}
+
+impl TxTimeRelationSchema {
+    pub(crate) fn from_metadata(meta: &crate::data::relation::StoredRelationMetadata) -> Self {
+        let conv = |col: &ColumnDef| TxTimeColumnSchema {
+            name: col.name.to_string(),
+            typing: col.typing.clone(),
+            default_expr: col.default_gen.as_ref().map(|e| e.to_string()),
+        };
+        Self {
+            keys: meta.keys.iter().map(conv).collect(),
+            non_keys: meta.non_keys.iter().map(conv).collect(),
+        }
+    }
+}
+
+/// Portable transaction-time snapshot bundle produced by
+/// [`Db::export_txtime_state`] and consumed by
+/// [`Db::import_relations_with_history`] (mnestic fork, EA4 Batch 4.3).
+#[derive(Debug, Clone, Default, serde_derive::Serialize, serde_derive::Deserialize)]
+pub struct TxTimeExportBundle {
+    /// Persisted commit-clock high-water mark at export time (`0` if never written).
+    pub tt_hwm: i64,
+    /// Exact schema metadata (`keys`, `non_keys`, types, nullability, defaults)
+    /// for every relation in `relations`.
+    pub schemas: BTreeMap<String, TxTimeRelationSchema>,
+    /// Per-relation `::history_gc` floor (`relation_name -> cutoff_us`) for
+    /// exported relations that have a floor set.
+    pub gc_floors: BTreeMap<String, i64>,
+    /// Full raw version rows (including `tt` and assertion/retraction flags) per relation.
+    pub relations: BTreeMap<String, NamedRows>,
+    /// Optional `mnestic_evict_audit` rows present in the snapshot.
+    pub evict_audit: Option<NamedRows>,
+}
+
+impl TxTimeExportBundle {
+    /// Convert this bundle to Cozo's portable JSON format (`DataValue::Validity`
+    /// encoded as `[timestamp_us, is_assert]`).
+    pub fn into_json(self) -> JsonValue {
+        let relations: serde_json::Map<String, JsonValue> = self
+            .relations
+            .into_iter()
+            .map(|(k, v)| (k, v.into_json()))
+            .collect();
+        let evict_audit = match self.evict_audit {
+            Some(rows) => rows.into_json(),
+            None => JsonValue::Null,
+        };
+        json!({
+            "tt_hwm": self.tt_hwm,
+            "schemas": self.schemas,
+            "gc_floors": self.gc_floors,
+            "relations": relations,
+            "evict_audit": evict_audit,
+        })
+    }
+
+    /// Reconstruct a bundle from Cozo's portable JSON format.
+    pub fn from_json(value: &JsonValue) -> Result<Self> {
+        let obj = value
+            .as_object()
+            .ok_or_else(|| miette!("TxTimeExportBundle requires a JSON object"))?;
+        let tt_hwm = obj
+            .get("tt_hwm")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| miette!("TxTimeExportBundle requires integer 'tt_hwm' field"))?;
+        let schemas: BTreeMap<String, TxTimeRelationSchema> = match obj.get("schemas") {
+            Some(v) => serde_json::from_value(v.clone()).into_diagnostic()?,
+            None => BTreeMap::new(),
+        };
+        let mut gc_floors = BTreeMap::new();
+        if let Some(floors_val) = obj.get("gc_floors") {
+            let floors_obj = floors_val
+                .as_object()
+                .ok_or_else(|| miette!("'gc_floors' must be a JSON object"))?;
+            for (k, v) in floors_obj {
+                let floor = v.as_i64().ok_or_else(|| {
+                    miette!("gc_floor for relation '{}' must be an integer", k)
+                })?;
+                gc_floors.insert(k.clone(), floor);
+            }
+        }
+        let rels_obj = obj
+            .get("relations")
+            .and_then(|v| v.as_object())
+            .ok_or_else(|| miette!("TxTimeExportBundle requires object 'relations' field"))?;
+        let mut relations = BTreeMap::new();
+        for (k, v) in rels_obj {
+            relations.insert(k.clone(), NamedRows::from_json(v)?);
+        }
+        let evict_audit = match obj.get("evict_audit") {
+            None | Some(JsonValue::Null) => None,
+            Some(v) => Some(NamedRows::from_json(v)?),
+        };
+        Ok(Self {
+            tt_hwm,
+            schemas,
+            gc_floors,
+            relations,
+            evict_audit,
+        })
+    }
+}
+
+struct InvalidateTtBuildsOnDrop<'a> {
+    registry: &'a crate::runtime::txtime_index::SharedBuildRegistry,
+    ids: &'a [u64],
+}
+
+impl Drop for InvalidateTtBuildsOnDrop<'_> {
+    fn drop(&mut self) {
+        if self.ids.is_empty() {
+            return;
+        }
+        let mut guard = self
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for &id in self.ids {
+            guard.invalidate(id, None);
+        }
+    }
+}
+
+/// Summary returned by [`Db::import_relations_with_history`] (mnestic fork, EA4 Batch 4.3).
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde_derive::Serialize, serde_derive::Deserialize)]
+pub struct HistoryImportReport {
+    /// Total raw version rows imported across all relations (including `mnestic_evict_audit`).
+    pub rows_imported: usize,
+    /// Effective persisted `tt_hwm` after the import commits.
+    pub tt_hwm: i64,
+    /// Search indexes (`"<relation>:<index>"`) not populated by raw history
+    /// restore; run `::reindex <relation>` after import to rebuild them.
+    pub indexes_needing_reindex: Vec<String>,
+}
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("cannot import historical rows into non-empty TxTime relation '{0}'")]
+#[diagnostic(
+    code(tx::history_import_non_empty),
+    help(
+        "merging historical timestamps into a non-empty relation would interleave commit history; \
+         import into an empty relation or restore the full store with restore_backup()"
+    )
+)]
+struct HistoryImportNonEmpty(String);
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("cannot import relation '{0}' with history: schema does not match destination relation")]
+#[diagnostic(
+    code(tx::import_schema_mismatch),
+    help("re-create the destination relation with the exact exported column names and types")
+)]
+struct HistoryImportSchemaMismatch(String);
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("invalid transaction timestamp in history import: {0}")]
+#[diagnostic(code(tx::history_import_invalid_tt))]
+struct HistoryImportInvalidTt(String);
+
+#[derive(Debug, Error, Diagnostic)]
+#[error("invalid gc_floor for relation '{0}' in history import: {1}")]
+#[diagnostic(code(tx::history_import_invalid_gc_floor))]
+struct HistoryImportInvalidGcFloor(String, String);
+
+fn export_relation_raw(tx: &SessionTx<'_>, handle: &RelationHandle) -> Result<NamedRows> {
+    let size_hint = handle.metadata.keys.len() + handle.metadata.non_keys.len();
+    let headers: Vec<String> = handle
+        .metadata
+        .keys
+        .iter()
+        .chain(handle.metadata.non_keys.iter())
+        .map(|col| col.name.to_string())
+        .collect();
+    let start = Tuple::default().encode_as_key(handle.id);
+    let end = Tuple::default().encode_as_key(handle.id.next());
+    let mut rows = vec![];
+    for data in tx.store_tx.range_scan(&start, &end) {
+        let (k, v) = data?;
+        let tuple = try_decode_tuple_from_kv(&k, &v, Some(size_hint))?;
+        rows.push(tuple);
+    }
+    Ok(NamedRows::new(headers, rows))
+}
+
+fn parse_history_tt(value: DataValue, is_bitemporal: bool, relation: &str) -> Result<Validity> {
+    let vld = match value {
+        DataValue::Validity(v) => v,
+        DataValue::List(l) if l.len() == 2 => {
+            let Some(ts) = l[0].get_int_strict() else {
+                bail!(HistoryImportInvalidTt(format!(
+                    "relation '{relation}': expected integer microsecond timestamp, got {:?}",
+                    l[0]
+                )));
+            };
+            let Some(is_assert) = l[1].get_bool() else {
+                bail!(HistoryImportInvalidTt(format!(
+                    "relation '{relation}': expected boolean assert flag, got {:?}",
+                    l[1]
+                )));
+            };
+            Validity {
+                timestamp: ValidityTs(std::cmp::Reverse(ts)),
+                is_assert: std::cmp::Reverse(is_assert),
+            }
+        }
+        other => {
+            bail!(HistoryImportInvalidTt(format!(
+                "relation '{relation}': expected Validity or [ts_us, is_assert], got {other:?}"
+            )));
+        }
+    };
+    let ts = vld.timestamp.0 .0;
+    ensure!(
+        ts >= 0 && ts != i64::MAX,
+        HistoryImportInvalidTt(format!(
+            "relation '{relation}': timestamp {ts} must be in [0, i64::MAX)"
+        ))
+    );
+    if is_bitemporal {
+        ensure!(
+            vld.is_assert.0,
+            HistoryImportInvalidTt(format!(
+                "relation '{relation}': bitemporal tt flag must be true (retractions ride the vt column)"
+            ))
+        );
+    }
+    Ok(vld)
+}
+
+fn persist_relation_handle(tx: &mut SessionTx<'_>, handle: &RelationHandle) -> Result<()> {
+    let name_key = vec![DataValue::Str(handle.name.clone())].encode_as_key(RelationId::SYSTEM);
+    let mut meta_val = vec![];
+    serde::Serialize::serialize(
+        handle,
+        &mut rmp_serde::Serializer::new(&mut meta_val).with_struct_map(),
+    )
+    .into_diagnostic()?;
+    tx.store_tx.put(&name_key, &meta_val)?;
+    Ok(())
+}
+
+fn rebuild_tt_btree_indexes(tx: &mut SessionTx<'_>, handle: &RelationHandle) -> Result<()> {
+    let current_rows: Vec<Tuple> = handle
+        .skip_scan_all(tx, MAX_VALIDITY_TS)
+        .collect::<Result<Vec<_>>>()?;
+    for (idx_handle, extraction_indices) in handle.indices.values() {
+        for row in &current_rows {
+            let vals: Vec<DataValue> = extraction_indices
+                .iter()
+                .map(|&i| row[i].clone())
+                .collect();
+            let key = idx_handle.encode_key_for_store(&vals, Default::default())?;
+            tx.store_tx.put(&key, &[])?;
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn stranded_index_names(handle: &RelationHandle) -> Vec<String> {
     handle
         .hnsw_indices

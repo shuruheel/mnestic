@@ -35,6 +35,31 @@ provenance and licensing.
   drop, `::repair_corrupt`) deletes the rows of all of them. Stores restored by
   a build before 0.13.0 (`f125fbd2`) can hold such IDs.
 
+### Added — history-preserving export, import, and backup contract for transaction-time relations (EA4 Batch 4.3)
+
+- Added `Db::export_txtime_state` / `DbInstance::export_txtime_state` returning
+  `TxTimeExportBundle` (`tt_hwm`, exact per-relation `schemas`, per-relation
+  `gc_floors`, raw `relations` with full `tt` version history and retraction
+  flags, and optional `evict_audit`, with portable `into_json` / `from_json`
+  round-trip).
+- Added `Db::import_relations_with_history` /
+  `DbInstance::import_relations_with_history` returning `HistoryImportReport`.
+  Restores raw `TxTime` history into empty schema-matched relations (rejecting
+  non-empty targets with `tx::history_import_non_empty`, schema mismatches with
+  `tx::import_schema_mismatch`, invalid timestamps, and same-`tt`
+  assert/retract collisions with `eval::txtime_assert_retract_conflict`),
+  restores `gc_floor` and `mnestic_evict_audit`, rebuilds attached B-tree
+  secondary indexes in-transaction, advances and persists `tt_hwm` under
+  `tt_commit_lock`, invalidates graph projections, and reports stranded search
+  indexes via `indexes_needing_reindex` and `import.stranded_indexes` without
+  firing triggers. Ordinary `import_relations` continues to reject `tt` columns.
+- `Db::import_from_backup` now admits empty schema-matched `TxTime` relations,
+  copying raw history, restoring `gc_floor`, advancing `tt_hwm` under
+  `tt_commit_lock`, invalidating projections, and warning on stranded search
+  indexes while continuing to reject non-empty targets with
+  `tx::history_import_non_empty`. Added explicit physical `backup_db` /
+  `restore_backup` parity and clock-skew monotonicity integration tests.
+
 ### Added — as-of vector search and B-tree secondary indexes on transaction-time relations (EA4 Batch 4.1)
 
 - `:as_of` vector search on tt-only relations executes a bounded exact scan over

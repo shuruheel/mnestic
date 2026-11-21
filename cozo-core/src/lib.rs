@@ -69,6 +69,7 @@ pub use cypher::{CypherGraphSchema, EdgeMap, NodeMap};
 pub use data::aggr::{
     CustomAggrRegistries, MeetAggrObj, NormalAggrObj, RegisteredAggr, RegisteredBoundedMeet,
 };
+pub use data::relation::{ColType, NullableColType, VecElementType};
 pub use data::value::{DataValue, Num, RegexWrapper, UuidWrapper, Validity, ValidityTs};
 pub use fixed_rule::{FixedRule, FixedRuleInputRelation, FixedRulePayload};
 /// The adjacency types a graph projection hands out (mnestic fork).
@@ -89,7 +90,9 @@ pub use graph::prelude::{DirectedCsrGraph, DirectedNeighbors, DirectedNeighborsW
 #[cfg(feature = "columnar-io")]
 pub use runtime::columnar::{ColumnarFileFormat, ColumnarImportOptions, ColumnarImportReport};
 pub use runtime::db::Db;
-pub use runtime::db::NamedRows;
+pub use runtime::db::{
+    HistoryImportReport, NamedRows, TxTimeColumnSchema, TxTimeExportBundle, TxTimeRelationSchema,
+};
 pub use runtime::diagnostics::QueryWarning;
 #[cfg(feature = "graph-algo")]
 pub use runtime::graph_projection::{
@@ -851,6 +854,45 @@ impl DbInstance {
             DbInstance::Sled(db) => db.import_relations(data),
             #[cfg(feature = "storage-tikv")]
             DbInstance::TiKv(db) => db.import_relations(data),
+        }
+    }
+    /// Dispatcher method. See [crate::Db::export_txtime_state].
+    pub fn export_txtime_state<I, T>(&self, relations: I) -> Result<TxTimeExportBundle>
+    where
+        T: AsRef<str>,
+        I: Iterator<Item = T>,
+    {
+        match self {
+            DbInstance::Mem(db) => db.export_txtime_state(relations),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.export_txtime_state(relations),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.export_txtime_state(relations),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.export_txtime_state(relations),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.export_txtime_state(relations),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.export_txtime_state(relations),
+        }
+    }
+    /// Dispatcher method. See [crate::Db::import_relations_with_history].
+    pub fn import_relations_with_history(
+        &self,
+        bundle: TxTimeExportBundle,
+    ) -> Result<HistoryImportReport> {
+        match self {
+            DbInstance::Mem(db) => db.import_relations_with_history(bundle),
+            #[cfg(feature = "storage-sqlite")]
+            DbInstance::Sqlite(db) => db.import_relations_with_history(bundle),
+            #[cfg(feature = "storage-rocksdb")]
+            DbInstance::RocksDb(db) => db.import_relations_with_history(bundle),
+            #[cfg(feature = "storage-new-rocksdb")]
+            DbInstance::NewRocksDb(db) => db.import_relations_with_history(bundle),
+            #[cfg(feature = "storage-sled")]
+            DbInstance::Sled(db) => db.import_relations_with_history(bundle),
+            #[cfg(feature = "storage-tikv")]
+            DbInstance::TiKv(db) => db.import_relations_with_history(bundle),
         }
     }
     /// Atomically import a Parquet or Arrow IPC file into an existing relation.
