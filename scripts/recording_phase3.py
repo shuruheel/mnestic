@@ -21,15 +21,17 @@ try:
 except ImportError:
     np = None
 
-PHASE = 5
+PHASE = 6
 BLOCKS = 10
 PAIRS = 100
-READ_PAIRS = 1000
+READ_PAIRS = 3000
 MUTATION_PAIRS = 1000
+ROUND_IDLE_SECONDS = 30
+CELL_IDLE_SECONDS = 2
 DRAWS = 10000
-# Fresh Phase 5 Hetzner dedicated-core Linux campaign (ea3-phase5-hetzner-amendment.md); no prior observations pooled.
+# Fresh Phase 6 Hetzner dedicated-core Linux campaign (ea3-phase6-hetzner-amendment.md); no prior observations pooled.
 PRIOR_ATTEMPT_SECONDS = 0
-BUDGET = 12600 - PRIOR_ATTEMPT_SECONDS
+BUDGET = 10800 - PRIOR_ATTEMPT_SECONDS
 BASELINE_HEAD = '94595f8e9b57941fcd3827aba78d0f8e61843dda'
 
 
@@ -221,7 +223,7 @@ def run(candidate, baseline, output, review_manifest, scratch_dir=None):
     os.environ.update(environment)
     scripts = [Path(__file__),Path(host.__file__),Path(controls.__file__),Path(harness.__file__),
                Path(__file__).with_name('analyze_timing_diagnostics.py')]
-    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-phase5-hetzner-amendment.md'
+    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-phase6-hetzner-amendment.md'
     builds = {}
     for arm,path in [('candidate',candidate),('baseline',baseline)]:
         info = json.loads((path/'build.json').read_text())
@@ -256,9 +258,10 @@ def run(candidate, baseline, output, review_manifest, scratch_dir=None):
                   protocol=str(protocol),protocol_sha256=file_hash(protocol),environment=environment,
                   scratch_dir=scratch_resolved,
                   blocks=BLOCKS,read_pairs_per_block=READ_PAIRS,mutation_pairs_per_block=MUTATION_PAIRS,
-                  draws=DRAWS,total_budget_seconds=12600,
+                  draws=DRAWS,total_budget_seconds=10800,
                   prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,remaining_budget_seconds=BUDGET,
-                  host=dict(idle_seconds=30,max_preflight_seconds=300,other_cpu_percent=25),
+                  host=dict(round_idle_seconds=ROUND_IDLE_SECONDS,cell_idle_seconds=CELL_IDLE_SECONDS,
+                            max_preflight_seconds=300,other_cpu_percent=25),
                   cell_seconds=300,rss_mib=4096,min_free_mib=2048)
     save(output/'campaign-manifest.json',frozen)
     observations = {c['name']:[] for c in cells}
@@ -270,14 +273,16 @@ def run(candidate, baseline, output, review_manifest, scratch_dir=None):
             raise RuntimeError('campaign wall budget')
     try:
         for block in range(BLOCKS):
-            for cell in cells:
+            for cell_idx, cell in enumerate(cells):
                 budget()
                 validate_frozen_builds(builds)
                 if file_hash(review_manifest) != frozen['review_manifest_sha256']:
                     raise ValueError('review manifest changed after freeze')
                 name = cell['name']; prefix = output/f'{name}-block-{block:02}'
+                quiet_s = ROUND_IDLE_SECONDS if cell_idx == 0 else CELL_IDLE_SECONDS
                 pre = host.preflight(prefix.with_suffix('.preflight.jsonl'),output,
-                                     max_seconds=min(300,BUDGET-(time.monotonic()-started)))
+                                     max_seconds=min(300,BUDGET-(time.monotonic()-started)),
+                                     quiet_seconds=quiet_s)
                 save(prefix.with_suffix('.preflight-result.json'),pre)
                 if not pre['eligible']:
                     stop = dict(reason='host_preflight',block=block,cell=name,detail=pre)

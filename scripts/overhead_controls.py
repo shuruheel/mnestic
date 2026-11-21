@@ -17,7 +17,7 @@ def fixture(backend, temporal, kind, pairs=None, warmup_count=None, shared_reado
     if shared_readonly is None:
         shared_readonly = (kind == 'read')
     if pairs is None:
-        pairs = 1000
+        pairs = 3000 if shared_readonly else 1000
     if warmup_count is None:
         warmup_count = 100 if shared_readonly else 20
     rows = base['setup'][1]['params']['r']

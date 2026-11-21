@@ -160,7 +160,7 @@ class Ea3QualifyTests(unittest.TestCase):
             controls.mkdir()
             (controls / "campaign-manifest.json").write_text("{}")
             (controls / "campaign-completion.json").write_text(
-                json.dumps(dict(all_recording_controls_passed=False, phase=5, completed_blocks=180))
+                json.dumps(dict(all_recording_controls_passed=False, phase=6, completed_blocks=180))
             )
             with self.assertRaisesRegex(RuntimeError, "qualification blocked"):
                 qual.run_qualification(root / "cand", root / "base", controls, root / "bench", root / "out")
