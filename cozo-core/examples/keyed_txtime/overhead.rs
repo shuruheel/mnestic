@@ -85,7 +85,7 @@ fn logical_digest(db: &DbInstance) -> Result<String> {
         .into_json();
     let mut names: Vec<String> = rels["rows"]
         .as_array()
-        .ok_or_else(|| miette!("expected ::relations rows array"))?
+        .ok_or_else(|| miette::miette!("expected ::relations rows array"))?
         .iter()
         .filter_map(|row| row.get(0).and_then(|v| v.as_str()).map(str::to_owned))
         .collect();
