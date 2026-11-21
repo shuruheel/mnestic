@@ -21,6 +21,17 @@ provenance and licensing.
 
 ### Changed
 
+- **Plain scalar counts can validate stored vector rows without constructing
+  unused vectors on RocksDB.** Only an unfiltered, non-temporal stored scan
+  under row-preserving projection/unit wrappers, with one vector non-key column,
+  qualifies. Counts retain the
+  existing snapshot, aggregate, output and budget paths. The recognized value
+  encoding is checked in full; malformed or other encodings use the ordinary
+  decoder, preserving corruption errors. Other backends retain their original query path. No storage-format change or persisted count/cache is introduced.
+  End-to-end API latency and retrieval qualification remain open; this change
+  has no published speedup claim. Contract: `docs/specs/validated-scalar-count.md`.
+
+
 - **A storage ID shared by more than one relation is reported through
   `::warnings`.** The check at open already logged an error for each shared
   ID. A host that embeds the engine and does not read its log never saw it: a
