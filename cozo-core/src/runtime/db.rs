@@ -154,6 +154,9 @@ pub struct Db<S> {
     tt_clock: Arc<TtClock>,
     /// Critical section for tt allocation + persist + commit (spec §13.10).
     pub(crate) tt_commit_lock: Arc<Mutex<()>>,
+    /// Strict FIFO ticket queue guarding entry to `tt_commit_lock`, preventing
+    /// mutual starvation between concurrent writers and shadow index drain.
+    pub(crate) tt_commit_queue: Arc<crate::runtime::relation_lock::RelationLock>,
     /// User-registered aggregates (mnestic fork, provenance semirings R0b) —
     /// mirrors `fixed_rules`. In-memory, `Db`-scoped; consulted by the parser
     /// when a head aggregate is not a builtin. NOT consulted when parsing
@@ -421,6 +424,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             relation_store_id: Default::default(),
             tt_clock: Default::default(),
             tt_commit_lock: Default::default(),
+            tt_commit_queue: Default::default(),
             custom_aggrs: Default::default(),
             custom_bounded_meets: Default::default(),
             queries_count: Default::default(),
@@ -2276,6 +2280,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             keyed_access: self.enable_keyed_access.load(Ordering::Relaxed),
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
+            tt_commit_queue: self.tt_commit_queue.clone(),
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
             pending_tt_evicts: Vec::new(),
@@ -2313,6 +2318,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             keyed_access: self.enable_keyed_access.load(Ordering::Relaxed),
             tt_clock: self.tt_clock.clone(),
             tt_commit_lock: self.tt_commit_lock.clone(),
+            tt_commit_queue: self.tt_commit_queue.clone(),
             pending_tt_writes: Vec::new(),
             tt_hwm_dirty: false,
             pending_tt_evicts: Vec::new(),

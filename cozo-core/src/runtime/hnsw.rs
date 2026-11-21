@@ -98,6 +98,7 @@ pub(crate) struct VectorCache<'r, 's> {
     pub(crate) cache: FxHashMap<CompoundKey, Vector>,
     pub(crate) distance: HnswDistance,
     pub(crate) base_tx: Option<&'r SessionTx<'s>>,
+    pub(crate) shadow: Option<(crate::runtime::txtime_index::SharedBuildRegistry, u64)>,
 }
 
 impl VectorCache<'static, 'static> {
@@ -106,6 +107,19 @@ impl VectorCache<'static, 'static> {
             cache: FxHashMap::default(),
             distance,
             base_tx: None,
+            shadow: None,
+        }
+    }
+    pub(crate) fn with_shadow(
+        distance: HnswDistance,
+        shared: crate::runtime::txtime_index::SharedBuildRegistry,
+        token: u64,
+    ) -> Self {
+        Self {
+            cache: FxHashMap::default(),
+            distance,
+            base_tx: None,
+            shadow: Some((shared, token)),
         }
     }
 }
@@ -116,6 +130,7 @@ impl<'r, 's> VectorCache<'r, 's> {
             cache: FxHashMap::default(),
             distance,
             base_tx: Some(base_tx),
+            shadow: None,
         }
     }
     pub(crate) fn seed_row(
@@ -292,9 +307,18 @@ impl<'r, 's> VectorCache<'r, 's> {
         tx: &SessionTx<'_>,
     ) -> Result<()> {
         if !self.cache.contains_key(key) {
-            let found = match self.base_tx {
-                Some(base_tx) => handle.get_current(base_tx, &key.0)?,
-                None => handle.get_current(tx, &key.0)?,
+            let found = if let Some((ref shared, token)) = self.shadow {
+                let encoded = crate::data::tuple::TupleT::encode_as_key(&key.0, handle.id);
+                match crate::runtime::txtime_index::lookup_shadow_pending(shared, token, &encoded)?
+                {
+                    Some(opt_tuple) => opt_tuple,
+                    None => handle.get_current(tx, &key.0)?,
+                }
+            } else {
+                match self.base_tx {
+                    Some(base_tx) => handle.get_current(base_tx, &key.0)?,
+                    None => handle.get_current(tx, &key.0)?,
+                }
             };
             match found {
                 Some(tuple) => self.insert_from_tuple(key, &tuple)?,
@@ -323,6 +347,37 @@ impl<'r, 's> VectorCache<'r, 's> {
         }
         if missing.len() == 1 {
             return self.ensure_key(missing[0], handle, tx);
+        }
+        if let Some((ref shared, token)) = self.shadow {
+            let encoded_keys: Vec<Vec<u8>> = missing
+                .iter()
+                .map(|k| crate::data::tuple::TupleT::encode_as_key(&k.0, handle.id))
+                .collect();
+            let overrides = crate::runtime::txtime_index::lookup_shadow_pending_batch(
+                shared,
+                token,
+                &encoded_keys,
+            )?;
+            let mut from_db: Vec<&CompoundKey> = Vec::new();
+            for (key, ov) in missing.into_iter().zip(overrides) {
+                match ov {
+                    Some(Some(tuple)) => self.insert_from_tuple(key, &tuple)?,
+                    Some(None) => bail!("Cannot find compound key for HNSW: {:?}", key),
+                    None => from_db.push(key),
+                }
+            }
+            if from_db.is_empty() {
+                return Ok(());
+            }
+            let key_slices: Vec<&[DataValue]> = from_db.iter().map(|k| k.0.as_slice()).collect();
+            let tuples = handle.get_current_batch(tx, &key_slices)?;
+            for (key, tuple) in from_db.into_iter().zip(tuples) {
+                match tuple {
+                    Some(tuple) => self.insert_from_tuple(key, &tuple)?,
+                    None => bail!("Cannot find compound key for HNSW: {:?}", key),
+                }
+            }
+            return Ok(());
         }
         let key_slices: Vec<&[DataValue]> = missing.iter().map(|k| k.0.as_slice()).collect();
         let tuples = match self.base_tx {

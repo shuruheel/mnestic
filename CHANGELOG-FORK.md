@@ -45,6 +45,16 @@ provenance and licensing.
   bounded touched-key log; publication catches up concurrent commits before
   attaching the generation. Mem and SQLite use their existing single-writer
   transaction model. Failed rebuilds preserve the attached generation.
+- **WRITE_ONLY shadow dual-write maintenance for detached RocksDB TxTime HNSW
+  builds and strict FIFO `tt_commit_queue`.** After initial detached graph
+  construction completes, HNSW builds transition the detached generation to a
+  `WRITE_ONLY` shadow state and release the pinned snapshot immediately. Live
+  writers dual-write their committed key changes directly into the detached
+  generation (with error isolation so shadow failures abort only the build,
+  never user writes), while the builder drains keys touched during the snapshot
+  phase one key per strict FIFO `tt_commit_queue` (`RelationLock`) turn before
+  atomic publication. `runtime/db.rs`, `runtime/transact.rs`, `runtime/hnsw.rs`,
+  `runtime/txtime_index.rs`, `runtime/txtime_build.rs`.
 - TxTime index/catalog DDL must be standalone. The tt column cannot appear in
   indexed fields, extractors or filters. Eviction of an indexed relation is
   limited to 1,000 logical keys per command. Bitemporal search and B-tree
