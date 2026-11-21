@@ -26,6 +26,18 @@ class PhaseTests(unittest.TestCase):
         self.assertFalse(result['freeze_control_passed'])
         self.assertEqual(result['estimates']['0.99']['conservative_upper95'],1.2)
 
+    def test_numpy_estimates_matches_pure_python_bit_for_bit(self):
+        if phase.np is None:
+            self.skipTest('numpy not installed')
+        blocks = [
+            ([100 + (b * 37 + i * 13) % 97 for i in range(200)],
+             [100 + (b * 29 + i * 17) % 89 for i in range(200)])
+            for b in range(10)
+        ]
+        pure = phase.estimates(blocks, draws=300, use_numpy=False)
+        fast = phase.estimates(blocks, draws=300, use_numpy=True)
+        self.assertEqual(fast, pure)
+
     def test_archive_preserves_full_evidence_and_report(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)/'run'; root.mkdir()
@@ -52,7 +64,7 @@ class PhaseTests(unittest.TestCase):
     def test_native_disk_power_and_swap_conditions_fail_closed(self):
         valid=dict(free_mib=3000,ac_power=True,low_power_disabled=True,native=[],swapouts=10,steal_delta=0)
         self.assertIsNone(host.invalid(valid,10))
-        self.assertEqual(phase.BUDGET, 10800)
+        self.assertEqual(phase.BUDGET, 12600)
         for key,value,reason in [('free_mib',1000,'disk_limit'),('ac_power',False,'power_condition'),
                                   ('low_power_disabled',False,'power_condition'),('native',[(1,'cargo')],'competing_native_process'),
                                   ('swapouts',11,'swapout_change'),('steal_delta',1,'hypervisor_steal')]:
@@ -85,7 +97,7 @@ class PhaseTests(unittest.TestCase):
             (path/'build.json').write_text(json.dumps(info))
             builds[arm]=dict(directory=str(path),executable_sha256=info['executable_sha256'],
                              build_manifest_sha256=phase.file_hash(path/'build.json'),build=info)
-        review=dict(phase=4,implementation_review_passed=True,
+        review=dict(phase=5,implementation_review_passed=True,
                     builds={arm:dict(build_manifest_sha256=b['build_manifest_sha256'],executable_sha256=b['executable_sha256'],source=b['build']['source']) for arm,b in builds.items()},
                     shared_runner={name:{arm:'same' for arm in builds} for name in ['cozo-core/examples/keyed_txtime_timing.rs','cozo-core/examples/keyed_txtime/overhead.rs']})
         review_path=root/'review.json';review_path.write_text(json.dumps(review))

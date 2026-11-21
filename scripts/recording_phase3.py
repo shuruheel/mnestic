@@ -16,15 +16,20 @@ import overhead_controls as controls
 import timing_harness as harness
 from analyze_timing_diagnostics import quantile
 
-PHASE = 4
+try:
+    import numpy as np
+except ImportError:
+    np = None
+
+PHASE = 5
 BLOCKS = 10
 PAIRS = 100
 READ_PAIRS = 1000
-MUTATION_PAIRS = 500
+MUTATION_PAIRS = 1000
 DRAWS = 10000
-# Fresh Phase 4 Hetzner dedicated-core Linux campaign (ea3-phase4-hetzner-amendment.md); no prior observations pooled.
+# Fresh Phase 5 Hetzner dedicated-core Linux campaign (ea3-phase5-hetzner-amendment.md); no prior observations pooled.
 PRIOR_ATTEMPT_SECONDS = 0
-BUDGET = 10800 - PRIOR_ATTEMPT_SECONDS
+BUDGET = 12600 - PRIOR_ATTEMPT_SECONDS
 BASELINE_HEAD = '94595f8e9b57941fcd3827aba78d0f8e61843dda'
 
 
@@ -98,7 +103,7 @@ def measured_pairs(directory):
     return values['True'], values['False']
 
 
-def estimates(blocks, draws=DRAWS, check_budget=lambda: None):
+def estimates(blocks, draws=DRAWS, check_budget=lambda: None, use_numpy=None):
     if len(blocks) != BLOCKS or not blocks[0][0]:
         raise ValueError('all ten complete blocks are required')
     n_pairs = len(blocks[0][0])
@@ -106,34 +111,62 @@ def estimates(blocks, draws=DRAWS, check_budget=lambda: None):
         raise ValueError('all ten complete blocks are required')
     if any(v <= 0 for arms in blocks for arm in arms for v in arm):
         raise ValueError('nonpositive duration')
+    if use_numpy is None:
+        use_numpy = np is not None
+    if use_numpy and np is None:
+        raise RuntimeError('numpy is required when use_numpy=True')
     sub_block = n_pairs // 10
+    total = BLOCKS * n_pairs
     on = [v for a,_ in blocks for v in a]
     off = [v for _,b in blocks for v in b]
     output = {str(q):dict(ratio=quantile(on,q)/quantile(off,q),upper95={}) for q in [.5,.99]}
+    k50 = math.ceil(.5*total)-1
+    k99 = math.ceil(.99*total)-1
+    kth = (k50, k99)
+    if use_numpy:
+        on_arr = np.asarray(on, dtype=np.int64)
+        off_arr = np.asarray(off, dtype=np.int64)
+        on_sub = on_arr.reshape(BLOCKS, 10, sub_block)
+        off_sub = off_arr.reshape(BLOCKS, 10, sub_block)
     for method in ['hierarchical_block10','conditional_iid']:
         rng = random.Random(20261114)
         distributions = {.5:[],.99:[]}
         for draw in range(draws):
             if draw % 100 == 0:
                 check_budget()
-            if method == 'hierarchical_block10':
-                selected = [rng.randrange(BLOCKS) for _ in range(BLOCKS)]
-                indices = []
-                for block in selected:
-                    starts = [rng.randrange(10)*sub_block for _ in range(10)]
-                    indices.extend(block*n_pairs+i for start in starts for i in range(start,start+sub_block))
+            if use_numpy:
+                if method == 'hierarchical_block10':
+                    selected = [rng.randrange(BLOCKS) for _ in range(BLOCKS)]
+                    b_idx = [b for b in selected for _ in range(10)]
+                    s_idx = [rng.randrange(10) for _ in range(BLOCKS * 10)]
+                    a = on_sub[b_idx, s_idx].ravel()
+                    b = off_sub[b_idx, s_idx].ravel()
+                else:
+                    indices = [rng.randrange(total) for _ in range(total)]
+                    a = on_arr[indices]
+                    b = off_arr[indices]
+                pa = np.partition(a, kth)
+                pb = np.partition(b, kth)
+                distributions[.5].append(int(pa[k50])/int(pb[k50]))
+                distributions[.99].append(int(pa[k99])/int(pb[k99]))
             else:
-                indices = [rng.randrange(BLOCKS*n_pairs) for _ in range(BLOCKS*n_pairs)]
-            a = sorted(on[i] for i in indices)
-            b = sorted(off[i] for i in indices)
-            for q in distributions:
-                k = math.ceil(q*len(a))-1
-                distributions[q].append(a[k]/b[k])
+                if method == 'hierarchical_block10':
+                    selected = [rng.randrange(BLOCKS) for _ in range(BLOCKS)]
+                    indices = []
+                    for block in selected:
+                        starts = [rng.randrange(10)*sub_block for _ in range(10)]
+                        indices.extend(block*n_pairs+i for start in starts for i in range(start,start+sub_block))
+                else:
+                    indices = [rng.randrange(total) for _ in range(total)]
+                a = sorted(on[i] for i in indices)
+                b = sorted(off[i] for i in indices)
+                distributions[.5].append(a[k50]/b[k50])
+                distributions[.99].append(a[k99]/b[k99])
         for q,samples in distributions.items():
             output[str(q)]['upper95'][method] = quantile(samples,.95)
     for e in output.values():
         e['conservative_upper95'] = max(e['upper95'].values())
-    return dict(estimates=output,blocks=BLOCKS,pairs=BLOCKS*n_pairs,
+    return dict(estimates=output,blocks=BLOCKS,pairs=total,
                 block_quantiles=[{str(q):dict(on_ns=quantile(a,q),off_ns=quantile(b,q)) for q in [.5,.99]} for a,b in blocks],
                 freeze_control_passed=all(e['conservative_upper95'] <= 1.05 for e in output.values()))
 
@@ -188,7 +221,7 @@ def run(candidate, baseline, output, review_manifest, scratch_dir=None):
     os.environ.update(environment)
     scripts = [Path(__file__),Path(host.__file__),Path(controls.__file__),Path(harness.__file__),
                Path(__file__).with_name('analyze_timing_diagnostics.py')]
-    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-phase4-hetzner-amendment.md'
+    protocol = Path(__file__).resolve().parents[1]/'docs/plans/ea3-phase5-hetzner-amendment.md'
     builds = {}
     for arm,path in [('candidate',candidate),('baseline',baseline)]:
         info = json.loads((path/'build.json').read_text())
@@ -223,7 +256,7 @@ def run(candidate, baseline, output, review_manifest, scratch_dir=None):
                   protocol=str(protocol),protocol_sha256=file_hash(protocol),environment=environment,
                   scratch_dir=scratch_resolved,
                   blocks=BLOCKS,read_pairs_per_block=READ_PAIRS,mutation_pairs_per_block=MUTATION_PAIRS,
-                  draws=DRAWS,total_budget_seconds=10800,
+                  draws=DRAWS,total_budget_seconds=12600,
                   prior_attempt_budget_seconds=PRIOR_ATTEMPT_SECONDS,remaining_budget_seconds=BUDGET,
                   host=dict(idle_seconds=30,max_preflight_seconds=300,other_cpu_percent=25),
                   cell_seconds=300,rss_mib=4096,min_free_mib=2048)

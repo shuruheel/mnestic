@@ -1086,7 +1086,7 @@ def analyze_qualification(output_dir, inputs_dir, canonical_attempts=None):
 
     summary = dict(
         version=1,
-        protocol="docs/plans/ea3-phase4-hetzner-amendment.md",
+        protocol="docs/plans/ea3-phase5-hetzner-amendment.md",
         seeds=SEEDS,
         all_gates_passed=all_passed,
         gates=gates,
@@ -1115,7 +1115,7 @@ def run_qualification(candidate_dir, baseline_dir, controls_dir, bench_repo, out
     cman_sha = phase.file_hash(cman_path)
     if not (
         comp.get("all_recording_controls_passed") is True
-        and comp.get("phase") == 4
+        and comp.get("phase") == 5
         and comp.get("completed_blocks") == 180
         and comp.get("scripts_and_protocol_unchanged") is True
         and comp.get("campaign_manifest_sha256") == cman_sha
@@ -1158,7 +1158,7 @@ def run_qualification(candidate_dir, baseline_dir, controls_dir, bench_repo, out
     all_specs = build_all_plans(metas, plans_dir)
 
     bench_head = subprocess.check_output(["git", "-C", str(bench_repo), "rev-parse", "HEAD"], text=True).strip()
-    proto_path = Path(__file__).resolve().parents[1] / "docs/plans/ea3-phase4-hetzner-amendment.md"
+    proto_path = Path(__file__).resolve().parents[1] / "docs/plans/ea3-phase5-hetzner-amendment.md"
     scripts_list = [
         Path(__file__),
         Path(host.__file__),
