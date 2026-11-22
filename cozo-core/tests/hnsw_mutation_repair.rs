@@ -497,3 +497,46 @@ fn sustained_clustered_churn_never_fails_a_write() {
         orphans.rows
     );
 }
+
+/// A newly inserted vertex selects at most `m` links on layer 0, where the
+/// degree cap is `m_max0 = 2m` (Malkov & Yashunin Alg. 1, as in hnswlib).
+/// Selecting up to the cap filled every new vertex, so nearly every later
+/// back-link forced a shrink. Back-links may still raise a vertex to `2m`.
+#[test]
+fn a_new_vertex_selects_m_links_on_layer_zero() {
+    let (n, dim, m) = (200usize, 16usize, 4usize);
+    for engine in engines() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = DbInstance::new(engine, dir.path().join("db").to_str().unwrap(), "").unwrap();
+        let mut rng = Rng(0x2545_F491_4F6C_DD1D);
+        run(&db, &format!(":create t {{id:Int=>v:<F32;{dim}>}}"));
+        run(
+            &db,
+            &format!(
+                "::hnsw create t:vec {{dim:{dim},m:{m},dtype:F32,fields:[v],distance:L2,ef_construction:64}}"
+            ),
+        );
+        let mut max_new_degree = 0f64;
+        let mut max_degree = 0f64;
+        for id in 0..n as i64 {
+            let v: Vec<f32> = (0..dim).map(|_| rng.unit()).collect();
+            run(
+                &db,
+                &format!("?[id,v]<-[[{id},{}]] :put t{{id=>v}}", vec_literal(&v)),
+            );
+            // Out-degree of the vertex just inserted, before any back-link.
+            let deg = run(
+                &db,
+                &format!("?[d] := *t:vec{{layer: 0, fr_id: {id}, to_id: {id}, dist: d}}"),
+            );
+            max_new_degree = max_new_degree.max(deg.rows[0][0].get_float().unwrap());
+        }
+        for row in run(&db, "?[d] := *t:vec{layer: 0, fr_id: a, to_id: a, dist: d}").rows {
+            max_degree = max_degree.max(row[0].get_float().unwrap());
+        }
+        assert!(max_new_degree <= m as f64, "{engine}: new vertex took {max_new_degree} links");
+        assert!(max_degree <= (2 * m) as f64, "{engine}: degree {max_degree} over m_max0");
+        // Back-links still use the 2m headroom on layer 0.
+        assert!(max_degree > m as f64, "{engine}: no vertex grew past m ({max_degree})");
+    }
+}

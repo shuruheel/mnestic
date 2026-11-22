@@ -55,6 +55,17 @@ impl HnswIndexManifest {
         // the level is the largest integer smaller than r
         -(r.floor() as i64)
     }
+
+    /// How many links a newly inserted vertex selects on a layer whose degree
+    /// cap is `cap`: `m_neighbours` (M), never more than the cap. Layer 0 caps
+    /// existing vertices at `m_max0 = 2M`; selecting only M there, as in
+    /// Malkov & Yashunin (2018) Alg. 1 and hnswlib, leaves room for incoming
+    /// links. Selecting the full 2M filled every new vertex to its cap, so
+    /// nearly every later back-link forced a shrink (mnestic fork).
+    #[inline]
+    pub(crate) fn insert_degree(&self, cap: usize) -> usize {
+        self.m_neighbours.min(cap)
+    }
 }
 
 mod repair;
@@ -804,7 +815,7 @@ impl SessionTx<'_> {
                     let tentative = self.hnsw_select_neighbours_heuristic(
                         q,
                         &level_candidates,
-                        m_max,
+                        manifest.insert_degree(m_max),
                         current_level,
                         manifest,
                         idx_table,
@@ -1089,7 +1100,7 @@ impl SessionTx<'_> {
                         None => self.hnsw_select_neighbours_heuristic(
                             q,
                             &pre_lvl.candidates,
-                            m_max,
+                            manifest.insert_degree(m_max),
                             current_level,
                             manifest,
                             idx_table,
@@ -1110,7 +1121,7 @@ impl SessionTx<'_> {
                     self.hnsw_select_neighbours_heuristic(
                         q,
                         &found_nn,
-                        m_max,
+                        manifest.insert_degree(m_max),
                         current_level,
                         manifest,
                         idx_table,

@@ -22,6 +22,7 @@ Options default_db_options() {
     BlockBasedTableOptions table_options;
     table_options.block_size = 16 * 1024;
     table_options.cache_index_and_filter_blocks = true;
+    table_options.cache_index_and_filter_blocks_with_high_priority = true;
     table_options.pin_l0_filter_and_index_blocks_in_cache = true;
     table_options.format_version = 5;
 
@@ -45,6 +46,7 @@ ColumnFamilyOptions default_cf_options() {
 
     table_options.block_size = 16 * 1024;
     table_options.cache_index_and_filter_blocks = true;
+    table_options.cache_index_and_filter_blocks_with_high_priority = true;
     table_options.pin_l0_filter_and_index_blocks_in_cache = true;
     table_options.format_version = 5;
 
@@ -76,10 +78,14 @@ open_db_impl(const DbOpts &opts, const shared_ptr<RocksMemoryResources> &memory,
         report.used_shared_resources = true;
         report.shared_cache_capacity = memory->cache->GetCapacity();
     } else if (opts.block_cache_size > 0) {
-        // Honour the size the caller asked for. This used to hardcode 1 GiB and ignore
-        // `block_cache_size` entirely, so a caller requesting 64 MB silently got sixteen
-        // times that.
-        cache = NewLRUCache(opts.block_cache_size);
+        // Honour the size the caller asked for. Keep each LRU shard >= 16 MiB
+        // so monolithic SSTable index/filter blocks (~2+ MiB after compaction)
+        // never exceed a single shard and miss on every Get(), while leaving
+        // 100% of the cache usable for data blocks (high_pri_pool_ratio = 0.0)
+        // so read-heavy working sets near cache capacity do not thrash.
+        cache = NewLRUCache(opts.block_cache_size,
+                            lru_cache_shard_bits(opts.block_cache_size),
+                            false, 0.0);
     }
 
     if (!opts.options_path.empty()) {
