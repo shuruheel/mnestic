@@ -791,7 +791,7 @@ fn hnsw_extend_candidates_concurrent_replacements_stay_consistent() {
 }
 
 #[test]
-fn hnsw_pre_shadow_unlocked_catchup_drains_large_backlog_before_shadow_mode() {
+fn hnsw_shadow_persistent_cache_drain_handles_large_backlog_and_concurrent_writes() {
     let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(
         DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "{}").unwrap(),

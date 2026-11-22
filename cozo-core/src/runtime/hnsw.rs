@@ -101,6 +101,7 @@ pub(crate) struct VectorCache<'r, 's> {
     pub(crate) distance: HnswDistance,
     pub(crate) base_tx: Option<&'r SessionTx<'s>>,
     pub(crate) shadow: Option<(crate::runtime::txtime_index::SharedBuildRegistry, u64)>,
+    has_list_vectors: bool,
 }
 
 impl VectorCache<'static, 'static> {
@@ -110,6 +111,7 @@ impl VectorCache<'static, 'static> {
             distance,
             base_tx: None,
             shadow: None,
+            has_list_vectors: false,
         }
     }
     pub(crate) fn with_shadow(
@@ -122,6 +124,7 @@ impl VectorCache<'static, 'static> {
             distance,
             base_tx: None,
             shadow: Some((shared, token)),
+            has_list_vectors: false,
         }
     }
 }
@@ -133,7 +136,12 @@ impl<'r, 's> VectorCache<'r, 's> {
             distance,
             base_tx: Some(base_tx),
             shadow: None,
+            has_list_vectors: false,
         }
+    }
+    pub(crate) fn clear(&mut self) {
+        self.cache.clear();
+        self.has_list_vectors = false;
     }
     pub(crate) fn seed_row(
         &mut self,
@@ -145,13 +153,12 @@ impl<'r, 's> VectorCache<'r, 's> {
         for &field in &manifest.vec_fields {
             match &row[field] {
                 DataValue::Vec(v) => {
-                    self.cache.insert((key.clone(), field, -1), v.clone());
+                    self.insert((key.clone(), field, -1), v.clone());
                 }
                 DataValue::List(values) => {
                     for (sub, value) in values.iter().enumerate() {
                         if let DataValue::Vec(v) = value {
-                            self.cache
-                                .insert((key.clone(), field, sub as i32), v.clone());
+                            self.insert((key.clone(), field, sub as i32), v.clone());
                         }
                     }
                 }
@@ -180,11 +187,29 @@ impl<'r, 's> VectorCache<'r, 's> {
             }
         }
     }
-    pub(crate) fn evict_logical_key(&mut self, logical_key: &[DataValue]) {
-        self.cache.retain(|(k, _, _), _| k.as_slice() != logical_key);
+    pub(crate) fn evict_logical_keys(
+        &mut self,
+        manifest: &HnswIndexManifest,
+        keys: &FxHashSet<Tuple>,
+    ) {
+        if keys.is_empty() || self.cache.is_empty() {
+            return;
+        }
+        if !self.has_list_vectors {
+            for logical_key in keys {
+                for &field in &manifest.vec_fields {
+                    self.cache.remove(&(logical_key.clone(), field, -1));
+                }
+            }
+        } else {
+            self.cache.retain(|(k, _, _), _| !keys.contains(k));
+        }
     }
-    fn insert(&mut self, k: CompoundKey, v: Vector) {
-        self.cache.insert(k, v);
+    fn insert(&mut self, k: CompoundKey, v: Vector) -> Option<Vector> {
+        if k.2 >= 0 {
+            self.has_list_vectors = true;
+        }
+        self.cache.insert(k, v)
     }
     #[inline]
     pub(super) fn vec_norm_sq(&self, v: &Vector) -> f64 {
@@ -481,7 +506,7 @@ impl<'r, 's> VectorCache<'r, 's> {
         }
         match field {
             DataValue::Vec(v) => {
-                self.cache.insert(key.clone(), v.clone());
+                self.insert(key.clone(), v.clone());
             }
             _ => bail!("Cannot interpret {} as vector", field),
         }
@@ -844,7 +869,7 @@ impl SessionTx<'_> {
                     }
                     if !full_neighbours.is_empty() {
                         let prev_self_vec =
-                            vec_cache.cache.insert(inserted_key.clone(), q.clone());
+                            vec_cache.insert(inserted_key.clone(), q.clone());
                         for (neighbour, dist_to_q, existing) in full_neighbours {
                             if vec_cache.ensure_key(&neighbour, orig_table, self).is_err() {
                                 continue;
@@ -899,7 +924,7 @@ impl SessionTx<'_> {
                         }
                         match prev_self_vec {
                             Some(v) => {
-                                vec_cache.cache.insert(inserted_key.clone(), v);
+                                vec_cache.insert(inserted_key.clone(), v);
                             }
                             None => {
                                 vec_cache.cache.remove(&inserted_key);

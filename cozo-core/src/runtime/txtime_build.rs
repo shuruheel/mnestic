@@ -621,61 +621,13 @@ impl<'s, S: Storage<'s>> Db<S> {
             let mut snapshot = Some(snapshot);
             let mut shadow_active = false;
             if !build.hnsw_indices.is_empty() {
-                // Phase A: while `build` is still detached and invisible to
-                // writers, shrink any large backfill-era backlog via unlocked
-                // chunked catch-up rounds (zero `tt_commit_lock` holds during
-                // replay). Stop as soon as the backlog is small (<= 32 keys)
-                // or stops shrinking meaningfully, then hand off to WRITE_ONLY
-                // shadow dual-write maintenance so arbitrary writer bursts
-                // converge monotonically without long exclusive holds.
-                const HNSW_PRE_SHADOW_MAX_ROUNDS: usize = 4;
-                const HNSW_PRE_SHADOW_STOP_KEYS: usize = 32;
-                let mut prev_pending: Option<usize> = None;
-                for round in 0..HNSW_PRE_SHADOW_MAX_ROUNDS {
-                    poison.check()?;
-                    let (next_snapshot, pending) = {
-                        let _section =
-                            section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
-                        let peek_len = registration.keys()?.len();
-                        if peek_len <= HNSW_PRE_SHADOW_STOP_KEYS {
-                            break;
-                        }
-                        if prev_pending.is_some_and(|prev| peek_len * 4 >= prev * 3) {
-                            break;
-                        }
-                        let pending = registration.take_keys()?;
-                        let next_snapshot = self.transact()?;
-                        let current = next_snapshot.get_relation(name, false)?;
-                        validate(&original, &current, &build)?;
-                        (next_snapshot, pending)
-                    };
-                    let pending_len = pending.len();
-                    let t_round = Instant::now();
-                    count = self.replay_tt_catchup_unlocked(
-                        &original,
-                        &build,
-                        snapshot.as_ref().expect("snapshot live"),
-                        &next_snapshot,
-                        &pending,
-                        count,
-                        &poison,
-                    )?;
-                    if profile {
-                        eprintln!(
-                            "tt hnsw pre-shadow catchup round {round}: replayed {pending_len} keys in {:?}",
-                            t_round.elapsed()
-                        );
-                    }
-                    snapshot = Some(next_snapshot);
-                    prev_pending = Some(pending_len);
-                }
-
-                // Phase B: WRITE_ONLY (shadow dual-write) catch-up for HNSW builds
+                // WRITE_ONLY (shadow dual-write) catch-up for HNSW builds
                 // (Google F1 / PostgreSQL CREATE INDEX CONCURRENTLY pattern):
-                // activate shadow mode unconditionally so both remaining
-                // backfill-era keys and any post-backfill writer bursts are
-                // maintained directly by writers, while residual keys drain 1
-                // per brief `tt_commit_lock` turn.
+                // activate shadow mode immediately after backfill so writers
+                // maintain all post-backfill mutations directly (avoiding
+                // backlog growth when writers are faster than single-threaded
+                // replay), while backfill-era keys drain in small pre-warmed
+                // batches per brief `tt_commit_lock` turn.
                 poison.check()?;
                 let initial_keys = {
                     let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
@@ -716,81 +668,124 @@ impl<'s, S: Storage<'s>> Db<S> {
                 #[cfg(feature = "test-hooks")]
                 self.run_tt_index_build_fence("shadow_active");
                 if activated_len > 0 {
+                    const MAX_SHADOW_DRAIN_CACHE_VECTORS: usize = 50_000;
                     let drain_filters = SessionTx::make_hnsw_filters(&build)?;
+                    // Keep one persistent VectorCache per HNSW index across the
+                    // shadow drain loop instead of rebuilding it cold on every
+                    // key, evicting any keys mutated since `cache_seq` via
+                    // `tt_recent_mutations` before each pre-warm pass.
+                    let mut cache_seq = self.tt_recent_mutations.seq();
+                    let mut drain_caches: BTreeMap<
+                        smartstring::SmartString<smartstring::LazyCompact>,
+                        crate::runtime::hnsw::VectorCache<'static, 'static>,
+                    > = build
+                        .hnsw_indices
+                        .iter()
+                        .map(|(idx_name, (_, manifest))| {
+                            (
+                                idx_name.clone(),
+                                crate::runtime::hnsw::VectorCache::with_shadow(
+                                    manifest.distance,
+                                    self.tt_index_builds.clone(),
+                                    registration.token(),
+                                ),
+                            )
+                        })
+                        .collect();
                     loop {
                         poison.check()?;
                         // Peek the next pending key and pre-search/pre-warm on a
                         // read snapshot OUTSIDE `tt_commit_lock` so the builder
-                        // holds `tt_commit_lock` only for graph mutation + commit.
+                        // holds `tt_commit_lock` only for 1-key graph mutation + commit.
                         let Some((encoded, key, prior)) = registration.peek_shadow_pending()?
                         else {
                             break;
                         };
                         let mut prewarm = {
                             let pre_tx = self.transact()?;
+                            let mutated_opt = self
+                                .tt_recent_mutations
+                                .mutated_since(cache_seq, original.id.0);
+                            cache_seq = pre_tx.tt_pre_seq;
                             let mut pw = crate::runtime::txtime_index::PrewarmedTtHnsw {
                                 pre_seq: pre_tx.tt_pre_seq,
                                 attached: BTreeMap::new(),
                                 shadow: BTreeMap::new(),
                             };
-                            if let Ok(now_spec) = original.get_current(&pre_tx, &key) {
-                                let mut stack = Vec::new();
-                                for (idx_name, (idx_handle, manifest)) in &build.hnsw_indices {
-                                    let filter = drain_filters.get(idx_name);
-                                    let new_passes = match (now_spec.as_ref(), filter) {
-                                        (None, _) => false,
-                                        (Some(_), None) => true,
-                                        (Some(r), Some(code)) => crate::data::expr::eval_bytecode_pred(
+                            let now_spec = original.get_current(&pre_tx, &key).ok().flatten();
+                            let mut stack = Vec::new();
+                            for (idx_name, (idx_handle, manifest)) in &build.hnsw_indices {
+                                let mut vec_cache =
+                                    drain_caches.remove(idx_name).unwrap_or_else(|| {
+                                        crate::runtime::hnsw::VectorCache::with_shadow(
+                                            manifest.distance,
+                                            self.tt_index_builds.clone(),
+                                            registration.token(),
+                                        )
+                                    });
+                                match mutated_opt.as_ref() {
+                                    Some(mutated) => {
+                                        vec_cache.evict_logical_keys(manifest, mutated);
+                                    }
+                                    None => vec_cache.clear(),
+                                }
+                                if vec_cache.cache.len() > MAX_SHADOW_DRAIN_CACHE_VECTORS {
+                                    vec_cache.clear();
+                                }
+                                let filter = drain_filters.get(idx_name);
+                                let new_passes = match (now_spec.as_ref(), filter) {
+                                    (None, _) => false,
+                                    (Some(_), None) => true,
+                                    (Some(r), Some(code)) => {
+                                        crate::data::expr::eval_bytecode_pred(
                                             code,
                                             r,
                                             &mut stack,
                                             Default::default(),
                                         )
-                                        .unwrap_or(false),
-                                    };
-                                    let new_for_hnsw =
-                                        new_passes.then(|| now_spec.as_ref().unwrap());
-                                    let mut vec_cache =
-                                        crate::runtime::hnsw::VectorCache::with_shadow(
-                                            manifest.distance,
-                                            self.tt_index_builds.clone(),
-                                            registration.token(),
-                                        );
-                                    if let Some(p) = prior.as_ref() {
-                                        vec_cache.seed_row(manifest, &build, p);
+                                        .unwrap_or(false)
                                     }
-                                    let mut presearch_map = BTreeMap::new();
-                                    let mut removals_map = BTreeMap::new();
-                                    if let Ok(found) = pre_tx.hnsw_presearch_and_warm(
-                                        prior.as_ref(),
-                                        new_for_hnsw,
-                                        manifest,
-                                        &build,
-                                        idx_handle,
-                                        &mut vec_cache,
-                                    ) {
-                                        if !found.inserts.is_empty() {
-                                            presearch_map.insert(key.clone(), found.inserts);
-                                        }
-                                        if !found.removals.is_empty() {
-                                            removals_map.insert(key.clone(), found.removals);
-                                        }
-                                    }
-                                    pw.shadow.insert(
-                                        (registration.token(), idx_name.clone()),
-                                        crate::runtime::txtime_index::PrewarmedIndex {
-                                            vec_cache,
-                                            presearch: presearch_map,
-                                            removals: removals_map,
-                                        },
-                                    );
+                                };
+                                let new_for_hnsw =
+                                    new_passes.then(|| now_spec.as_ref().unwrap());
+                                if let Some(p) = prior.as_ref() {
+                                    vec_cache.seed_row(manifest, &build, p);
                                 }
+                                let mut presearch_map = BTreeMap::new();
+                                let mut removals_map = BTreeMap::new();
+                                if let Ok(found) = pre_tx.hnsw_presearch_and_warm(
+                                    prior.as_ref(),
+                                    new_for_hnsw,
+                                    manifest,
+                                    &build,
+                                    idx_handle,
+                                    &mut vec_cache,
+                                ) {
+                                    if !found.inserts.is_empty() {
+                                        presearch_map.insert(key.clone(), found.inserts);
+                                    }
+                                    if !found.removals.is_empty() {
+                                        removals_map.insert(key.clone(), found.removals);
+                                    }
+                                }
+                                pw.shadow.insert(
+                                    (registration.token(), idx_name.clone()),
+                                    crate::runtime::txtime_index::PrewarmedIndex {
+                                        vec_cache,
+                                        presearch: presearch_map,
+                                        removals: removals_map,
+                                    },
+                                );
                             }
                             pw
                         };
                         let _section = section(&self.tt_commit_queue, &self.tt_commit_lock, &poison)?;
                         if !registration.is_shadow_key_pending(&encoded)? {
-                            // A concurrent writer already claimed this key while we pre-warmed.
+                            // Concurrent writer already claimed this key while we pre-warmed;
+                            // reclaim the warmed caches for the next iteration.
+                            for ((_, idx_name), pw_idx) in prewarm.shadow {
+                                drain_caches.insert(idx_name, pw_idx.vec_cache);
+                            }
                             continue;
                         }
                         let mut tx = self.transact_write()?;
@@ -813,6 +808,9 @@ impl<'s, S: Storage<'s>> Db<S> {
                         let complete_res = registration.complete_shadow_key(&encoded, delta);
                         self.tt_recent_mutations.record_key(original.id.0, key);
                         complete_res?;
+                        for ((_, idx_name), pw_idx) in prewarm.shadow {
+                            drain_caches.insert(idx_name, pw_idx.vec_cache);
+                        }
                         drained_by_builder += 1;
                         if profile && drained_by_builder % 500 == 0 {
                             eprintln!(
