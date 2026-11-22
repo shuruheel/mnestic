@@ -102,7 +102,8 @@ Complete transaction-time (`TxTime`) current-belief indexing (FTS, HNSW, LSH, an
 - FTS, HNSW and LSH indexes can be created on tt-only relations. Index identity
   uses logical keys; corrections, retractions, imports and evictions maintain
   the current belief atomically with the base rows. Historical base reads
-  remain available; historical search fails with `search::as_of_unsupported`.
+  remain available; historical FTS/LSH search fails with `search::as_of_unsupported`
+  (historical `:as_of` vector search is served via `hnsw_history_scan` per Batch 4.1 above).
 - RocksDB builds and rebuilds use private generations, a pinned snapshot and a
   bounded touched-key log; publication catches up concurrent commits before
   attaching the generation. Mem and SQLite use their existing single-writer

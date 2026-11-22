@@ -199,7 +199,9 @@ jobs:
       matrix:
         python: ["3.8", "3.12"]
         platform:
-          - { os: ubuntu-latest,    artifact: mnestic-wheels-ubuntu-latest-x86_64 }
+          # Pin Ubuntu 24.04 for the Linux x86_64 smoke test: actions/python-versions
+          # has no Python 3.8 binary for ubuntu-26.04 (ubuntu-latest).
+          - { os: ubuntu-24.04,     artifact: mnestic-wheels-ubuntu-latest-x86_64 }
           - { os: ubuntu-24.04-arm, artifact: mnestic-wheels-ubuntu-latest-aarch64 }
           - { os: macos-15,         artifact: mnestic-wheels-macos-15-aarch64 }
           - { os: windows-latest,   artifact: mnestic-wheels-windows-latest-x64 }
