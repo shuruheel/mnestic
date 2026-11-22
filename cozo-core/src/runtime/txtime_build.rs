@@ -359,7 +359,7 @@ impl<'s, S: Storage<'s>> Db<S> {
             registration_span.finish();
             #[cfg(feature = "test-hooks")]
             let backfill_span = crate::measurement::Span::new("build_backfill");
-            let rows = current.scan_current(&tx).collect::<Result<Vec<_>>>()?;
+            let rows = current.scan_current_uncached(&tx).collect::<Result<Vec<_>>>()?;
             tx.populate_tt_indexes(&build, &rows, &poison)?;
             #[cfg(feature = "test-hooks")]
             backfill_span.finish();
@@ -481,7 +481,7 @@ impl<'s, S: Storage<'s>> Db<S> {
                 let mut lsh_rows: Vec<Tuple> = Vec::new();
                 let mut stack = Vec::new();
 
-                for row_res in original.scan_current(&snapshot) {
+                for row_res in original.scan_current_uncached(&snapshot) {
                     if count % 256 == 0 {
                         poison.check()?;
                     }

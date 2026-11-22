@@ -3,6 +3,65 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
+## Unreleased
+
+### Changed
+
+- **A new HNSW vertex selects `m` links on layer 0, not `2m`.** Layer 0 caps
+  every vertex at `m_max0 = 2m`, and the insert path selected up to that cap
+  for the new vertex. Each vertex therefore started full, and nearly every
+  later back-link forced a shrink of the neighbour it landed on. The new vertex
+  now selects `m` (Malkov & Yashunin 2018, Alg. 1; hnswlib does the same), and
+  the cap stays at `2m`, so back-links fill the headroom. Upper layers are
+  unchanged (their cap is already `m`). Applies to incremental inserts, updates
+  and `::hnsw create` bulk builds; existing graphs are not rewritten and keep
+  their degrees until their vectors are re-inserted. `runtime/hnsw.rs`
+  (`HnswIndexManifest::insert_degree`), `runtime/hnsw_build.rs`; guarded by
+  `a_new_vertex_selects_m_links_on_layer_zero`.
+  Measured with this release's other changes against 0.20.0 (20,000 clustered
+  384-dim vectors, Cosine, `m: 16`, `ef_construction: 50`, RocksDB, 200
+  queries, mean of two seeds on the shared CI host): per-row insert 10% faster
+  on a plain relation and 14% on a tt-only one, replacement 13% and 12%, bulk
+  build 9%; recall@10 equal within noise at `ef` 16–128 on all three paths
+  (for example 0.9983 against 0.9960 at `ef: 32` incremental, 0.9718 against
+  0.9643 at `ef: 16` bulk); query time 6–20% lower on an incrementally built
+  plain index, 24–30% lower on a tt-only one, and 3–5% lower on a bulk-built one.
+- **RocksDB block cache shards are at least 16 MiB (`mnestic-rocks`).** With
+  RocksDB's default sharding a 128 MiB cache has 64 shards of 2 MiB. An entry
+  larger than its shard is never retained, so the Bloom filter of a compacted
+  64 MiB SST (about 2.05 MiB) was re-read on every point lookup. The shard count
+  now keeps each shard at 16 MiB or more (at most 64 shards), for both a
+  standalone cache and the shared `RocksMemoryResources` cache. Index and
+  filter blocks are inserted with high priority, which keeps them resident in
+  the shared cache's high-priority pool; the standalone cache keeps no
+  high-priority pool, so all of it stays available to data blocks.
+  `cozorocks/bridge/db.{h,cpp}`.
+
+  **Release note for whoever cuts the next version:** this is a `cozorocks`
+  change, so `mnestic-rocks` publishes first and `cozo-core/Cargo.toml` re-pins.
+- **One-pass index builds no longer fill the block cache.** Building a search
+  index scans the whole base relation once; the scanned blocks used to evict
+  the working set of concurrent readers and writers. The TxTime backfills
+  (blocking and detached) and the attached LSH, FTS and HNSW builds now read
+  with `fill_cache(false)` through `RelationHandle::scan_current_uncached`.
+  Non-RocksDB backends read as before. B-tree builds are unchanged.
+  `storage/{mod,rocks}.rs`, `runtime/relation.rs`, `runtime/txtime_build.rs`.
+- **Batched current-row lookups on tt-only relations share one iterator.**
+  `RelationHandle::get_current_batch`, which fetches neighbour vectors on each
+  hop of HNSW search and maintenance (`VectorCache::ensure_keys`) and the
+  HNSW and FTS top-`k` rows, opened a fresh storage iterator per key. It now
+  probes every key in sorted order through one iterator
+  (`StoreTx::multi_skip_first`; RocksDB override, per-key default elsewhere).
+  Results are identical to `get_current`, including retracted and missing
+  keys. `storage/{mod,rocks}.rs`, `runtime/relation.rs`.
+- **Read-only queries no longer touch the relation-lock map.** A query with no
+  write target returned an empty lock list only after taking the map's read
+  lock; a single-relation write no longer builds a `BTreeSet`.
+  `runtime/db.rs` (`obtain_relation_locks`).
+
+These are ported from the closed PR #101 (EA3 Stage 2), whose remaining
+changes were superseded by #100 and #102.
+
 ## 0.20.0 — 2026-11-22
 
 Complete transaction-time (`TxTime`) current-belief indexing (FTS, HNSW, LSH, and B-tree), bounded exact `:as_of` vector search, commit-section triggers, cached `:graph` projections, and history-preserving export/import/backup — plus planner keyed access & stored negation, native parallel `hybrid_search`, HNSW/FTS query speedups, `query.missing_index` & `storage.relation_id_collision` warnings, and GCC 15+ RocksDB builds. No storage version change; existing databases open without migration. `mnestic-rocks` moves to `0.1.14`.

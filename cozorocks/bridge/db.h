@@ -28,12 +28,24 @@
 // construction; shared_ptr copies are refcounted handles to the same live
 // cache/WBM. Input validation (nonzero total, fraction strictly in (0,1))
 // happens on the Rust side before construction.
+// Choose an LRU shard count that keeps each shard at least 16 MiB (capped at
+// 64 shards). With RocksDB's default 64 shards on a 128 MiB cache, each shard
+// is only 2.00 MiB, so a compacted 64 MiB SSTable's monolithic Bloom filter
+// (~2.05+ MiB) exceeds a single shard and misses on every Get().
+inline int lru_cache_shard_bits(size_t total_bytes) {
+    int bits = 0;
+    while (bits < 6 && (total_bytes >> (bits + 1)) >= (16ULL << 20)) {
+        bits++;
+    }
+    return bits;
+}
+
 struct RocksMemoryResources {
     shared_ptr<Cache> cache;
     shared_ptr<WriteBufferManager> write_buffer_manager;
 
     RocksMemoryResources(size_t total_bytes, double memtable_fraction)
-            : cache(NewLRUCache(total_bytes, /*num_shard_bits*/ -1,
+            : cache(NewLRUCache(total_bytes, lru_cache_shard_bits(total_bytes),
                                 /*strict_capacity_limit*/ false,
                                 /*high_pri_pool_ratio*/ 0.5)),
               write_buffer_manager(make_shared<WriteBufferManager>(

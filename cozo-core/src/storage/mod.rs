@@ -223,6 +223,53 @@ pub trait StoreTx<'s>: Sync {
         valid_at: ValidityTs,
     ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>;
 
+    /// Like `range_scan_tuple`, but hints to block-cached backends (RocksDB)
+    /// not to fill the LRU block cache with scanned blocks (used for full-table
+    /// background index backfill scans so concurrent hot workloads keep their
+    /// cached blocks). (mnestic fork)
+    fn range_scan_tuple_uncached<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a>
+    where
+        's: 'a,
+    {
+        self.range_scan_tuple(lower, upper)
+    }
+
+    /// Like `range_skip_scan_tuple`, but hints not to fill the LRU block cache.
+    /// (mnestic fork)
+    fn range_skip_scan_tuple_uncached<'a>(
+        &'a self,
+        lower: &[u8],
+        upper: &[u8],
+        valid_at: ValidityTs,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        self.range_skip_scan_tuple(lower, upper, valid_at)
+    }
+
+    /// Batched first-match skip scans within a single relation's keyspace
+    /// (`rel_upper` is an exclusive upper bound covering every `(lower, upper)`
+    /// pair in `bounds`). Returns one entry per pair in the original order.
+    /// Hot backends may override to reuse one pinned iterator across sorted
+    /// probes instead of constructing a fresh iterator per key. (mnestic fork)
+    fn multi_skip_first(
+        &self,
+        _rel_upper: &[u8],
+        bounds: &[(Vec<u8>, Vec<u8>)],
+        valid_at: ValidityTs,
+    ) -> Result<Vec<Option<Tuple>>> {
+        bounds
+            .iter()
+            .map(|(lower, upper)| {
+                self.range_skip_scan_tuple(lower, upper, valid_at)
+                    .next()
+                    .transpose()
+            })
+            .collect()
+    }
+
     /// Two-level bitemporal scan (mnestic fork, bitemporality step 4b; see
     /// `data/bitemporal.rs`). The default implementation drives the generic
     /// probe loop over `range_scan` — one fresh range per probe. Correct on

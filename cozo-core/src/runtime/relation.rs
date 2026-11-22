@@ -611,10 +611,32 @@ impl RelationHandle {
 
     #[inline]
     pub(crate) fn get_current_batch(&self, tx: &SessionTx<'_>, keys: &[&[DataValue]]) -> Result<Vec<Option<Tuple>>> {
-        if self.is_tt_only() {
-            keys.iter().map(|key| self.get_current(tx, key)).collect()
+        if !self.is_tt_only() {
+            return self.get_batch(tx, keys);
+        }
+        if keys.len() <= 1 {
+            return keys.iter().map(|key| self.get_current(tx, key)).collect();
+        }
+        // One storage iterator serves every probe instead of one per key
+        // (mnestic fork). Bounds match `get_current` exactly.
+        use crate::data::memcmp::MemCmpEncoder;
+        let bounds: Vec<(Vec<u8>, Vec<u8>)> = keys
+            .iter()
+            .map(|key| {
+                let prefix_len = key.len().min(self.metadata.keys.len());
+                let lower = (&key[..prefix_len]).encode_as_key(self.id);
+                let mut upper = Vec::with_capacity(lower.len() + 1);
+                upper.extend_from_slice(&lower);
+                upper.encode_datavalue(&DataValue::Bot);
+                (lower, upper)
+            })
+            .collect();
+        let rel_upper = Tuple::default().encode_as_key(self.id.next());
+        let valid_at = crate::data::functions::MAX_VALIDITY_TS;
+        if self.is_temp {
+            tx.temp_store_tx.multi_skip_first(&rel_upper, &bounds, valid_at)
         } else {
-            self.get_batch(tx, keys)
+            tx.store_tx.multi_skip_first(&rel_upper, &bounds, valid_at)
         }
     }
 
@@ -624,6 +646,24 @@ impl RelationHandle {
             Box::new(self.skip_scan_all(tx, crate::data::functions::MAX_VALIDITY_TS))
         } else {
             Box::new(self.scan_all(tx))
+        }
+    }
+
+    /// `scan_current` for one-pass index backfills: block-cached backends do
+    /// not keep the scanned blocks, so a backfill does not evict the working
+    /// set of concurrent readers and writers (mnestic fork).
+    pub(crate) fn scan_current_uncached<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+    ) -> Box<dyn Iterator<Item = Result<Tuple>> + 'a> {
+        let lower = Tuple::default().encode_as_key(self.id);
+        let upper = Tuple::default().encode_as_key(self.id.next());
+        let valid_at = crate::data::functions::MAX_VALIDITY_TS;
+        match (self.is_temp, self.is_tt_only()) {
+            (true, true) => tx.temp_store_tx.range_skip_scan_tuple_uncached(&lower, &upper, valid_at),
+            (true, false) => tx.temp_store_tx.range_scan_tuple_uncached(&lower, &upper),
+            (false, true) => tx.store_tx.range_skip_scan_tuple_uncached(&lower, &upper, valid_at),
+            (false, false) => tx.store_tx.range_scan_tuple_uncached(&lower, &upper),
         }
     }
 
@@ -1423,7 +1463,7 @@ impl<'a> SessionTx<'a> {
 
         let hash_perms = manifest.get_hash_perms();
         let mut existing = TempCollector::default();
-        for tuple in rel_handle.scan_current(self) {
+        for tuple in rel_handle.scan_current_uncached(self) {
             existing.push(tuple?);
         }
 
@@ -1567,7 +1607,7 @@ impl<'a> SessionTx<'a> {
         let extractor = code_expr.compile()?;
 
         let mut existing = TempCollector::default();
-        for tuple in rel_handle.scan_current(self) {
+        for tuple in rel_handle.scan_current_uncached(self) {
             existing.push(tuple?);
         }
         let tuples: Vec<Tuple> = existing.into_iter().collect();
@@ -1862,7 +1902,7 @@ impl<'a> SessionTx<'a> {
 
         // populate index
         let mut all_tuples = TempCollector::default();
-        for tuple in rel_handle.scan_current(self) {
+        for tuple in rel_handle.scan_current_uncached(self) {
             all_tuples.push(tuple?);
         }
         let filter_ref = if filter.is_empty() {

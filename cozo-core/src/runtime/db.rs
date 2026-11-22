@@ -2812,11 +2812,24 @@ impl<'s, S: Storage<'s>> Db<S> {
 
     pub(crate) fn obtain_relation_locks<'a, T: Iterator<Item = &'a SmartString<LazyCompact>>>(
         &'s self,
-        rels: T,
+        mut rels: T,
     ) -> Vec<Arc<RelationLock>> {
+        // No names (every read-only query): no lock-map access at all.
+        let Some(first) = rels.next() else {
+            return Vec::new();
+        };
+        let Some(second) = rels.next() else {
+            // Single relation, the common case: no BTreeSet allocation.
+            if let Some(lock) = self.relation_locks.read().unwrap().get(first) {
+                return vec![lock.clone()];
+            }
+            let mut locks = self.relation_locks.write().unwrap();
+            return vec![locks.entry(first.clone()).or_default().clone()];
+        };
         // Canonical order and deduplication must hold even when only some names
         // already exist. Partitioning existing/missing locks inverted order.
-        let names = rels.collect::<BTreeSet<_>>();
+        let mut names = BTreeSet::from([first, second]);
+        names.extend(rels);
         {
             let locks = self.relation_locks.read().unwrap();
             if names.iter().all(|name| locks.contains_key(*name)) {

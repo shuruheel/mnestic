@@ -156,6 +156,8 @@ pub(crate) struct FlatHnswGraph {
 pub(crate) struct FlatHnswBuilder {
     dim: usize,
     distance: HnswDistance,
+    /// Links a new node selects per layer (`HnswIndexManifest::insert_degree`).
+    m_neighbours: usize,
     m_max: usize,
     m_max0: usize,
     ef_construction: usize,
@@ -179,6 +181,7 @@ impl FlatHnswBuilder {
         Self {
             dim: manifest.vec_dim,
             distance: manifest.distance,
+            m_neighbours: manifest.m_neighbours,
             m_max: manifest.m_max,
             m_max0: manifest.m_max0,
             ef_construction: manifest.ef_construction,
@@ -324,7 +327,7 @@ impl FlatHnswBuilder {
             self.search_level(q, self.ef_construction, level, bufs);
             let neighbours = self.select_heuristic(
                 q,
-                m_max,
+                self.m_neighbours.min(m_max),
                 level,
                 self.extend_candidates,
                 &bufs.found,
