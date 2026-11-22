@@ -74,7 +74,18 @@
 其余部分 —— CozoScript、存储引擎、数据模型 —— 均为上游 CozoDB，除非
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md) 中另有说明。
 
-## 0.19.4 新增
+## 0.20.0 新增
+
+**完整的事务时间（`TxTime`）索引、触发器、图投影与保留历史的备份恢复，以及键控查询计划、原生并行 `hybrid_search` 与 GCC 15+ RocksDB 编译修复。**
+
+- **事务时间当前信念索引、`:as_of` 向量检索、触发器、图投影与历史导出/导入：** FTS、HNSW、LSH 与二级 B 树索引（`::index create`）、提交区段触发器（`::set_triggers` `on put`/`on rm`）与缓存 `::graph` 投影现均支持 `tt-only` 关系（RocksDB 上采用 `SortedKvArena` SST 离线回填与 `WRITE_ONLY` 影子双写）；`:as_of` 向量检索采用有界精确历史扫描（`hnsw_history_scan`，200,000 行上限）；`export_txtime_state` / `import_relations_with_history` / `import_from_backup` 完整保留 `TxTime` 历史、`gc_floor` 与单调 `tt_hwm`。
+- **查询计划键控点查与存储否定：** 尾部等式、全键非邻接值连接（`stored_point_join`）与存储否定（`stored_neg_point_join`）改用键控点查；缺少索引的存储连接在 `::explain` 中输出 `missing_index_advisory` 并在 `::warnings` 中记录 `query.missing_index`。
+- **原生并行 `hybrid_search` 与 HNSW/FTS 查询优化：** 单快照并行执行向量、全文与图分支（`GraphLeg` 新增 `target_relation`/`target_node_col`/`target_id_col`/`limit`），RocksDB 默认 128 MiB 块缓存、原始 KV 邻居解码与零分配 FTS 倒排快速路径。
+- **运维诊断与 GCC 15+ 修复：** 共享存储 ID 在打开时通过 `::warnings` 报告 `storage.relation_id_collision`；`mnestic-rocks` 升至 **0.1.14** 修复 GCC 15+ 缺少 `<cstdint>` 的编译问题。
+
+存储格式不变，现有数据库无需迁移；`mnestic-rocks` 升至 0.1.14。
+
+## 0.19.4 起
 
 **全文索引中指向已删除行的倒排项不再使检索失败。** 检索会读取每个命中结果对应的行；此前只要有一行缺失就报 `corrupted index`，一条残留的倒排项会让所有命中它的查询失败。现在检索跳过该命中，由下一个最佳结果补位，并记录 `fts.dangling_posting` 警告（`::warnings`）；`cozo::fts_dangling_postings_skipped()` 返回进程内的累计次数。
 
