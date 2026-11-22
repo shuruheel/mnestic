@@ -74,6 +74,10 @@ pub struct SessionTx<'a> {
     pub(crate) tt_commit_queue: Arc<crate::runtime::relation_lock::RelationLock>,
     pub(crate) tt_recent_mutations: Arc<crate::runtime::txtime_index::TtRecentMutations>,
     pub(crate) tt_pre_seq: u64,
+    /// True when the backing storage supports concurrent writers (e.g. RocksDB).
+    /// Single-writer backends (SQLite, Mem) skip speculative HNSW pre-warming
+    /// outside `tt_commit_lock` because there is no lock contention to hide.
+    pub(crate) supports_concurrent_writers: bool,
     /// Buffered writes to tt-stamped relations (mnestic fork, bitemporality
     /// step 3): rows are collected at statement time and stamped + written at
     /// commit inside `commit_tx_with_tt`, so every row of the transaction
@@ -355,7 +359,15 @@ impl<'a> SessionTx<'a> {
             if result.is_ok() { commit_span.finish(); }
             return result;
         }
-        self.begun_commit_relations = self.dirty_relations.clone();
+        let has_tt_commit = !self.pending_tt_writes.is_empty() || self.tt_hwm_dirty;
+        if has_tt_commit {
+            self.begun_commit_relations = self.dirty_relations.clone();
+        } else {
+            // Plain non-TxTime commits cannot run commit-section triggers or
+            // add to `dirty_relations` during `commit_tx_inner`, so move the
+            // set in O(1) without cloning or computing set differences.
+            std::mem::swap(&mut self.begun_commit_relations, &mut self.dirty_relations);
+        }
         self.projections.begin_commit(&self.begun_commit_relations);
         self.commit_inflight = true;
         let res = self.commit_tx_inner();
@@ -363,13 +375,17 @@ impl<'a> SessionTx<'a> {
         self.projections.run_commit_fence(&self.begun_commit_relations);
         self.commit_inflight = false;
         self.projections.finish_commit(&self.begun_commit_relations);
-        let unbegun: BTreeSet<RelationId> = self
-            .dirty_relations
-            .difference(&self.begun_commit_relations)
-            .copied()
-            .collect();
-        if !unbegun.is_empty() {
-            self.projections.bump_aborted(&unbegun);
+        if !self.dirty_relations.is_empty()
+            && self.dirty_relations.len() != self.begun_commit_relations.len()
+        {
+            let unbegun: BTreeSet<RelationId> = self
+                .dirty_relations
+                .difference(&self.begun_commit_relations)
+                .copied()
+                .collect();
+            if !unbegun.is_empty() {
+                self.projections.bump_aborted(&unbegun);
+            }
         }
         self.begun_commit_relations.clear();
         self.dirty_relations.clear();
@@ -455,7 +471,13 @@ impl<'a> SessionTx<'a> {
             // VectorCache on this transaction's read snapshot BEFORE entering
             // `tt_commit_queue` / `tt_commit_lock`, so concurrent writers run
             // read-only ANN descent and base-vector fetches in parallel.
-            let mut prewarm = self.prewarm_tt_hnsw_outside_lock()?;
+            // Single-writer backends (SQLite, Mem) skip pre-warming to avoid
+            // redundant read-pass overhead when there is no lock contention.
+            let mut prewarm = if self.supports_concurrent_writers {
+                self.prewarm_tt_hnsw_outside_lock()?
+            } else {
+                crate::runtime::txtime_index::PrewarmedTtHnsw::default()
+            };
             #[cfg(feature = "test-hooks")]
             let wait = crate::measurement::Span::new("tt_commit_section");
             let _turn = queue.write_with_poison(&poison)?;

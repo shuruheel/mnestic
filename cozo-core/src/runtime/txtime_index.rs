@@ -746,9 +746,7 @@ impl SessionTx<'_> {
                         (Some(mut mutated), Some(mut pw)) => {
                             let no_concurrent =
                                 mutated.is_empty() && removed.len() <= 1 && inserted.len() <= 1;
-                            for k in &mutated {
-                                pw.vec_cache.evict_logical_key(k);
-                            }
+                            pw.vec_cache.evict_logical_keys(manifest, &mutated);
                             for row in &removed {
                                 mutated.insert(row[..handle.index_key_len()].to_vec());
                             }
@@ -1117,9 +1115,7 @@ impl SessionTx<'_> {
                                     let no_concurrent = mutated.is_empty()
                                         && removed.len() <= 1
                                         && inserted.len() <= 1;
-                                    for k in &mutated {
-                                        pw.vec_cache.evict_logical_key(k);
-                                    }
+                                    pw.vec_cache.evict_logical_keys(manifest, &mutated);
                                     for row in &removed {
                                         mutated.insert(row[..handle.index_key_len()].to_vec());
                                     }
@@ -1210,6 +1206,19 @@ impl SessionTx<'_> {
                             Some(&touched_by_remove),
                         )?;
                     }
+                }
+                // Return the warmed VectorCache back to the caller's prewarm map
+                // so a multi-step builder drain loop can reuse cached base vectors
+                // across iterations (invalidating mutated keys via `tt_recent_mutations`).
+                if let Some(pw_all) = prewarm.as_deref_mut() {
+                    pw_all.shadow.insert(
+                        (token, name.clone()),
+                        PrewarmedIndex {
+                            vec_cache,
+                            presearch: BTreeMap::new(),
+                            removals: BTreeMap::new(),
+                        },
+                    );
                 }
             }
         }

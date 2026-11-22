@@ -9,7 +9,7 @@
 //! Acquire multiple relations in canonical name order, before storage/TT locks.
 //! A queued exclusive request stops new shared arrivals, while existing holders
 //! drain. Waiting requests keep their queue position across cancellation polls.
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::marker::PhantomData;
 use std::rc::Rc;
 use std::sync::{Condvar, Mutex};
@@ -28,7 +28,7 @@ enum Mode {
 
 #[derive(Default)]
 struct State {
-    readers: HashMap<ThreadId, usize>,
+    readers: Vec<(ThreadId, usize)>,
     writer: Option<ThreadId>,
     queue: VecDeque<u64>,
     next_ticket: u64,
@@ -106,7 +106,7 @@ impl RelationLock {
         // A recursive shared acquisition must not queue behind a writer that
         // is itself waiting for this thread's existing shared guard to drain.
         if mode == Mode::Shared {
-            if let Some(count) = state.readers.get_mut(&owner) {
+            if let Some((_, count)) = state.readers.iter_mut().find(|(id, _)| *id == owner) {
                 *count += 1;
                 return Ok(guard());
             }
@@ -116,7 +116,7 @@ impl RelationLock {
             "recursive exclusive relation admission"
         );
         ensure!(
-            mode != Mode::Exclusive || !state.readers.contains_key(&owner),
+            mode != Mode::Exclusive || !state.readers.iter().any(|(id, _)| *id == owner),
             "cannot upgrade shared relation admission to exclusive admission"
         );
         if state.queue.is_empty()
@@ -125,7 +125,7 @@ impl RelationLock {
         {
             match mode {
                 Mode::Shared => {
-                    state.readers.insert(owner, 1);
+                    state.readers.push((owner, 1));
                 }
                 Mode::Exclusive => state.writer = Some(owner),
             }
@@ -155,11 +155,15 @@ impl RelationLock {
                 waiting.queued = false;
                 match mode {
                     Mode::Shared => {
-                        state.readers.insert(owner, 1);
+                        state.readers.push((owner, 1));
                     }
                     Mode::Exclusive => state.writer = Some(owner),
                 }
-                self.changed.notify_all();
+                let wake = !state.queue.is_empty();
+                drop(state);
+                if wake {
+                    self.changed.notify_all();
+                }
                 return Ok(guard());
             }
             let wait = poison
@@ -179,15 +183,23 @@ impl Drop for RelationGuard<'_> {
         let mut state = self.lock.state.lock().unwrap();
         match self.mode {
             Mode::Shared => {
-                let count = state.readers.get_mut(&self.owner).unwrap();
-                *count -= 1;
-                if *count == 0 {
-                    state.readers.remove(&self.owner);
+                let pos = state
+                    .readers
+                    .iter()
+                    .position(|(id, _)| *id == self.owner)
+                    .expect("active shared relation guard");
+                state.readers[pos].1 -= 1;
+                if state.readers[pos].1 == 0 {
+                    state.readers.swap_remove(pos);
                 }
             }
             Mode::Exclusive => state.writer = None,
         }
-        self.lock.changed.notify_all();
+        let wake = !state.queue.is_empty();
+        drop(state);
+        if wake {
+            self.lock.changed.notify_all();
+        }
     }
 }
 
