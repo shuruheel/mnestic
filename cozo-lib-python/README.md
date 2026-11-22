@@ -150,7 +150,16 @@ non-`file://` URLs. Only run CozoScript from callers you trust with those
 capabilities, or build the binding from source without the `rdf-io` feature
 for a locked-down deployment.
 
-## New in 0.19.4
+## New in 0.20.0
+
+- **Transaction-time (`TxTime`) indexing, `:as_of` vector search, triggers, and graph projections:** FTS, HNSW, LSH, and B-tree indexes (`::index create`), commit-section triggers (`::set_triggers` `on put`/`on rm`), and cached `::graph` projections now work on `tt-only` relations; `:as_of` vector queries execute a bounded exact history scan (`hnsw_history_scan`, 200,000-row fail-closed bound). History-preserving export/import (`export_txtime_state` / `import_relations_with_history`) is exposed in the Rust API.
+- **Native parallel `hybrid_search` & `GraphLeg` mapping:** `db.hybrid_search(...)` runs independent HNSW, FTS, and graph legs in parallel on one snapshot, and graph legs now accept `target_relation`, `target_node_col`, `target_id_col`, and `limit`.
+- **Faster lookups, HNSW/FTS queries, and diagnostics:** Planner keyed point lookups (`stored_point_join`, `stored_neg_point_join`), 128 MiB default RocksDB block cache, raw-KV HNSW neighbour decoding, zero-allocation FTS posting fast path, `query.missing_index` advisories, and `storage.relation_id_collision` warnings in `::warnings`.
+- **RocksDB GCC 15+ build fix:** `mnestic-rocks` moves to 0.1.14 (wheel builds include RocksDB on Linux, macOS, and Windows).
+
+No storage version change.
+
+## From 0.19.4
 
 - **A full-text posting with no row no longer fails the search.** The search
   skips the hit instead of raising `corrupted index` and records an

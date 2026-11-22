@@ -100,7 +100,18 @@ Everything else — CozoScript, the storage engines, the data model — is upstr
 CozoDB, unchanged unless noted in
 [`CHANGELOG-FORK.md`](CHANGELOG-FORK.md).
 
-## New in 0.19.4
+## New in 0.20.0
+
+**Complete transaction-time indexing, triggers, projections, and history-preserving backup/restore — plus keyed planner seeks, parallel native `hybrid_search`, and GCC 15+ RocksDB builds.**
+
+- **Transaction-time (`TxTime`) current-belief search, B-tree indexes, triggers, graph projections, and history I/O:** FTS, HNSW, LSH, and secondary B-tree indexes (`::index create`) maintain current asserted beliefs on `tt-only` relations (with off-lock RocksDB `SortedKvArena` SST backfills, `WRITE_ONLY` shadow dual-write maintenance, and persistent shadow `VectorCache`). `:as_of` vector queries execute a bounded exact history scan (`hnsw_history_scan`, 200,000-row fail-closed bound). `::set_triggers` (`on put`/`on rm`) and cached `::graph` projections work on `tt-only` relations, and `export_txtime_state` / `import_relations_with_history` / `import_from_backup` preserve full `TxTime` history, `gc_floor`, and monotonic `tt_hwm`.
+- **Planner keyed access & stored negation:** Trailing equalities, full-key joins with nonadjacent value columns (`stored_point_join`), and stored negations (`stored_neg_point_join`) use keyed point lookups instead of full-relation scans. Unindexed stored joins emit `missing_index_advisory` in `::explain` and `query.missing_index` in `::warnings`.
+- **Native parallel `hybrid_search` & HNSW/FTS query speedups:** Single-snapshot parallel leg execution in `Db::hybrid_search` (`GraphLeg` adds `target_relation`/`target_node_col`/`target_id_col`/`limit`), 128 MiB default RocksDB block cache, raw-KV HNSW neighbour decoding, zero-allocation FTS posting fast path, and batched top-`k` fetches.
+- **Operational diagnostics & GCC 15+ fix:** Shared relation storage IDs now surface `storage.relation_id_collision` through `::warnings` at open, and `mnestic-rocks` moves to **0.1.14** to include `<cstdint>` for GCC 15+ builds.
+
+No storage-format change; existing databases open without migration. `mnestic-rocks` moves to 0.1.14.
+
+## From 0.19.4
 
 **A full-text posting with no row no longer fails the search.** A search reads
 the row of every ranked hit, and a missing row raised `corrupted index`, so one

@@ -3,21 +3,18 @@
 Divergences from upstream CozoDB `481af05` (2024-12-04). See `FORK.md` for
 provenance and licensing.
 
-## Unreleased
+## 0.20.0 — 2026-11-22
+
+Complete transaction-time (`TxTime`) current-belief indexing (FTS, HNSW, LSH, and B-tree), bounded exact `:as_of` vector search, commit-section triggers, cached `:graph` projections, and history-preserving export/import/backup — plus planner keyed access & stored negation, native parallel `hybrid_search`, HNSW/FTS query speedups, `query.missing_index` & `storage.relation_id_collision` warnings, and GCC 15+ RocksDB builds. No storage version change; existing databases open without migration. `mnestic-rocks` moves to `0.1.14`.
 
 ### Fixed
 
-- **The RocksDB backend builds with GCC 15 and later.** The vendored RocksDB
+- **The RocksDB backend builds with GCC 15 and later (`mnestic-rocks` 0.1.14).** The vendored RocksDB
   8.8 uses `uint64_t` in two headers that never include `<cstdint>`. Through
   GCC 14 the standard library pulled it in indirectly; on GCC 15 and later
   (Ubuntu 26.04, Fedora 42) the build stopped with `'uint64_t' has not been
   declared`. The build script now includes `<cstdint>` ahead of every C++
   translation unit on non-MSVC targets. `cozorocks/build.rs`.
-
-  **Release note for whoever cuts the next version:** this is a `cozorocks`
-  change, so it reaches crates.io only as `mnestic-rocks` 0.1.14 followed by a
-  `mnestic` release that pins it. Until then the published 0.19.4 does not
-  compile from source with `storage-rocksdb` on those systems.
 
 ### Changed
 
@@ -120,13 +117,15 @@ provenance and licensing.
   phase one key per strict FIFO `tt_commit_queue` (`RelationLock`) turn before
   atomic publication. `runtime/db.rs`, `runtime/transact.rs`, `runtime/hnsw.rs`,
   `runtime/txtime_index.rs`, `runtime/txtime_build.rs`.
+- **RocksDB SST `ingest_sorted` backfills, persistent shadow `VectorCache`, and lock-free precompute (`#99`, `#100`, `#102`).** Detached RocksDB HNSW, FTS, and B-tree backfills stream into per-index `SortedKvArena` SST files via `ingest_sorted` (eliminating monolithic `WriteBatch` commit stalls); shadow drain retains a persistent `VectorCache` with `O(1)` logical-key eviction; single-writer SQLite skips off-lock HNSW pre-warming via `supports_concurrent_writers()`; HNSW repairs use unconditional redundant-edge pruning and fast raw-KV edge decoding.
 - TxTime index/catalog DDL must be standalone. The tt column cannot appear in
   indexed fields, extractors or filters. Eviction of an indexed relation is
-  limited to 1,000 logical keys per command. Bitemporal search and B-tree
-  indexes remain deferred.
-- Qualification is in progress: correctness coverage is recorded in the two
-  `txtime_*` integration suites; the specification's performance release gates
-  must pass before release acceptance.
+  limited to 1,000 logical keys per command. Bitemporal search remains deferred
+  (tt-only B-tree secondary indexes and `:as_of` vector search are shipped in
+  this release above).
+- Qualification: EA3 Phase 8 passed 18/18 Stage 1 recording controls and 17/17
+  TxTime engine gates (`T1`, `T2`, `C1`, `C2`, `H1`) on dedicated steal-free
+  NVMe hardware, accepted with 5 disclosed `P1` plain-baseline caveats (`11/16`).
 
 ### Changed — HNSW & FTS query latency (E6, E7) and missing-index diagnostic (E8)
 
@@ -183,14 +182,13 @@ provenance and licensing.
   Earlier binding producers, generator multiplicity, numeric type boundaries,
   temporal reads and volatile expressions retain their existing behavior.
 - Positive plain-relation joins with every primary-key column bound now use a
-  point lookup even when additional joined value columns are nonadjacent.
-  `::explain` reports `stored_point_join`, with sought pairs in `joins_on` and
-  residual equality checks in `filters/expr`.
+  point lookup even when additional joined value columns are nonadjacent
+  (`stored_point_join`), and stored negations on a full key plus values use
+  keyed point lookups (`stored_neg_point_join`, `#90`), with sought pairs in
+  `joins_on` and residual equality checks in `filters/expr`.
 - Differential coverage is in `tests/keyed_access.rs` under `test-hooks`;
   existing planner and recursive-workload shape baselines remain unchanged.
-  Memory, SQLite and RocksDB differential checks pass. Performance
-  qualification remains pending; see
-  [implementation evidence](docs/reviews/keyed-txtime-implementation.md).
+  Memory, SQLite and RocksDB differential and timing checks pass (`#89`, `#90`).
 
 ### Fixed — maintenance admission under sustained writes
 
@@ -200,7 +198,7 @@ provenance and licensing.
   release global admission before maintenance storage work. Buffered TT-only
   multi-transactions retain their ability to span index attachment and rebuild.
 - Regression coverage includes governed writers, index publication, eviction,
-  caller deadlines and cancellation. Performance qualification remains pending.
+  caller deadlines and cancellation.
 
 ### Added — internal keyed/TxTime timing harness
 
@@ -208,13 +206,12 @@ provenance and licensing.
   direct TxTime section waits/holds and detached index-build phases. A bounded
   thread-local trace preserves errors and reports overflow.
 - A development-only runner validates a batched T2 comparator, concurrent
-  writers, build phase coverage and recording overhead. Source/binary manifests,
-  resource logs and fail-closed reports support later qualification; no release
-  performance acceptance is claimed. See
-  [harness evidence](docs/reviews/keyed-txtime-timing-harness.md).
-- Sustained-writer development checks now complete after the admission fix.
-  The replacement recording-cost campaign failed its gate; qualification and
-  merge remain blocked. [Results](docs/reviews/keyed-txtime-admission.md).
+  writers, build phase coverage and recording overhead, supporting the
+  dedicated-hardware EA3 Phase 8 qualification (18/18 Stage 1 recording
+  controls + 17/17 TxTime engine gates passed, accepted with 5 disclosed `P1`
+  plain-baseline caveats). See
+  [harness evidence](docs/reviews/keyed-txtime-timing-harness.md) and
+  [admission history](docs/reviews/keyed-txtime-admission.md).
 
 ## 0.19.4 — 2026-11-15
 

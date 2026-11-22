@@ -67,6 +67,14 @@ release/issue descriptions retain their September 6 reconciliation date.
 - `mnestic` 0.19.4 (November 15, 2026) is a fix release: a full-text search
   skips a posting whose row is gone instead of failing with `corrupted index`,
   and reports it through `::warnings`. `::reindex` removes such postings.
+- `mnestic` 0.20.0 (November 22, 2026) ships transaction-time (`TxTime`)
+  current-belief search/B-tree indexes (EA3 + EA4 Batch 4.1), bounded exact
+  `:as_of` vector search, commit-section triggers & cached `:graph` projections
+  (EA4 Batch 4.2), history-preserving export/import/backup (EA4 Batch 4.3),
+  planner keyed access & stored negation (EA1/EA2), native parallel
+  `hybrid_search` & HNSW/FTS latency optimizations (E5–E8),
+  `storage.relation_id_collision` warnings, and the GCC 15+ RocksDB fix
+  (`mnestic-rocks` moves to 0.1.14).
 
 ### Selected next — owner decision, November 13, 2026
 
