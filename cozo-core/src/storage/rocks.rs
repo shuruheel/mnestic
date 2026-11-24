@@ -388,6 +388,11 @@ impl Storage<'_> for RocksDbStorage {
         let sst_path_str = sst_path
             .to_str()
             .ok_or_else(|| miette!("bad SST staging path"))?;
+        // Opening the writer creates the file, so remove it on every exit path:
+        // nothing to publish, an entry or writer error, a failed ingest, and
+        // success (ingest copies it). Declared before the writer, so the writer
+        // is closed first. (mnestic fork)
+        let _staging = StagingSst(sst_path.clone());
 
         let mut writer = self
             .db
@@ -408,14 +413,20 @@ impl Storage<'_> for RocksDbStorage {
             .finish()
             .into_diagnostic()
             .wrap_err("finalising SST for index build")?;
-        let ingest_res = self
-            .db
+        self.db
             .ingest_sst_file(sst_path_str)
             .into_diagnostic()
-            .wrap_err("ingesting SST for index build");
-        // Best-effort cleanup of the staging file (ingest copies it).
-        let _ = fs::remove_file(&sst_path);
-        ingest_res
+            .wrap_err("ingesting SST for index build")
+    }
+}
+
+/// A staging SST written by `ingest_sorted`, deleted (best effort) when dropped.
+/// (mnestic fork)
+struct StagingSst(PathBuf);
+
+impl Drop for StagingSst {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
     }
 }
 
@@ -930,6 +941,65 @@ mod tests {
         )?;
 
         Ok((temp_dir, db))
+    }
+
+    /// Leftover `idx_build_*.sst` staging files beside the data directory.
+    fn staging_files(dir: &Path) -> Vec<String> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("idx_build_"))
+            .collect()
+    }
+
+    /// `ingest_sorted` must not leave its staging SST behind on any exit path.
+    /// The empty and error cases each leaked one zero-byte file before the fix;
+    /// a production restore drill (2026-11-24) found 60 next to tenant databases.
+    #[test]
+    fn ingest_sorted_never_leaves_staging_file() -> Result<()> {
+        let (temp_dir, db) = setup_test_db()?;
+        let none: Vec<Result<(Vec<u8>, Vec<u8>)>> = vec![];
+        db.db.ingest_sorted(Box::new(none.into_iter()))?;
+        assert_eq!(
+            staging_files(temp_dir.path()),
+            Vec::<String>::new(),
+            "empty ingest"
+        );
+
+        let failing: Vec<Result<(Vec<u8>, Vec<u8>)>> = vec![
+            Ok((b"\xffstaging-test-a".to_vec(), b"1".to_vec())),
+            Err(miette!("entry source failed")),
+        ];
+        assert!(db.db.ingest_sorted(Box::new(failing.into_iter())).is_err());
+        assert_eq!(
+            staging_files(temp_dir.path()),
+            Vec::<String>::new(),
+            "failed ingest"
+        );
+
+        let out_of_order: Vec<Result<(Vec<u8>, Vec<u8>)>> = vec![
+            Ok((b"\xffstaging-test-c".to_vec(), b"1".to_vec())),
+            Ok((b"\xffstaging-test-b".to_vec(), b"2".to_vec())),
+        ];
+        assert!(db
+            .db
+            .ingest_sorted(Box::new(out_of_order.into_iter()))
+            .is_err());
+        assert_eq!(
+            staging_files(temp_dir.path()),
+            Vec::<String>::new(),
+            "writer error"
+        );
+
+        let ok: Vec<Result<(Vec<u8>, Vec<u8>)>> =
+            vec![Ok((b"\xffstaging-test-d".to_vec(), b"1".to_vec()))];
+        db.db.ingest_sorted(Box::new(ok.into_iter()))?;
+        assert_eq!(
+            staging_files(temp_dir.path()),
+            Vec::<String>::new(),
+            "successful ingest"
+        );
+        Ok(())
     }
 
     #[test]
