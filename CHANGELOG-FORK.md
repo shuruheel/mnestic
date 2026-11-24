@@ -62,6 +62,18 @@ provenance and licensing.
 These are ported from the closed PR #101 (EA3 Stage 2), whose remaining
 changes were superseded by #100 and #102.
 
+### Fixed
+
+- **SST ingest no longer leaves empty staging files behind.** `ingest_sorted`
+  stages each bulk index load as `idx_build_<pid>_<seq>.sst` beside the RocksDB
+  data directory. Opening the SST writer creates that file, but it was only
+  deleted after an ingest was attempted: when there was nothing to publish, or
+  an entry or writer error ended the build early, the file stayed. A restore
+  drill of MindGraph's production volume (2026-11-24) found 60 such zero-byte
+  files next to tenant databases. RocksDB never reads them, so no data was
+  affected. The file is now removed on every exit path. Files left by earlier
+  versions, or by a process that died mid-build, are not swept. `storage/rocks.rs`
+
 ## 0.20.0 — 2026-11-22
 
 Complete transaction-time (`TxTime`) current-belief indexing (FTS, HNSW, LSH, and B-tree), bounded exact `:as_of` vector search, commit-section triggers, cached `:graph` projections, and history-preserving export/import/backup — plus planner keyed access & stored negation, native parallel `hybrid_search`, HNSW/FTS query speedups, `query.missing_index` & `storage.relation_id_collision` warnings, and GCC 15+ RocksDB builds. No storage version change; existing databases open without migration. `mnestic-rocks` moves to `0.1.14`.
