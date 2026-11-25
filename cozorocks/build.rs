@@ -90,7 +90,10 @@ fn main() {
     if !try_to_find_and_link_lib("ROCKSDB") {
         println!("cargo:rerun-if-changed=rocksdb/");
         fail_on_empty_directory("rocksdb");
-        build_rocksdb();
+        match rocksdb_cache_dir() {
+            Some(cache_dir) => build_rocksdb_cached(&cache_dir),
+            None => build_rocksdb(),
+        }
     } else {
         let target = env::var("TARGET").unwrap();
         // according to https://github.com/alexcrichton/cc-rs/blob/master/src/lib.rs#L2189
@@ -135,6 +138,190 @@ fn rocksdb_include_dir() -> String {
     match env::var("ROCKSDB_INCLUDE_DIR") {
         Ok(val) => val,
         Err(_) => "rocksdb/include".to_string(),
+    }
+}
+
+/// Opt-in, content-addressed cache for the compiled RocksDB archive, shared by
+/// every target directory on the machine.
+///
+/// Compiling the vendored RocksDB dominates this crate's build time (minutes), and
+/// Cargo repeats it for every target directory: each worktree, CI job, or
+/// `cargo clean`. When `MNESTIC_ROCKSDB_CACHE_DIR` is set, the first build stores
+/// `librocksdb.a` under `<dir>/<fingerprint>/` and later builds link that archive
+/// into `OUT_DIR` instead of compiling it again.
+///
+/// The fingerprint covers everything that shapes the archive: RocksDB's sources and
+/// headers, this build script (which holds the compile flags), the C++ compiler's
+/// version and arguments (target, profile, `CXXFLAGS`), enabled features, and the
+/// zstd/lz4 headers. Any change selects a new entry instead of reusing a stale one.
+/// Entries are never pruned; delete the directory to reclaim space.
+fn rocksdb_cache_dir() -> Option<PathBuf> {
+    println!("cargo:rerun-if-env-changed=MNESTIC_ROCKSDB_CACHE_DIR");
+    env::var_os("MNESTIC_ROCKSDB_CACHE_DIR")
+        .filter(|dir| !dir.is_empty())
+        .map(PathBuf::from)
+}
+
+fn build_rocksdb_cached(cache_dir: &Path) {
+    let out_lib = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("librocksdb.a");
+    let entry = cache_dir.join(format!("{:032x}", rocksdb_fingerprint()));
+    let cached_lib = entry.join("librocksdb.a");
+
+    // Never trust an archive left in OUT_DIR by an earlier run: it may come from
+    // other sources. The bridge's `cc` build already puts OUT_DIR on the link
+    // search path, and `main` links `rocksdb` statically.
+    let _ = fs::remove_file(&out_lib);
+    if cached_lib.is_file() && link_or_copy(&cached_lib, &out_lib).is_ok() {
+        return;
+    }
+
+    build_rocksdb();
+    if let Err(e) = store_in_cache(&out_lib, &entry) {
+        println!(
+            "cargo:warning=mnestic-rocks: could not cache RocksDB in {}: {e}",
+            cache_dir.display()
+        );
+    }
+}
+
+/// Hard links when both paths share a filesystem (instant, no extra space) and
+/// copies otherwise. Either way OUT_DIR gets its own directory entry, so deleting
+/// the cache later does not break an existing target directory.
+fn link_or_copy(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::hard_link(from, to).or_else(|_| fs::copy(from, to).map(|_| ()))
+}
+
+/// Publishes an entry atomically: concurrent builds see a complete entry or none,
+/// and the loser of a race discards its staging directory.
+fn store_in_cache(lib: &Path, entry: &Path) -> std::io::Result<()> {
+    let parent = entry.parent().expect("cache entry has a parent directory");
+    fs::create_dir_all(parent)?;
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let staging = parent.join(format!(".staging-{}-{nanos}", std::process::id()));
+    fs::create_dir(&staging)?;
+    let result =
+        link_or_copy(lib, &staging.join("librocksdb.a")).and_then(|()| fs::rename(&staging, entry));
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&staging);
+        if entry.join("librocksdb.a").is_file() {
+            return Ok(()); // another build published the same entry first
+        }
+    }
+    result
+}
+
+fn rocksdb_fingerprint() -> u128 {
+    let mut hasher = Fnv128::default();
+    hasher.field(b"build.rs", include_bytes!("build.rs"));
+    for file in ["rocksdb_lib_sources.txt", "build_version.cc"] {
+        hasher.field(file.as_bytes(), &fs::read(file).unwrap_or_default());
+    }
+    hash_sources(&mut hasher, Path::new("rocksdb"));
+    // Hash the zstd/lz4 headers' contents, not their paths: the paths point into a
+    // particular target directory, and entries must be shareable across them.
+    for dep in ["DEP_ZSTD_INCLUDE", "DEP_LZ4_INCLUDE"] {
+        hasher.field(dep.as_bytes(), b"");
+        if let Some(dir) = env::var_os(dep) {
+            hash_sources(&mut hasher, Path::new(&dir));
+        }
+    }
+    for var in [
+        "TARGET",
+        "OPT_LEVEL",
+        "DEBUG",
+        "CARGO_CFG_TARGET_FEATURE",
+        "CARGO_FEATURE_JEMALLOC",
+        "CARGO_FEATURE_IO_URING",
+        "ROCKSDB_CXX_STD",
+    ] {
+        hasher.field(var.as_bytes(), env::var(var).unwrap_or_default().as_bytes());
+    }
+    // The compiler `build_rocksdb` will use, with the arguments cc derives from the
+    // target, profile and CXXFLAGS. Its path is left out so that wrappers or shims
+    // in front of the same compiler share entries.
+    let compiler = cc::Build::new().cpp(true).get_compiler();
+    for arg in compiler.args() {
+        hasher.field(b"arg", arg.as_encoded_bytes());
+    }
+    let version = Command::new(compiler.path())
+        .arg("--version")
+        .output()
+        .map(|out| out.stdout)
+        .unwrap_or_default();
+    hasher.field(b"compiler --version", &version);
+    hasher.finish()
+}
+
+/// Hashes every C/C++ source and header below `root` in a stable order, keyed by
+/// path relative to `root` so identical trees in different places match.
+fn hash_sources(hasher: &mut Fnv128, root: &Path) {
+    let mut files = Vec::new();
+    collect_sources(root, &mut files);
+    files.sort();
+    for file in files {
+        let relative = file.strip_prefix(root).unwrap_or(&file);
+        hasher.field(
+            relative.as_os_str().as_encoded_bytes(),
+            &fs::read(&file).unwrap_or_default(),
+        );
+    }
+}
+
+fn collect_sources(dir: &Path, files: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            if !matches!(entry.file_name().to_str(), Some("java" | "docs" | ".git")) {
+                collect_sources(&path, files);
+            }
+        } else if matches!(
+            path.extension().and_then(|ext| ext.to_str()),
+            Some("h" | "hpp" | "c" | "cc" | "cpp" | "inc")
+        ) {
+            files.push(path);
+        }
+    }
+}
+
+/// FNV-1a, 128-bit. Not cryptographic, but unlike `std`'s `DefaultHasher` its
+/// output is fixed across Rust releases, which a persistent cache key needs.
+struct Fnv128(u128);
+
+const FNV128_OFFSET_BASIS: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+const FNV128_PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+impl Default for Fnv128 {
+    fn default() -> Self {
+        Self(FNV128_OFFSET_BASIS)
+    }
+}
+
+impl Fnv128 {
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u128::from(byte);
+            self.0 = self.0.wrapping_mul(FNV128_PRIME);
+        }
+    }
+
+    /// Length-prefixes the name and value so adjacent fields cannot run together.
+    fn field(&mut self, name: &[u8], value: &[u8]) {
+        for part in [name, value] {
+            self.write(&(part.len() as u64).to_le_bytes());
+            self.write(part);
+        }
+    }
+
+    fn finish(&self) -> u128 {
+        self.0
     }
 }
 
