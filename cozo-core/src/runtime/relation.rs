@@ -781,6 +781,23 @@ impl RelationHandle {
         }
     }
 
+    pub(crate) fn supports_count_scan(&self, tx: &SessionTx<'_>) -> bool {
+        !self.is_temp && tx.store_tx.supports_count_scan()
+    }
+
+    pub(crate) fn scan_for_count<'a>(
+        &self,
+        tx: &'a SessionTx<'_>,
+    ) -> impl Iterator<Item = Result<()>> + 'a {
+        let lower = Tuple::default().encode_as_key(self.id);
+        let upper = Tuple::default().encode_as_key(self.id.next());
+        if self.is_temp {
+            tx.temp_store_tx.range_scan_for_count(&lower, &upper)
+        } else {
+            tx.store_tx.range_scan_for_count(&lower, &upper)
+        }
+    }
+
     pub(crate) fn skip_scan_all<'a>(
         &self,
         tx: &'a SessionTx<'_>,
@@ -1030,6 +1047,53 @@ fn decode_val_blob(val: &[u8], key: impl FnOnce() -> String) -> Result<Vec<DataV
         }
         .into()
     })
+}
+
+/// Recognize only the canonical encoding of one vector value. Every other
+/// representation uses the ordinary decoder, including all malformed inputs.
+/// The borrowed bytes accept exactly the tags/lengths accepted by VectorVisitor;
+/// no vector allocation/copy is needed when the aggregate discards its value.
+#[cfg(any(test, feature = "storage-rocksdb"))]
+fn canonical_vector_payload(val: &[u8]) -> bool {
+    let Some(payload) = val.get(ENCODED_KEY_MIN_LEN..) else {
+        return false;
+    };
+    // [ { "Vec": [ dtype, <MessagePack binary> ] } ]
+    if !payload.starts_with(&[0x91, 0x81, 0xa3, b'V', b'e', b'c', 0x92]) {
+        return false;
+    }
+    let width = match payload.get(7) {
+        Some(0) => 4,
+        Some(1) => 8,
+        _ => return false,
+    };
+    let (header, len) = match payload.get(8) {
+        Some(0xc4) => match payload.get(9) {
+            Some(n) => (10, *n as usize),
+            None => return false,
+        },
+        Some(0xc5) => match payload.get(9..11) {
+            Some(n) => (11, u16::from_be_bytes([n[0], n[1]]) as usize),
+            None => return false,
+        },
+        Some(0xc6) => match payload.get(9..13) {
+            Some(n) => (13, u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize),
+            None => return false,
+        },
+        _ => return false,
+    };
+    len % width == 0 && payload.len().checked_sub(header) == Some(len)
+}
+
+#[cfg(any(test, feature = "storage-rocksdb"))]
+pub(crate) fn validate_count_row(key: &[u8], val: &[u8]) -> Result<()> {
+    if canonical_vector_payload(val) {
+        // Keep the same key decoder; only the unused vector allocation is skipped.
+        let _ = decode_tuple_from_key(key, DEFAULT_SIZE_HINT);
+        Ok(())
+    } else {
+        try_decode_tuple_from_kv(key, val, None).map(|_| ())
+    }
 }
 
 fn encoded_key_label(key: &[u8]) -> String {
@@ -2500,5 +2564,121 @@ mod catalog_compat_tests {
         let reread = RelationHandle::decode(&buf).expect("map-encoded catalog must decode");
         assert_eq!(reread.name, "edge");
         assert!(reread.indices.contains_key("from_idx"));
+    }
+}
+
+#[cfg(test)]
+mod scalar_count_validation_tests {
+    use super::*;
+    use crate::data::value::Vector;
+    use ndarray::Array1;
+
+    fn value_blob(values: &[DataValue]) -> Vec<u8> {
+        let mut blob = vec![0; ENCODED_KEY_MIN_LEN];
+        blob.extend(rmp_serde::to_vec(values).unwrap());
+        blob
+    }
+
+    fn same_validation(key: &[u8], blob: &[u8]) {
+        // The existing decoder panics on reserved Regex values. Preserve and
+        // compare that existing failure too; do not silently skip fuzz inputs.
+        let normal =
+            std::panic::catch_unwind(|| try_decode_tuple_from_kv(key, blob, None).map(|_| ()));
+        let counted = std::panic::catch_unwind(|| validate_count_row(key, blob));
+        match (normal, counted) {
+            (Ok(a), Ok(b)) => {
+                assert_eq!(a.is_ok(), b.is_ok(), "{blob:?}");
+                if let (Err(a), Err(b)) = (a, b) {
+                    assert_eq!(
+                        a.code().map(|c| c.to_string()),
+                        b.code().map(|c| c.to_string())
+                    );
+                    assert_eq!(a.to_string(), b.to_string());
+                }
+            }
+            (Err(a), Err(b)) => {
+                assert!(!canonical_vector_payload(blob));
+                assert_eq!(a.downcast_ref::<&str>(), b.downcast_ref::<&str>());
+                assert_eq!(a.downcast_ref::<String>(), b.downcast_ref::<String>());
+            }
+            _ => panic!("count decoder changed panic behavior for {blob:?}"),
+        }
+    }
+
+    #[cfg(feature = "storage-rocksdb")]
+    #[test]
+    fn scalar_count_rocks_corruption_is_still_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let db =
+            crate::DbInstance::new("rocksdb", dir.path().join("db").to_str().unwrap(), "").unwrap();
+        db.run_default(":create damaged {id: Int => embedding: <F32; 4>}")
+            .unwrap();
+        db.run_default(
+            "?[id, embedding] <- [[1, vec([1, 0, 0, 0])]] :put damaged {id => embedding}",
+        )
+        .unwrap();
+        let crate::DbInstance::RocksDb(inner) = &db else {
+            unreachable!()
+        };
+        let mut tx = inner.transact_write().unwrap();
+        let handle = tx.get_relation("damaged", false).unwrap();
+        let key = vec![DataValue::from(1)].encode_as_key(handle.id);
+        tx.store_tx.put(&key, &[0x91, 1, 2]).unwrap();
+        tx.commit_tx().unwrap();
+        drop(tx);
+        for query in [
+            "?[count(id)] := *damaged{id}",
+            "?[sum(one)] := *damaged{id}, one = 1",
+        ] {
+            let error = db.run_default(query).unwrap_err();
+            assert_eq!(
+                error.code().unwrap().to_string(),
+                "eval::corrupt_value_blob"
+            );
+        }
+    }
+
+    #[test]
+    fn scalar_count_canonical_vectors_validate_without_materializing() {
+        let key = vec![DataValue::from(7)].encode_as_key(RelationId::new(1));
+        for len in [0, 1, 63, 64, 1536, 16384] {
+            for value in [
+                DataValue::Vec(Vector::F32(Array1::from(vec![f32::NAN; len]))),
+                DataValue::Vec(Vector::F64(Array1::from(vec![f64::NEG_INFINITY; len]))),
+            ] {
+                let blob = value_blob(&[value]);
+                assert!(canonical_vector_payload(&blob), "len {len}");
+                same_validation(&key, &blob);
+            }
+        }
+    }
+
+    #[test]
+    fn scalar_count_invalid_and_noncanonical_blobs_keep_decoder_errors() {
+        let key = vec![DataValue::from(7)].encode_as_key(RelationId::new(1));
+        let blob = value_blob(&[DataValue::Vec(Vector::F32(Array1::from(vec![1.0; 4])))]);
+        // Exhaustive single-byte substitutions and every truncation of a real encoding.
+        for i in 0..blob.len() {
+            same_validation(&key, &blob[..i]);
+            for byte in 0..=255u8 {
+                let mut changed = blob.clone();
+                changed[i] = byte;
+                same_validation(&key, &changed);
+            }
+        }
+        for values in [
+            vec![],
+            vec![DataValue::Null],
+            vec![DataValue::from("text")],
+            vec![DataValue::from(1), DataValue::from(2)],
+        ] {
+            let blob = value_blob(&values);
+            assert!(!canonical_vector_payload(&blob));
+            same_validation(&key, &blob);
+        }
+        let mut trailing = blob.clone();
+        trailing.push(0);
+        assert!(!canonical_vector_payload(&trailing));
+        same_validation(&key, &trailing);
     }
 }
