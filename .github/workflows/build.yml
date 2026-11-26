@@ -130,12 +130,24 @@ jobs:
   rocksdb:
     name: build (storage-rocksdb, C++ bridge)
     runs-on: ubuntu-24.04
+    env:
+      MNESTIC_ROCKSDB_CACHE_DIR: ${{ runner.temp }}/mnestic-rocksdb-cache
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: Compute RocksDB submodule commit
+        id: rocksdb-rev
+        run: echo "sha=$(git rev-parse HEAD:cozorocks/rocksdb)" >> "$GITHUB_OUTPUT"
+      - name: Cache compiled RocksDB archive
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.MNESTIC_ROCKSDB_CACHE_DIR }}
+          key: mnestic-rocksdb-${{ runner.os }}-${{ runner.arch }}-${{ steps.rocksdb-rev.outputs.sha }}-${{ hashFiles('cozorocks/build.rs', 'cozorocks/rocksdb_lib_sources.txt', 'cozorocks/build_version.cc') }}
+          restore-keys: |
+            mnestic-rocksdb-${{ runner.os }}-${{ runner.arch }}-
       - name: Build with RocksDB backend
         run: cargo build -p mnestic --features storage-rocksdb --verbose
       # The graph-projection freshness protocol has race windows that mem and
